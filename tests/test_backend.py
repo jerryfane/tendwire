@@ -115,7 +115,7 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
                 "capture_output": True,
                 "text": True,
                 "check": False,
-                "timeout": herdr_command._HERDR_SEND_TIMEOUT_SECONDS,
+                "timeout": config.herdr_timeout_seconds,
             },
         )
     ]

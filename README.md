@@ -46,11 +46,13 @@ tendwire doctor --json
 
 `doctor --json` prints JSON-only diagnostics for `herdr workspace list`,
 `herdr agent list`, and `herdr pane list`, with `--json` compatibility variants
-run only when a no-flag command is not healthy. It distinguishes a missing Herdr
-binary, command timeout, nonzero exit, malformed JSON, empty healthy output, and
-non-empty healthy output. The Herdr binary path, data directory, and database
-path expand `~`; each Herdr probe uses `TENDWIRE_HERDR_TIMEOUT_SECONDS` or
-`--herdr-timeout` when set, defaulting to 5.0 seconds.
+run only when a no-flag command is not healthy. It distinguishes missing Herdr
+binary, launch error, command timeout, nonzero exit, malformed JSON, empty
+healthy output, non-empty healthy output, skipped compatibility probes, and
+checks skipped after a timeout. The Herdr binary path, data directory, and
+database path expand `~`; each Herdr probe uses
+`TENDWIRE_HERDR_TIMEOUT_SECONDS` or `--herdr-timeout` when set, defaulting to
+5.0 seconds.
 
 When Herdr 0.7.0 is present, the adapter first tries the no-flag JSON envelopes
 (`herdr workspace list`, `herdr agent list`) that wrap records under

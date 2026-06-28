@@ -23,10 +23,6 @@ from ..core.commands import (
 )
 from ..core.models import _string_value
 
-
-_HERDR_SEND_TIMEOUT_SECONDS = 5.0
-
-
 def _run_agent_send(
     config: Config,
     target_value: str,
