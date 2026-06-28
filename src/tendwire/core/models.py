@@ -100,6 +100,11 @@ FORBIDDEN_FIELD_NAMES = frozenset(
         "delivery",
         "route",
         "herdres_delivery",
+        "backend_target",
+        "terminal_id",
+        "pane_id",
+        "agent_session",
+        "session_id",
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
@@ -421,6 +426,7 @@ class Worker:
     last_seen_at: str | None = None
     summary: str | None = None
     fingerprint: str = ""
+    backend_target: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         worker_id = _string_value(self.id, "unknown")
@@ -449,6 +455,10 @@ class Worker:
         object.__setattr__(self, "last_seen_at", last_seen_at)
         object.__setattr__(self, "summary", summary)
         object.__setattr__(self, "fingerprint", fingerprint)
+        backend_target = None
+        if isinstance(self.backend_target, Mapping):
+            backend_target = {str(key): value for key, value in self.backend_target.items()}
+        object.__setattr__(self, "backend_target", backend_target)
 
     def to_dict(self) -> dict[str, Any]:
         return {

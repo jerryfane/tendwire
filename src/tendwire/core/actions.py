@@ -115,7 +115,10 @@ def _resolve_target_result(request: CommandRequest, workers: list[Worker]) -> Co
 
 def _send_instruction_result(request: CommandRequest, context: CommandContext) -> CommandEnvelope:
     resolved, candidates, status = resolve_target(
-        request.target, context.workers, allow_disallowed_status=True
+        request.target,
+        context.workers,
+        allow_disallowed_status=True,
+        include_backend_target=True,
     )
     if status != STATUS_RESOLVED:
         return _resolve_target_result(request, context.workers)
@@ -144,11 +147,12 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
     text = instruction.get("text", "")
 
     if request.dry_run:
+        public_target = worker_candidate(resolved_worker) if resolved_worker is not None else target
         return CommandEnvelope.from_result(
             request,
             ok=True,
             status=STATUS_DRY_RUN,
-            result={"target": target, "instruction": {"text": text}},
+            result={"target": public_target, "instruction": {"text": text}},
         )
 
     if context.backend_sender is None:

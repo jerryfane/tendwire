@@ -59,15 +59,14 @@ def send_instruction(
     target: dict[str, Any],
     instruction: dict[str, Any],
 ) -> CommandEnvelope:
-    """Send instruction text to the backend-resolved neutral Herdr worker id."""
-    target_value = _string_value(target.get("worker_id"))
+    """Send instruction text to the backend-resolved private Herdr target."""
+    backend_target = target.get("backend_target")
+    target_value = ""
+    if isinstance(backend_target, dict):
+        target_value = _string_value(backend_target.get("value"))
+    public_worker_id = _string_value(target.get("worker_id"))
     instruction_text = instruction.get("text")
 
-    if not target_value:
-        return _backend_error(
-            STATUS_BACKEND_FAILED,
-            "resolved target is missing a worker id",
-        )
     if not isinstance(instruction_text, str) or not instruction_text:
         return _backend_error(
             STATUS_BACKEND_FAILED,
@@ -84,6 +83,12 @@ def send_instruction(
         return _backend_error(
             STATUS_BACKEND_UNAVAILABLE,
             "Herdr binary is unavailable",
+        )
+
+    if not target_value:
+        return _backend_error(
+            STATUS_BACKEND_FAILED,
+            "resolved target is missing a backend target",
         )
 
     try:
@@ -107,7 +112,7 @@ def send_instruction(
             action="send_instruction",
             request_id=None,
             dry_run=False,
-            result={"target": {"worker_id": target_value}},
+            result={"target": {"worker_id": public_worker_id}},
             error=None,
         )
 

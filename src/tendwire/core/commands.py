@@ -103,6 +103,9 @@ FORBIDDEN_REQUEST_FIELDS = frozenset(
         "shell",
         "connector",
         "connectors",
+        "backend_target",
+        "agent_session",
+        "session_id",
     }
 )
 
@@ -141,6 +144,9 @@ _COMMAND_RESULT_FORBIDDEN_FIELDS = frozenset(
         "connector",
         "connectors",
         "herdres_delivery",
+        "backend_target",
+        "agent_session",
+        "session_id",
     }
 )
 _COMMAND_RESULT_FORBIDDEN_COMPACT = frozenset(
@@ -560,7 +566,7 @@ class CommandEnvelope:
         return cls.from_result(request, ok=False, status=error.get("code", STATUS_REJECTED), error=error)
 
 
-def worker_candidate(worker: Worker) -> dict[str, Any]:
+def worker_candidate(worker: Worker, *, include_backend_target: bool = False) -> dict[str, Any]:
     """Return a sanitized neutral candidate description for a worker."""
     candidate: dict[str, Any] = {
         "worker_id": worker.id,
@@ -571,6 +577,8 @@ def worker_candidate(worker: Worker) -> dict[str, Any]:
     }
     if worker.summary:
         candidate["summary"] = worker.summary
+    if include_backend_target and worker.backend_target:
+        candidate["backend_target"] = dict(worker.backend_target)
     return candidate
 
 
@@ -579,6 +587,7 @@ def resolve_target(
     workers: list[Worker],
     *,
     allow_disallowed_status: bool = False,
+    include_backend_target: bool = False,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str]:
     """Resolve a target dict against live workers.
 
@@ -619,7 +628,10 @@ def resolve_target(
     else:
         candidates = identity_matches
 
-    sanitized = [worker_candidate(worker) for worker in candidates]
+    sanitized = [
+        worker_candidate(worker, include_backend_target=include_backend_target)
+        for worker in candidates
+    ]
 
     if len(candidates) == 0:
         return None, [], STATUS_NOT_FOUND

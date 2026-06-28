@@ -360,6 +360,9 @@ def test_public_result_contains_no_connector_fields() -> None:
                     "argv",
                     "command",
                     "shell",
+                    "backend_target",
+                    "agent_session",
+                    "session_id",
                 }, f"forbidden field {path}.{key}"
                 check(value[key], f"{path}.{key}")
         elif isinstance(value, list):
@@ -367,3 +370,45 @@ def test_public_result_contains_no_connector_fields() -> None:
                 check(item, f"{path}[{i}]")
 
     check(payload)
+
+
+def test_send_instruction_backend_receives_private_target_but_public_result_is_sanitized() -> None:
+    calls: list[tuple[Any, Any]] = []
+    worker = Worker(
+        id="public-worker",
+        name="Agent",
+        status="active",
+        backend_target={"kind": "agent_id", "value": "send-agent"},
+    )
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(
+            ok=True,
+            status="accepted",
+            action="send_instruction",
+            result={"target": target},
+        )
+
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-private-target",
+        dry_run=False,
+        target={"worker_id": "public-worker"},
+        instruction={"text": "hello"},
+    )
+    envelope = execute_command(
+        request,
+        CommandContext(host_id="host", workers=[worker], backend_sender=fake_backend),
+    )
+    payload = json.loads(envelope.to_json())
+
+    assert envelope.ok is True
+    assert calls[0][0]["backend_target"] == {"kind": "agent_id", "value": "send-agent"}
+    assert payload["result"]["target"] == {
+        "worker_id": "public-worker",
+        "name": "Agent",
+        "space_id": None,
+        "status": "active",
+        "worker_fingerprint": worker.fingerprint,
+    }

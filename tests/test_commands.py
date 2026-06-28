@@ -55,6 +55,9 @@ _FORBIDDEN_COMMAND_FIELDS = {
     "shell",
     "connector",
     "connectors",
+    "backend_target",
+    "agent_session",
+    "session_id",
 }
 
 
@@ -447,6 +450,9 @@ _COMMAND_RESULT_FORBIDDEN_KEYS = {
     "thread_id",
     "bot_token",
     "herdres_delivery",
+    "backend_target",
+    "agent_session",
+    "session_id",
 }
 
 
@@ -463,11 +469,15 @@ def test_sanitize_command_result_strips_plural_and_variant_forbidden_keys() -> N
         "deliveries": [{"id": 1}],
         "tokens": "secret",
         "connectors": {"telegram": "leaked"},
+        "backend_target": {"kind": "agent_id", "value": "agent-1"},
+        "agent_session": {"value": "sess-1"},
+        "session_id": "session-1",
         "nested": {
             "safe": "kept",
             "window_id": "w-1",
             "tab_id": "t-1",
             "argv": ["-c"],
+            "backend_target": {"value": "nested"},
         },
         "list": [
             {"safe": "kept", "route": "r"},

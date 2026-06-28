@@ -154,5 +154,7 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
     assert payload["spaces"][0]["id"] == "ws-cli"
     assert payload["spaces"][0]["status"] == "active"
     assert len(payload["workers"]) == 1
-    assert payload["workers"][0]["id"] == "sess-cli"
+    assert payload["workers"][0]["id"] == "CLI Agent"
     assert payload["workers"][0]["status"] == "active"
+    assert "agent_session" not in json.dumps(payload)
+    assert "sess-cli" not in json.dumps(payload)

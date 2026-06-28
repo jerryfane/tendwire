@@ -32,6 +32,11 @@ _FORBIDDEN_FIELDS = {
     "route",
     "herdres_delivery",
     "command",
+    "backend_target",
+    "terminal_id",
+    "pane_id",
+    "agent_session",
+    "session_id",
 }
 
 
@@ -156,6 +161,30 @@ def test_space_worker_and_attention_serialization_include_contract_fields() -> N
     assert Worker.from_dict(worker_payload).to_dict() == worker_payload
     assert AttentionSignal.from_dict(signal_payload).to_dict() == signal_payload
     _assert_no_forbidden_fields(signal_payload)
+
+
+def test_worker_private_backend_target_and_raw_backend_meta_do_not_serialize() -> None:
+    worker = Worker(
+        id="public-worker",
+        name="Agent One",
+        status="active",
+        meta={
+            "safe": "kept",
+            "terminal_id": "term-1",
+            "pane_id": "pane-1",
+            "agent_session": {"value": "sess-1"},
+            "session_id": "session-1",
+            "backend_target": {"kind": "agent_id", "value": "agent-1"},
+        },
+        backend_target={"kind": "agent_id", "value": "agent-1"},
+    )
+
+    payload = worker.to_dict()
+
+    assert payload["id"] == "public-worker"
+    assert payload["meta"] == {"safe": "kept"}
+    assert worker.backend_target == {"kind": "agent_id", "value": "agent-1"}
+    _assert_no_forbidden_fields(payload)
 
 
 def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() -> None:

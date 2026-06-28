@@ -551,6 +551,9 @@ _COMMAND_PUBLIC_FORBIDDEN_KEYS = {
     "tokens",
     "connector",
     "connectors",
+    "backend_target",
+    "agent_session",
+    "session_id",
 }
 
 
@@ -592,8 +595,12 @@ def _fake_herdr_state_with_terminal(config: Any) -> tuple[list[Space], list[Work
                 "tokens": ["t1"],
                 "connector": {"x": 1},
                 "connectors": [{"y": 2}],
+                "backend_target": {"kind": "agent_id", "value": "agent-1"},
+                "agent_session": {"value": "sess-1"},
+                "session_id": "session-1",
                 "safe": "kept",
             },
+            backend_target={"kind": "agent_id", "value": "agent-1"},
         )
     ]
 
@@ -631,7 +638,7 @@ def test_cli_command_read_snapshot_strips_command_public_terminal_fields(
         assert key not in meta, key
     assert meta["safe"] == "kept"
 
-    # The same worker data still flows through the standalone snapshot path.
+    # The standalone snapshot path is public too, so backend identifiers are absent there as well.
     code2 = main(
         [
             "--host-id",
@@ -647,8 +654,8 @@ def test_cli_command_read_snapshot_strips_command_public_terminal_fields(
     snapshot = json.loads(captured2.out)
     assert snapshot["schema_version"] == 2
     snap_meta = snapshot["workers"][0]["meta"]
-    assert snap_meta["pane_id"] == "p-1"
-    assert snap_meta["terminal_id"] == "t-1"
+    for key in ("pane_id", "terminal_id", "backend_target", "agent_session", "session_id"):
+        assert key not in snap_meta
     assert snap_meta["safe"] == "kept"
 
 

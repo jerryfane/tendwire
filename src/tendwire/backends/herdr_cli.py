@@ -10,6 +10,7 @@ core models.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -17,7 +18,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from ..config import Config
-from ..core.models import Space, Worker, normalize_status
+from ..core.models import Space, Worker, normalize_status, stable_fingerprint
 
 
 _HERDR_TIMEOUT_SECONDS = 5.0
@@ -57,6 +58,17 @@ def _compact_field_name(key: object) -> str:
 def _field_matches(key: object, expected: str) -> bool:
     """Return True when a payload key matches snake_case or camelCase spelling."""
     return _compact_field_name(key) == _compact_field_name(expected)
+
+
+def _private_fingerprint(value: Any) -> str:
+    """Return a private adapter-only fingerprint without public sanitization."""
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
 
 
 def _is_forbidden_connector_field(key: object) -> bool:
@@ -267,12 +279,56 @@ def _space_name_from_item(item: Mapping[str, Any], space_id: str) -> str:
     return _first_text(item, ("label", "name", "title", "workspace_id", "space_id")) or space_id
 
 
-def _worker_id_from_item(item: Mapping[str, Any]) -> str:
-    """Resolve a stable worker id, preferring session value then pane/terminal ids."""
+def _public_worker_id_base_from_item(item: Mapping[str, Any]) -> str:
+    """Resolve a neutral public worker id without terminal/session handles."""
     return (
-        _nested_text(item, "agent_session", "value")
-        or _first_text(item, ("pane_id", "terminal_id", "agent_id", "worker_id", "id", "slug", "name"))
+        _first_text(item, ("worker_id", "id", "slug", "agent_id"))
+        or _first_text(item, ("agent", "name", "label", "title"))
         or "unknown"
+    )
+
+
+def _worker_id_from_item(item: Mapping[str, Any]) -> str:
+    """Resolve a stable public worker id."""
+    return _public_worker_id_base_from_item(item)
+
+
+def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, str] | None:
+    """Resolve the private Herdr send target without using agent_session."""
+    identity = _private_fingerprint(
+        {
+            "public_id": _public_worker_id_base_from_item(item),
+            "name": _first_text(item, ("agent", "name", "label", "title")),
+            "space_id": _worker_space_id_from_item(item),
+            "agent_session": _nested_text(item, "agent_session", "value"),
+            "session_id": _first_text(item, ("session_id",)),
+            "terminal_id": _first_text(item, ("terminal_id",)),
+            "pane_id": _first_text(item, ("pane_id",)),
+        }
+    )
+    candidates = (
+        ("agent_id", _first_text(item, ("agent_id",))),
+        ("agent", _first_text(item, ("agent", "name", "label", "title"))),
+        ("terminal_id", _first_text(item, ("terminal_id",))),
+        ("pane_id", _first_text(item, ("pane_id",))),
+    )
+    for kind, value in candidates:
+        if value:
+            return {"kind": kind, "value": value, "identity": identity}
+    return None
+
+
+def _worker_with_id(worker: Worker, worker_id: str) -> Worker:
+    """Return a worker copy with a disambiguated public id."""
+    return Worker(
+        id=worker_id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta=worker.meta,
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+        backend_target=worker.backend_target,
     )
 
 
@@ -370,6 +426,11 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
             "description",
             "fingerprint",
             "agent_status",
+            "backend_target",
+            "terminal_id",
+            "pane_id",
+            "agent_session",
+            "session_id",
         },
         raw_status,
     )
@@ -381,19 +442,61 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
         meta=meta,
         last_seen_at=last_seen_at,
         summary=summary,
+        backend_target=_backend_target_from_item(item),
     )
 
 
 def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
-    """Drop duplicate workers by stable identity; keep deterministic order by id."""
-    seen: set[str] = set()
+    """Drop exact duplicates, then disambiguate duplicate public ids."""
+    seen: set[tuple[str, str, str | None, str, str, str]] = set()
     unique: list[Worker] = []
     for worker in workers:
-        if worker.id in seen:
+        backend_kind = ""
+        backend_value = ""
+        if worker.backend_target:
+            backend_kind = str(worker.backend_target.get("kind", ""))
+            backend_value = str(worker.backend_target.get("value", ""))
+            backend_identity = str(worker.backend_target.get("identity", ""))
+        else:
+            backend_identity = ""
+        key = (worker.id, worker.name, worker.space_id, backend_kind, backend_value, backend_identity)
+        if key in seen:
             continue
-        seen.add(worker.id)
+        seen.add(key)
         unique.append(worker)
-    return sorted(unique, key=lambda w: w.id)
+
+    groups: dict[str, list[Worker]] = {}
+    for worker in unique:
+        groups.setdefault(worker.id, []).append(worker)
+
+    disambiguated: list[Worker] = []
+    for worker_id, group in groups.items():
+        if len(group) == 1:
+            disambiguated.extend(group)
+            continue
+        ordered = sorted(
+            group,
+            key=lambda w: (
+                w.name,
+                w.space_id or "",
+                str((w.backend_target or {}).get("kind", "")),
+                str((w.backend_target or {}).get("value", "")),
+                str((w.backend_target or {}).get("identity", "")),
+                stable_fingerprint(
+                    {
+                        "id": w.id,
+                        "name": w.name,
+                        "space_id": w.space_id,
+                        "status": w.status,
+                        "summary": w.summary,
+                    }
+                ),
+            ),
+        )
+        for index, worker in enumerate(ordered, start=1):
+            disambiguated.append(_worker_with_id(worker, f"{worker_id}-{index}"))
+
+    return sorted(disambiguated, key=lambda w: w.id)
 
 
 def _workers_from_payload(payload: Any) -> list[Worker]:

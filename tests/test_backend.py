@@ -32,6 +32,9 @@ _FORBIDDEN_FIELDS = {
     "herdres_delivery",
     "pane_id",
     "terminal_id",
+    "backend_target",
+    "agent_session",
+    "session_id",
     "argv",
     "command",
     "shell",
@@ -94,16 +97,20 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
 
     envelope = herdr_command.send_instruction(
         config,
-        {"worker_id": "worker-1", "terminal_id": "ignored"},
+        {
+            "worker_id": "public-worker-1",
+            "backend_target": {"kind": "agent_id", "value": "agent-send-1"},
+            "terminal_id": "ignored",
+        },
         {"text": "hello"},
     )
 
     assert envelope.ok is True
     assert envelope.status == STATUS_ACCEPTED
-    assert envelope.result == {"target": {"worker_id": "worker-1"}}
+    assert envelope.result == {"target": {"worker_id": "public-worker-1"}}
     assert calls == [
         (
-            ["herdr", "agent", "send", "worker-1", "hello"],
+            ["herdr", "agent", "send", "agent-send-1", "hello"],
             {
                 "capture_output": True,
                 "text": True,
@@ -115,6 +122,25 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
     assert "shell" not in calls[0][1]
 
 
+def test_send_instruction_requires_private_backend_target(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[Any] = []
+
+    monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_command, "_run_agent_send", lambda *args: calls.append(args))
+
+    envelope = herdr_command.send_instruction(
+        config,
+        {"worker_id": "public-worker-1", "agent_session": {"value": "sess-ignored"}},
+        {"text": "hello"},
+    )
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_FAILED
+    assert calls == []
+    _assert_no_forbidden_fields(envelope.to_dict())
+
+
 def test_send_instruction_maps_missing_binary_to_backend_unavailable(monkeypatch) -> None:
     config = Config(host_id="testhost", herdr_bin="missing-herdr")
     monkeypatch.setattr(herdr_command.shutil, "which", lambda _: None)
@@ -124,7 +150,11 @@ def test_send_instruction_maps_missing_binary_to_backend_unavailable(monkeypatch
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not run")),
     )
 
-    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+    envelope = herdr_command.send_instruction(
+        config,
+        {"worker_id": "worker-1", "backend_target": {"kind": "agent_id", "value": "agent-1"}},
+        {"text": "hello"},
+    )
 
     assert envelope.ok is False
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
@@ -136,7 +166,11 @@ def test_send_instruction_maps_nonzero_exit_to_backend_failed(monkeypatch) -> No
     monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
     monkeypatch.setattr(herdr_command, "_run_agent_send", lambda *args: _send_completed(returncode=2))
 
-    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+    envelope = herdr_command.send_instruction(
+        config,
+        {"worker_id": "worker-1", "backend_target": {"kind": "agent_id", "value": "agent-1"}},
+        {"text": "hello"},
+    )
 
     assert envelope.ok is False
     assert envelope.status == STATUS_BACKEND_FAILED
@@ -153,7 +187,11 @@ def test_send_instruction_maps_timeout_to_uncertain(monkeypatch) -> None:
     monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
     monkeypatch.setattr(herdr_command, "_run_agent_send", raise_timeout)
 
-    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+    envelope = herdr_command.send_instruction(
+        config,
+        {"worker_id": "worker-1", "backend_target": {"kind": "agent_id", "value": "agent-1"}},
+        {"text": "hello"},
+    )
 
     assert envelope.ok is False
     assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
@@ -246,6 +284,92 @@ def test_sample_herdr_projection_is_neutral_and_fingerprinted(monkeypatch) -> No
     _assert_no_forbidden_fields(payload)
 
 
+def test_herdr_agent_public_id_and_private_backend_target_are_separate(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-worker",
+                        "agent_id": "send-agent",
+                        "agent": "Coder",
+                        "agent_session": {"value": "sess-must-not-leak"},
+                        "terminal_id": "term-must-not-leak",
+                        "pane_id": "pane-must-not-leak",
+                        "session_id": "session-must-not-leak",
+                        "workspace_id": "ws-1",
+                    }
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    spaces, workers = fetch_herdr_state(config)
+    snapshot = project_from_observations(config, spaces=spaces, workers=workers)
+    payload = json.loads(snapshot.to_json())
+
+    assert len(workers) == 1
+    assert workers[0].id == "public-worker"
+    assert workers[0].backend_target is not None
+    assert workers[0].backend_target["kind"] == "agent_id"
+    assert workers[0].backend_target["value"] == "send-agent"
+    assert payload["workers"][0]["id"] == "public-worker"
+    assert payload["workers"][0]["name"] == "Coder"
+    assert "sess-must-not-leak" not in json.dumps(payload)
+    assert "term-must-not-leak" not in json.dumps(payload)
+    assert "pane-must-not-leak" not in json.dumps(payload)
+    assert "session-must-not-leak" not in json.dumps(payload)
+    _assert_no_forbidden_fields(payload)
+
+
+def test_herdr_backend_target_precedence_and_pane_fallback(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "id": "public-id",
+                        "agent_id": "agent-send",
+                        "agent": "agent-name",
+                        "label": "agent-label",
+                        "terminal_id": "term-fallback",
+                        "pane_id": "pane-fallback",
+                    },
+                    {
+                        "slug": "pane-public",
+                        "agent_session": {"value": "sess-not-sendable"},
+                        "terminal_id": "term-send",
+                        "pane_id": "pane-send",
+                        "state_labels": ["agent"],
+                    },
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    _, workers = fetch_herdr_state(config)
+    by_id = {worker.id: worker for worker in workers}
+
+    assert by_id["public-id"].backend_target is not None
+    assert by_id["public-id"].backend_target["kind"] == "agent_id"
+    assert by_id["public-id"].backend_target["value"] == "agent-send"
+    assert by_id["pane-public"].backend_target is not None
+    assert by_id["pane-public"].backend_target["kind"] == "terminal_id"
+    assert by_id["pane-public"].backend_target["value"] == "term-send"
+    assert all(
+        (worker.backend_target or {}).get("value") != "sess-not-sendable"
+        for worker in workers
+    )
+
+
 def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypatch) -> None:
     """Herdr 0.7.0 no-flag envelopes are used before compatibility --json fallbacks."""
     config = Config(host_id="testhost", herdr_bin="herdr")
@@ -297,10 +421,13 @@ def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypa
     assert spaces[0].meta.get("active_tab_id") == "tab-1"
     assert spaces[0].meta.get("raw_status") == "working"
     assert len(workers) == 1
-    assert workers[0].id == "sess-1"
+    assert workers[0].id == "Coder"
     assert workers[0].name == "Coder"
     assert workers[0].status == "done"
     assert workers[0].space_id == "ws-1"
+    assert workers[0].backend_target is not None
+    assert workers[0].backend_target["kind"] == "agent"
+    assert workers[0].backend_target["value"] == "Coder"
     assert workers[0].meta.get("cwd") == "/home/dev"
     assert "raw_status" not in workers[0].meta
 
@@ -368,7 +495,7 @@ def test_json_agent_list_fallback_when_no_flag_is_malformed(monkeypatch) -> None
     assert calls == [("workspace", "list"), ("agent", "list"), ("agent", "list", "--json")]
     assert spaces == []
     assert len(workers) == 1
-    assert workers[0].id == "sess-json"
+    assert workers[0].id == "CompatAgent"
     assert workers[0].name == "CompatAgent"
     assert workers[0].space_id == "ws-1"
 
@@ -394,7 +521,7 @@ def test_result_envelopes_parse(monkeypatch) -> None:
     assert len(spaces) == 1
     assert spaces[0].id == "ws-result"
     assert len(workers) == 1
-    assert workers[0].id == "sess-result"
+    assert workers[0].id == "Agent"
 
 
 def test_pane_fallback_only_when_agent_list_yields_none(monkeypatch) -> None:
@@ -420,8 +547,11 @@ def test_pane_fallback_only_when_agent_list_yields_none(monkeypatch) -> None:
     spaces, workers = fetch_herdr_state(config)
 
     assert len(workers) == 1
-    assert workers[0].id == "pane-agent"
+    assert workers[0].id == "Runner"
     assert workers[0].name == "Runner"
+    assert workers[0].backend_target is not None
+    assert workers[0].backend_target["kind"] == "agent"
+    assert workers[0].backend_target["value"] == "Runner"
 
 
 def test_pane_fallback_skipped_when_agents_present(monkeypatch) -> None:
@@ -441,7 +571,7 @@ def test_pane_fallback_skipped_when_agents_present(monkeypatch) -> None:
     spaces, workers = fetch_herdr_state(config)
 
     assert len(workers) == 1
-    assert workers[0].id == "sess-1"
+    assert workers[0].id == "Agent"
 
 
 def test_agent_and_pane_duplicates_emit_one_worker(monkeypatch) -> None:
@@ -467,7 +597,7 @@ def test_agent_and_pane_duplicates_emit_one_worker(monkeypatch) -> None:
     spaces, workers = fetch_herdr_state(config)
 
     assert len(workers) == 1
-    assert workers[0].id == "pane-1"
+    assert workers[0].id == "Runner"
 
 
 def test_repeated_agent_names_with_distinct_ids_remain_distinct(monkeypatch) -> None:
@@ -491,8 +621,10 @@ def test_repeated_agent_names_with_distinct_ids_remain_distinct(monkeypatch) -> 
     spaces, workers = fetch_herdr_state(config)
 
     assert len(workers) == 2
-    assert {w.id for w in workers} == {"sess-a", "sess-b"}
+    assert {w.id for w in workers} == {"Coder-1", "Coder-2"}
     assert workers[0].id < workers[1].id
+    assert all((w.backend_target or {}).get("kind") == "agent" for w in workers)
+    assert all((w.backend_target or {}).get("value") == "Coder" for w in workers)
 
 
 def test_status_aliases_for_live_herdr(monkeypatch) -> None:
@@ -525,11 +657,11 @@ def test_status_aliases_for_live_herdr(monkeypatch) -> None:
     assert spaces[0].meta.get("raw_status") == "working"
     assert spaces[1].status == "waiting"
     assert spaces[1].meta.get("raw_status") == "responding"
-    by_id = {w.id: w for w in workers}
-    assert by_id["sess-1"].status == "done"
-    assert "raw_status" not in by_id["sess-1"].meta
-    assert by_id["sess-2"].status == "waiting"
-    assert by_id["sess-2"].meta.get("raw_status") == "awaiting-input"
+    by_space = {w.space_id: w for w in workers}
+    assert by_space["ws-1"].status == "done"
+    assert "raw_status" not in by_space["ws-1"].meta
+    assert by_space["ws-2"].status == "waiting"
+    assert by_space["ws-2"].meta.get("raw_status") == "awaiting-input"
 
 
 def test_forbidden_connector_fields_stripped_in_herdr_070(monkeypatch) -> None:
