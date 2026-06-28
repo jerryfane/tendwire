@@ -7,9 +7,15 @@ import subprocess
 from collections.abc import Sequence
 from typing import Any
 
-from tendwire.backends import herdr_cli
+from tendwire.backends import herdr_cli, herdr_command
 from tendwire.backends.herdr_cli import fetch_herdr_state
 from tendwire.config import Config
+from tendwire.core.commands import (
+    STATUS_ACCEPTED,
+    STATUS_BACKEND_FAILED,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_REQUEST_STATE_UNCERTAIN,
+)
 from tendwire.core.projector import project_from_observations
 
 
@@ -24,6 +30,13 @@ _FORBIDDEN_FIELDS = {
     "delivery",
     "route",
     "herdres_delivery",
+    "pane_id",
+    "terminal_id",
+    "argv",
+    "command",
+    "shell",
+    "connector",
+    "connectors",
 }
 
 
@@ -58,6 +71,93 @@ def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
         for index, item in enumerate(value):
             _assert_no_forbidden_fields(item, f"{path}[{index}]")
 
+
+def _send_completed(returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["herdr", "agent", "send", "worker-1", "hello"],
+        returncode=returncode,
+        stdout="",
+        stderr="",
+    )
+
+
+def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        return _send_completed()
+
+    monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_command.subprocess, "run", fake_run)
+
+    envelope = herdr_command.send_instruction(
+        config,
+        {"worker_id": "worker-1", "terminal_id": "ignored"},
+        {"text": "hello"},
+    )
+
+    assert envelope.ok is True
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.result == {"target": {"worker_id": "worker-1"}}
+    assert calls == [
+        (
+            ["herdr", "agent", "send", "worker-1", "hello"],
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": herdr_command._HERDR_SEND_TIMEOUT_SECONDS,
+            },
+        )
+    ]
+    assert "shell" not in calls[0][1]
+
+
+def test_send_instruction_maps_missing_binary_to_backend_unavailable(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="missing-herdr")
+    monkeypatch.setattr(herdr_command.shutil, "which", lambda _: None)
+    monkeypatch.setattr(
+        herdr_command,
+        "_run_agent_send",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+
+    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_UNAVAILABLE
+    _assert_no_forbidden_fields(envelope.to_dict())
+
+
+def test_send_instruction_maps_nonzero_exit_to_backend_failed(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_command, "_run_agent_send", lambda *args: _send_completed(returncode=2))
+
+    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_FAILED
+    assert envelope.error["details"] == {"exit_code": 2}
+    _assert_no_forbidden_fields(envelope.to_dict())
+
+
+def test_send_instruction_maps_timeout_to_uncertain(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+
+    def raise_timeout(*args: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=["herdr", "agent", "send"], timeout=5.0)
+
+    monkeypatch.setattr(herdr_command.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_command, "_run_agent_send", raise_timeout)
+
+    envelope = herdr_command.send_instruction(config, {"worker_id": "worker-1"}, {"text": "hello"})
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    _assert_no_forbidden_fields(envelope.to_dict())
 
 def test_fetch_herdr_state_returns_empty_when_binary_missing() -> None:
     config = Config(host_id="testhost", herdr_bin="definitely-not-a-real-herdr-binary")

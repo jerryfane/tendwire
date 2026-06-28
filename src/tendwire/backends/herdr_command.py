@@ -1,21 +1,57 @@
-"""Backend command boundary for Herdr.
+"""Narrow mutating command adapter for Herdr.
 
-This module is the narrow adapter for mutating commands directed at Herdr. In
-milestone 1 no safe high-level Herdr instruction API is used, so
-send_instruction returns backend_unsupported rather than performing unsafe
-terminal control (send-keys, send-text, pane commands, PTY manipulation, etc.).
+Only the high-level ``herdr agent send <target> <text>`` API is used here.
+This module must not fall back to pane control, key sending, shell commands,
+PTY control, signals, paste buffers, raw argv, or client-provided backend
+parameters.
 """
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from typing import Any
 
 from ..config import Config
 from ..core.commands import (
-    STATUS_BACKEND_UNSUPPORTED,
+    STATUS_ACCEPTED,
+    STATUS_BACKEND_FAILED,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_REQUEST_STATE_UNCERTAIN,
     CommandEnvelope,
     error_value,
 )
+from ..core.models import _string_value
+
+
+_HERDR_SEND_TIMEOUT_SECONDS = 5.0
+
+
+def _run_agent_send(
+    config: Config,
+    target_value: str,
+    instruction_text: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run the single allowed Herdr send surface with an argv list."""
+    return subprocess.run(
+        [config.herdr_bin, "agent", "send", target_value, instruction_text],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_HERDR_SEND_TIMEOUT_SECONDS,
+    )
+
+
+def _backend_error(status: str, message: str, details: dict[str, Any] | None = None) -> CommandEnvelope:
+    return CommandEnvelope(
+        ok=False,
+        status=status,
+        action="send_instruction",
+        request_id=None,
+        dry_run=False,
+        result=None,
+        error=error_value(status, message, details=details),
+    )
 
 
 def send_instruction(
@@ -23,17 +59,60 @@ def send_instruction(
     target: dict[str, Any],
     instruction: dict[str, Any],
 ) -> CommandEnvelope:
-    """Return backend_unsupported for send_instruction in this milestone."""
-    return CommandEnvelope(
-        ok=False,
-        status=STATUS_BACKEND_UNSUPPORTED,
-        action="send_instruction",
-        request_id=None,
-        dry_run=False,
-        result=None,
-        error=error_value(
-            STATUS_BACKEND_UNSUPPORTED,
-            "send_instruction is not supported by this backend in this milestone",
-            details={"target": target.get("worker_id")},
-        ),
+    """Send instruction text to the backend-resolved neutral Herdr worker id."""
+    target_value = _string_value(target.get("worker_id"))
+    instruction_text = instruction.get("text")
+
+    if not target_value:
+        return _backend_error(
+            STATUS_BACKEND_FAILED,
+            "resolved target is missing a worker id",
+        )
+    if not isinstance(instruction_text, str) or not instruction_text:
+        return _backend_error(
+            STATUS_BACKEND_FAILED,
+            "instruction text is missing after validation",
+        )
+
+    try:
+        if shutil.which(config.herdr_bin) is None:
+            return _backend_error(
+                STATUS_BACKEND_UNAVAILABLE,
+                "Herdr binary is unavailable",
+            )
+    except (OSError, TypeError, ValueError):
+        return _backend_error(
+            STATUS_BACKEND_UNAVAILABLE,
+            "Herdr binary is unavailable",
+        )
+
+    try:
+        completed = _run_agent_send(config, target_value, instruction_text)
+    except subprocess.TimeoutExpired:
+        return _backend_error(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            "Herdr agent send timed out after starting",
+            details={"timeout_seconds": _HERDR_SEND_TIMEOUT_SECONDS},
+        )
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return _backend_error(
+            STATUS_BACKEND_UNAVAILABLE,
+            "Herdr agent send could not be launched",
+        )
+
+    if completed.returncode == 0:
+        return CommandEnvelope(
+            ok=True,
+            status=STATUS_ACCEPTED,
+            action="send_instruction",
+            request_id=None,
+            dry_run=False,
+            result={"target": {"worker_id": target_value}},
+            error=None,
+        )
+
+    return _backend_error(
+        STATUS_BACKEND_FAILED,
+        "Herdr agent send exited non-zero",
+        details={"exit_code": int(completed.returncode)},
     )

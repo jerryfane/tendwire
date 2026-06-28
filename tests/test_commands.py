@@ -191,25 +191,28 @@ def test_command_request_from_dict_drops_unknown_top_level_keys() -> None:
     assert "pane_id" not in request.to_dict()
 
 
-def test_validate_request_rejects_disallowed_target_fields() -> None:
+@pytest.mark.parametrize("field", ["pane_id", "terminal_id", "argv", "shell"])
+def test_validate_request_rejects_disallowed_target_fields(field: str) -> None:
     request = CommandRequest(
         action="resolve_target",
-        target={"worker_id": "w-1", "pane_id": "leaked"},
+        target={"worker_id": "w-1", field: "leaked"},
     )
     error = validate_request(request)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
+    assert field in str(error.get("details", {}))
 
-
-def test_validate_request_rejects_disallowed_instruction_fields() -> None:
+@pytest.mark.parametrize("field", ["argv", "command", "shell"])
+def test_validate_request_rejects_disallowed_instruction_fields(field: str) -> None:
     request = CommandRequest(
         action="send_instruction",
         target={"worker_id": "w-1"},
-        instruction={"text": "ok", "shell": "bash"},
+        instruction={"text": "ok", field: "leaked"},
     )
     error = validate_request(request)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
+    assert field in str(error.get("details", {}))
 
 
 def test_validate_send_instruction_requires_target_and_text() -> None:

@@ -196,9 +196,9 @@ backend argv, or route/delivery fields.
   target (`resolved`) or a list of sanitized candidates (`not_found`,
   `ambiguous_target`, `stale_target`).
 - `send_instruction` — validates target/instruction/idempotency. Dry runs return
-  status `dry_run` without creating receipts or touching the backend. Non-dry
-  runs currently return `backend_unsupported` because no safe high-level Herdr
-  instruction API is available in this milestone.
+  status `dry_run` without creating receipts or calling the Herdr send adapter.
+  Non-dry runs are active through the narrow Herdr 0.7 high-level API
+  `herdr agent send <target> <text>`.
 
 ### Safety rules
 
@@ -208,6 +208,9 @@ backend argv, or route/delivery fields.
   resolution.
 - Targets with status `closed`, `failed`, or `unknown` are rejected for
   `send_instruction`.
+- The send adapter chooses the backend target from the resolved neutral
+  `worker_id`; client-provided pane IDs, terminal IDs, argv, shell, or backend
+  parameters are rejected before mutation.
 - Instruction text is validated: it must be non-empty, no longer than 4096
   characters, and must not contain NUL, ESC/ANSI/OSC sequences, bracketed-paste
   sequences, or raw control characters.
@@ -229,13 +232,12 @@ Receipt semantics:
 - A pending/uncertain receipt rejects with `request_state_uncertain` and does
   not retry the mutation.
 
-### Future work
+### Unsafe non-goals
 
-Actual Herdr mutation support remains future work until a safe high-level
-instruction API is available. Until then, `send_instruction` stays deliberately
-backend-unsupported to avoid unsafe terminal control such as `send-keys`,
-`send-text`, pane commands, PTY manipulation, signals, paste buffers, or
-client-provided argv.
+The only active Herdr mutation surface is `agent send`, which Herdr help
+describes as writing literal text. Tendwire does not use `pane send-text`,
+`send-keys`, `pane run`, shell/PTY control, signals, paste buffers, raw argv,
+client-provided backend params, or fallback terminal-control paths.
 
 ## Milestone 2 non-goals
 
