@@ -14,7 +14,9 @@ import hashlib
 import json
 import shutil
 import subprocess
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import Config
@@ -45,6 +47,26 @@ _STATUS_KEYS = (
     "lifecycle_state",
     "raw_status",
 )
+
+_BACKEND_FALLBACK_TARGET_KINDS = frozenset({"agent", "name", "label"})
+_BACKEND_TARGET_KINDS = frozenset(
+    {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
+)
+
+
+@dataclass(frozen=True)
+class HerdrCommandObservation:
+    """Command execution observation with health metadata."""
+
+    spaces: list[Space]
+    workers: list[Worker]
+    status: str
+    outcome: str
+    message: str = ""
+
+    @property
+    def healthy(self) -> bool:
+        return self.status == "healthy"
 
 
 _FORBIDDEN_CONNECTOR_FIELDS_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_CONNECTOR_FIELDS}
@@ -89,6 +111,29 @@ def _run_herdr(args: Sequence[str], config: Config) -> subprocess.CompletedProce
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError, TypeError):
         return None
+
+
+def _probe_herdr(args: Sequence[str], config: Config) -> tuple[str, Any]:
+    """Run a read-only Herdr command and retain failure class for mutations."""
+    try:
+        completed = subprocess.run(
+            [config.herdr_bin, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout", None
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+        return "launch_error", None
+
+    if completed.returncode != 0:
+        return "nonzero", None
+    payload = _parse_json_output(completed.stdout)
+    if payload is None:
+        return "malformed_json", None
+    return "ok", payload
 
 
 def _parse_json_output(stdout: str | None) -> Any:
@@ -465,9 +510,9 @@ def _worker_id_from_item(item: Mapping[str, Any]) -> str:
     return _public_worker_id_base_from_item(item)
 
 
-def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, str] | None:
-    """Resolve the private Herdr send target without using agent_session."""
-    identity = _private_fingerprint(
+def _private_identity_from_item(item: Mapping[str, Any]) -> str:
+    """Return a private identity used only to avoid collapsing distinct workers."""
+    return _private_fingerprint(
         {
             "public_id": _public_worker_id_base_from_item(item),
             "name": _first_text(item, ("agent", "name", "label", "title")),
@@ -478,15 +523,31 @@ def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, str] | None:
             "pane_id": _first_text(item, ("pane_id",)),
         }
     )
+
+
+def _private_backend_target(kind: str, value: str, *, sendable: bool = True, reason: str | None = None) -> dict[str, Any]:
+    """Return the internal backend target shape."""
+    return {
+        "kind": kind,
+        "value": value,
+        "sendable": bool(sendable),
+        "reason": reason,
+    }
+
+
+def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Resolve the private Herdr send target from backend-observed fields."""
     candidates = (
         ("agent_id", _first_text(item, ("agent_id",))),
-        ("agent", _first_text(item, ("agent", "name", "label", "title"))),
         ("terminal_id", _first_text(item, ("terminal_id",))),
         ("pane_id", _first_text(item, ("pane_id",))),
+        ("agent", _first_text(item, ("agent",))),
+        ("name", _first_text(item, ("name",))),
+        ("label", _first_text(item, ("label",))),
     )
     for kind, value in candidates:
         if value:
-            return {"kind": kind, "value": value, "identity": identity}
+            return _private_backend_target(kind, value)
     return None
 
 
@@ -618,65 +679,143 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
     )
 
 
-def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
+def _worker_record_from_item(item: Mapping[str, Any]) -> tuple[Worker, str]:
+    return _worker_from_item(item), _private_identity_from_item(item)
+
+
+def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] | None) -> Worker:
+    return Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta=worker.meta,
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+        fingerprint=worker.fingerprint,
+        backend_target=backend_target,
+    )
+
+
+def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
+    """Mark duplicate or non-unique private backend targets as not sendable."""
+    fallback_values = Counter(
+        str(worker.backend_target.get("value"))
+        for worker in workers
+        if isinstance(worker.backend_target, dict)
+        and worker.backend_target.get("kind") in _BACKEND_FALLBACK_TARGET_KINDS
+        and str(worker.backend_target.get("value") or "")
+    )
+    marked: list[Worker] = []
+    for worker in workers:
+        target = worker.backend_target
+        if not isinstance(target, dict):
+            marked.append(worker)
+            continue
+        kind = str(target.get("kind") or "")
+        value = str(target.get("value") or "")
+        if kind not in _BACKEND_TARGET_KINDS or not value:
+            marked.append(
+                _worker_with_backend_target(
+                    worker,
+                    _private_backend_target(kind or "agent", value, sendable=False, reason="backend_unsupported"),
+                )
+            )
+            continue
+        if kind in _BACKEND_FALLBACK_TARGET_KINDS and fallback_values[value] > 1:
+            marked.append(
+                _worker_with_backend_target(
+                    worker,
+                    _private_backend_target(kind, value, sendable=False, reason="not_unique"),
+                )
+            )
+            continue
+        marked.append(_worker_with_backend_target(worker, _private_backend_target(kind, value)))
+
+    sendable_counts = Counter(
+        (str(worker.backend_target.get("kind")), str(worker.backend_target.get("value")))
+        for worker in marked
+        if isinstance(worker.backend_target, dict) and worker.backend_target.get("sendable") is True
+    )
+    final: list[Worker] = []
+    for worker in marked:
+        target = worker.backend_target
+        if not isinstance(target, dict) or target.get("sendable") is not True:
+            final.append(worker)
+            continue
+        key = (str(target.get("kind")), str(target.get("value")))
+        if sendable_counts[key] > 1:
+            final.append(
+                _worker_with_backend_target(
+                    worker,
+                    _private_backend_target(key[0], key[1], sendable=False, reason="duplicate_backend_target"),
+                )
+            )
+            continue
+        final.append(worker)
+    return final
+
+
+def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worker]:
     """Drop exact duplicates, then disambiguate duplicate public ids."""
     seen: set[tuple[str, str, str | None, str, str, str]] = set()
-    unique: list[Worker] = []
-    for worker in workers:
+    unique: list[tuple[Worker, str]] = []
+    for worker, identity in records:
         backend_kind = ""
         backend_value = ""
         if worker.backend_target:
             backend_kind = str(worker.backend_target.get("kind", ""))
             backend_value = str(worker.backend_target.get("value", ""))
-            backend_identity = str(worker.backend_target.get("identity", ""))
-        else:
-            backend_identity = ""
-        key = (worker.id, worker.name, worker.space_id, backend_kind, backend_value, backend_identity)
+        key = (worker.id, worker.name, worker.space_id, backend_kind, backend_value, identity)
         if key in seen:
             continue
         seen.add(key)
-        unique.append(worker)
+        unique.append((worker, identity))
 
-    groups: dict[str, list[Worker]] = {}
-    for worker in unique:
-        groups.setdefault(worker.id, []).append(worker)
+    groups: dict[str, list[tuple[Worker, str]]] = {}
+    for worker, identity in unique:
+        groups.setdefault(worker.id, []).append((worker, identity))
 
     disambiguated: list[Worker] = []
     for worker_id, group in groups.items():
         if len(group) == 1:
-            disambiguated.extend(group)
+            disambiguated.append(group[0][0])
             continue
         ordered = sorted(
             group,
-            key=lambda w: (
-                w.name,
-                w.space_id or "",
-                str((w.backend_target or {}).get("kind", "")),
-                str((w.backend_target or {}).get("value", "")),
-                str((w.backend_target or {}).get("identity", "")),
+            key=lambda record: (
+                record[0].name,
+                record[0].space_id or "",
+                str((record[0].backend_target or {}).get("kind", "")),
+                str((record[0].backend_target or {}).get("value", "")),
+                record[1],
                 stable_fingerprint(
                     {
-                        "id": w.id,
-                        "name": w.name,
-                        "space_id": w.space_id,
-                        "status": w.status,
-                        "summary": w.summary,
+                        "id": record[0].id,
+                        "name": record[0].name,
+                        "space_id": record[0].space_id,
+                        "status": record[0].status,
+                        "summary": record[0].summary,
                     }
                 ),
             ),
         )
-        for index, worker in enumerate(ordered, start=1):
+        for index, (worker, _identity) in enumerate(ordered, start=1):
             disambiguated.append(_worker_with_id(worker, f"{worker_id}-{index}"))
 
-    return sorted(disambiguated, key=lambda w: w.id)
+    return _mark_backend_sendability(sorted(disambiguated, key=lambda w: w.id))
+
+
+def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
+    return _deduplicate_worker_records([(worker, worker.fingerprint) for worker in workers])
 
 
 def _workers_from_payload(payload: Any) -> list[Worker]:
     """Extract neutral Worker objects from a herdr agent-list payload."""
-    workers: list[Worker] = []
+    records: list[tuple[Worker, str]] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
-        workers.append(_worker_from_item(item))
-    return _deduplicate_workers(workers)
+        records.append(_worker_record_from_item(item))
+    return _deduplicate_worker_records(records)
 
 
 def _pane_has_agent(item: Mapping[str, Any]) -> bool:
@@ -697,12 +836,97 @@ def _pane_has_agent(item: Mapping[str, Any]) -> bool:
 
 def _workers_from_pane_payload(payload: Any) -> list[Worker]:
     """Extract worker objects from herdr pane list, only for agent-bearing panes."""
-    workers: list[Worker] = []
+    records: list[tuple[Worker, str]] = []
     for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
         if not _pane_has_agent(item):
             continue
-        workers.append(_worker_from_item(item))
-    return _deduplicate_workers(workers)
+        records.append(_worker_record_from_item(item))
+    return _deduplicate_worker_records(records)
+
+
+def _probe_payload_variants(
+    variants: Sequence[Sequence[str]],
+    config: Config,
+) -> tuple[str, Any]:
+    outcomes: list[str] = []
+    for args in variants:
+        outcome, payload = _probe_herdr(args, config)
+        if outcome == "ok":
+            return outcome, payload
+        outcomes.append(outcome)
+    if "timeout" in outcomes:
+        return "timeout", None
+    if outcomes and all(outcome == "launch_error" for outcome in outcomes):
+        return "launch_error", None
+    if "malformed_json" in outcomes:
+        return "malformed_json", None
+    if "nonzero" in outcomes:
+        return "nonzero", None
+    return outcomes[-1] if outcomes else "nonzero", None
+
+
+def _degraded_observation(outcome: str, message: str) -> HerdrCommandObservation:
+    status = "unavailable" if outcome in {"missing_binary", "launch_error"} else "degraded"
+    return HerdrCommandObservation(
+        spaces=[],
+        workers=[],
+        status=status,
+        outcome=outcome,
+        message=message,
+    )
+
+
+def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
+    """Return Herdr observations plus health metadata for mutation safety."""
+    try:
+        if shutil.which(config.herdr_bin) is None:
+            return _degraded_observation("missing_binary", "Herdr binary is unavailable")
+    except (TypeError, ValueError, OSError):
+        return _degraded_observation("launch_error", "Herdr binary could not be inspected")
+
+    workspace_outcome, workspace_payload = _probe_payload_variants(
+        [
+            ["workspace", "list"],
+            ["workspace", "list", "--json"],
+        ],
+        config,
+    )
+    if workspace_outcome != "ok":
+        return _degraded_observation(
+            workspace_outcome,
+            "Herdr workspace observation is not healthy",
+        )
+
+    agent_outcome, agent_payload = _probe_payload_variants(
+        [
+            ["agent", "list"],
+            ["agent", "list", "--json"],
+        ],
+        config,
+    )
+    if agent_outcome != "ok":
+        return _degraded_observation(
+            agent_outcome,
+            "Herdr agent observation is not healthy",
+        )
+
+    spaces = _spaces_from_payload(workspace_payload)
+    workers = _workers_from_payload(agent_payload)
+    if not workers:
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+        if pane_outcome != "ok":
+            return _degraded_observation(
+                pane_outcome,
+                "Herdr pane fallback observation is not healthy",
+            )
+        workers = _workers_from_pane_payload(pane_payload)
+
+    return HerdrCommandObservation(
+        spaces=spaces,
+        workers=workers,
+        status="healthy",
+        outcome="healthy_non_empty" if spaces or workers else "empty_healthy",
+    )
 
 
 def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:

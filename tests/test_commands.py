@@ -82,6 +82,30 @@ def test_command_request_defaults_are_dry_run() -> None:
     assert request.request_id is None
 
 
+@pytest.mark.parametrize("value", [True, False])
+def test_parse_command_request_accepts_literal_boolean_dry_run(value: bool) -> None:
+    request, error = parse_command_request(json.dumps({"schema_version": 1, "action": "noop", "dry_run": value}))
+    assert error is None
+    assert request is not None
+    assert request.dry_run is value
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_parse_command_request_rejects_non_boolean_dry_run(value: Any) -> None:
+    request, error = parse_command_request(json.dumps({"schema_version": 1, "action": "noop", "dry_run": value}))
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_validate_request_rejects_non_boolean_dry_run(value: Any) -> None:
+    request = CommandRequest(action="noop", dry_run=value)
+    error = validate_request(request)
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
 def test_command_request_to_dict_roundtrip() -> None:
     request = CommandRequest(
         action="send_instruction",

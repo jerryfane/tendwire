@@ -43,6 +43,7 @@ STATUS_AMBIGUOUS_TARGET = "ambiguous_target"
 STATUS_STALE_TARGET = "stale_target"
 STATUS_BACKEND_UNAVAILABLE = "backend_unavailable"
 STATUS_BACKEND_UNSUPPORTED = "backend_unsupported"
+STATUS_AMBIGUOUS_BACKEND_TARGET = "ambiguous_backend_target"
 STATUS_BACKEND_FAILED = "backend_failed"
 STATUS_DUPLICATE_REQUEST = "duplicate_request"
 STATUS_REQUEST_STATE_UNCERTAIN = "request_state_uncertain"
@@ -62,6 +63,7 @@ VALID_STATUSES = frozenset(
         STATUS_STALE_TARGET,
         STATUS_BACKEND_UNAVAILABLE,
         STATUS_BACKEND_UNSUPPORTED,
+        STATUS_AMBIGUOUS_BACKEND_TARGET,
         STATUS_BACKEND_FAILED,
         STATUS_DUPLICATE_REQUEST,
         STATUS_REQUEST_STATE_UNCERTAIN,
@@ -326,7 +328,7 @@ class CommandRequest:
         object.__setattr__(self, "action", _string_value(self.action))
         object.__setattr__(self, "schema_version", int(self.schema_version))
         object.__setattr__(self, "request_id", _optional_string(self.request_id))
-        object.__setattr__(self, "dry_run", bool(self.dry_run))
+        object.__setattr__(self, "dry_run", self.dry_run)
         object.__setattr__(self, "target", _clean_mapping(self.target))
         object.__setattr__(self, "instruction", _clean_mapping(self.instruction))
         object.__setattr__(self, "params", _clean_mapping(self.params))
@@ -370,6 +372,13 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
 
     if not request.action:
         return error_value(STATUS_INVALID_REQUEST, "action is required", details={"field": "action"})
+
+    if not isinstance(request.dry_run, bool):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "dry_run must be a JSON boolean",
+            details={"field": "dry_run"},
+        )
 
     if request.action not in ALLOWED_ACTIONS:
         return error_value(
@@ -458,6 +467,12 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             STATUS_INVALID_REQUEST,
             f"request contains unknown top-level fields: {unknown}",
             details={"fields": [f"$.{field}" for field in unknown]},
+        )
+    if "dry_run" in data and not isinstance(data.get("dry_run"), bool):
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            "dry_run must be a JSON boolean",
+            details={"field": "dry_run"},
         )
     try:
         request = CommandRequest.from_dict(data)

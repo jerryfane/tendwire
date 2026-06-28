@@ -15,8 +15,10 @@ from typing import Any
 from ..config import Config
 from ..core.commands import (
     STATUS_ACCEPTED,
+    STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
+    STATUS_BACKEND_UNSUPPORTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
     CommandEnvelope,
     error_value,
@@ -58,8 +60,10 @@ def send_instruction(
     """Send instruction text to the backend-resolved private Herdr target."""
     backend_target = target.get("backend_target")
     target_value = ""
+    target_reason = ""
     if isinstance(backend_target, dict):
         target_value = _string_value(backend_target.get("value"))
+        target_reason = _string_value(backend_target.get("reason"))
     public_worker_id = _string_value(target.get("worker_id"))
     instruction_text = instruction.get("text")
 
@@ -81,10 +85,15 @@ def send_instruction(
             "Herdr binary is unavailable",
         )
 
-    if not target_value:
+    if not isinstance(backend_target, dict) or backend_target.get("sendable") is not True or not target_value:
+        if target_reason == "duplicate_backend_target":
+            return _backend_error(
+                STATUS_AMBIGUOUS_BACKEND_TARGET,
+                "resolved target is ambiguous for backend send",
+            )
         return _backend_error(
-            STATUS_BACKEND_FAILED,
-            "resolved target is missing a backend target",
+            STATUS_BACKEND_UNSUPPORTED,
+            "resolved target has no backend-owned sendable target",
         )
 
     try:

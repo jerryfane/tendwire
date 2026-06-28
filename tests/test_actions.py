@@ -10,6 +10,7 @@ import pytest
 from tendwire.config import Config
 from tendwire.core.actions import CommandContext, execute_command
 from tendwire.core.commands import (
+    STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_DRY_RUN,
     STATUS_INVALID_REQUEST,
@@ -42,6 +43,52 @@ def _snapshot(host_id: str = "action-host") -> Snapshot:
 
 def _workers(snapshot: Snapshot) -> list[Worker]:
     return list(snapshot.workers)
+
+
+def _sendable_worker(
+    worker_id: str,
+    name: str,
+    *,
+    status: str = "active",
+    space_id: str | None = "s-1",
+    target_value: str | None = None,
+    sendable: bool = True,
+    reason: str | None = None,
+) -> Worker:
+    return Worker(
+        id=worker_id,
+        name=name,
+        status=status,
+        space_id=space_id,
+        backend_target={
+            "kind": "agent_id",
+            "value": target_value or f"agent-{worker_id}",
+            "sendable": sendable,
+            "reason": reason,
+        },
+    )
+
+
+def _workers_with_backend_targets(snapshot: Snapshot) -> list[Worker]:
+    return [
+        Worker(
+            id=worker.id,
+            name=worker.name,
+            status=worker.status,
+            space_id=worker.space_id,
+            meta=worker.meta,
+            last_seen_at=worker.last_seen_at,
+            summary=worker.summary,
+            fingerprint=worker.fingerprint,
+            backend_target={
+                "kind": "agent_id",
+                "value": f"agent-{worker.id}",
+                "sendable": True,
+                "reason": None,
+            },
+        )
+        for worker in snapshot.workers
+    ]
 
 
 def test_noop_action_succeeds() -> None:
@@ -147,7 +194,7 @@ def test_send_instruction_dry_run_does_not_call_backend() -> None:
     )
     context = CommandContext(
         host_id=snapshot.host_id,
-        workers=_workers(snapshot),
+        workers=_workers_with_backend_targets(snapshot),
         backend_sender=fake_backend,
     )
     envelope = execute_command(request, context)
@@ -185,6 +232,74 @@ def test_send_instruction_non_dry_run_returns_backend_unsupported() -> None:
     assert envelope.status == STATUS_BACKEND_UNSUPPORTED
     assert envelope.request_id == "req-1"
     assert envelope.dry_run is False
+
+
+def test_send_instruction_without_sendable_backend_target_skips_backend() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
+
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-no-binding",
+        dry_run=False,
+        target={"worker_id": "w-no-binding"},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(
+        host_id="host",
+        workers=[
+            _sendable_worker(
+                "w-no-binding",
+                "No Binding",
+                sendable=False,
+                reason="backend_unsupported",
+            )
+        ],
+        backend_sender=fake_backend,
+    )
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_BACKEND_UNSUPPORTED
+    assert calls == []
+
+
+def test_send_instruction_ambiguous_backend_target_skips_backend() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
+
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-ambiguous-binding",
+        dry_run=False,
+        target={"worker_id": "w-ambiguous"},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(
+        host_id="host",
+        workers=[
+            _sendable_worker(
+                "w-ambiguous",
+                "Ambiguous",
+                sendable=False,
+                reason="duplicate_backend_target",
+            )
+        ],
+        backend_sender=fake_backend,
+    )
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_AMBIGUOUS_BACKEND_TARGET
+    assert calls == []
 
 
 def test_send_instruction_rejects_empty_target_before_only_worker_fallback() -> None:
@@ -231,7 +346,7 @@ def test_send_instruction_allows_done_status() -> None:
     )
     context = CommandContext(
         host_id=snapshot.host_id,
-        workers=_workers(snapshot),
+        workers=_workers_with_backend_targets(snapshot),
         backend_sender=fake_backend,
     )
 
@@ -277,7 +392,7 @@ def test_send_instruction_backend_receives_resolved_worker_id() -> None:
     )
     context = CommandContext(
         host_id=snapshot.host_id,
-        workers=_workers(snapshot),
+        workers=_workers_with_backend_targets(snapshot),
         backend_sender=fake_backend,
     )
 
@@ -293,6 +408,12 @@ def test_send_instruction_backend_receives_resolved_worker_id() -> None:
                 "space_id": "s-1",
                 "status": "idle",
                 "worker_fingerprint": snapshot.workers[1].fingerprint,
+                "backend_target": {
+                    "kind": "agent_id",
+                    "value": "agent-w-2",
+                    "sendable": True,
+                    "reason": None,
+                },
             },
             {"text": "hello"},
         )
@@ -378,7 +499,7 @@ def test_send_instruction_backend_receives_private_target_but_public_result_is_s
         id="public-worker",
         name="Agent",
         status="active",
-        backend_target={"kind": "agent_id", "value": "send-agent"},
+        backend_target={"kind": "agent_id", "value": "send-agent", "sendable": True, "reason": None},
     )
 
     def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
@@ -404,7 +525,12 @@ def test_send_instruction_backend_receives_private_target_but_public_result_is_s
     payload = json.loads(envelope.to_json())
 
     assert envelope.ok is True
-    assert calls[0][0]["backend_target"] == {"kind": "agent_id", "value": "send-agent"}
+    assert calls[0][0]["backend_target"] == {
+        "kind": "agent_id",
+        "value": "send-agent",
+        "sendable": True,
+        "reason": None,
+    }
     assert payload["result"]["target"] == {
         "worker_id": "public-worker",
         "name": "Agent",

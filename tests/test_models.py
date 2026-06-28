@@ -174,16 +174,16 @@ def test_worker_private_backend_target_and_raw_backend_meta_do_not_serialize() -
             "pane_id": "pane-1",
             "agent_session": {"value": "sess-1"},
             "session_id": "session-1",
-            "backend_target": {"kind": "agent_id", "value": "agent-1"},
+            "backend_target": {"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None},
         },
-        backend_target={"kind": "agent_id", "value": "agent-1"},
+        backend_target={"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None},
     )
 
     payload = worker.to_dict()
 
     assert payload["id"] == "public-worker"
     assert payload["meta"] == {"safe": "kept"}
-    assert worker.backend_target == {"kind": "agent_id", "value": "agent-1"}
+    assert worker.backend_target == {"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None}
     _assert_no_forbidden_fields(payload)
 
 

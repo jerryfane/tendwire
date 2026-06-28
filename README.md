@@ -168,8 +168,8 @@ readable.
 - `schema_version` — must be `1`.
 - `action` — one of `noop`, `read_snapshot`, `resolve_target`, `send_instruction`.
 - `request_id` — optional; required for non-dry-run `send_instruction`.
-- `dry_run` — defaults to `true`; a request must explicitly set `dry_run: false`
-  to ask for mutation.
+- `dry_run` — defaults to `true`; only literal JSON booleans are accepted, and
+  a request must explicitly set `dry_run: false` to ask for mutation.
 - `target` — optional neutral target descriptor using only `worker_id`,
   `worker_fingerprint`, `space_id`, and `name`. `send_instruction` requires at
   least one non-empty explicit selector.
@@ -179,8 +179,8 @@ readable.
 Requests containing connector or low-level terminal fields are rejected before
 any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 `message_id`, `thread_id`, `route`, `delivery`, `token`, `bot_token`,
-`pane_id`, `terminal_id`, `tty`, `pty`, `pid`, `tmux`, `screen_session`,
-`window_id`, `tab_id`, `argv`, `command`, and `shell`.
+`pane_id`, `terminal_id`, `backend_target`, `tty`, `pty`, `pid`, `tmux`,
+`screen_session`, `window_id`, `tab_id`, `argv`, `command`, and `shell`.
 
 ### Command result/envelope shape v1
 
@@ -200,7 +200,8 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
-`backend_unavailable`, `backend_unsupported`, `backend_failed`,
+`backend_unavailable`, `ambiguous_backend_target`, `backend_unsupported`,
+`backend_failed`,
 `duplicate_request`, `request_state_uncertain`, `invalid_request`, and
 `pending` for internal receipt reservation.
 
@@ -218,8 +219,10 @@ backend argv, or route/delivery fields.
   `ambiguous_target`, `stale_target`).
 - `send_instruction` — validates target/instruction/idempotency. Dry runs return
   status `dry_run` without creating receipts or calling the Herdr send adapter.
-  Non-dry runs are active through the narrow Herdr 0.7 high-level API
-  `herdr agent send <target> <text>`.
+  Non-dry runs resolve a neutral public worker selector. The backend adapter
+  then uses Tendwire backend-owned private bindings captured from Herdr
+  observation to call the narrow Herdr 0.7 high-level API
+  `herdr agent send <private-target> <text>`.
 
 ### Safety rules
 
@@ -229,9 +232,11 @@ backend argv, or route/delivery fields.
   target selector, and exact single target resolution.
 - Targets with status `closed`, `failed`, or `unknown` are rejected for
   `send_instruction`.
-- The send adapter chooses the backend target from the resolved neutral
-  `worker_id`; client-provided pane IDs, terminal IDs, argv, shell, or backend
-  parameters are rejected before mutation.
+- The send adapter never treats public selectors as raw Herdr send targets.
+  Clients may use `worker_id` only as a neutral Tendwire selector, never as a
+  backend target value. Clients must never provide `terminal_id`, `pane_id`,
+  `backend_target`, `argv`, `shell`, `worker_id`, or backend parameters as raw
+  Herdr send targets; low-level backend fields are rejected before mutation.
 - Instruction text is validated: it must be non-empty, no longer than 4096
   characters, and must not contain NUL, ESC/ANSI/OSC sequences, bracketed-paste
   sequences, or raw control characters.
@@ -259,7 +264,8 @@ Receipt semantics:
 The only active Herdr mutation surface is `agent send`, which Herdr help
 describes as writing literal text. Tendwire does not use `pane send-text`,
 `send-keys`, `pane run`, shell/PTY control, signals, paste buffers, raw argv,
-client-provided backend params, or fallback terminal-control paths.
+client-provided worker IDs as backend targets, client-provided backend params,
+or fallback terminal-control paths.
 
 ## Milestone 2 non-goals
 

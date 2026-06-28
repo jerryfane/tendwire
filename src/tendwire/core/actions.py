@@ -14,6 +14,7 @@ from typing import Any, Callable
 from ..config import Config
 from .commands import (
     STATUS_AMBIGUOUS_TARGET,
+    STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_DRY_RUN,
     STATUS_NOOP,
@@ -153,6 +154,31 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
             ok=True,
             status=STATUS_DRY_RUN,
             result={"target": public_target, "instruction": {"text": text}},
+        )
+
+    backend_target = target.get("backend_target")
+    backend_reason = ""
+    if isinstance(backend_target, dict):
+        backend_reason = str(backend_target.get("reason") or "")
+    if not isinstance(backend_target, dict) or backend_target.get("sendable") is not True:
+        if backend_reason == "duplicate_backend_target":
+            return CommandEnvelope.from_result(
+                request,
+                ok=False,
+                status=STATUS_AMBIGUOUS_BACKEND_TARGET,
+                error=error_value(
+                    STATUS_AMBIGUOUS_BACKEND_TARGET,
+                    "target resolves to an ambiguous backend send target",
+                ),
+            )
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_BACKEND_UNSUPPORTED,
+            error=error_value(
+                STATUS_BACKEND_UNSUPPORTED,
+                "target has no backend-owned sendable private binding",
+            ),
         )
 
     if context.backend_sender is None:
