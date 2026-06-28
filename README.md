@@ -86,8 +86,10 @@ Top-level keys:
 - `attention` — deterministic attention signals derived from the snapshot.
 
 Canonical statuses are `unknown`, `active`, `idle`, `waiting`, `blocked`,
-`warning`, `failed`, and `closed`. Raw adapter status strings may appear only as
-`meta.raw_status` after connector-specific fields have been stripped.
+`warning`, `done`, `failed`, and `closed`. `done`, `complete`, `completed`, and
+`success` canonicalize to `done`, which remains eligible for follow-up
+instructions. Raw adapter status strings may appear only as `meta.raw_status`
+after connector-specific fields have been stripped.
 
 Snapshot hashing uses the Python standard library only:
 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, then
@@ -99,8 +101,9 @@ Attention signals expose deterministic `id` and `fingerprint` values plus
 `suggested_actions`, and `meta`. The attention fingerprint input includes
 `host_id`, `source`, `kind`, `severity`, `reason`, and normalized `status`, so
 the same logical condition keeps the same attention ID across snapshots.
-Suggested actions are neutral data with `action_id`, `label`, `command`, and
-`params`; they do not include delivery state.
+Suggested actions are neutral data with `action_id`, `label`,
+`tendwire_action`, and `params`; they do not include delivery state or raw shell
+command fields.
 
 ## SQLite store
 
@@ -151,7 +154,8 @@ readable.
 - `dry_run` — defaults to `true`; a request must explicitly set `dry_run: false`
   to ask for mutation.
 - `target` — optional neutral target descriptor using only `worker_id`,
-  `worker_fingerprint`, `space_id`, and `name`.
+  `worker_fingerprint`, `space_id`, and `name`. `send_instruction` requires at
+  least one non-empty explicit selector.
 - `instruction` — optional; for `send_instruction` contains `text` only.
 - `params` — optional opaque parameters.
 
@@ -180,7 +184,8 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
 `backend_unavailable`, `backend_unsupported`, `backend_failed`,
-`duplicate_request`, `request_state_uncertain`, and `invalid_request`.
+`duplicate_request`, `request_state_uncertain`, `invalid_request`, and
+`pending` for internal receipt reservation.
 
 Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
 results must never include connector delivery state, Herdr routing objects, bot
@@ -203,8 +208,8 @@ backend argv, or route/delivery fields.
 
 - Dry-run by default. A request must explicitly set `dry_run: false` to request
   mutation.
-- Non-dry-run `send_instruction` requires a `request_id` and exact single target
-  resolution.
+- Non-dry-run `send_instruction` requires a `request_id`, at least one explicit
+  target selector, and exact single target resolution.
 - Targets with status `closed`, `failed`, or `unknown` are rejected for
   `send_instruction`.
 - The send adapter chooses the backend target from the resolved neutral
@@ -217,10 +222,11 @@ backend argv, or route/delivery fields.
 
 ### Idempotency receipts
 
-Non-dry-run `send_instruction` writes a neutral receipt to the SQLite store when
-a database path is available. The receipt key is `host_id`/`request_id`/`action`
-and records `action`, `payload_fingerprint`, `status`, timestamps, and a
-sanitized `result_json`. Dry-runs never create receipts.
+Non-dry-run `send_instruction` first reserves a neutral pending receipt in the
+SQLite store when a database path is available, before backend mutation. The
+receipt key is `host_id`/`request_id`/`action` and records `action`,
+`payload_fingerprint`, `status`, timestamps, and a sanitized `result_json`.
+Dry-runs never create receipts.
 
 Receipt semantics:
 

@@ -32,6 +32,10 @@ def _snapshot(host_id: str = "action-host") -> Snapshot:
             {"id": "w-2", "name": "Beta", "status": "idle", "space_id": "s-1"},
             {"id": "w-3", "name": "Alpha", "status": "waiting", "space_id": "s-2"},
             {"id": "w-4", "name": "Failed", "status": "failed", "space_id": "s-1"},
+            {"id": "w-5", "name": "Done", "status": "done", "space_id": "s-1"},
+            {"id": "w-6", "name": "Closed", "status": "closed", "space_id": "s-1"},
+            {"id": "w-7", "name": "Unknown", "status": "unknown", "space_id": "s-1"},
+            {"id": "w-8", "name": "Mystery", "status": "mystery", "space_id": "s-1"},
         ],
     )
 
@@ -181,6 +185,79 @@ def test_send_instruction_non_dry_run_returns_backend_unsupported() -> None:
     assert envelope.status == STATUS_BACKEND_UNSUPPORTED
     assert envelope.request_id == "req-1"
     assert envelope.dry_run is False
+
+
+def test_send_instruction_rejects_empty_target_before_only_worker_fallback() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
+
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-empty",
+        dry_run=False,
+        target={},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(
+        host_id="host",
+        workers=[Worker(id="only-worker", name="Only", status="active")],
+        backend_sender=fake_backend,
+    )
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_INVALID_REQUEST
+    assert calls == []
+
+
+def test_send_instruction_allows_done_status() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
+
+    snapshot = _snapshot()
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-done",
+        dry_run=False,
+        target={"worker_id": "w-5"},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(
+        host_id=snapshot.host_id,
+        workers=_workers(snapshot),
+        backend_sender=fake_backend,
+    )
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is True
+    assert envelope.status == "accepted"
+    assert calls[0][0]["status"] == "done"
+
+
+@pytest.mark.parametrize("worker_id", ["w-4", "w-6", "w-7", "w-8"])
+def test_send_instruction_rejects_closed_failed_unknown_statuses(worker_id: str) -> None:
+    snapshot = _snapshot()
+    request = CommandRequest(
+        action="send_instruction",
+        request_id=f"req-{worker_id}",
+        dry_run=False,
+        target={"worker_id": worker_id},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(host_id=snapshot.host_id, workers=_workers(snapshot))
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_REJECTED
 
 
 def test_send_instruction_backend_receives_resolved_worker_id() -> None:

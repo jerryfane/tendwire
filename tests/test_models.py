@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from tendwire.config import Config
-from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker, utc_timestamp
+from tendwire.core.models import (
+    AttentionSignal,
+    Snapshot,
+    Space,
+    SuggestedAction,
+    Worker,
+    normalize_status,
+    utc_timestamp,
+)
 from tendwire.core.projector import project_empty, project_from_raw
 
 
@@ -23,6 +31,7 @@ _FORBIDDEN_FIELDS = {
     "delivery",
     "route",
     "herdres_delivery",
+    "command",
 }
 
 
@@ -109,7 +118,7 @@ def test_space_worker_and_attention_serialization_include_contract_fields() -> N
                 {
                     "action_id": "inspect-worker",
                     "label": "Inspect worker",
-                    "command": "tendwire snapshot --json",
+                    "tendwire_action": "snapshot",
                     "params": {"worker_id": "worker-1"},
                 }
             ],
@@ -141,6 +150,8 @@ def test_space_worker_and_attention_serialization_include_contract_fields() -> N
     assert len(signal_payload["fingerprint"]) == 24
     assert signal_payload["id"]
     assert signal_payload["suggested_actions"][0]["action_id"] == "inspect-worker"
+    assert signal_payload["suggested_actions"][0]["tendwire_action"] == "snapshot"
+    assert "command" not in signal_payload["suggested_actions"][0]
     assert Space.from_dict(space_payload).to_dict() == space_payload
     assert Worker.from_dict(worker_payload).to_dict() == worker_payload
     assert AttentionSignal.from_dict(signal_payload).to_dict() == signal_payload
@@ -185,7 +196,14 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
         "worker_id": "worker-1",
         "safe": "kept",
     }
+    assert payload["suggested_actions"][0]["tendwire_action"] == "tendwire snapshot --json"
+    assert "command" not in payload["suggested_actions"][0]
     _assert_no_forbidden_fields(payload)
+
+
+def test_done_status_aliases_canonicalize_to_sendable_done() -> None:
+    for raw_status in ("done", "complete", "completed", "success"):
+        assert normalize_status(raw_status) == "done"
 
 
 def test_snapshot_json_has_schema_version_content_fingerprint_and_legacy_keys() -> None:
@@ -257,6 +275,7 @@ def test_attention_ids_are_stable_and_fingerprints_track_logical_changes() -> No
 
     assert same["id"] == base["id"]
     assert same["fingerprint"] == base["fingerprint"]
+    assert same["updated_at"] != base["updated_at"]
     assert changed_status["fingerprint"] != base["fingerprint"]
     assert changed_reason["fingerprint"] != base["fingerprint"]
     assert changed_source["fingerprint"] != base["fingerprint"]
@@ -299,6 +318,19 @@ def test_snapshot_content_fingerprint_ignores_updated_at_and_sorts_content() -> 
     assert payload_a["content_fingerprint"] == payload_b["content_fingerprint"]
     assert payload_a["content_fingerprint"] == _expected_snapshot_fingerprint(payload_a)
     assert changed.content_fingerprint != snapshot_a.content_fingerprint
+
+
+def test_worker_attention_includes_local_target_metadata() -> None:
+    config = Config(host_id="attention-host")
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Agent One", "status": "blocked", "space_id": "space-1"}],
+    )
+    signal = _snapshot_payload(snapshot)["attention"][0]
+
+    assert signal["meta"]["needs_human"] is True
+    assert signal["meta"]["worker_id"] == "worker-1"
+    assert signal["meta"]["space_id"] == "space-1"
 
 
 def test_project_from_raw_normalizes_status_and_strips_connector_fields() -> None:

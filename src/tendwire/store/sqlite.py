@@ -128,6 +128,47 @@ def _content_fingerprint(data: Mapping[str, Any]) -> str:
     )
 
 
+def _command_receipt_from_row(row: Any) -> dict[str, Any]:
+    return {
+        "host_id": row[0],
+        "request_id": row[1],
+        "action": row[2],
+        "payload_fingerprint": row[3],
+        "status": row[4],
+        "result_json": row[5],
+        "created_at": row[6],
+        "completed_at": row[7],
+        "uncertain": bool(row[8]),
+    }
+
+
+def _latest_command_receipt_row(
+    conn: sqlite3.Connection,
+    host_id: str,
+    request_id: str,
+    action: str,
+) -> Any:
+    return conn.execute(
+        """
+        SELECT
+            host_id,
+            request_id,
+            action,
+            payload_fingerprint,
+            status,
+            result_json,
+            created_at,
+            completed_at,
+            uncertain
+        FROM command_receipts
+        WHERE host_id = ? AND request_id = ? AND action = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(host_id), str(request_id), str(action)),
+    ).fetchone()
+
+
 def _snapshot_payload(data: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     payload_data = dict(data)
     payload_data.setdefault("schema_version", SCHEMA_VERSION)
@@ -270,9 +311,41 @@ def get_command_receipt(
         return None
     with sqlite3.connect(str(db_path)) as conn:
         _ensure_schema(conn)
-        row = conn.execute(
+        row = _latest_command_receipt_row(conn, host_id, request_id, action)
+    if row is None:
+        return None
+    return _command_receipt_from_row(row)
+
+
+def reserve_command_receipt(
+    db_path: Path,
+    host_id: str,
+    request_id: str,
+    action: str,
+    payload_fingerprint: str,
+    pending_result_json: str,
+    *,
+    status: str = "pending",
+) -> dict[str, Any]:
+    """Atomically reserve a mutating command receipt key if it is unused.
+
+    Returns {"reserved": True, "receipt": None} when this caller owns the
+    mutation attempt. If another receipt already exists for the same key, the
+    existing latest receipt is returned and no new row is inserted.
+    """
+    _ensure_dir(db_path)
+    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_schema(conn)
+        row = _latest_command_receipt_row(conn, host_id, request_id, action)
+        if row is not None:
+            conn.execute("COMMIT")
+            return {"reserved": False, "receipt": _command_receipt_from_row(row)}
+        now = utc_timestamp()
+        conn.execute(
             """
-            SELECT
+            INSERT INTO command_receipts (
                 host_id,
                 request_id,
                 action,
@@ -282,26 +355,27 @@ def get_command_receipt(
                 created_at,
                 completed_at,
                 uncertain
-            FROM command_receipts
-            WHERE host_id = ? AND request_id = ? AND action = ?
-            ORDER BY id DESC
-            LIMIT 1
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (str(host_id), str(request_id), str(action)),
-        ).fetchone()
-    if row is None:
-        return None
-    return {
-        "host_id": row[0],
-        "request_id": row[1],
-        "action": row[2],
-        "payload_fingerprint": row[3],
-        "status": row[4],
-        "result_json": row[5],
-        "created_at": row[6],
-        "completed_at": row[7],
-        "uncertain": bool(row[8]),
-    }
+            (
+                str(host_id),
+                str(request_id),
+                str(action),
+                str(payload_fingerprint),
+                str(status),
+                str(pending_result_json),
+                now,
+                None,
+                1,
+            ),
+        )
+        conn.execute("COMMIT")
+        return {"reserved": True, "receipt": None}
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def save_command_receipt(

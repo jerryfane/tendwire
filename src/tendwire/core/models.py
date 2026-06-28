@@ -18,7 +18,7 @@ SCHEMA_VERSION = 2
 FINGERPRINT_HEX_CHARS = 24
 
 CANONICAL_STATUSES = frozenset(
-    {"unknown", "active", "idle", "waiting", "blocked", "warning", "failed", "closed"}
+    {"unknown", "active", "idle", "waiting", "blocked", "warning", "done", "failed", "closed"}
 )
 
 _STATUS_ALIASES = {
@@ -31,7 +31,7 @@ _STATUS_ALIASES = {
     "online": "active",
     "connected": "active",
     "healthy": "active",
-    "success": "active",
+    "success": "done",
     "open": "active",
     "working": "active",
     "busy": "active",
@@ -67,9 +67,9 @@ _STATUS_ALIASES = {
     "crash": "failed",
     "panic": "failed",
     "closed": "closed",
-    "complete": "closed",
-    "completed": "closed",
-    "done": "closed",
+    "complete": "done",
+    "completed": "done",
+    "done": "done",
     "stopped": "closed",
     "exited": "closed",
     "terminated": "closed",
@@ -289,32 +289,46 @@ def attention_id(
     return f"attn-{attention_fingerprint(host_id=host_id, source=source, kind=kind, severity=severity, reason=reason, status=status)}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class SuggestedAction:
     """A neutral action suggestion with no connector delivery state."""
 
     action_id: str = ""
     label: str = ""
-    command: str = ""
+    tendwire_action: str = ""
     params: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        label = _string_value(self.label)
-        command = _string_value(self.command)
-        params = sanitize_forbidden_fields(self.params if isinstance(self.params, Mapping) else {})
-        action_id = _string_value(self.action_id) or stable_fingerprint(
-            {"label": label, "command": command, "params": params}
+    def __init__(
+        self,
+        action_id: str = "",
+        label: str = "",
+        tendwire_action: str = "",
+        params: Mapping[str, Any] | None = None,
+        *,
+        command: str | None = None,
+    ) -> None:
+        label = _string_value(label)
+        action_value = tendwire_action if tendwire_action or command is None else command
+        tendwire_action = _string_value(action_value)
+        params = sanitize_forbidden_fields(params if isinstance(params, Mapping) else {})
+        action_id = _string_value(action_id) or stable_fingerprint(
+            {"label": label, "tendwire_action": tendwire_action, "params": params}
         )
         object.__setattr__(self, "action_id", action_id)
         object.__setattr__(self, "label", label)
-        object.__setattr__(self, "command", command)
+        object.__setattr__(self, "tendwire_action", tendwire_action)
         object.__setattr__(self, "params", params)
+
+    @property
+    def command(self) -> str:
+        """Backward-compatible in-process alias; not serialized."""
+        return self.tendwire_action
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "action_id": self.action_id,
             "label": self.label,
-            "command": self.command,
+            "tendwire_action": self.tendwire_action,
             "params": sanitize_forbidden_fields(self.params),
         }
 
@@ -326,7 +340,7 @@ class SuggestedAction:
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
-            command=_string_value(clean.get("command")),
+            tendwire_action=_string_value(clean.get("tendwire_action", clean.get("command"))),
             params=clean.get("params", {}),
         )
 

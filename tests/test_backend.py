@@ -299,10 +299,10 @@ def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypa
     assert len(workers) == 1
     assert workers[0].id == "sess-1"
     assert workers[0].name == "Coder"
-    assert workers[0].status == "closed"
+    assert workers[0].status == "done"
     assert workers[0].space_id == "ws-1"
     assert workers[0].meta.get("cwd") == "/home/dev"
-    assert workers[0].meta.get("raw_status") == "done"
+    assert "raw_status" not in workers[0].meta
 
 
 def test_json_workspace_list_fallback_when_no_flag_fails(monkeypatch) -> None:
@@ -496,7 +496,7 @@ def test_repeated_agent_names_with_distinct_ids_remain_distinct(monkeypatch) -> 
 
 
 def test_status_aliases_for_live_herdr(monkeypatch) -> None:
-    """Working maps to active, done maps to closed, and raw_status is preserved."""
+    """Working maps to active, done maps to done, and raw_status is preserved."""
     config = Config(host_id="testhost", herdr_bin="herdr")
     responses = {
         ("workspace", "list", "--json"): {
@@ -526,8 +526,8 @@ def test_status_aliases_for_live_herdr(monkeypatch) -> None:
     assert spaces[1].status == "waiting"
     assert spaces[1].meta.get("raw_status") == "responding"
     by_id = {w.id: w for w in workers}
-    assert by_id["sess-1"].status == "closed"
-    assert by_id["sess-1"].meta.get("raw_status") == "done"
+    assert by_id["sess-1"].status == "done"
+    assert "raw_status" not in by_id["sess-1"].meta
     assert by_id["sess-2"].status == "waiting"
     assert by_id["sess-2"].meta.get("raw_status") == "awaiting-input"
 

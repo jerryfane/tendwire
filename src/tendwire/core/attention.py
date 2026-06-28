@@ -17,6 +17,12 @@ def _worker_attention_signal(
     updated_at: str | None = None,
 ) -> AttentionSignal:
     status = normalize_status(worker.status)
+    meta = {
+        "worker_id": worker.id,
+        "needs_human": severity in {"warning", "critical"},
+    }
+    if worker.space_id is not None:
+        meta["space_id"] = worker.space_id
     return AttentionSignal(
         kind="worker_status",
         severity=severity,
@@ -24,6 +30,7 @@ def _worker_attention_signal(
         reason=reason,
         source=f"worker:{worker.id}",
         updated_at=updated_at or worker.last_seen_at,
+        meta=meta,
         host_id=host_id,
     )
 
