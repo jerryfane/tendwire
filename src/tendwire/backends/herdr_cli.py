@@ -100,7 +100,7 @@ def _is_forbidden_connector_field(key: object) -> bool:
 
 
 def _run_herdr(args: Sequence[str], config: Config) -> subprocess.CompletedProcess[str] | None:
-    """Run the Herdr CLI with read-only arguments; return None on any CLI failure."""
+    """Run the Herdr CLI with read-only arguments; return None on launch failure."""
     try:
         return subprocess.run(
             [config.herdr_bin, *args],
@@ -109,23 +109,17 @@ def _run_herdr(args: Sequence[str], config: Config) -> subprocess.CompletedProce
             check=False,
             timeout=config.herdr_timeout_seconds,
         )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError, TypeError):
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
         return None
 
 
 def _probe_herdr(args: Sequence[str], config: Config) -> tuple[str, Any]:
     """Run a read-only Herdr command and retain failure class for mutations."""
     try:
-        completed = subprocess.run(
-            [config.herdr_bin, *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=config.herdr_timeout_seconds,
-        )
+        completed = _run_herdr(args, config)
     except subprocess.TimeoutExpired:
         return "timeout", None
-    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+    if completed is None:
         return "launch_error", None
 
     if completed.returncode != 0:
@@ -148,19 +142,16 @@ def _parse_json_output(stdout: str | None) -> Any:
 
 def _command_payload(args: Sequence[str], config: Config) -> Any:
     """Return parsed JSON for a single herdr command, or None on any bad output."""
-    result = _run_herdr(args, config)
-    if result is None or result.returncode != 0:
+    outcome, payload = _probe_herdr(args, config)
+    if outcome != "ok":
         return None
-    return _parse_json_output(result.stdout)
+    return payload
 
 
 def _command_payload_variants(variants: Sequence[Sequence[str]], config: Config) -> Any:
     """Try a sequence of herdr arg lists in order; return first successful payload."""
-    for args in variants:
-        payload = _command_payload(args, config)
-        if payload is not None:
-            return payload
-    return None
+    outcome, payload = _probe_payload_variants(variants, config)
+    return payload if outcome == "ok" else None
 
 
 def _safe_text_sample(value: str | None) -> str | None:
@@ -853,9 +844,9 @@ def _probe_payload_variants(
         outcome, payload = _probe_herdr(args, config)
         if outcome == "ok":
             return outcome, payload
+        if outcome == "timeout":
+            return "timeout", None
         outcomes.append(outcome)
-    if "timeout" in outcomes:
-        return "timeout", None
     if outcomes and all(outcome == "launch_error" for outcome in outcomes):
         return "launch_error", None
     if "malformed_json" in outcomes:
@@ -937,14 +928,17 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
     except (TypeError, ValueError, OSError):
         return [], []
 
-    workspace_payload = _command_payload_variants(
+    workspace_outcome, workspace_payload = _probe_payload_variants(
         [
             ["workspace", "list"],
             ["workspace", "list", "--json"],
         ],
         config,
     )
-    agent_payload = _command_payload_variants(
+    if workspace_outcome == "timeout":
+        return [], []
+
+    agent_outcome, agent_payload = _probe_payload_variants(
         [
             ["agent", "list"],
             ["agent", "list", "--json"],
@@ -953,9 +947,14 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
     )
 
     spaces = _spaces_from_payload(workspace_payload)
+    if agent_outcome == "timeout":
+        return spaces, []
+
     workers = _workers_from_payload(agent_payload)
     if not workers:
-        pane_payload = _command_payload(["pane", "list"], config)
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+        if pane_outcome != "ok":
+            return spaces, []
         workers = _workers_from_pane_payload(pane_payload)
 
     return spaces, workers

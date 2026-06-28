@@ -60,7 +60,9 @@ When Herdr 0.7.0 is present, the adapter first tries the no-flag JSON envelopes
 compatibility fallback. If no agents are returned, it uses `herdr pane list` as
 a worker fallback, keeping only panes that describe an agent. Each attempt is
 independent and safe: a missing binary, timeout, or malformed response simply
-produces empty spaces or workers rather than failing the snapshot.
+produces empty spaces or workers rather than failing the snapshot. Timeout
+handling is conservative: once a probe times out, Tendwire stops that
+compatibility/fallback chain instead of trying every remaining variant.
 
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
@@ -100,7 +102,8 @@ Top-level keys:
   `status`, optional timestamps/status text, per-item `fingerprint`, and `meta`.
 - `workers` — neutral worker observations with stable `id`, `name`, canonical
   `status`, optional `last_seen_at`/summary, per-item `fingerprint`, and `meta`.
-- `attention` — deterministic attention signals derived from the snapshot.
+- `attention` — deterministic human-actionable attention signals derived from
+  the snapshot.
 
 Canonical statuses are `unknown`, `active`, `idle`, `waiting`, `blocked`,
 `warning`, `done`, `failed`, and `closed`. `done`, `complete`, `completed`, and
@@ -121,6 +124,19 @@ the same logical condition keeps the same attention ID across snapshots.
 Suggested actions are neutral data with `action_id`, `label`,
 `tendwire_action`, and `params`; they do not include delivery state or raw shell
 command fields.
+
+Attention is for human-actionable items, not a general worker status feed.
+Empty snapshots and workers that are idle, active/running, done/completed, or
+closed do not create attention items by default. Failed/error workers create
+critical attention; blocked/warning workers create warning attention.
+Waiting/pending workers create attention only when structured metadata or very
+explicit summary text says human input, review, or approval is required. Generic
+waiting, responding, or pending wording alone is not enough.
+
+Worker-derived attention `updated_at` uses a source worker timestamp when one is
+available, such as `last_seen_at` or a backend `updated_at` normalized into
+`last_seen_at`. It does not fall back to the snapshot `updated_at`; when no
+worker source time exists, the attention item serializes `updated_at` as `null`.
 
 ## SQLite store
 
@@ -238,8 +254,9 @@ backend argv, or route/delivery fields.
   `backend_target`, `argv`, `shell`, `worker_id`, or backend parameters as raw
   Herdr send targets; low-level backend fields are rejected before mutation.
 - Instruction text is validated: it must be non-empty, no longer than 4096
-  characters, and must not contain NUL, ESC/ANSI/OSC sequences, bracketed-paste
-  sequences, or raw control characters.
+  characters, and may include LF newlines and tab characters. It must not
+  contain NUL, ESC/ANSI/CSI/OSC sequences, bracketed-paste sequences, carriage
+  returns, DEL, C1 controls, or other raw control characters.
 - Unknown actions are rejected before any backend or store call.
 
 ### Idempotency receipts

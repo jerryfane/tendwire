@@ -91,6 +91,7 @@ def _send_completed(returncode: int = 0) -> subprocess.CompletedProcess[str]:
 def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
     config = Config(host_id="testhost", herdr_bin="herdr")
     calls: list[tuple[list[str], dict[str, Any]]] = []
+    instruction_text = "line one\nline two\tindented"
 
     def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append((args, kwargs))
@@ -106,7 +107,7 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
             "backend_target": {"kind": "agent_id", "value": "agent-send-1", "sendable": True, "reason": None},
             "terminal_id": "ignored",
         },
-        {"text": "hello"},
+        {"text": instruction_text},
     )
 
     assert envelope.ok is True
@@ -114,7 +115,7 @@ def test_send_instruction_uses_agent_send_argv(monkeypatch) -> None:
     assert envelope.result == {"target": {"worker_id": "public-worker-1"}}
     assert calls == [
         (
-            ["herdr", "agent", "send", "agent-send-1", "hello"],
+            ["herdr", "agent", "send", "agent-send-1", instruction_text],
             {
                 "capture_output": True,
                 "text": True,
@@ -488,6 +489,89 @@ def test_fetch_herdr_command_observation_reports_healthy_empty(monkeypatch) -> N
     assert observation.healthy is True
     assert observation.outcome == "empty_healthy"
     assert observation.workers == []
+
+
+def test_probe_payload_variants_stops_after_timeout(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_probe(args: Sequence[str], cfg: Config) -> tuple[str, Any]:
+        calls.append(tuple(args))
+        return "timeout", None
+
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    outcome, payload = herdr_cli._probe_payload_variants(
+        [["agent", "list"], ["agent", "list", "--json"]],
+        config,
+    )
+
+    assert outcome == "timeout"
+    assert payload is None
+    assert calls == [("agent", "list")]
+
+
+def test_fetch_herdr_command_observation_stops_fallbacks_after_timeout(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_probe(args: Sequence[str], cfg: Config) -> tuple[str, Any]:
+        calls.append(tuple(args))
+        if tuple(args) == ("workspace", "list"):
+            return "ok", {"result": {"workspaces": []}}
+        return "timeout", None
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    observation = herdr_cli.fetch_herdr_command_observation(config)
+
+    assert observation.healthy is False
+    assert observation.outcome == "timeout"
+    assert observation.workers == []
+    assert calls == [("workspace", "list"), ("agent", "list")]
+
+
+def test_fetch_herdr_state_short_circuits_after_timeout(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(args))
+        raise subprocess.TimeoutExpired(cmd=["herdr", *args], timeout=config.herdr_timeout_seconds)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert spaces == []
+    assert workers == []
+    assert calls == [("workspace", "list")]
+
+
+def test_fetch_herdr_state_returns_spaces_and_skips_worker_fallback_after_agent_timeout(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    calls: list[tuple[str, ...]] = []
+
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "Build"}]}},
+    }
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(args))
+        if tuple(args) == ("workspace", "list"):
+            return _respond(args, responses)
+        raise subprocess.TimeoutExpired(cmd=["herdr", *args], timeout=config.herdr_timeout_seconds)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    spaces, workers = fetch_herdr_state(config)
+
+    assert [space.id for space in spaces] == ["ws-1"]
+    assert workers == []
+    assert calls == [("workspace", "list"), ("agent", "list")]
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "malformed_json", "nonzero"])

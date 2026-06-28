@@ -243,6 +243,10 @@ def _contains_bracketed_paste(text: str) -> bool:
     return "\x1b[200~" in text or "\x1b[201~" in text
 
 
+def _contains_c1_control(text: str) -> bool:
+    return any(0x80 <= ord(char) <= 0x9F for char in text)
+
+
 def validate_instruction_text(text: Any) -> dict[str, Any] | None:
     """Validate instruction text and return an error dict, or None if valid."""
     if text is None:
@@ -263,10 +267,20 @@ def validate_instruction_text(text: Any) -> dict[str, Any] | None:
             STATUS_INVALID_REQUEST,
             "instruction.text must not contain bracketed-paste sequences",
         )
-    # Reject C0 control characters (0x00-0x1f) and DEL (0x7f).
+    if "\x1b" in text:
+        return instruction_text_error(
+            STATUS_INVALID_REQUEST,
+            "instruction.text must not contain escape sequences",
+        )
+    if _contains_c1_control(text):
+        return instruction_text_error(
+            STATUS_INVALID_REQUEST,
+            "instruction.text must not contain C1 control characters",
+        )
+    # Reject C0 controls except LF and tab, plus DEL.
     for char in text:
         code = ord(char)
-        if code < 32 or code == 127:
+        if (code < 32 and code not in {9, 10}) or code == 127:
             return instruction_text_error(
                 STATUS_INVALID_REQUEST,
                 "instruction.text must not contain raw control characters",

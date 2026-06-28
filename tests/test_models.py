@@ -256,7 +256,7 @@ def test_snapshot_json_has_schema_version_content_fingerprint_and_legacy_keys() 
     assert isinstance(payload["updated_at"], str)
     assert isinstance(payload["spaces"], list)
     assert isinstance(payload["workers"], list)
-    assert isinstance(payload["attention"], list)
+    assert payload["attention"] == []
     _assert_no_forbidden_fields(payload)
 
 
@@ -304,10 +304,115 @@ def test_attention_ids_are_stable_and_fingerprints_track_logical_changes() -> No
 
     assert same["id"] == base["id"]
     assert same["fingerprint"] == base["fingerprint"]
-    assert same["updated_at"] != base["updated_at"]
+    assert same["updated_at"] is None
+    assert base["updated_at"] is None
     assert changed_status["fingerprint"] != base["fingerprint"]
     assert changed_reason["fingerprint"] != base["fingerprint"]
     assert changed_source["fingerprint"] != base["fingerprint"]
+
+
+def test_attention_filters_status_feed_noise_and_empty_snapshots() -> None:
+    config = Config(host_id="attention-host")
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {"id": "active", "name": "Active", "status": "running"},
+            {"id": "idle", "name": "Idle", "status": "idle"},
+            {"id": "done", "name": "Done", "status": "completed"},
+            {"id": "closed", "name": "Closed", "status": "closed"},
+            {"id": "waiting", "name": "Waiting", "status": "waiting", "summary": "waiting for response"},
+            {"id": "pending", "name": "Pending", "status": "pending", "summary": "pending work"},
+        ],
+    )
+
+    assert _snapshot_payload(project_empty(config))["attention"] == []
+    assert _snapshot_payload(snapshot)["attention"] == []
+
+
+def test_attention_emits_failed_blocked_warning_and_explicit_human_waiting() -> None:
+    config = Config(host_id="attention-host")
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {"id": "failed", "name": "Failed", "status": "error"},
+            {"id": "blocked", "name": "Blocked", "status": "blocked"},
+            {"id": "warning", "name": "Warning", "status": "warning"},
+            {
+                "id": "needs-input",
+                "name": "Needs Input",
+                "status": "waiting",
+                "space_id": "space-1",
+                "meta": {"needs_human": True},
+            },
+            {
+                "id": "approval",
+                "name": "Approval",
+                "status": "pending",
+                "summary": "human approval required before continuing",
+            },
+        ],
+    )
+    attention = {item["source"]: item for item in _snapshot_payload(snapshot)["attention"]}
+
+    assert attention["worker:failed"]["severity"] == "critical"
+    assert attention["worker:failed"]["status"] == "failed"
+    assert attention["worker:blocked"]["severity"] == "warning"
+    assert attention["worker:warning"]["severity"] == "warning"
+    assert attention["worker:needs-input"]["severity"] == "warning"
+    assert attention["worker:needs-input"]["meta"]["worker_id"] == "needs-input"
+    assert attention["worker:needs-input"]["meta"]["space_id"] == "space-1"
+    assert attention["worker:needs-input"]["meta"]["needs_human"] is True
+    assert attention["worker:approval"]["severity"] == "warning"
+
+
+def test_attention_updated_at_uses_worker_source_time_without_snapshot_fallback() -> None:
+    config = Config(host_id="attention-host")
+    timestamp_a = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    timestamp_b = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    source_time = "2026-01-03T00:00:00+00:00"
+
+    first = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Agent One", "status": "blocked"}],
+        timestamp=timestamp_a,
+    )
+    second = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Agent One", "status": "blocked"}],
+        timestamp=timestamp_b,
+    )
+    sourced = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Agent One",
+                "status": "blocked",
+                "last_seen_at": source_time,
+            }
+        ],
+        timestamp=timestamp_b,
+    )
+    sourced_from_updated = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-2",
+                "name": "Agent Two",
+                "status": "blocked",
+                "updated_at": source_time,
+            }
+        ],
+        timestamp=timestamp_b,
+    )
+
+    first_signal = _snapshot_payload(first)["attention"][0]
+    second_signal = _snapshot_payload(second)["attention"][0]
+    assert first_signal["id"] == second_signal["id"]
+    assert first_signal["updated_at"] is None
+    assert second_signal["updated_at"] is None
+    assert _snapshot_payload(sourced)["attention"][0]["updated_at"] == source_time
+    assert _snapshot_payload(sourced_from_updated)["attention"][0]["updated_at"] == source_time
 
 
 def test_snapshot_content_fingerprint_ignores_updated_at_and_sorts_content() -> None:

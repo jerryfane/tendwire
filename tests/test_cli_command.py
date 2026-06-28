@@ -687,6 +687,42 @@ def test_cli_command_forbidden_field_rejected(capsys, monkeypatch) -> None:
     assert payload["status"] == STATUS_INVALID_REQUEST
 
 
+def test_cli_command_rejects_control_sequence_instruction_as_json_only(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello\x1b[31mworld"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert payload["error"]["details"] == {"field": "instruction.text"}
+    _assert_no_command_public_forbidden_fields(payload)
+
+
 def test_cli_command_backend_result_and_receipt_are_sanitized(capsys, monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "cmd.db"
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
