@@ -1,4 +1,4 @@
-"""Boundary tests: core modules must not import Telegram/Herdres/backend code."""
+"""Boundary tests: core modules must not load connector/runtime code."""
 
 from __future__ import annotations
 
@@ -12,8 +12,16 @@ _CORE_MODULE_NAMES = (
     "tendwire.core.attention",
 )
 
-_FORBIDDEN_PREFIXES = ("telegram", "herdres")
-_FORBIDDEN_TENDWIRE_MODULES = ("tendwire.backends.herdr_cli", "tendwire.store.sqlite")
+_FORBIDDEN_PREFIXES = (
+    "telegram",
+    "herdres",
+    "tendwire.backends",
+    "tendwire.store",
+    "tendwire.connectors",
+    "tendwire.routing",
+    "tendwire.delivery",
+)
+_FORBIDDEN_EXACT = {"subprocess"}
 
 
 def _loaded_modules_after_import(module_name: str) -> set[str]:
@@ -44,22 +52,12 @@ for name in sorted(after - before):
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def test_core_modules_do_not_load_telegram_or_herdres() -> None:
+def test_core_modules_do_not_load_connector_or_process_modules() -> None:
     for module_name in _CORE_MODULE_NAMES:
         loaded = _loaded_modules_after_import(module_name)
         for name in loaded:
             lower = name.lower()
-            if lower.startswith(_FORBIDDEN_PREFIXES):
+            if name in _FORBIDDEN_EXACT or lower.startswith(_FORBIDDEN_PREFIXES):
                 raise AssertionError(
                     f"{module_name} transitively loads forbidden module {name}"
-                )
-
-
-def test_core_modules_do_not_load_backend_or_store_connectors() -> None:
-    for module_name in _CORE_MODULE_NAMES:
-        loaded = _loaded_modules_after_import(module_name)
-        for forbidden in _FORBIDDEN_TENDWIRE_MODULES:
-            if forbidden in loaded:
-                raise AssertionError(
-                    f"{module_name} transitively loads connector module {forbidden}"
                 )

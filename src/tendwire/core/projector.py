@@ -6,7 +6,7 @@ Telegram, Herdres, or concrete backend connector modules.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from ..config import Config
