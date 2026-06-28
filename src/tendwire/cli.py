@@ -11,7 +11,7 @@ import json
 import sys
 from typing import Any
 
-from .backends.herdr_cli import diagnose_herdr, fetch_herdr_state
+from .backends.herdr_cli import diagnose_herdr, fetch_herdr_command_observation, fetch_herdr_state
 from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
@@ -167,6 +167,14 @@ def cmd_doctor(
 def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnvelope:
     if receipt is None:
         return None
+    if receipt["payload_fingerprint"] != request.payload_fingerprint():
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_DUPLICATE_REQUEST,
+                "request_id reused with a different payload",
+            ),
+        )
     if receipt["uncertain"]:
         return CommandEnvelope.error(
             request,
@@ -175,16 +183,8 @@ def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnve
                 "previous request state is uncertain; not retrying mutation",
             ),
         )
-    if receipt["payload_fingerprint"] == request.payload_fingerprint():
-        cached = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
-        return cached
-    return CommandEnvelope.error(
-        request,
-        error_value(
-            STATUS_DUPLICATE_REQUEST,
-            "request_id reused with a different payload",
-        ),
-    )
+    cached = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
+    return cached
 
 
 def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
@@ -265,6 +265,32 @@ def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelop
     )
 
 
+def _command_observation_error(request: Any, observation: Any) -> CommandEnvelope | None:
+    from .core.commands import CommandRequest
+
+    if not isinstance(request, CommandRequest):
+        return None
+    if request.action != "send_instruction" or request.dry_run:
+        return None
+    if observation.healthy:
+        return None
+    if observation.status == "unavailable":
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_BACKEND_UNAVAILABLE,
+                observation.message or "Herdr backend is unavailable",
+            ),
+        )
+    return CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            observation.message or "Herdr observation state is uncertain",
+        ),
+    )
+
+
 def cmd_command(
     config: Config,
     *,
@@ -299,7 +325,16 @@ def cmd_command(
         print(receipt_envelope.to_json(indent=2))
         return 0 if receipt_envelope.ok else 1
 
-    spaces, workers = fetch_herdr_state(config)
+    if request.action == "send_instruction" and not request.dry_run:
+        observation = fetch_herdr_command_observation(config)
+        observation_error = _command_observation_error(request, observation)
+        if observation_error is not None:
+            _save_command_receipt(config, request, observation_error)
+            print(observation_error.to_json(indent=2))
+            return 0 if observation_error.ok else 1
+        spaces, workers = observation.spaces, observation.workers
+    else:
+        spaces, workers = fetch_herdr_state(config)
     snapshot = project_from_observations(
         config,
         spaces=spaces,

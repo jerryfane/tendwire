@@ -7,16 +7,22 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from tendwire.backends.herdr_cli import HerdrCommandObservation
 from tendwire.cli import main
 from tendwire.core.commands import (
     STATUS_ACCEPTED,
+    STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DRY_RUN,
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_REQUEST,
+    STATUS_NOT_FOUND,
     STATUS_REQUEST_STATE_UNCERTAIN,
     CommandEnvelope,
+    CommandRequest,
 )
 from tendwire.core.models import Space, Worker
 from tendwire.store.sqlite import get_command_receipt
@@ -24,10 +30,33 @@ from tendwire.store.sqlite import get_command_receipt
 
 def _fake_herdr_state(config: Any) -> tuple[list[Space], list[Worker]]:
     workers = [
-        Worker(id="w-1", name="Alpha", status="active", space_id="s-1"),
-        Worker(id="w-2", name="Beta", status="idle", space_id="s-1"),
+        Worker(
+            id="w-1",
+            name="Alpha",
+            status="active",
+            space_id="s-1",
+            backend_target={"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None},
+        ),
+        Worker(
+            id="w-2",
+            name="Beta",
+            status="idle",
+            space_id="s-1",
+            backend_target={"kind": "agent_id", "value": "agent-2", "sendable": True, "reason": None},
+        ),
     ]
     return [], workers
+
+
+def _fake_herdr_command_observation(config: Any) -> HerdrCommandObservation:
+    spaces, workers = _fake_herdr_state(config)
+    return HerdrCommandObservation(
+        spaces=spaces,
+        workers=workers,
+        status="healthy",
+        outcome="healthy_non_empty",
+    )
+
 
 def _accepted_backend(calls: list[tuple[Any, Any]]):
     def send(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
@@ -213,6 +242,99 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(capsys, mo
     assert payload["status"] == STATUS_INVALID_REQUEST
 
 
+def test_cli_command_send_instruction_accepts_literal_false_for_mutation(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "literal-false.db"
+    calls: list[tuple[Any, Any]] = []
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_command_observation",
+        _fake_herdr_command_observation,
+    )
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "literal-false",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert payload["status"] == STATUS_ACCEPTED
+    assert payload["dry_run"] is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_cli_command_rejects_non_boolean_dry_run_before_backend(
+    value: Any, capsys, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    def guarded_observation(config: Any) -> HerdrCommandObservation:
+        calls.append("fetch")
+        raise AssertionError("invalid dry_run must not fetch")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_observation)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "bad-dry-run",
+                    "dry_run": value,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert calls == []
+    _assert_no_command_public_forbidden_fields(payload)
+
+
 def test_cli_command_send_instruction_empty_target_rejects_before_fetch(capsys, monkeypatch) -> None:
     calls: list[str] = []
 
@@ -255,6 +377,10 @@ def test_cli_command_send_instruction_empty_target_rejects_before_fetch(capsys, 
 
 def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_command_observation",
+        _fake_herdr_command_observation,
+    )
     calls: list[tuple[Any, Any]] = []
     monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
     db_path = tmp_path / "cmd.db"
@@ -315,6 +441,10 @@ def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, mo
 
 def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_command_observation",
+        _fake_herdr_command_observation,
+    )
     calls: list[tuple[Any, Any]] = []
     monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
     db_path = tmp_path / "cmd.db"
@@ -380,13 +510,20 @@ def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, 
     # Seed an uncertain receipt directly.
     from tendwire.store.sqlite import init_store, save_command_receipt
 
+    pending_request = CommandRequest(
+        action="send_instruction",
+        request_id="uncertain-1",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
     init_store(db_path)
     save_command_receipt(
         db_path,
         host_id="cmd-host",
         request_id="uncertain-1",
         action="send_instruction",
-        payload_fingerprint="fp",
+        payload_fingerprint=pending_request.payload_fingerprint(),
         status=STATUS_REQUEST_STATE_UNCERTAIN,
         result_json=json.dumps(
             {
@@ -437,6 +574,90 @@ def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, 
     assert result["status"] == STATUS_REQUEST_STATE_UNCERTAIN
 
 
+def test_cli_command_uncertain_receipt_changed_payload_is_duplicate_without_retry(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "cmd.db"
+    from tendwire.store.sqlite import init_store, save_command_receipt
+
+    original_request = CommandRequest(
+        action="send_instruction",
+        request_id="uncertain-changed",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "hello"},
+    )
+    init_store(db_path)
+    save_command_receipt(
+        db_path,
+        host_id="cmd-host",
+        request_id="uncertain-changed",
+        action="send_instruction",
+        payload_fingerprint=original_request.payload_fingerprint(),
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        result_json=json.dumps(
+            {
+                "schema_version": 1,
+                "action": "send_instruction",
+                "request_id": "uncertain-changed",
+                "ok": False,
+                "dry_run": False,
+                "status": STATUS_REQUEST_STATE_UNCERTAIN,
+                "result": None,
+                "error": {"code": STATUS_REQUEST_STATE_UNCERTAIN, "message": "pending", "details": {}},
+                "warnings": [],
+            }
+        ),
+        uncertain=True,
+    )
+    calls: list[str] = []
+
+    def guarded_observation(config: Any) -> HerdrCommandObservation:
+        calls.append("fetch")
+        raise AssertionError("changed duplicate receipt must not fetch Herdr")
+
+    def guarded_send(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append("send")
+        raise AssertionError("changed duplicate receipt must not send")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_observation)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "uncertain-changed",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "world"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+
+    assert code == 1
+    assert result["status"] == STATUS_DUPLICATE_REQUEST
+    assert calls == []
+
+
 def test_cli_command_forbidden_field_rejected(capsys, monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.stdin",
@@ -469,6 +690,10 @@ def test_cli_command_forbidden_field_rejected(capsys, monkeypatch) -> None:
 def test_cli_command_backend_result_and_receipt_are_sanitized(capsys, monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "cmd.db"
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_command_observation",
+        _fake_herdr_command_observation,
+    )
 
     def leaky_backend(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
         return CommandEnvelope(
@@ -595,12 +820,12 @@ def _fake_herdr_state_with_terminal(config: Any) -> tuple[list[Space], list[Work
                 "tokens": ["t1"],
                 "connector": {"x": 1},
                 "connectors": [{"y": 2}],
-                "backend_target": {"kind": "agent_id", "value": "agent-1"},
+                "backend_target": {"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None},
                 "agent_session": {"value": "sess-1"},
                 "session_id": "session-1",
                 "safe": "kept",
             },
-            backend_target={"kind": "agent_id", "value": "agent-1"},
+            backend_target={"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None},
         )
     ]
 
@@ -829,3 +1054,116 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     cached = json.loads(receipt["result_json"])
     assert cached["request_id"] == "req-visible"
     assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+
+
+def test_cli_command_degraded_observation_returns_uncertain_not_not_found(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "degraded.db"
+
+    def degraded_observation(config: Any) -> HerdrCommandObservation:
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[],
+            status="degraded",
+            outcome="malformed_json",
+            message="Herdr agent observation is not healthy",
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", degraded_observation)
+    monkeypatch.setattr(
+        "tendwire.cli.herdr_send_instruction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "degraded-1",
+                    "dry_run": False,
+                    "target": {"worker_id": "missing"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_REQUEST_STATE_UNCERTAIN
+    receipt = get_command_receipt(db_path, "cmd-host", "degraded-1", "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is True
+
+
+def test_cli_command_healthy_empty_observation_can_return_not_found(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "empty.db"
+
+    def empty_observation(config: Any) -> HerdrCommandObservation:
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[],
+            status="healthy",
+            outcome="empty_healthy",
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", empty_observation)
+    monkeypatch.setattr(
+        "tendwire.cli.herdr_send_instruction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "empty-1",
+                    "dry_run": False,
+                    "target": {"worker_id": "missing"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_NOT_FOUND
+    receipt = get_command_receipt(db_path, "cmd-host", "empty-1", "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is False
