@@ -9,6 +9,7 @@ backends, stores, Herdr, Herdres, Telegram, or connector modules.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -100,6 +101,42 @@ _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDD
 
 MAX_INSTRUCTION_LENGTH = 4096
 
+# Public command results use a stricter forbidden-field set than snapshots.
+_COMMAND_RESULT_FORBIDDEN_FIELDS = frozenset(
+    {
+        "telegram",
+        "chat_id",
+        "topic_id",
+        "message_id",
+        "thread_id",
+        "route",
+        "routes",
+        "delivery",
+        "deliveries",
+        "token",
+        "tokens",
+        "bot_token",
+        "pane_id",
+        "terminal_id",
+        "tty",
+        "pty",
+        "pid",
+        "tmux",
+        "screen_session",
+        "window_id",
+        "tab_id",
+        "argv",
+        "shell",
+        "command",
+        "connector",
+        "connectors",
+        "herdres_delivery",
+    }
+)
+_COMMAND_RESULT_FORBIDDEN_COMPACT = frozenset(
+    name.replace("_", "") for name in _COMMAND_RESULT_FORBIDDEN_FIELDS
+)
+
 # Workers that must not receive instructions.
 _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
 
@@ -112,6 +149,36 @@ def _is_forbidden_request_field(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_")
     compact = _compact_field_name(key)
     return normalized in FORBIDDEN_REQUEST_FIELDS or compact in _FORBIDDEN_REQUEST_COMPACT
+
+
+def _is_command_result_forbidden_field(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    compact = normalized.replace("_", "")
+    return normalized in _COMMAND_RESULT_FORBIDDEN_FIELDS or compact in _COMMAND_RESULT_FORBIDDEN_COMPACT
+
+
+def sanitize_command_result(value: Any) -> Any:
+    """Return a JSON-safe value with command-public forbidden fields removed.
+
+    This is stricter than the snapshot sanitizer: it also strips raw terminal
+    identifiers (pane_id, terminal_id, pid, tty, ...) and any route/delivery/token
+    or connector variants. It preserves ordinary snapshot schema v2 output.
+    """
+    if isinstance(value, Mapping):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_command_result_forbidden_field(key):
+                continue
+            sanitized[str(key)] = sanitize_command_result(item)
+        return sanitized
+    if isinstance(value, tuple | list):
+        return [sanitize_command_result(item) for item in value]
+    if isinstance(value, set | frozenset):
+        items = [sanitize_command_result(item) for item in value]
+        return sorted(items, key=stable_json_dumps)
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
 
 
 def _clean_mapping(value: Any) -> dict[str, Any] | None:
@@ -381,7 +448,7 @@ class CommandEnvelope:
         object.__setattr__(self, "schema_version", int(self.schema_version))
 
     def to_dict(self) -> dict[str, Any]:
-        return sanitize_forbidden_fields(
+        return sanitize_command_result(
             {
                 "schema_version": self.schema_version,
                 "action": self.action,
