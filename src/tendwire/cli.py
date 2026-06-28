@@ -23,6 +23,7 @@ from .core.commands import (
     CommandEnvelope,
     error_value,
     parse_command_request,
+    validate_request,
 )
 from .core.projector import project_from_observations
 from .store.sqlite import (
@@ -203,6 +204,12 @@ def cmd_command(
     request, parse_error = parse_command_request(payload)
     if request is None:
         envelope = CommandEnvelope.error(None, parse_error or error_value("invalid_request", "unknown parse error"))
+        print(envelope.to_json(indent=2))
+        return 1
+
+    validation_error = validate_request(request)
+    if validation_error is not None:
+        envelope = CommandEnvelope.error(request, validation_error)
         print(envelope.to_json(indent=2))
         return 1
 

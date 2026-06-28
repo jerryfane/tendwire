@@ -19,6 +19,7 @@ from tendwire.core.commands import (
     CommandRequest,
     MAX_INSTRUCTION_LENGTH,
     resolve_target,
+    sanitize_command_result,
     validate_instruction_text,
     validate_request,
     worker_candidate,
@@ -331,3 +332,93 @@ def test_command_envelope_roundtrip_via_dict() -> None:
     )
     restored = CommandEnvelope.from_dict(envelope.to_dict())
     assert restored.to_dict() == envelope.to_dict()
+
+
+_COMMAND_RESULT_FORBIDDEN_KEYS = {
+    "pane_id",
+    "terminal_id",
+    "pid",
+    "tty",
+    "pty",
+    "tmux",
+    "screen_session",
+    "window_id",
+    "tab_id",
+    "argv",
+    "shell",
+    "command",
+    "route",
+    "routes",
+    "delivery",
+    "deliveries",
+    "token",
+    "tokens",
+    "connector",
+    "connectors",
+    "telegram",
+    "chat_id",
+    "topic_id",
+    "message_id",
+    "thread_id",
+    "bot_token",
+    "herdres_delivery",
+}
+
+
+def test_sanitize_command_result_strips_plural_and_variant_forbidden_keys() -> None:
+    raw = {
+        "safe": "kept",
+        "pane_id": "p-1",
+        "terminal_id": "t-1",
+        "pid": 123,
+        "tty": "/dev/pts/0",
+        "shell": "bash",
+        "command": "python app.py",
+        "routes": ["r1"],
+        "deliveries": [{"id": 1}],
+        "tokens": "secret",
+        "connectors": {"telegram": "leaked"},
+        "nested": {
+            "safe": "kept",
+            "window_id": "w-1",
+            "tab_id": "t-1",
+            "argv": ["-c"],
+        },
+        "list": [
+            {"safe": "kept", "route": "r"},
+        ],
+    }
+    sanitized = sanitize_command_result(raw)
+    assert sanitized == {
+        "safe": "kept",
+        "nested": {"safe": "kept"},
+        "list": [{"safe": "kept"}],
+    }
+
+
+def test_sanitize_command_result_preserves_legitimate_envelope_and_target_fields() -> None:
+    envelope = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": "req-1",
+        "ok": True,
+        "dry_run": False,
+        "status": "accepted",
+        "result": {
+            "target": {
+                "worker_id": "w-1",
+                "space_id": "s-1",
+                "worker_fingerprint": "fp",
+                "name": "Alpha",
+            },
+            "snapshot": {
+                "schema_version": 2,
+                "host_id": "host",
+                "content_fingerprint": "fp",
+            },
+        },
+        "error": None,
+        "warnings": [],
+    }
+    sanitized = sanitize_command_result(envelope)
+    assert sanitized == envelope

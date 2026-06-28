@@ -162,7 +162,17 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
             ),
         )
 
-    return context.backend_sender(target, instruction)
+    backend_envelope = context.backend_sender(target, instruction)
+    # Rebuild the backend envelope against the original request so that
+    # caller context such as request_id and dry_run is always preserved.
+    return CommandEnvelope.from_result(
+        request,
+        ok=backend_envelope.ok,
+        status=backend_envelope.status,
+        result=backend_envelope.result,
+        error=backend_envelope.error,
+        warnings=backend_envelope.warnings,
+    )
 
 
 def execute_command(request: CommandRequest, context: CommandContext) -> CommandEnvelope:

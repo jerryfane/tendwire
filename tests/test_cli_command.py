@@ -423,3 +423,218 @@ def test_cli_command_backend_unsupported_result_is_sanitized(capsys, monkeypatch
     assert payload["status"] == STATUS_BACKEND_UNSUPPORTED
     assert "send_instruction" in str(payload)
     assert captured.err == ""
+
+
+_COMMAND_PUBLIC_FORBIDDEN_KEYS = {
+    "pane_id",
+    "terminal_id",
+    "pid",
+    "tty",
+    "pty",
+    "tmux",
+    "screen_session",
+    "window_id",
+    "tab_id",
+    "argv",
+    "shell",
+    "command",
+    "route",
+    "routes",
+    "delivery",
+    "deliveries",
+    "token",
+    "tokens",
+    "connector",
+    "connectors",
+}
+
+
+def _fake_herdr_state_with_terminal(config: Any) -> tuple[list[Space], list[Worker]]:
+    return [], [
+        Worker(
+            id="w-terminal",
+            name="Terminal",
+            status="active",
+            space_id="s-1",
+            meta={
+                "pane_id": "p-1",
+                "terminal_id": "t-1",
+                "pid": 123,
+                "tty": "/dev/pts/0",
+                "pty": "pts",
+                "tmux": "sess",
+                "screen_session": "scr",
+                "window_id": "win-1",
+                "tab_id": "tab-1",
+                "argv": ["bash"],
+                "shell": "bash",
+                "command": "python app.py",
+                "route": "telegram",
+                "routes": ["r1"],
+                "delivery": {"id": 1},
+                "deliveries": [{"id": 2}],
+                "token": "secret",
+                "tokens": ["t1"],
+                "connector": {"x": 1},
+                "connectors": [{"y": 2}],
+                "safe": "kept",
+            },
+        )
+    ]
+
+
+def test_cli_command_read_snapshot_strips_command_public_terminal_fields(
+    capsys, monkeypatch
+) -> None:
+    """Command-public read_snapshot strips terminal/connector identifiers while
+    leaving the ordinary snapshot --json output unchanged.
+    """
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state_with_terminal)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"schema_version": 1, "action": "read_snapshot"})),
+    )
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["ok"] is True
+    assert payload["status"] == "snapshot"
+    assert payload["action"] == "read_snapshot"
+    assert "request_id" in payload
+    meta = payload["result"]["snapshot"]["workers"][0]["meta"]
+    for key in _COMMAND_PUBLIC_FORBIDDEN_KEYS:
+        assert key not in meta, key
+    assert meta["safe"] == "kept"
+
+    # The same worker data still flows through the standalone snapshot path.
+    code2 = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "snapshot",
+            "--json",
+        ]
+    )
+    captured2 = capsys.readouterr()
+    assert code2 == 0
+    snapshot = json.loads(captured2.out)
+    assert snapshot["schema_version"] == 2
+    snap_meta = snapshot["workers"][0]["meta"]
+    assert snap_meta["pane_id"] == "p-1"
+    assert snap_meta["terminal_id"] == "t-1"
+    assert snap_meta["safe"] == "kept"
+
+
+def test_cli_command_forbidden_field_rejects_before_backend_and_store(
+    capsys, monkeypatch
+) -> None:
+    """A contract-invalid request must be rejected before any backend or store call."""
+    calls: list[str] = []
+
+    def guarded_fetch(config: Any) -> tuple[list[Space], list[Worker]]:
+        calls.append("fetch")
+        raise AssertionError("fetch_herdr_state called before validation")
+
+    def guarded_get_receipt(*args: Any, **kwargs: Any) -> Any:
+        calls.append("get_receipt")
+        raise AssertionError("get_command_receipt called before validation")
+
+    def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
+        calls.append("save_receipt")
+        raise AssertionError("save_command_receipt called before validation")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
+    monkeypatch.setattr("tendwire.cli.get_command_receipt", guarded_get_receipt)
+    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "rej-1",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                    "params": {"pane_id": "leaked"},
+                }
+            )
+        ),
+    )
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert payload["request_id"] == "rej-1"
+    assert calls == []
+
+
+def test_cli_command_backend_unsupported_preserves_request_id(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
+    """Non-dry-run send_instruction returns backend_unsupported with the caller's request_id
+    in stdout and in the cached receipt.
+    """
+    db_path = tmp_path / "req.db"
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "req-visible",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == STATUS_BACKEND_UNSUPPORTED
+    assert payload["request_id"] == "req-visible"
+
+    receipt = get_command_receipt(db_path, "cmd-host", "req-visible", "send_instruction")
+    assert receipt is not None
+    cached = json.loads(receipt["result_json"])
+    assert cached["request_id"] == "req-visible"
+    assert cached["status"] == STATUS_BACKEND_UNSUPPORTED
