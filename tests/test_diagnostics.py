@@ -22,6 +22,7 @@ _FORBIDDEN_TEXT = (
     "topic_id",
     "message_id",
     "thread_id",
+    "argv",
     "token",
     "bot_token",
     "delivery",
@@ -74,6 +75,7 @@ def test_doctor_reports_timeout_and_skips_remaining_checks(monkeypatch) -> None:
     outcomes = _doctor_outcomes(payload)
 
     assert payload["status"] == "timeout"
+    assert payload["aggregate_deadline_seconds"] == 1.5
     assert calls == [("workspace", "list")]
     assert outcomes["workspace_list"] == "timeout"
     assert outcomes["agent_list"] == "skipped_after_timeout"
@@ -160,6 +162,8 @@ def test_cli_herdr_timeout_knob_is_used_by_doctor(capsys, monkeypatch) -> None:
     assert captured.err == ""
     assert timeouts == [0.75, 0.75, 0.75]
     assert payload["timeout_seconds"] == 0.75
+    assert payload["aggregate_deadline_seconds"] == 4.5
+    assert all("aggregate_deadline_seconds" in check for check in payload["checks"])
 
 
 def test_tilde_path_expansion_for_configured_paths(monkeypatch) -> None:

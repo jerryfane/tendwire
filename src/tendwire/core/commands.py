@@ -340,7 +340,7 @@ class CommandRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", _string_value(self.action))
-        object.__setattr__(self, "schema_version", int(self.schema_version))
+        object.__setattr__(self, "schema_version", self.schema_version)
         object.__setattr__(self, "request_id", _optional_string(self.request_id))
         object.__setattr__(self, "dry_run", self.dry_run)
         object.__setattr__(self, "target", _clean_mapping(self.target))
@@ -377,7 +377,11 @@ class CommandRequest:
 
 def validate_request(request: CommandRequest) -> dict[str, Any] | None:
     """Validate a command request; return an error dict or None if valid."""
-    if request.schema_version != COMMAND_SCHEMA_VERSION:
+    if (
+        isinstance(request.schema_version, bool)
+        or not isinstance(request.schema_version, int)
+        or request.schema_version != COMMAND_SCHEMA_VERSION
+    ):
         return error_value(
             STATUS_INVALID_REQUEST,
             f"schema_version must be {COMMAND_SCHEMA_VERSION}",
@@ -481,6 +485,23 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             STATUS_INVALID_REQUEST,
             f"request contains unknown top-level fields: {unknown}",
             details={"fields": [f"$.{field}" for field in unknown]},
+        )
+    if "schema_version" not in data:
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            f"schema_version must be {COMMAND_SCHEMA_VERSION}",
+            details={"field": "schema_version"},
+        )
+    schema_version = data.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != COMMAND_SCHEMA_VERSION
+    ):
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            f"schema_version must be {COMMAND_SCHEMA_VERSION}",
+            details={"field": "schema_version"},
         )
     if "dry_run" in data and not isinstance(data.get("dry_run"), bool):
         return None, error_value(

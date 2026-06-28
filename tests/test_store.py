@@ -34,6 +34,20 @@ def _indexed_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return columns
 
 
+def _unique_index_columns(conn: sqlite3.Connection, table: str) -> dict[str, tuple[str, ...]]:
+    indexes: dict[str, tuple[str, ...]] = {}
+    for row in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        if int(row[2]) != 1:
+            continue
+        index_name = str(row[1])
+        columns = tuple(
+            str(index_row[2])
+            for index_row in conn.execute(f"PRAGMA index_info({index_name})").fetchall()
+        )
+        indexes[index_name] = columns
+    return indexes
+
+
 def test_store_initializes_v2_schema_with_content_fingerprint_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
 
@@ -46,6 +60,21 @@ def test_store_initializes_v2_schema_with_content_fingerprint_indexes(tmp_path: 
         indexed = _indexed_columns(conn, "snapshots")
         assert "host_id" in indexed
         assert "content_fingerprint" in indexed
+
+
+def test_store_command_receipts_have_unique_logical_key_index(tmp_path: Path) -> None:
+    db_path = tmp_path / "receipts.db"
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        indexes = _unique_index_columns(conn, "command_receipts")
+
+    assert indexes["ux_command_receipts_host_request_action"] == (
+        "host_id",
+        "request_id",
+        "action",
+    )
 
 
 def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Path) -> None:
@@ -172,6 +201,97 @@ def test_store_command_receipts_track_idempotency(tmp_path: Path) -> None:
     assert uncertain["completed_at"] is None
 
 
+def test_store_migrates_legacy_duplicate_command_receipts_by_latest_row(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-receipts.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                content_fingerprint TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE command_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payload_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                uncertain INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO command_receipts (
+                host_id, request_id, action, payload_fingerprint, status,
+                result_json, created_at, completed_at, uncertain
+            ) VALUES
+                ('host-a', 'req-1', 'send_instruction', 'fp-old', 'backend_failed',
+                 '{"status":"backend_failed"}', '2026-01-01T00:00:00+00:00',
+                 '2026-01-01T00:00:01+00:00', 0),
+                ('host-a', 'req-1', 'send_instruction', 'fp-new', 'accepted',
+                 '{"status":"accepted"}', '2026-01-01T00:00:02+00:00',
+                 '2026-01-01T00:00:03+00:00', 0);
+            PRAGMA user_version = 2;
+            """
+        )
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
+        indexes = _unique_index_columns(conn, "command_receipts")
+
+    receipt = get_command_receipt(db_path, "host-a", "req-1", "send_instruction")
+    assert count == 1
+    assert receipt is not None
+    assert receipt["payload_fingerprint"] == "fp-new"
+    assert receipt["status"] == STATUS_ACCEPTED
+    assert indexes["ux_command_receipts_host_request_action"] == (
+        "host_id",
+        "request_id",
+        "action",
+    )
+
+
+def test_store_completion_updates_reserved_receipt_row(tmp_path: Path) -> None:
+    db_path = tmp_path / "completion.db"
+    init_store(db_path)
+
+    reservation = reserve_command_receipt(
+        db_path,
+        host_id="host-a",
+        request_id="req-update",
+        action="send_instruction",
+        payload_fingerprint="fp-update",
+        pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
+    )
+    assert reservation["reserved"] is True
+
+    save_command_receipt(
+        db_path,
+        host_id="host-a",
+        request_id="req-update",
+        action="send_instruction",
+        payload_fingerprint="fp-update",
+        status=STATUS_ACCEPTED,
+        result_json='{"ok": true, "status": "accepted"}',
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
+
+    receipt = get_command_receipt(db_path, "host-a", "req-update", "send_instruction")
+    assert count == 1
+    assert receipt is not None
+    assert receipt["status"] == STATUS_ACCEPTED
+    assert receipt["uncertain"] is False
+    assert receipt["completed_at"] is not None
+
+
 def test_store_command_receipt_reservation_allows_one_concurrent_mutation(tmp_path: Path) -> None:
     db_path = tmp_path / "race.db"
     init_store(db_path)
@@ -219,3 +339,6 @@ def test_store_command_receipt_reservation_allows_one_concurrent_mutation(tmp_pa
     assert receipt is not None
     assert receipt["status"] == STATUS_ACCEPTED
     assert receipt["uncertain"] is False
+    with sqlite3.connect(str(db_path)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
+    assert count == 1

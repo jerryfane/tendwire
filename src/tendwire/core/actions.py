@@ -161,7 +161,7 @@ def _send_instruction_result(request: CommandRequest, context: CommandContext) -
     if isinstance(backend_target, dict):
         backend_reason = str(backend_target.get("reason") or "")
     if not isinstance(backend_target, dict) or backend_target.get("sendable") is not True:
-        if backend_reason == "duplicate_backend_target":
+        if backend_reason in {"duplicate_backend_target", "not_unique"}:
             return CommandEnvelope.from_result(
                 request,
                 ok=False,
