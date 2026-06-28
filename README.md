@@ -112,6 +112,131 @@ existing milestone-1 table, and index `host_id`, `created_at`, and
 `content_fingerprint`. The existing `latest_snapshot` and `list_hosts` behavior
 is preserved.
 
+## Milestone 3 neutral command contract
+
+Tendwire now exposes a minimal, safety-first command interface:
+
+```bash
+echo '{"schema_version": 1, "action": "noop"}' | tendwire command --json
+```
+
+The `command --json` subcommand reads exactly one JSON request from stdin and
+prints exactly one JSON result/envelope to stdout. Stdout remains JSON-only.
+Human argparse errors may use stderr, but the normal command output is machine
+readable.
+
+### Command request shape v1
+
+```json
+{
+  "schema_version": 1,
+  "action": "noop",
+  "request_id": "optional-id",
+  "dry_run": true,
+  "target": {
+    "worker_id": "...",
+    "worker_fingerprint": "...",
+    "space_id": "...",
+    "name": "..."
+  },
+  "instruction": {
+    "text": "..."
+  },
+  "params": {}
+}
+```
+
+- `schema_version` — must be `1`.
+- `action` — one of `noop`, `read_snapshot`, `resolve_target`, `send_instruction`.
+- `request_id` — optional; required for non-dry-run `send_instruction`.
+- `dry_run` — defaults to `true`; a request must explicitly set `dry_run: false`
+  to ask for mutation.
+- `target` — optional neutral target descriptor using only `worker_id`,
+  `worker_fingerprint`, `space_id`, and `name`.
+- `instruction` — optional; for `send_instruction` contains `text` only.
+- `params` — optional opaque parameters.
+
+Requests containing connector or low-level terminal fields are rejected before
+any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
+`message_id`, `thread_id`, `route`, `delivery`, `token`, `bot_token`,
+`pane_id`, `terminal_id`, `tty`, `pty`, `pid`, `tmux`, `screen_session`,
+`window_id`, `tab_id`, `argv`, `command`, and `shell`.
+
+### Command result/envelope shape v1
+
+```json
+{
+  "schema_version": 1,
+  "action": "noop",
+  "request_id": "optional-id",
+  "ok": true,
+  "dry_run": true,
+  "status": "noop",
+  "result": {},
+  "error": null,
+  "warnings": []
+}
+```
+
+Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
+`rejected`, `not_found`, `ambiguous_target`, `stale_target`,
+`backend_unavailable`, `backend_unsupported`, `backend_failed`,
+`duplicate_request`, `request_state_uncertain`, and `invalid_request`.
+
+Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
+results must never include connector delivery state, Herdr routing objects, bot
+tokens, chat/topic/message IDs, raw pane IDs, terminal IDs, PIDs, TTY paths,
+backend argv, or route/delivery fields.
+
+### Allowed actions
+
+- `noop` — returns immediately with status `noop`.
+- `read_snapshot` — returns the current neutral snapshot under `result.snapshot`.
+- `resolve_target` — resolves a target against live workers and returns a single
+  target (`resolved`) or a list of sanitized candidates (`not_found`,
+  `ambiguous_target`, `stale_target`).
+- `send_instruction` — validates target/instruction/idempotency. Dry runs return
+  status `dry_run` without creating receipts or touching the backend. Non-dry
+  runs currently return `backend_unsupported` because no safe high-level Herdr
+  instruction API is available in this milestone.
+
+### Safety rules
+
+- Dry-run by default. A request must explicitly set `dry_run: false` to request
+  mutation.
+- Non-dry-run `send_instruction` requires a `request_id` and exact single target
+  resolution.
+- Targets with status `closed`, `failed`, or `unknown` are rejected for
+  `send_instruction`.
+- Instruction text is validated: it must be non-empty, no longer than 4096
+  characters, and must not contain NUL, ESC/ANSI/OSC sequences, bracketed-paste
+  sequences, or raw control characters.
+- Unknown actions are rejected before any backend or store call.
+
+### Idempotency receipts
+
+Non-dry-run `send_instruction` writes a neutral receipt to the SQLite store when
+a database path is available. The receipt key is `host_id`/`request_id`/`action`
+and records `action`, `payload_fingerprint`, `status`, timestamps, and a
+sanitized `result_json`. Dry-runs never create receipts.
+
+Receipt semantics:
+
+- Same `request_id`/`action` with the same payload fingerprint returns the
+  cached completed result.
+- Same `request_id`/`action` with a different fingerprint rejects with
+  `duplicate_request`.
+- A pending/uncertain receipt rejects with `request_state_uncertain` and does
+  not retry the mutation.
+
+### Future work
+
+Actual Herdr mutation support remains future work until a safe high-level
+instruction API is available. Until then, `send_instruction` stays deliberately
+backend-unsupported to avoid unsafe terminal control such as `send-keys`,
+`send-text`, pane commands, PTY manipulation, signals, paste buffers, or
+client-provided argv.
+
 ## Milestone 2 non-goals
 
 This milestone intentionally does **not** include:

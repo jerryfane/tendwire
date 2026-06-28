@@ -8,7 +8,14 @@ from pathlib import Path
 
 from tendwire.config import Config
 from tendwire.core.projector import project_empty, project_from_raw
-from tendwire.store.sqlite import init_store, latest_snapshot, list_hosts, save_snapshot
+from tendwire.store.sqlite import (
+    get_command_receipt,
+    init_store,
+    latest_snapshot,
+    list_hosts,
+    save_command_receipt,
+    save_snapshot,
+)
 
 
 def _user_version(conn: sqlite3.Connection) -> int:
@@ -91,3 +98,43 @@ def test_store_save_latest_and_list_hosts(tmp_path: Path) -> None:
     assert restored.host_id == "host-a"
     assert restored.content_fingerprint == snapshot.content_fingerprint
     assert list_hosts(db_path) == ["host-a"]
+
+
+def test_store_command_receipts_track_idempotency(tmp_path: Path) -> None:
+    db_path = tmp_path / "tendwire.db"
+    init_store(db_path)
+
+    assert get_command_receipt(db_path, "host-a", "req-1", "send_instruction") is None
+
+    save_command_receipt(
+        db_path,
+        host_id="host-a",
+        request_id="req-1",
+        action="send_instruction",
+        payload_fingerprint="fp-1",
+        status="backend_unsupported",
+        result_json='{"ok": false}',
+    )
+
+    receipt = get_command_receipt(db_path, "host-a", "req-1", "send_instruction")
+    assert receipt is not None
+    assert receipt["payload_fingerprint"] == "fp-1"
+    assert receipt["status"] == "backend_unsupported"
+    assert receipt["uncertain"] is False
+    assert receipt["completed_at"] is not None
+
+    save_command_receipt(
+        db_path,
+        host_id="host-a",
+        request_id="req-2",
+        action="send_instruction",
+        payload_fingerprint="fp-2",
+        status="request_state_uncertain",
+        result_json='{"ok": false}',
+        uncertain=True,
+    )
+
+    uncertain = get_command_receipt(db_path, "host-a", "req-2", "send_instruction")
+    assert uncertain is not None
+    assert uncertain["uncertain"] is True
+    assert uncertain["completed_at"] is None

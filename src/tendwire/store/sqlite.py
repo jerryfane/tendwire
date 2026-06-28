@@ -12,12 +12,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..core.commands import CommandEnvelope
 from ..core.models import (
     FINGERPRINT_HEX_CHARS,
     SCHEMA_VERSION,
     Snapshot,
     stable_fingerprint,
     stable_json_dumps,
+    utc_timestamp,
 )
 
 
@@ -40,6 +42,26 @@ CREATE_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_snapshots_content_fingerprint "
         "ON snapshots(content_fingerprint)"
     ),
+)
+
+CREATE_COMMAND_RECEIPTS_TABLE = """
+CREATE TABLE IF NOT EXISTS command_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    uncertain INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+CREATE_COMMAND_RECEIPT_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_command_receipts_host_request_action "
+    "ON command_receipts(host_id, request_id, action)",
 )
 
 
@@ -170,6 +192,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _backfill_content_fingerprints(conn)
     for statement in CREATE_INDEXES:
         conn.execute(statement)
+    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+        conn.execute(statement)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -220,3 +245,102 @@ def list_hosts(db_path: Path) -> list[str]:
             "SELECT DISTINCT host_id FROM snapshots ORDER BY host_id"
         ).fetchall()
     return [r[0] for r in rows]
+
+
+def get_command_receipt(
+    db_path: Path,
+    host_id: str,
+    request_id: str,
+    action: str,
+) -> dict[str, Any] | None:
+    """Return the latest command receipt for a host/request/action key, or None."""
+    if not db_path.exists():
+        return None
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT
+                host_id,
+                request_id,
+                action,
+                payload_fingerprint,
+                status,
+                result_json,
+                created_at,
+                completed_at,
+                uncertain
+            FROM command_receipts
+            WHERE host_id = ? AND request_id = ? AND action = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(host_id), str(request_id), str(action)),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "host_id": row[0],
+        "request_id": row[1],
+        "action": row[2],
+        "payload_fingerprint": row[3],
+        "status": row[4],
+        "result_json": row[5],
+        "created_at": row[6],
+        "completed_at": row[7],
+        "uncertain": bool(row[8]),
+    }
+
+
+def save_command_receipt(
+    db_path: Path,
+    host_id: str,
+    request_id: str,
+    action: str,
+    payload_fingerprint: str,
+    status: str,
+    result_json: str,
+    *,
+    uncertain: bool = False,
+) -> None:
+    """Persist a neutral command receipt for idempotency tracking.
+
+    Dry-runs must not call this function. The receipt records the final or
+    pending state of a mutating command so repeated requests can be detected
+    and rejected instead of retried blindly.
+    """
+    _ensure_dir(db_path)
+    now = utc_timestamp()
+    with sqlite3.connect(str(db_path)) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id,
+                request_id,
+                action,
+                payload_fingerprint,
+                status,
+                result_json,
+                created_at,
+                completed_at,
+                uncertain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(host_id),
+                str(request_id),
+                str(action),
+                str(payload_fingerprint),
+                str(status),
+                str(result_json),
+                now,
+                None if uncertain else now,
+                int(uncertain),
+            ),
+        )
+
+
+def envelope_to_receipt_json(envelope: CommandEnvelope) -> str:
+    """Serialize a command envelope for storage in a receipt."""
+    return stable_json_dumps(envelope.to_dict())
