@@ -18,6 +18,7 @@ from tendwire.core.commands import (
     CommandEnvelope,
     CommandRequest,
     MAX_INSTRUCTION_LENGTH,
+    parse_command_request,
     resolve_target,
     sanitize_command_result,
     validate_instruction_text,
@@ -148,6 +149,45 @@ def test_validate_request_rejects_forbidden_nested_fields() -> None:
     error = validate_request(request)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("field", sorted(_FORBIDDEN_COMMAND_FIELDS))
+def test_parse_command_request_rejects_raw_top_level_forbidden_field(field: str) -> None:
+    """Raw decoded JSON with a forbidden top-level key is rejected before
+    CommandRequest.from_dict can silently drop it.
+    """
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "action": "send_instruction",
+            "request_id": "raw-rej",
+            "dry_run": False,
+            "target": {"worker_id": "w-1"},
+            "instruction": {"text": "hello"},
+            field: "leaked",
+        }
+    )
+    request, error = parse_command_request(payload)
+    assert request is None, field
+    assert error is not None, field
+    assert error["code"] == STATUS_INVALID_REQUEST, field
+    details_text = str(error.get("details", {}))
+    assert field in details_text, f"{field} not in {details_text}"
+
+
+def test_command_request_from_dict_drops_unknown_top_level_keys() -> None:
+    """Prove the normalization gap: unknown top-level keys disappear from the
+    canonical request shape, so the raw-dict scan is required.
+    """
+    data = {
+        "schema_version": 1,
+        "action": "noop",
+        "telegram": "leaked",
+        "pane_id": "p-1",
+    }
+    request = CommandRequest.from_dict(data)
+    assert "telegram" not in request.to_dict()
+    assert "pane_id" not in request.to_dict()
 
 
 def test_validate_request_rejects_disallowed_target_fields() -> None:
