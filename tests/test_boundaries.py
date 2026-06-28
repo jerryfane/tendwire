@@ -10,6 +10,8 @@ _CORE_MODULE_NAMES = (
     "tendwire.core.models",
     "tendwire.core.projector",
     "tendwire.core.attention",
+    "tendwire.core.commands",
+    "tendwire.core.actions",
 )
 
 _FORBIDDEN_PREFIXES = (

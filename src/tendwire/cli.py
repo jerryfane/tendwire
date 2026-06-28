@@ -7,11 +7,29 @@ Module entry point: python -m tendwire.cli snapshot --json
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from typing import Any
 
 from .backends.herdr_cli import fetch_herdr_state
+from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
+from .core.actions import CommandContext, execute_command
+from .core.commands import (
+    STATUS_BACKEND_FAILED,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_DUPLICATE_REQUEST,
+    STATUS_REQUEST_STATE_UNCERTAIN,
+    CommandEnvelope,
+    error_value,
+    parse_command_request,
+)
 from .core.projector import project_from_observations
+from .store.sqlite import (
+    envelope_to_receipt_json,
+    get_command_receipt,
+    save_command_receipt,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -59,6 +77,24 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite database path to use with --store (default: config path).",
     )
 
+    command_parser = subparsers.add_parser(
+        "command",
+        help="Read a JSON command request from stdin and print a JSON result.",
+    )
+    command_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Print result as JSON (default).",
+    )
+    command_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="SQLite database path for command receipts (default: config path).",
+    )
+
     return parser
 
 
@@ -93,6 +129,112 @@ def cmd_snapshot(
     return 0
 
 
+def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
+    """Return a cached/uncertain/duplicate envelope, or None if no receipt applies."""
+    from .core.commands import CommandRequest
+
+    if not isinstance(request, CommandRequest):
+        return None
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return None
+    if config.db_path is None:
+        return None
+    receipt = get_command_receipt(
+        config.db_path,
+        config.host_id,
+        request.request_id,
+        request.action,
+    )
+    if receipt is None:
+        return None
+    if receipt["uncertain"]:
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_REQUEST_STATE_UNCERTAIN,
+                "previous request state is uncertain; not retrying mutation",
+            ),
+        )
+    if receipt["payload_fingerprint"] == request.payload_fingerprint():
+        cached = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
+        return cached
+    return CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_DUPLICATE_REQUEST,
+            "request_id reused with a different payload",
+        ),
+    )
+
+
+def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelope) -> None:
+    from .core.commands import CommandRequest
+
+    if not isinstance(request, CommandRequest):
+        return
+    if config.db_path is None:
+        return
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return
+    uncertain = envelope.status in {
+        STATUS_BACKEND_FAILED,
+        STATUS_REQUEST_STATE_UNCERTAIN,
+        STATUS_BACKEND_UNAVAILABLE,
+    }
+    save_command_receipt(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id,
+        action=request.action,
+        payload_fingerprint=request.payload_fingerprint(),
+        status=envelope.status,
+        result_json=envelope_to_receipt_json(envelope),
+        uncertain=uncertain,
+    )
+
+
+def cmd_command(
+    config: Config,
+    *,
+    json_output: bool = True,
+) -> int:
+    """Read a JSON command request from stdin and print a JSON result envelope."""
+    payload = sys.stdin.read()
+    request, parse_error = parse_command_request(payload)
+    if request is None:
+        envelope = CommandEnvelope.error(None, parse_error or error_value("invalid_request", "unknown parse error"))
+        print(envelope.to_json(indent=2))
+        return 1
+
+    receipt_envelope = _check_command_receipt(config, request)
+    if receipt_envelope is not None:
+        print(receipt_envelope.to_json(indent=2))
+        return 0 if receipt_envelope.ok else 1
+
+    spaces, workers = fetch_herdr_state(config)
+    snapshot = project_from_observations(
+        config,
+        spaces=spaces,
+        workers=workers,
+    )
+
+    def backend_sender(target: dict[str, Any], instruction: dict[str, Any]) -> CommandEnvelope:
+        return herdr_send_instruction(config, target, instruction)
+
+    context = CommandContext(
+        host_id=config.host_id,
+        workers=workers,
+        snapshot=snapshot,
+        backend_sender=backend_sender,
+    )
+
+    envelope = execute_command(request, context)
+    _save_command_receipt(config, request, envelope)
+
+    print(envelope.to_json(indent=2))
+    return 0 if envelope.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -113,6 +255,9 @@ def main(argv: list[str] | None = None) -> int:
             json_output=args.json_output,
             store_snapshot=args.store_snapshot,
         )
+
+    if args.command == "command":
+        return cmd_command(config, json_output=args.json_output)
 
     parser.print_help()
     return 0
