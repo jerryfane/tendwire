@@ -82,6 +82,28 @@ def test_command_request_defaults_are_dry_run() -> None:
     assert request.request_id is None
 
 
+def test_parse_command_request_requires_schema_version() -> None:
+    request, error = parse_command_request(json.dumps({"action": "noop"}))
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("value", ["1", 1.0, True, False, None, [], {}, 2])
+def test_parse_command_request_rejects_non_integer_one_schema_version(value: Any) -> None:
+    request, error = parse_command_request(json.dumps({"schema_version": value, "action": "noop"}))
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
+def test_parse_command_request_accepts_integer_one_schema_version() -> None:
+    request, error = parse_command_request(json.dumps({"schema_version": 1, "action": "noop"}))
+    assert error is None
+    assert request is not None
+    assert request.schema_version == 1
+
+
 @pytest.mark.parametrize("value", [True, False])
 def test_parse_command_request_accepts_literal_boolean_dry_run(value: bool) -> None:
     request, error = parse_command_request(json.dumps({"schema_version": 1, "action": "noop", "dry_run": value}))
@@ -143,6 +165,14 @@ def test_command_envelope_shape_matches_contract() -> None:
 
 def test_validate_request_rejects_bad_schema_version() -> None:
     request = CommandRequest(action="noop", schema_version=2)
+    error = validate_request(request)
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("value", ["1", 1.0, True, False, None, [], {}])
+def test_validate_request_rejects_malformed_schema_version(value: Any) -> None:
+    request = CommandRequest(action="noop", schema_version=value)
     error = validate_request(request)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST

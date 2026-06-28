@@ -335,6 +335,57 @@ def test_cli_command_rejects_non_boolean_dry_run_before_backend(
     _assert_no_command_public_forbidden_fields(payload)
 
 
+@pytest.mark.parametrize("value", ["1", 1.0, True, False, None, [], {}, 2])
+def test_cli_command_rejects_malformed_schema_version_before_pipeline(
+    value: Any, capsys, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        calls.append("called")
+        raise AssertionError("invalid schema_version must stop before pipeline work")
+
+    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded)
+    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded)
+    monkeypatch.setattr("tendwire.cli.project_from_observations", guarded)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": value,
+                    "action": "send_instruction",
+                    "request_id": "bad-schema",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert calls == []
+    _assert_no_command_public_forbidden_fields(payload)
+
+
 def test_cli_command_send_instruction_empty_target_rejects_before_fetch(capsys, monkeypatch) -> None:
     calls: list[str] = []
 
@@ -930,16 +981,16 @@ def test_cli_command_forbidden_field_rejects_before_backend_and_store(
         calls.append("fetch")
         raise AssertionError("fetch_herdr_state called before validation")
 
-    def guarded_get_receipt(*args: Any, **kwargs: Any) -> Any:
-        calls.append("get_receipt")
-        raise AssertionError("get_command_receipt called before validation")
+    def guarded_reserve_receipt(*args: Any, **kwargs: Any) -> Any:
+        calls.append("reserve_receipt")
+        raise AssertionError("reserve_command_receipt called before validation")
 
     def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
         calls.append("save_receipt")
         raise AssertionError("save_command_receipt called before validation")
 
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
-    monkeypatch.setattr("tendwire.cli.get_command_receipt", guarded_get_receipt)
+    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded_reserve_receipt)
     monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
     monkeypatch.setattr(
         "sys.stdin",
@@ -981,9 +1032,9 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
     """Raw top-level forbidden fields reject before store, projection, or backend work."""
     calls: list[str] = []
 
-    def guarded_get_receipt(*args: Any, **kwargs: Any) -> Any:
-        calls.append("get_receipt")
-        raise AssertionError("get_command_receipt called before raw validation")
+    def guarded_reserve_receipt(*args: Any, **kwargs: Any) -> Any:
+        calls.append("reserve_receipt")
+        raise AssertionError("reserve_command_receipt called before raw validation")
 
     def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
         calls.append("save_receipt")
@@ -1005,7 +1056,7 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
         calls.append("backend")
         raise AssertionError("backend sender called before raw validation")
 
-    monkeypatch.setattr("tendwire.cli.get_command_receipt", guarded_get_receipt)
+    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded_reserve_receipt)
     monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
     monkeypatch.setattr("tendwire.cli.project_from_observations", guarded_project)
@@ -1087,6 +1138,7 @@ def test_cli_command_backend_unavailable_preserves_request_id(
 
     receipt = get_command_receipt(db_path, "cmd-host", "req-visible", "send_instruction")
     assert receipt is not None
+    assert receipt["uncertain"] is True
     cached = json.loads(receipt["result_json"])
     assert cached["request_id"] == "req-visible"
     assert cached["status"] == STATUS_BACKEND_UNAVAILABLE

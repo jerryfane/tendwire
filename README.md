@@ -49,10 +49,10 @@ tendwire doctor --json
 run only when a no-flag command is not healthy. It distinguishes missing Herdr
 binary, launch error, command timeout, nonzero exit, malformed JSON, empty
 healthy output, non-empty healthy output, skipped compatibility probes, and
-checks skipped after a timeout. The Herdr binary path, data directory, and
-database path expand `~`; each Herdr probe uses
-`TENDWIRE_HERDR_TIMEOUT_SECONDS` or `--herdr-timeout` when set, defaulting to
-5.0 seconds.
+checks skipped after a timeout or exhausted aggregate deadline. Diagnostics do
+not expose raw backend argv. The Herdr binary path, data directory, and database
+path expand `~`; each Herdr probe uses `TENDWIRE_HERDR_TIMEOUT_SECONDS` or
+`--herdr-timeout` when set, defaulting to 5.0 seconds.
 
 When Herdr 0.7.0 is present, the adapter first tries the no-flag JSON envelopes
 (`herdr workspace list`, `herdr agent list`) that wrap records under
@@ -63,6 +63,9 @@ independent and safe: a missing binary, timeout, or malformed response simply
 produces empty spaces or workers rather than failing the snapshot. Timeout
 handling is conservative: once a probe times out, Tendwire stops that
 compatibility/fallback chain instead of trying every remaining variant.
+Snapshot, command-observation, and doctor probe chains also use an aggregate
+deadline derived from the per-probe timeout and planned probes; remaining
+subprocess timeouts are capped by the time left in that budget.
 
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
@@ -181,7 +184,9 @@ readable.
 }
 ```
 
-- `schema_version` — must be `1`.
+- `schema_version` — required; must be the JSON integer `1` exactly. Missing
+  values, strings, floats, booleans, null, arrays, objects, and other integers
+  are rejected before store, projection, Herdr observation, or backend send work.
 - `action` — one of `noop`, `read_snapshot`, `resolve_target`, `send_instruction`.
 - `request_id` — optional; required for non-dry-run `send_instruction`.
 - `dry_run` — defaults to `true`; only literal JSON booleans are accepted, and
@@ -253,6 +258,17 @@ backend argv, or route/delivery fields.
   backend target value. Clients must never provide `terminal_id`, `pane_id`,
   `backend_target`, `argv`, `shell`, `worker_id`, or backend parameters as raw
   Herdr send targets; low-level backend fields are rejected before mutation.
+- Backend-owned Herdr targets are private. Tendwire computes the final
+  `herdr agent send <target> <text>` target token for every observed worker; if
+  two public workers would send to the same token, even from different private
+  target kinds, all affected targets are non-sendable and mutation fails closed
+  with `ambiguous_backend_target`. Missing, empty, unsupported, or otherwise
+  non-sendable private targets fail closed with `backend_unsupported`.
+- For non-dry-run `send_instruction`, missing Herdr, launch failures, timeouts,
+  nonzero/malformed observation output, and exhausted fallback/deadline state are
+  not projected into fake empty worker lists. They return `backend_unavailable`
+  or `request_state_uncertain` and do not execute send. Only a healthy empty
+  Herdr observation may produce final `not_found`.
 - Instruction text is validated: it must be non-empty, no longer than 4096
   characters, and may include LF newlines and tab characters. It must not
   contain NUL, ESC/ANSI/CSI/OSC sequences, bracketed-paste sequences, carriage
@@ -265,7 +281,10 @@ Non-dry-run `send_instruction` first reserves a neutral pending receipt in the
 SQLite store when a database path is available, before backend mutation. The
 receipt key is `host_id`/`request_id`/`action` and records `action`,
 `payload_fingerprint`, `status`, timestamps, and a sanitized `result_json`.
-Dry-runs never create receipts.
+The store enforces one durable row per key with a unique index and migrates
+legacy duplicate rows by keeping the latest receipt before enabling the
+constraint. Completion updates the reserved row instead of inserting another
+row. Dry-runs never create receipts.
 
 Receipt semantics:
 

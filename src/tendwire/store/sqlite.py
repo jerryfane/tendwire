@@ -63,6 +63,10 @@ CREATE_COMMAND_RECEIPT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_command_receipts_host_request_action "
     "ON command_receipts(host_id, request_id, action)",
 )
+CREATE_COMMAND_RECEIPT_UNIQUE_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_command_receipts_host_request_action "
+    "ON command_receipts(host_id, request_id, action)"
+)
 
 
 def _ensure_dir(db_path: Path) -> None:
@@ -140,6 +144,52 @@ def _command_receipt_from_row(row: Any) -> dict[str, Any]:
         "completed_at": row[7],
         "uncertain": bool(row[8]),
     }
+
+
+def _dedupe_command_receipts(conn: sqlite3.Connection) -> None:
+    """Keep the latest legacy receipt per logical command key before uniquing."""
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            host_id,
+            request_id,
+            action,
+            created_at,
+            completed_at
+        FROM command_receipts
+        ORDER BY id
+        """
+    ).fetchall()
+    keep_by_key: dict[tuple[str, str, str], tuple[str, str, int]] = {}
+    for row in rows:
+        row_id = int(row[0])
+        key = (str(row[1]), str(row[2]), str(row[3]))
+        created_at = str(row[4] or "")
+        completed_at = str(row[5] or "")
+        sort_key = (completed_at or created_at, created_at, row_id)
+        if key not in keep_by_key or sort_key > keep_by_key[key]:
+            keep_by_key[key] = sort_key
+
+    keep_ids = {item[2] for item in keep_by_key.values()}
+    delete_ids = [int(row[0]) for row in rows if int(row[0]) not in keep_ids]
+    if not delete_ids:
+        return
+    placeholders = ",".join("?" for _ in delete_ids)
+    conn.execute(
+        f"DELETE FROM command_receipts WHERE id IN ({placeholders})",
+        delete_ids,
+    )
+
+
+def _ensure_command_receipt_unique_index(conn: sqlite3.Connection) -> None:
+    for row in conn.execute("PRAGMA index_list(command_receipts)").fetchall():
+        index_name = str(row[1])
+        is_unique = int(row[2]) == 1
+        if index_name == "ux_command_receipts_host_request_action" and not is_unique:
+            conn.execute("DROP INDEX ux_command_receipts_host_request_action")
+            break
+    conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
 
 
 def _latest_command_receipt_row(
@@ -234,8 +284,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for statement in CREATE_INDEXES:
         conn.execute(statement)
     conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    _dedupe_command_receipts(conn)
     for statement in CREATE_COMMAND_RECEIPT_INDEXES:
         conn.execute(statement)
+    _ensure_command_receipt_unique_index(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -397,34 +449,75 @@ def save_command_receipt(
     """
     _ensure_dir(db_path)
     now = utc_timestamp()
-    with sqlite3.connect(str(db_path)) as conn:
+    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
-        conn.execute(
+        row = conn.execute(
             """
-            INSERT INTO command_receipts (
-                host_id,
-                request_id,
-                action,
-                payload_fingerprint,
-                status,
-                result_json,
-                created_at,
-                completed_at,
-                uncertain
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT id, payload_fingerprint
+            FROM command_receipts
+            WHERE host_id = ? AND request_id = ? AND action = ?
+            LIMIT 1
             """,
-            (
-                str(host_id),
-                str(request_id),
-                str(action),
-                str(payload_fingerprint),
-                str(status),
-                str(result_json),
-                now,
-                None if uncertain else now,
-                int(uncertain),
-            ),
-        )
+            (str(host_id), str(request_id), str(action)),
+        ).fetchone()
+        completed_at = None if uncertain else now
+        if row is not None:
+            if str(row[1]) != str(payload_fingerprint):
+                raise ValueError("receipt payload fingerprint mismatch")
+            conn.execute(
+                """
+                UPDATE command_receipts
+                SET
+                    status = ?,
+                    result_json = ?,
+                    completed_at = ?,
+                    uncertain = ?
+                WHERE id = ? AND payload_fingerprint = ?
+                """,
+                (
+                    str(status),
+                    str(result_json),
+                    completed_at,
+                    int(uncertain),
+                    int(row[0]),
+                    str(payload_fingerprint),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO command_receipts (
+                    host_id,
+                    request_id,
+                    action,
+                    payload_fingerprint,
+                    status,
+                    result_json,
+                    created_at,
+                    completed_at,
+                    uncertain
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(host_id),
+                    str(request_id),
+                    str(action),
+                    str(payload_fingerprint),
+                    str(status),
+                    str(result_json),
+                    now,
+                    completed_at,
+                    int(uncertain),
+                ),
+            )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def envelope_to_receipt_json(envelope: CommandEnvelope) -> str:

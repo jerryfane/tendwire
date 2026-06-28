@@ -25,6 +25,11 @@ from ..core.commands import (
 )
 from ..core.models import _string_value
 
+_BACKEND_TARGET_KINDS = frozenset(
+    {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
+)
+
+
 def _run_agent_send(
     config: Config,
     target_value: str,
@@ -60,9 +65,11 @@ def send_instruction(
     """Send instruction text to the backend-resolved private Herdr target."""
     backend_target = target.get("backend_target")
     target_value = ""
+    target_kind = ""
     target_reason = ""
     if isinstance(backend_target, dict):
         target_value = _string_value(backend_target.get("value"))
+        target_kind = _string_value(backend_target.get("kind"))
         target_reason = _string_value(backend_target.get("reason"))
     public_worker_id = _string_value(target.get("worker_id"))
     instruction_text = instruction.get("text")
@@ -85,8 +92,13 @@ def send_instruction(
             "Herdr binary is unavailable",
         )
 
-    if not isinstance(backend_target, dict) or backend_target.get("sendable") is not True or not target_value:
-        if target_reason == "duplicate_backend_target":
+    if (
+        not isinstance(backend_target, dict)
+        or backend_target.get("sendable") is not True
+        or target_kind not in _BACKEND_TARGET_KINDS
+        or not target_value
+    ):
+        if target_reason in {"duplicate_backend_target", "not_unique"}:
             return _backend_error(
                 STATUS_AMBIGUOUS_BACKEND_TARGET,
                 "resolved target is ambiguous for backend send",

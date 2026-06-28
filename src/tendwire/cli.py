@@ -16,7 +16,6 @@ from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
 from .core.commands import (
-    STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DUPLICATE_REQUEST,
     STATUS_REQUEST_STATE_UNCERTAIN,
@@ -29,7 +28,6 @@ from .core.commands import (
 from .core.projector import project_from_observations
 from .store.sqlite import (
     envelope_to_receipt_json,
-    get_command_receipt,
     reserve_command_receipt,
     save_command_receipt,
 )
@@ -187,27 +185,6 @@ def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnve
     return cached
 
 
-def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
-    """Return a cached/uncertain/duplicate envelope, or None if no receipt applies."""
-    from .core.commands import CommandRequest
-
-    if not isinstance(request, CommandRequest):
-        return None
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
-        return None
-    if config.db_path is None:
-        return None
-    receipt = get_command_receipt(
-        config.db_path,
-        config.host_id,
-        request.request_id,
-        request.action,
-    )
-    if receipt is None:
-        return None
-    return _envelope_from_receipt(request, receipt)
-
-
 def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
     """Reserve a mutating command key, or return an existing receipt envelope."""
     from .core.commands import CommandRequest
@@ -249,7 +226,6 @@ def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelop
     if request.action != "send_instruction" or request.dry_run or not request.request_id:
         return
     uncertain = envelope.status in {
-        STATUS_BACKEND_FAILED,
         STATUS_REQUEST_STATE_UNCERTAIN,
         STATUS_BACKEND_UNAVAILABLE,
     }

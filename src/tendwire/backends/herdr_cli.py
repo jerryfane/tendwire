@@ -14,6 +14,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -48,10 +49,40 @@ _STATUS_KEYS = (
     "raw_status",
 )
 
-_BACKEND_FALLBACK_TARGET_KINDS = frozenset({"agent", "name", "label"})
 _BACKEND_TARGET_KINDS = frozenset(
     {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
 )
+_DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
+
+
+@dataclass(frozen=True)
+class _ProbeBudget:
+    """Aggregate deadline for a read-only Herdr observation chain."""
+
+    started_at: float
+    per_probe_timeout_seconds: float
+    aggregate_deadline_seconds: float
+
+    @classmethod
+    def from_config(cls, config: Config, *, planned_probes: int) -> "_ProbeBudget":
+        per_probe = float(config.herdr_timeout_seconds)
+        planned = max(1, int(planned_probes))
+        return cls(
+            started_at=time.monotonic(),
+            per_probe_timeout_seconds=per_probe,
+            aggregate_deadline_seconds=per_probe * planned,
+        )
+
+    def remaining_seconds(self) -> float:
+        return self.aggregate_deadline_seconds - (time.monotonic() - self.started_at)
+
+    def subprocess_timeout_seconds(self) -> float | None:
+        remaining = self.remaining_seconds()
+        if remaining <= 0:
+            return None
+        if remaining >= self.per_probe_timeout_seconds:
+            return self.per_probe_timeout_seconds
+        return max(0.001, remaining)
 
 
 @dataclass(frozen=True)
@@ -99,24 +130,53 @@ def _is_forbidden_connector_field(key: object) -> bool:
     return str(key).lower().replace("-", "_") in _FORBIDDEN_CONNECTOR_FIELDS or compact in _FORBIDDEN_CONNECTOR_FIELDS_COMPACT
 
 
-def _run_herdr(args: Sequence[str], config: Config) -> subprocess.CompletedProcess[str] | None:
+def _run_herdr(
+    args: Sequence[str],
+    config: Config,
+    *,
+    timeout_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str] | None:
     """Run the Herdr CLI with read-only arguments; return None on launch failure."""
+    timeout = config.herdr_timeout_seconds if timeout_seconds is None else timeout_seconds
     try:
         return subprocess.run(
             [config.herdr_bin, *args],
             capture_output=True,
             text=True,
             check=False,
-            timeout=config.herdr_timeout_seconds,
+            timeout=timeout,
         )
     except (OSError, UnicodeDecodeError, ValueError, TypeError):
         return None
 
 
-def _probe_herdr(args: Sequence[str], config: Config) -> tuple[str, Any]:
-    """Run a read-only Herdr command and retain failure class for mutations."""
+def _run_herdr_probe(
+    args: Sequence[str],
+    config: Config,
+    timeout_seconds: float | None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Call _run_herdr with timeout support while preserving simple test fakes."""
+    if timeout_seconds is None:
+        return _run_herdr(args, config)
     try:
-        completed = _run_herdr(args, config)
+        return _run_herdr(args, config, timeout_seconds=timeout_seconds)
+    except TypeError:
+        return _run_herdr(args, config)
+
+
+def _probe_herdr(
+    args: Sequence[str],
+    config: Config,
+    budget: _ProbeBudget | None = None,
+) -> tuple[str, Any]:
+    """Run a read-only Herdr command and retain failure class for mutations."""
+    timeout_seconds: float | None = None
+    if budget is not None:
+        timeout_seconds = budget.subprocess_timeout_seconds()
+        if timeout_seconds is None:
+            return "deadline_exhausted", None
+    try:
+        completed = _run_herdr_probe(args, config, timeout_seconds)
     except subprocess.TimeoutExpired:
         return "timeout", None
     if completed is None:
@@ -181,22 +241,32 @@ def _diagnostic_item_count(payload: Any, keys: Sequence[str]) -> int:
     return len(_payload_items(payload, keys))
 
 
-def _diagnostic_check(name: str, args: Sequence[str], config: Config, keys: Sequence[str]) -> dict[str, Any]:
+def _diagnostic_check(
+    name: str,
+    args: Sequence[str],
+    config: Config,
+    keys: Sequence[str],
+    budget: _ProbeBudget,
+) -> dict[str, Any]:
     """Run one read-only Herdr command and return a sanitized diagnostic record."""
     check: dict[str, Any] = {
         "name": name,
-        "argv": [config.herdr_bin, *args],
         "ok": False,
         "outcome": "unknown",
         "timeout_seconds": config.herdr_timeout_seconds,
+        "aggregate_deadline_seconds": budget.aggregate_deadline_seconds,
     }
+    timeout_seconds = budget.subprocess_timeout_seconds()
+    if timeout_seconds is None:
+        check["outcome"] = "deadline_exhausted"
+        return check
     try:
         completed = subprocess.run(
             [config.herdr_bin, *args],
             capture_output=True,
             text=True,
             check=False,
-            timeout=config.herdr_timeout_seconds,
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
         check["outcome"] = "timeout"
@@ -253,6 +323,7 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
         "command": "doctor",
         "herdr_bin": config.herdr_bin,
         "timeout_seconds": config.herdr_timeout_seconds,
+        "aggregate_deadline_seconds": config.herdr_timeout_seconds * len(planned),
         "status": "ok",
         "checks": [],
     }
@@ -266,27 +337,30 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
         result["checks"] = [
             {
                 "name": name,
-                "argv": [config.herdr_bin, *args],
                 "ok": False,
                 "outcome": "missing_binary",
                 "timeout_seconds": config.herdr_timeout_seconds,
+                "aggregate_deadline_seconds": result["aggregate_deadline_seconds"],
             }
             for name, args, _keys in planned
         ]
         return result
 
+    budget = _ProbeBudget.from_config(config, planned_probes=len(planned))
     checks: list[dict[str, Any]] = []
     stop_after_timeout = False
+    stop_after_outcome = ""
     for group in groups:
         if stop_after_timeout:
             break
         for index, (name, args, keys) in enumerate(group):
             if index > 0 and checks[-1]["ok"]:
                 break
-            check = _diagnostic_check(name, args, config, keys)
+            check = _diagnostic_check(name, args, config, keys, budget)
             checks.append(check)
-            if check["outcome"] == "timeout":
+            if check["outcome"] in _DEADLINE_EXHAUSTED_OUTCOMES:
                 stop_after_timeout = True
+                stop_after_outcome = str(check["outcome"])
                 break
 
     names_seen = {str(check["name"]) for check in checks}
@@ -296,14 +370,19 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
         if name not in names_seen
     ]
     if stop_after_timeout:
+        skipped_outcome = (
+            "skipped_after_deadline"
+            if stop_after_outcome == "deadline_exhausted"
+            else "skipped_after_timeout"
+        )
         for name, args, _keys in remaining_planned:
             checks.append(
                 {
                     "name": name,
-                    "argv": [config.herdr_bin, *args],
                     "ok": False,
-                    "outcome": "skipped_after_timeout",
+                    "outcome": skipped_outcome,
                     "timeout_seconds": config.herdr_timeout_seconds,
+                    "aggregate_deadline_seconds": budget.aggregate_deadline_seconds,
                 }
             )
     else:
@@ -311,15 +390,15 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
             checks.append(
                 {
                     "name": name,
-                    "argv": [config.herdr_bin, *args],
                     "ok": True,
                     "outcome": "skipped_not_needed",
                     "timeout_seconds": config.herdr_timeout_seconds,
+                    "aggregate_deadline_seconds": budget.aggregate_deadline_seconds,
                 }
             )
 
     result["checks"] = checks
-    if any(check["outcome"] == "timeout" for check in checks):
+    if any(check["outcome"] in _DEADLINE_EXHAUSTED_OUTCOMES for check in checks):
         result["status"] = "timeout"
     elif any(not check["ok"] for check in checks):
         result["status"] = "degraded"
@@ -688,15 +767,15 @@ def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] |
     )
 
 
+def _backend_target_send_token(target: Mapping[str, Any] | None) -> str:
+    """Return the exact value passed as herdr agent send's target argv token."""
+    if not isinstance(target, Mapping):
+        return ""
+    return str(target.get("value") or "")
+
+
 def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
-    """Mark duplicate or non-unique private backend targets as not sendable."""
-    fallback_values = Counter(
-        str(worker.backend_target.get("value"))
-        for worker in workers
-        if isinstance(worker.backend_target, dict)
-        and worker.backend_target.get("kind") in _BACKEND_FALLBACK_TARGET_KINDS
-        and str(worker.backend_target.get("value") or "")
-    )
+    """Mark unsupported or duplicate final Herdr send tokens as not sendable."""
     marked: list[Worker] = []
     for worker in workers:
         target = worker.backend_target
@@ -704,7 +783,7 @@ def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
             marked.append(worker)
             continue
         kind = str(target.get("kind") or "")
-        value = str(target.get("value") or "")
+        value = _backend_target_send_token(target)
         if kind not in _BACKEND_TARGET_KINDS or not value:
             marked.append(
                 _worker_with_backend_target(
@@ -713,18 +792,10 @@ def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
                 )
             )
             continue
-        if kind in _BACKEND_FALLBACK_TARGET_KINDS and fallback_values[value] > 1:
-            marked.append(
-                _worker_with_backend_target(
-                    worker,
-                    _private_backend_target(kind, value, sendable=False, reason="not_unique"),
-                )
-            )
-            continue
         marked.append(_worker_with_backend_target(worker, _private_backend_target(kind, value)))
 
-    sendable_counts = Counter(
-        (str(worker.backend_target.get("kind")), str(worker.backend_target.get("value")))
+    send_token_counts = Counter(
+        _backend_target_send_token(worker.backend_target)
         for worker in marked
         if isinstance(worker.backend_target, dict) and worker.backend_target.get("sendable") is True
     )
@@ -734,17 +805,34 @@ def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
         if not isinstance(target, dict) or target.get("sendable") is not True:
             final.append(worker)
             continue
-        key = (str(target.get("kind")), str(target.get("value")))
-        if sendable_counts[key] > 1:
+        kind = str(target.get("kind") or "")
+        value = _backend_target_send_token(target)
+        if send_token_counts[value] > 1:
             final.append(
                 _worker_with_backend_target(
                     worker,
-                    _private_backend_target(key[0], key[1], sendable=False, reason="duplicate_backend_target"),
+                    _private_backend_target(kind, value, sendable=False, reason="duplicate_backend_target"),
                 )
             )
             continue
         final.append(worker)
     return final
+
+
+def assert_unique_sendable_backend_targets(workers: Iterable[Worker]) -> bool:
+    """Prove no sendable workers share the same final Herdr argv target token."""
+    seen: set[str] = set()
+    for worker in workers:
+        target = worker.backend_target
+        if not isinstance(target, Mapping) or target.get("sendable") is not True:
+            continue
+        token = _backend_target_send_token(target)
+        if not token:
+            raise AssertionError("sendable backend target is missing a send token")
+        if token in seen:
+            raise AssertionError("duplicate sendable backend target token")
+        seen.add(token)
+    return True
 
 
 def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worker]:
@@ -794,7 +882,9 @@ def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worke
         for index, (worker, _identity) in enumerate(ordered, start=1):
             disambiguated.append(_worker_with_id(worker, f"{worker_id}-{index}"))
 
-    return _mark_backend_sendability(sorted(disambiguated, key=lambda w: w.id))
+    workers = _mark_backend_sendability(sorted(disambiguated, key=lambda w: w.id))
+    assert_unique_sendable_backend_targets(workers)
+    return workers
 
 
 def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
@@ -838,13 +928,20 @@ def _workers_from_pane_payload(payload: Any) -> list[Worker]:
 def _probe_payload_variants(
     variants: Sequence[Sequence[str]],
     config: Config,
+    budget: _ProbeBudget | None = None,
 ) -> tuple[str, Any]:
     outcomes: list[str] = []
     for args in variants:
-        outcome, payload = _probe_herdr(args, config)
+        if budget is None:
+            outcome, payload = _probe_herdr(args, config)
+        else:
+            try:
+                outcome, payload = _probe_herdr(args, config, budget)
+            except TypeError:
+                outcome, payload = _probe_herdr(args, config)
         if outcome == "ok":
             return outcome, payload
-        if outcome == "timeout":
+        if outcome in _DEADLINE_EXHAUSTED_OUTCOMES:
             return "timeout", None
         outcomes.append(outcome)
     if outcomes and all(outcome == "launch_error" for outcome in outcomes):
@@ -875,12 +972,14 @@ def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
     except (TypeError, ValueError, OSError):
         return _degraded_observation("launch_error", "Herdr binary could not be inspected")
 
+    budget = _ProbeBudget.from_config(config, planned_probes=5)
     workspace_outcome, workspace_payload = _probe_payload_variants(
         [
             ["workspace", "list"],
             ["workspace", "list", "--json"],
         ],
         config,
+        budget,
     )
     if workspace_outcome != "ok":
         return _degraded_observation(
@@ -894,6 +993,7 @@ def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
             ["agent", "list", "--json"],
         ],
         config,
+        budget,
     )
     if agent_outcome != "ok":
         return _degraded_observation(
@@ -904,7 +1004,10 @@ def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
     spaces = _spaces_from_payload(workspace_payload)
     workers = _workers_from_payload(agent_payload)
     if not workers:
-        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+        try:
+            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
+        except TypeError:
+            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
         if pane_outcome != "ok":
             return _degraded_observation(
                 pane_outcome,
@@ -928,12 +1031,14 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
     except (TypeError, ValueError, OSError):
         return [], []
 
+    budget = _ProbeBudget.from_config(config, planned_probes=5)
     workspace_outcome, workspace_payload = _probe_payload_variants(
         [
             ["workspace", "list"],
             ["workspace", "list", "--json"],
         ],
         config,
+        budget,
     )
     if workspace_outcome == "timeout":
         return [], []
@@ -944,6 +1049,7 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
             ["agent", "list", "--json"],
         ],
         config,
+        budget,
     )
 
     spaces = _spaces_from_payload(workspace_payload)
@@ -952,7 +1058,10 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
 
     workers = _workers_from_payload(agent_payload)
     if not workers:
-        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+        try:
+            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
+        except TypeError:
+            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
         if pane_outcome != "ok":
             return spaces, []
         workers = _workers_from_pane_payload(pane_payload)

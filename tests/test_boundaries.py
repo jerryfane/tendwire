@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 
 _CORE_MODULE_NAMES = (
@@ -63,3 +64,17 @@ def test_core_modules_do_not_load_connector_or_process_modules() -> None:
                 raise AssertionError(
                     f"{module_name} transitively loads forbidden module {name}"
                 )
+
+
+def test_readme_documents_production_risk_hardening_contracts() -> None:
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    for phrase in (
+        "JSON integer `1` exactly",
+        "ambiguous_backend_target",
+        "healthy empty",
+        "final `not_found`",
+        "one durable row per key with a unique index",
+        "aggregate deadline",
+    ):
+        assert phrase in readme
