@@ -592,6 +592,76 @@ def test_cli_command_forbidden_field_rejects_before_backend_and_store(
     assert calls == []
 
 
+def test_cli_command_top_level_forbidden_field_rejects_before_any_lookup(
+    capsys, monkeypatch
+) -> None:
+    """A forbidden top-level key is rejected before CommandRequest normalization,
+    receipt lookup, herdr fetch, projection, or backend invocation can occur.
+    """
+    calls: list[str] = []
+
+    def guarded_fetch(config: Any) -> tuple[list[Space], list[Worker]]:
+        calls.append("fetch_herdr_state")
+        raise AssertionError("fetch_herdr_state called before validation")
+
+    def guarded_project(config: Any, **kwargs: Any) -> Any:
+        calls.append("project_from_observations")
+        raise AssertionError("project_from_observations called before validation")
+
+    def guarded_get_receipt(*args: Any, **kwargs: Any) -> Any:
+        calls.append("get_command_receipt")
+        raise AssertionError("get_command_receipt called before validation")
+
+    def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
+        calls.append("save_command_receipt")
+        raise AssertionError("save_command_receipt called before validation")
+
+    def guarded_backend_sender(target: dict[str, Any], instruction: dict[str, Any]) -> Any:
+        calls.append("backend_sender")
+        raise AssertionError("backend_sender called before validation")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
+    monkeypatch.setattr("tendwire.cli.project_from_observations", guarded_project)
+    monkeypatch.setattr("tendwire.cli.get_command_receipt", guarded_get_receipt)
+    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_backend_sender)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "top-rej-1",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                    "pane_id": "leaked",
+                }
+            )
+        ),
+    )
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+            "--db-path",
+            ":memory:",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert payload["request_id"] is None
+    assert "pane_id" in str(payload.get("error", {}).get("details", {}))
+    assert calls == []
+
+
 def test_cli_command_backend_unsupported_preserves_request_id(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:

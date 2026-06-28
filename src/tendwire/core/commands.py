@@ -96,8 +96,29 @@ FORBIDDEN_REQUEST_FIELDS = frozenset(
     }
 )
 
+# Top-level request keys that must be rejected before CommandRequest construction so
+# unknown keys are not silently dropped. Includes plural/variant connector routing keys
+# in addition to the per-field forbidden set.
+FORBIDDEN_TOP_LEVEL_REQUEST_FIELDS = frozenset(
+    FORBIDDEN_REQUEST_FIELDS
+    | {
+        "connector",
+        "connectors",
+        "route",
+        "routes",
+        "delivery",
+        "deliveries",
+        "token",
+        "tokens",
+        "herdres_delivery",
+    }
+)
+
 # Conservative forbidden-field matching including common case and separator variants.
 _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_REQUEST_FIELDS)
+_FORBIDDEN_TOP_LEVEL_COMPACT = frozenset(
+    name.replace("_", "") for name in FORBIDDEN_TOP_LEVEL_REQUEST_FIELDS
+)
 
 MAX_INSTRUCTION_LENGTH = 4096
 
@@ -149,6 +170,12 @@ def _is_forbidden_request_field(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_")
     compact = _compact_field_name(key)
     return normalized in FORBIDDEN_REQUEST_FIELDS or compact in _FORBIDDEN_REQUEST_COMPACT
+
+
+def _is_forbidden_top_level_request_field(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    compact = _compact_field_name(key)
+    return normalized in FORBIDDEN_TOP_LEVEL_REQUEST_FIELDS or compact in _FORBIDDEN_TOP_LEVEL_COMPACT
 
 
 def _is_command_result_forbidden_field(key: Any) -> bool:
@@ -411,6 +438,17 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             "request must be a JSON object",
             details={"field": "request"},
         )
+
+    # Reject forbidden top-level keys in the raw decoded object before any
+    # CommandRequest construction/normalization can silently drop unknown keys.
+    forbidden_top_level = [str(k) for k in data.keys() if _is_forbidden_top_level_request_field(k)]
+    if forbidden_top_level:
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            "request contains forbidden top-level fields",
+            details={"fields": sorted(forbidden_top_level)},
+        )
+
     try:
         request = CommandRequest.from_dict(data)
     except Exception as exc:  # noqa: BLE001
