@@ -62,6 +62,13 @@ def test_cli_command_invalid_json(capsys, monkeypatch) -> None:
 
 
 def test_cli_command_noop_success(capsys, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def guarded_fetch(config: Any) -> tuple[list[Space], list[Worker]]:
+        calls.append("fetch")
+        raise AssertionError("noop must not fetch Herdr state")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(json.dumps({"schema_version": 1, "action": "noop"})),
@@ -83,6 +90,7 @@ def test_cli_command_noop_success(capsys, monkeypatch) -> None:
     assert payload["status"] == "noop"
     assert payload["schema_version"] == 1
     assert captured.err == ""
+    assert calls == []
 
 
 def test_cli_command_unknown_action_rejected(capsys, monkeypatch) -> None:
@@ -203,6 +211,46 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(capsys, mo
     payload = json.loads(captured.out)
     assert payload["ok"] is False
     assert payload["status"] == STATUS_INVALID_REQUEST
+
+
+def test_cli_command_send_instruction_empty_target_rejects_before_fetch(capsys, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def guarded_fetch(config: Any) -> tuple[list[Space], list[Worker]]:
+        calls.append("fetch")
+        raise AssertionError("empty target must reject before Herdr fetch")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "empty-target",
+                    "dry_run": False,
+                    "target": {},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 1
+    assert payload["status"] == STATUS_INVALID_REQUEST
+    assert calls == []
 
 
 def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, monkeypatch, tmp_path: Path) -> None:

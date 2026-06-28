@@ -177,6 +177,37 @@ def test_parse_command_request_rejects_raw_top_level_forbidden_field(field: str)
     assert field in str(error.get("details", {}))
 
 
+def test_parse_command_request_rejects_unknown_top_level_fields() -> None:
+    payload = json.dumps({"schema_version": 1, "action": "noop", "surprise": True})
+    request, error = parse_command_request(payload)
+
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert "$.surprise" in str(error.get("details", {}))
+
+
+def test_parse_command_request_rejects_raw_nested_forbidden_field() -> None:
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "action": "send_instruction",
+            "request_id": "raw-nested-rej",
+            "dry_run": False,
+            "target": {"worker_id": "w-1"},
+            "instruction": {"text": "hello"},
+            "params": {"nested": [{"raw": {"shell": "bash"}}]},
+        }
+    )
+    request, error = parse_command_request(payload)
+
+    assert request is not None
+    assert request.request_id == "raw-nested-rej"
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert "$.params.nested[0].raw.shell" in str(error.get("details", {}))
+
+
 def test_command_request_from_dict_drops_unknown_top_level_keys() -> None:
     """Unknown top-level keys disappear from the canonical request shape."""
     request = CommandRequest.from_dict(
@@ -223,6 +254,16 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
     error = validate_request(missing_target)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
+
+    empty_target = CommandRequest(
+        action="send_instruction",
+        target={},
+        instruction={"text": "ok"},
+    )
+    error = validate_request(empty_target)
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert "explicit target selector" in error["message"]
 
     missing_text = CommandRequest(
         action="send_instruction",

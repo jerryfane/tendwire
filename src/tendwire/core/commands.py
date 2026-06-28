@@ -27,6 +27,9 @@ from .models import (
 COMMAND_SCHEMA_VERSION = 1
 
 ALLOWED_ACTIONS = frozenset({"noop", "read_snapshot", "resolve_target", "send_instruction"})
+REQUEST_ALLOWED_FIELDS = frozenset(
+    {"schema_version", "action", "request_id", "dry_run", "target", "instruction", "params"}
+)
 
 # Canonical status values for command results/envelopes.
 STATUS_NOOP = "noop"
@@ -44,6 +47,7 @@ STATUS_BACKEND_FAILED = "backend_failed"
 STATUS_DUPLICATE_REQUEST = "duplicate_request"
 STATUS_REQUEST_STATE_UNCERTAIN = "request_state_uncertain"
 STATUS_INVALID_REQUEST = "invalid_request"
+STATUS_PENDING = "pending"
 
 VALID_STATUSES = frozenset(
     {
@@ -62,6 +66,7 @@ VALID_STATUSES = frozenset(
         STATUS_DUPLICATE_REQUEST,
         STATUS_REQUEST_STATE_UNCERTAIN,
         STATUS_INVALID_REQUEST,
+        STATUS_PENDING,
     }
 )
 
@@ -276,6 +281,12 @@ def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | No
     return None
 
 
+def _target_has_explicit_selector(target: dict[str, Any] | None) -> bool:
+    if not isinstance(target, dict):
+        return False
+    return any(_string_value(target.get(field)) for field in TARGET_ALLOWED_FIELDS)
+
+
 def _validate_instruction_shape(instruction: dict[str, Any] | None) -> dict[str, Any] | None:
     if instruction is None:
         return None
@@ -384,6 +395,12 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                 "send_instruction requires a target",
                 details={"field": "target"},
             )
+        if not _target_has_explicit_selector(request.target):
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "send_instruction requires at least one explicit target selector",
+                details={"field": "target", "allowed": sorted(TARGET_ALLOWED_FIELDS)},
+            )
         if request.instruction is None or not _string_value(request.instruction.get("text")):
             return error_value(
                 STATUS_INVALID_REQUEST,
@@ -416,12 +433,25 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
             "request must be a JSON object",
             details={"field": "request"},
         )
-    forbidden = [f"$.{key}" for key in data if _is_forbidden_request_field(key)]
+    forbidden = _find_forbidden_fields(data)
     if forbidden:
-        return None, error_value(
+        request = None
+        if not any(path.count(".") == 1 and "[" not in path for path in forbidden):
+            try:
+                request = CommandRequest.from_dict(data)
+            except Exception:
+                request = None
+        return request, error_value(
             STATUS_INVALID_REQUEST,
             "request contains forbidden connector or terminal fields",
             details={"fields": forbidden},
+        )
+    unknown = sorted(str(key) for key in data if str(key) not in REQUEST_ALLOWED_FIELDS)
+    if unknown:
+        return None, error_value(
+            STATUS_INVALID_REQUEST,
+            f"request contains unknown top-level fields: {unknown}",
+            details={"fields": [f"$.{field}" for field in unknown]},
         )
     try:
         request = CommandRequest.from_dict(data)

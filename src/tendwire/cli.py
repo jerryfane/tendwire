@@ -20,6 +20,7 @@ from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DUPLICATE_REQUEST,
     STATUS_REQUEST_STATE_UNCERTAIN,
+    STATUS_PENDING,
     CommandEnvelope,
     error_value,
     parse_command_request,
@@ -29,6 +30,7 @@ from .core.projector import project_from_observations
 from .store.sqlite import (
     envelope_to_receipt_json,
     get_command_receipt,
+    reserve_command_receipt,
     save_command_receipt,
 )
 
@@ -130,22 +132,7 @@ def cmd_snapshot(
     return 0
 
 
-def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
-    """Return a cached/uncertain/duplicate envelope, or None if no receipt applies."""
-    from .core.commands import CommandRequest
-
-    if not isinstance(request, CommandRequest):
-        return None
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
-        return None
-    if config.db_path is None:
-        return None
-    receipt = get_command_receipt(
-        config.db_path,
-        config.host_id,
-        request.request_id,
-        request.action,
-    )
+def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnvelope:
     if receipt is None:
         return None
     if receipt["uncertain"]:
@@ -166,6 +153,58 @@ def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | No
             "request_id reused with a different payload",
         ),
     )
+
+
+def _check_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
+    """Return a cached/uncertain/duplicate envelope, or None if no receipt applies."""
+    from .core.commands import CommandRequest
+
+    if not isinstance(request, CommandRequest):
+        return None
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return None
+    if config.db_path is None:
+        return None
+    receipt = get_command_receipt(
+        config.db_path,
+        config.host_id,
+        request.request_id,
+        request.action,
+    )
+    if receipt is None:
+        return None
+    return _envelope_from_receipt(request, receipt)
+
+
+def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
+    """Reserve a mutating command key, or return an existing receipt envelope."""
+    from .core.commands import CommandRequest
+
+    if not isinstance(request, CommandRequest):
+        return None
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return None
+    if config.db_path is None:
+        return None
+    pending = CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            "request is pending backend mutation",
+        ),
+    )
+    reservation = reserve_command_receipt(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id,
+        action=request.action,
+        payload_fingerprint=request.payload_fingerprint(),
+        pending_result_json=envelope_to_receipt_json(pending),
+        status=STATUS_PENDING,
+    )
+    if reservation["reserved"]:
+        return None
+    return _envelope_from_receipt(request, reservation["receipt"])
 
 
 def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelope) -> None:
@@ -202,8 +241,10 @@ def cmd_command(
     """Read a JSON command request from stdin and print a JSON result envelope."""
     payload = sys.stdin.read()
     request, parse_error = parse_command_request(payload)
-    if request is None:
+    if parse_error is not None:
         envelope = CommandEnvelope.error(None, parse_error or error_value("invalid_request", "unknown parse error"))
+        if request is not None:
+            envelope = CommandEnvelope.error(request, parse_error)
         print(envelope.to_json(indent=2))
         return 1
 
@@ -213,7 +254,15 @@ def cmd_command(
         print(envelope.to_json(indent=2))
         return 1
 
-    receipt_envelope = _check_command_receipt(config, request)
+    if request.action == "noop":
+        envelope = execute_command(
+            request,
+            CommandContext(host_id=config.host_id, workers=[]),
+        )
+        print(envelope.to_json(indent=2))
+        return 0 if envelope.ok else 1
+
+    receipt_envelope = _reserve_command_receipt(config, request)
     if receipt_envelope is not None:
         print(receipt_envelope.to_json(indent=2))
         return 0 if receipt_envelope.ok else 1

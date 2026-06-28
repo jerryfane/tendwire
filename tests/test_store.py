@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 
+from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store.sqlite import (
@@ -13,6 +15,7 @@ from tendwire.store.sqlite import (
     init_store,
     latest_snapshot,
     list_hosts,
+    reserve_command_receipt,
     save_command_receipt,
     save_snapshot,
 )
@@ -167,3 +170,52 @@ def test_store_command_receipts_track_idempotency(tmp_path: Path) -> None:
     assert uncertain is not None
     assert uncertain["uncertain"] is True
     assert uncertain["completed_at"] is None
+
+
+def test_store_command_receipt_reservation_allows_one_concurrent_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "race.db"
+    init_store(db_path)
+    barrier = threading.Barrier(2)
+    mutations: list[str] = []
+    results: list[dict[str, object]] = []
+    lock = threading.Lock()
+
+    def attempt(label: str) -> None:
+        barrier.wait(timeout=5)
+        reservation = reserve_command_receipt(
+            db_path,
+            host_id="host-a",
+            request_id="req-race",
+            action="send_instruction",
+            payload_fingerprint="same-fp",
+            pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
+        )
+        with lock:
+            results.append(reservation)
+            if reservation["reserved"]:
+                mutations.append(label)
+        if reservation["reserved"]:
+            save_command_receipt(
+                db_path,
+                host_id="host-a",
+                request_id="req-race",
+                action="send_instruction",
+                payload_fingerprint="same-fp",
+                status=STATUS_ACCEPTED,
+                result_json='{"ok": true, "status": "accepted"}',
+            )
+
+    threads = [threading.Thread(target=attempt, args=(label,)) for label in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(results) == 2
+    assert sum(1 for result in results if result["reserved"]) == 1
+    assert len(mutations) == 1
+    receipt = get_command_receipt(db_path, "host-a", "req-race", "send_instruction")
+    assert receipt is not None
+    assert receipt["status"] == STATUS_ACCEPTED
+    assert receipt["uncertain"] is False
