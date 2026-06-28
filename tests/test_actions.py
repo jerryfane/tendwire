@@ -183,6 +183,44 @@ def test_send_instruction_non_dry_run_returns_backend_unsupported() -> None:
     assert envelope.dry_run is False
 
 
+def test_send_instruction_backend_receives_resolved_worker_id() -> None:
+    calls: list[tuple[Any, Any]] = []
+
+    def fake_backend(target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
+        return CommandEnvelope(ok=True, status="accepted", action="send_instruction")
+
+    snapshot = _snapshot()
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="req-1",
+        dry_run=False,
+        target={"name": "Beta"},
+        instruction={"text": "hello"},
+    )
+    context = CommandContext(
+        host_id=snapshot.host_id,
+        workers=_workers(snapshot),
+        backend_sender=fake_backend,
+    )
+
+    envelope = execute_command(request, context)
+
+    assert envelope.ok is True
+    assert envelope.status == "accepted"
+    assert calls == [
+        (
+            {
+                "worker_id": "w-2",
+                "name": "Beta",
+                "space_id": "s-1",
+                "status": "idle",
+                "worker_fingerprint": snapshot.workers[1].fingerprint,
+            },
+            {"text": "hello"},
+        )
+    ]
+
 def test_send_instruction_respects_ambiguous_target_before_backend() -> None:
     snapshot = _snapshot()
     request = CommandRequest(
