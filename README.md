@@ -78,6 +78,34 @@ Snapshot, command-observation, and doctor probe chains also use an aggregate
 deadline derived from the per-probe timeout and planned probes; remaining
 subprocess timeouts are capped by the time left in that budget.
 
+### Daemon skeleton
+
+Tendwire also exposes a stdlib-only local daemon skeleton:
+
+```bash
+tendwire daemon
+tendwire daemon --socket-path /tmp/tendwire.sock --db-path /tmp/tendwire.db
+```
+
+On POSIX systems the daemon serves a local Unix domain socket JSON
+request/response API. Startup loads the normal Tendwire config, initializes the
+SQLite store, performs one initial one-shot observation, persists the resulting
+snapshot/projections through the existing store APIs, and then serves these
+methods: `ping`, `health.get`, `snapshot.get`, `attention.list`, `turn.list`,
+`pending.list`, and `command.submit`.
+
+Existing CLI commands remain one-shot by default. When `--socket-path` or
+`TENDWIRE_SOCKET_PATH` explicitly points a CLI command at a daemon, unreachable,
+stale, or timed-out sockets fall back to the existing one-shot path with the
+same public JSON output and exit behavior. `command.submit` uses the same
+command parser, validator, receipt/idempotency store, and backend sender as
+`tendwire command --json`.
+
+The daemon skeleton is lifecycle/store/API scaffolding only. It does not add
+Herdr socket subscriptions, connector polling, source mode, Herdres integration,
+raw terminal control, or a daemonized replacement for the existing one-shot
+backend observation path.
+
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
 
@@ -394,5 +422,5 @@ This milestone intentionally does **not** include:
 - Modifications to Herdres or local Herdres files.
 - Connector-specific routing or delivery state inside core models or snapshots.
 - A required plugin ingestion path; plugins remain future optional triggers.
-- A persistent daemon, network sync, or cross-device transport.
+- Network sync or cross-device transport.
 - Runtime dependencies beyond the Python standard library.

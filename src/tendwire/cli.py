@@ -40,6 +40,7 @@ from .core.turns import (
     pending_payload_from_snapshot,
     turns_payload_from_snapshot,
 )
+from .core.models import stable_json_dumps
 from .store.sqlite import (
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
@@ -52,6 +53,7 @@ from .store.sqlite import (
 
 _HERDR_BACKEND = "herdr"
 _DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
+_DAEMON_CLIENT_TIMEOUT_SECONDS = 0.35
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -76,6 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="herdr_timeout_seconds",
         default=None,
         help="Seconds to wait for each Herdr CLI probe (default: 5.0).",
+    )
+    parser.add_argument(
+        "--socket-path",
+        dest="socket_path",
+        default=None,
+        help="Unix socket path for daemon-backed requests when explicitly enabled.",
     )
 
     subparsers = parser.add_subparsers(dest="command")
@@ -145,6 +153,23 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="db_path",
         default=None,
         help="SQLite database path for command receipts (default: config path).",
+    )
+
+    daemon_parser = subparsers.add_parser(
+        "daemon",
+        help="Run the local Tendwire JSON request daemon.",
+    )
+    daemon_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="SQLite database path for daemon state (default: config path).",
+    )
+    daemon_parser.add_argument(
+        "--socket-path",
+        dest="socket_path",
+        default=argparse.SUPPRESS,
+        help="Unix socket path to listen on (default: data_dir/tendwire.sock).",
     )
 
     doctor_parser = subparsers.add_parser(
@@ -285,17 +310,68 @@ def _health_observed_at(backend_health: list[BackendHealth]) -> str:
     return health.observed_at or utc_timestamp()
 
 
-def _current_public_snapshot(config: Config) -> Any:
-    spaces, workers, _bindings, backend_health = _fetch_snapshot_observation_with_bindings(
+def observe_public_snapshot(
+    config: Config,
+    *,
+    store_snapshot: bool = False,
+) -> Any:
+    """Build the public snapshot through the existing one-shot observation path."""
+    stored_bindings = _load_worker_bindings(config) if store_snapshot else []
+    spaces, workers, bindings, backend_health = _fetch_snapshot_observation_with_bindings(
         config,
-        [],
+        stored_bindings,
     )
-    return project_from_observations(
+    snapshot = project_from_observations(
         config,
         spaces=spaces,
         workers=workers,
         backend_health=backend_health,
     )
+
+    if store_snapshot:
+        from .store.sqlite import save_snapshot
+
+        if config.db_path is None:
+            raise RuntimeError("snapshot persistence requires a db path")
+        save_snapshot(config.db_path, snapshot)
+        _persist_binding_observation(
+            config,
+            bindings,
+            observed_at=snapshot.updated_at,
+            workers_present=bool(workers),
+            authoritative=_herdr_health_from_items(backend_health).status == "healthy",
+        )
+
+    return snapshot
+
+
+def _current_public_snapshot(config: Config) -> Any:
+    return observe_public_snapshot(config)
+
+
+def _try_daemon_result(
+    config: Config,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return a daemon result when explicitly configured and reachable."""
+    if config.socket_path is None:
+        return None
+    try:
+        from .daemon_api import DaemonAPIClient, DaemonAPIError
+    except Exception:
+        return None
+    try:
+        response = DaemonAPIClient(
+            config.socket_path,
+            timeout_seconds=_DAEMON_CLIENT_TIMEOUT_SECONDS,
+        ).request(method, params or {})
+    except DaemonAPIError:
+        return None
+    if not response.get("ok"):
+        return None
+    result = response.get("result")
+    return result if isinstance(result, dict) else None
 
 
 def _persist_binding_observation(
@@ -329,34 +405,13 @@ def cmd_snapshot(
     store_snapshot: bool = False,
 ) -> int:
     """Build and print a neutral snapshot."""
-    stored_bindings = _load_worker_bindings(config) if store_snapshot else []
-    spaces, workers, bindings, backend_health = _fetch_snapshot_observation_with_bindings(
-        config,
-        stored_bindings,
-    )
-    snapshot = project_from_observations(
-        config,
-        spaces=spaces,
-        workers=workers,
-        backend_health=backend_health,
-    )
-
-    if store_snapshot:
-        from .store.sqlite import save_snapshot
-
-        if config.db_path is None:
-            raise RuntimeError("snapshot persistence requires a db path")
-        save_snapshot(config.db_path, snapshot)
-        bindings = _persist_binding_observation(
-            config,
-            bindings,
-            observed_at=snapshot.updated_at,
-            workers_present=bool(workers),
-            authoritative=_herdr_health_from_items(backend_health).status == "healthy",
-        )
-
     if json_output:
-        print(snapshot.to_json(indent=2))
+        daemon_result = None if store_snapshot else _try_daemon_result(config, "snapshot.get")
+        if daemon_result is not None:
+            print(stable_json_dumps(daemon_result, indent=2))
+        else:
+            snapshot = observe_public_snapshot(config, store_snapshot=store_snapshot)
+            print(snapshot.to_json(indent=2))
     else:
         # Non-JSON output is out of scope; reject cleanly.
         print("error: only --json output is supported", file=sys.stderr)
@@ -374,6 +429,10 @@ def cmd_turns(
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
+    daemon_result = _try_daemon_result(config, "turn.list")
+    if daemon_result is not None:
+        print(payload_to_json(daemon_result, indent=2))
+        return 0
     snapshot = _current_public_snapshot(config)
     print(payload_to_json(turns_payload_from_snapshot(snapshot), indent=2))
     return 0
@@ -388,6 +447,10 @@ def cmd_pending(
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
+    daemon_result = _try_daemon_result(config, "pending.list")
+    if daemon_result is not None:
+        print(payload_to_json(daemon_result, indent=2))
+        return 0
     snapshot = _current_public_snapshot(config)
     print(payload_to_json(pending_payload_from_snapshot(snapshot), indent=2))
     return 0
@@ -514,39 +577,28 @@ def _command_observation_error(request: Any, observation: Any) -> CommandEnvelop
     )
 
 
-def cmd_command(
-    config: Config,
-    *,
-    json_output: bool = True,
-) -> int:
-    """Read a JSON command request from stdin and print a JSON result envelope."""
-    payload = sys.stdin.read()
+def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelope:
+    """Execute a JSON command request through the existing command path."""
     request, parse_error = parse_command_request(payload)
     if parse_error is not None:
         envelope = CommandEnvelope.error(None, parse_error or error_value("invalid_request", "unknown parse error"))
         if request is not None:
             envelope = CommandEnvelope.error(request, parse_error)
-        print(envelope.to_json(indent=2))
-        return 1
+        return envelope
 
     validation_error = validate_request(request)
     if validation_error is not None:
-        envelope = CommandEnvelope.error(request, validation_error)
-        print(envelope.to_json(indent=2))
-        return 1
+        return CommandEnvelope.error(request, validation_error)
 
     if request.action == "noop":
-        envelope = execute_command(
+        return execute_command(
             request,
             CommandContext(host_id=config.host_id, workers=[]),
         )
-        print(envelope.to_json(indent=2))
-        return 0 if envelope.ok else 1
 
     receipt_envelope = _reserve_command_receipt(config, request)
     if receipt_envelope is not None:
-        print(receipt_envelope.to_json(indent=2))
-        return 0 if receipt_envelope.ok else 1
+        return receipt_envelope
 
     stored_bindings: list[WorkerBinding] = []
     if request.action == "send_instruction" and not request.dry_run:
@@ -555,8 +607,7 @@ def cmd_command(
         observation_error = _command_observation_error(request, observation)
         if observation_error is not None:
             _save_command_receipt(config, request, observation_error)
-            print(observation_error.to_json(indent=2))
-            return 0 if observation_error.ok else 1
+            return observation_error
         backend_health = list(getattr(observation, "backend_health", []) or [])
         spaces, workers = observation.spaces, observation.workers
         current_bindings = list(getattr(observation, "bindings", []) or [])
@@ -603,9 +654,41 @@ def cmd_command(
 
     envelope = execute_command(request, context)
     _save_command_receipt(config, request, envelope)
+    return envelope
 
-    print(envelope.to_json(indent=2))
+
+def _command_exit_code(envelope: CommandEnvelope) -> int:
     return 0 if envelope.ok else 1
+
+
+def cmd_command(
+    config: Config,
+    *,
+    json_output: bool = True,
+) -> int:
+    """Read a JSON command request from stdin and print a JSON result envelope."""
+    payload = sys.stdin.read()
+    if json_output:
+        try:
+            request_payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            request_payload = None
+        if isinstance(request_payload, dict):
+            daemon_result = _try_daemon_result(config, "command.submit", request_payload)
+            if daemon_result is not None:
+                print(stable_json_dumps(daemon_result, indent=2))
+                return 0 if bool(daemon_result.get("ok")) else 1
+
+    envelope = command_envelope_from_payload(config, payload)
+    print(envelope.to_json(indent=2))
+    return _command_exit_code(envelope)
+
+
+def cmd_daemon(config: Config) -> int:
+    """Run the long-lived local daemon."""
+    from .daemon import run_daemon
+
+    return run_daemon(config)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -620,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         host_id=args.host_id,
         herdr_bin=args.herdr_bin,
         db_path=getattr(args, "db_path", None),
+        socket_path=getattr(args, "socket_path", None),
         herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
 
@@ -638,6 +722,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)
+
+    if args.command == "daemon":
+        return cmd_daemon(config)
 
     if args.command == "doctor":
         return cmd_doctor(config, json_output=args.json_output)
