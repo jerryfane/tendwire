@@ -14,8 +14,10 @@ from tendwire.core.models import (
     Space,
     SuggestedAction,
     Worker,
+    WorkerBinding,
     normalize_status,
     utc_timestamp,
+    worker_binding_private_fingerprint,
 )
 from tendwire.core.projector import project_empty, project_from_raw
 
@@ -37,6 +39,13 @@ _FORBIDDEN_FIELDS = {
     "pane_id",
     "agent_session",
     "session_id",
+    "herdr_state",
+    "herdres_state",
+    "target_kind",
+    "target_value",
+    "turn_target_kind",
+    "turn_target_value",
+    "private_fingerprint",
 }
 
 
@@ -184,6 +193,69 @@ def test_worker_private_backend_target_and_raw_backend_meta_do_not_serialize() -
     assert payload["id"] == "public-worker"
     assert payload["meta"] == {"safe": "kept"}
     assert worker.backend_target == {"kind": "agent_id", "value": "agent-1", "sendable": True, "reason": None}
+    _assert_no_forbidden_fields(payload)
+
+
+def test_worker_binding_is_private_and_not_snapshot_serialized() -> None:
+    private_fingerprint = worker_binding_private_fingerprint(
+        host_id="host-a",
+        backend="herdr",
+        identity_material={"agent_session": "sess-private", "pane_id": "pane-private"},
+    )
+    assert private_fingerprint != worker_binding_private_fingerprint(
+        host_id="host-b",
+        backend="herdr",
+        identity_material={"agent_session": "sess-private", "pane_id": "pane-private"},
+    )
+    binding = WorkerBinding(
+        host_id="host-a",
+        worker_id="worker-public",
+        worker_fingerprint="worker-fp",
+        backend="herdr",
+        target_kind="pane_id",
+        target_value="pane-private",
+        turn_target_kind="terminal_id",
+        turn_target_value="term-private",
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        expires_at="2026-01-02T00:00:00+00:00",
+        private_fingerprint=private_fingerprint,
+    )
+    snapshot = Snapshot(
+        host_id="host-a",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[
+            Worker(
+                id="worker-public",
+                name="Worker",
+                status="active",
+                meta={
+                    "safe": "kept",
+                    "target_kind": "pane_id",
+                    "target_value": "pane-private",
+                    "turn_target_kind": "terminal_id",
+                    "turn_target_value": "term-private",
+                    "private_fingerprint": private_fingerprint,
+                },
+                backend_target=binding.backend_target(),
+            )
+        ],
+    )
+
+    payload = snapshot.to_dict()
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert binding.private_fingerprint == private_fingerprint
+    assert binding.backend_target() == {
+        "kind": "pane_id",
+        "value": "pane-private",
+        "sendable": True,
+        "reason": None,
+    }
+    assert payload["workers"][0]["meta"] == {"safe": "kept"}
+    assert "pane-private" not in encoded
+    assert private_fingerprint not in encoded
     _assert_no_forbidden_fields(payload)
 
 

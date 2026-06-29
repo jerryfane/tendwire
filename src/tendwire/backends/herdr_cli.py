@@ -17,14 +17,23 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Config
-from ..core.models import Space, Worker, normalize_status, stable_fingerprint
+from ..core.models import (
+    Space,
+    Worker,
+    WorkerBinding,
+    normalize_status,
+    stable_fingerprint,
+    utc_timestamp,
+    worker_binding_private_fingerprint,
+)
 
 
 _HERDR_TIMEOUT_SECONDS = 5.0
+_BACKEND_NAME = "herdr"
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -94,6 +103,7 @@ class HerdrCommandObservation:
     status: str
     outcome: str
     message: str = ""
+    bindings: list[WorkerBinding] = field(default_factory=list)
 
     @property
     def healthy(self) -> bool:
@@ -580,18 +590,37 @@ def _worker_id_from_item(item: Mapping[str, Any]) -> str:
     return _public_worker_id_base_from_item(item)
 
 
-def _private_identity_from_item(item: Mapping[str, Any]) -> str:
-    """Return a private identity used only to avoid collapsing distinct workers."""
-    return _private_fingerprint(
-        {
-            "public_id": _public_worker_id_base_from_item(item),
-            "name": _first_text(item, ("agent", "name", "label", "title")),
+def _private_identity_material_from_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Return private Herdr identity material that is never serialized publicly."""
+    agent_id = _first_text(item, ("agent_id",))
+    agent_session = _nested_text(item, "agent_session", "value")
+    session_id = _first_text(item, ("session_id",))
+    if agent_id or agent_session or session_id:
+        return {
+            "agent_id": agent_id,
+            "agent_session": agent_session,
+            "session_id": session_id,
             "space_id": _worker_space_id_from_item(item),
-            "agent_session": _nested_text(item, "agent_session", "value"),
-            "session_id": _first_text(item, ("session_id",)),
-            "terminal_id": _first_text(item, ("terminal_id",)),
-            "pane_id": _first_text(item, ("pane_id",)),
         }
+    base = {
+        "public_id": _public_worker_id_base_from_item(item),
+        "name": _first_text(item, ("agent", "name", "label", "title")),
+        "space_id": _worker_space_id_from_item(item),
+    }
+    base["terminal_id"] = _first_text(item, ("terminal_id",))
+    base["pane_id"] = _first_text(item, ("pane_id",))
+    return base
+
+
+def _private_identity_from_item(item: Mapping[str, Any], config: Config | None = None) -> str:
+    """Return a private identity used only to avoid collapsing distinct workers."""
+    material = _private_identity_material_from_item(item)
+    if config is None:
+        return _private_fingerprint(material)
+    return worker_binding_private_fingerprint(
+        host_id=config.host_id,
+        backend=_BACKEND_NAME,
+        identity_material=material,
     )
 
 
@@ -749,8 +778,8 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
     )
 
 
-def _worker_record_from_item(item: Mapping[str, Any]) -> tuple[Worker, str]:
-    return _worker_from_item(item), _private_identity_from_item(item)
+def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = None) -> tuple[Worker, str]:
+    return _worker_from_item(item), _private_identity_from_item(item, config)
 
 
 def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] | None) -> Worker:
@@ -835,8 +864,66 @@ def assert_unique_sendable_backend_targets(workers: Iterable[Worker]) -> bool:
     return True
 
 
-def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worker]:
+def _binding_target_key(binding: WorkerBinding) -> tuple[str, str]:
+    return (binding.target_kind, binding.target_value)
+
+
+def _worker_target_key(worker: Worker) -> tuple[str, str] | None:
+    target = worker.backend_target
+    if not isinstance(target, Mapping):
+        return None
+    kind = str(target.get("kind") or "")
+    value = str(target.get("value") or "")
+    if not kind or not value:
+        return None
+    return kind, value
+
+
+def _reuse_worker_ids_from_bindings(
+    records: list[tuple[Worker, str]],
+    stored_bindings: Sequence[WorkerBinding] | None,
+) -> list[tuple[Worker, str]]:
+    """Reuse stable public ids from private binding matches when safe."""
+    if not stored_bindings:
+        return records
+
+    by_private: dict[str, WorkerBinding] = {}
+    by_target: dict[tuple[str, str], list[WorkerBinding]] = {}
+    for binding in stored_bindings:
+        if binding.backend != _BACKEND_NAME:
+            continue
+        by_private[binding.private_fingerprint] = binding
+        key = _binding_target_key(binding)
+        if key[0] and key[1]:
+            by_target.setdefault(key, []).append(binding)
+
+    current_target_counts = Counter(
+        key
+        for key in (_worker_target_key(worker) for worker, _identity in records)
+        if key is not None
+    )
+
+    reused: list[tuple[Worker, str]] = []
+    for worker, private_fingerprint in records:
+        matched = by_private.get(private_fingerprint)
+        if matched is None:
+            key = _worker_target_key(worker)
+            candidates = by_target.get(key or ("", ""), [])
+            if key is not None and current_target_counts[key] == 1 and len(candidates) == 1:
+                matched = candidates[0]
+        if matched is not None and matched.worker_id:
+            reused.append((_worker_with_id(worker, matched.worker_id), private_fingerprint))
+        else:
+            reused.append((worker, private_fingerprint))
+    return reused
+
+
+def _deduplicated_worker_records(
+    records: list[tuple[Worker, str]],
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> list[tuple[Worker, str]]:
     """Drop exact duplicates, then disambiguate duplicate public ids."""
+    records = _reuse_worker_ids_from_bindings(records, stored_bindings)
     seen: set[tuple[str, str, str | None, str, str, str]] = set()
     unique: list[tuple[Worker, str]] = []
     for worker, identity in records:
@@ -855,10 +942,10 @@ def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worke
     for worker, identity in unique:
         groups.setdefault(worker.id, []).append((worker, identity))
 
-    disambiguated: list[Worker] = []
+    disambiguated: list[tuple[Worker, str]] = []
     for worker_id, group in groups.items():
         if len(group) == 1:
-            disambiguated.append(group[0][0])
+            disambiguated.append(group[0])
             continue
         ordered = sorted(
             group,
@@ -880,23 +967,164 @@ def _deduplicate_worker_records(records: list[tuple[Worker, str]]) -> list[Worke
             ),
         )
         for index, (worker, _identity) in enumerate(ordered, start=1):
-            disambiguated.append(_worker_with_id(worker, f"{worker_id}-{index}"))
+            disambiguated.append((_worker_with_id(worker, f"{worker_id}-{index}"), _identity))
 
-    workers = _mark_backend_sendability(sorted(disambiguated, key=lambda w: w.id))
+    disambiguated = sorted(disambiguated, key=lambda record: record[0].id)
+    workers = _mark_backend_sendability([worker for worker, _identity in disambiguated])
     assert_unique_sendable_backend_targets(workers)
-    return workers
+    return list(zip(workers, [identity for _worker, identity in disambiguated], strict=True))
+
+
+def _deduplicate_worker_records(
+    records: list[tuple[Worker, str]],
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> list[Worker]:
+    return [worker for worker, _identity in _deduplicated_worker_records(records, stored_bindings)]
 
 
 def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
     return _deduplicate_worker_records([(worker, worker.fingerprint) for worker in workers])
 
 
-def _workers_from_payload(payload: Any) -> list[Worker]:
+def _binding_from_worker_record(
+    config: Config,
+    worker: Worker,
+    private_fingerprint: str,
+    observed_at: str,
+) -> WorkerBinding | None:
+    target = worker.backend_target
+    if not isinstance(target, Mapping):
+        return None
+    target_kind = str(target.get("kind") or "")
+    target_value = str(target.get("value") or "")
+    if not target_kind or not target_value:
+        return None
+    reason = target.get("reason")
+    return WorkerBinding(
+        host_id=config.host_id,
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend=_BACKEND_NAME,
+        target_kind=target_kind,
+        target_value=target_value,
+        turn_target_kind=None,
+        turn_target_value=None,
+        sendable=target.get("sendable") is True,
+        reason=str(reason) if reason is not None else None,
+        observed_at=observed_at,
+        expires_at=None,
+        private_fingerprint=private_fingerprint,
+    )
+
+
+def _workers_and_bindings_from_records(
+    config: Config,
+    records: list[tuple[Worker, str]],
+    *,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> tuple[list[Worker], list[WorkerBinding]]:
+    observed_at = utc_timestamp()
+    deduplicated = _deduplicated_worker_records(records, stored_bindings)
+    workers = [worker for worker, _private_fingerprint in deduplicated]
+    bindings = [
+        binding
+        for worker, private_fingerprint in deduplicated
+        if (binding := _binding_from_worker_record(config, worker, private_fingerprint, observed_at)) is not None
+    ]
+    return workers, bindings
+
+
+def bindings_from_workers(
+    config: Config,
+    workers: Sequence[Worker],
+    *,
+    observed_at: str | None = None,
+) -> list[WorkerBinding]:
+    """Build private Herdr bindings from in-memory workers when raw records are absent."""
+    timestamp = observed_at or utc_timestamp()
+    bindings: list[WorkerBinding] = []
+    for worker in workers:
+        target = worker.backend_target
+        if not isinstance(target, Mapping):
+            continue
+        target_kind = str(target.get("kind") or "")
+        target_value = str(target.get("value") or "")
+        if not target_kind or not target_value:
+            continue
+        private_fingerprint = worker_binding_private_fingerprint(
+            host_id=config.host_id,
+            backend=_BACKEND_NAME,
+            identity_material={
+                "worker_id": worker.id,
+                "worker_fingerprint": worker.fingerprint,
+                "target_kind": target_kind,
+                "target_value": target_value,
+            },
+        )
+        binding = _binding_from_worker_record(config, worker, private_fingerprint, timestamp)
+        if binding is not None:
+            bindings.append(binding)
+    return bindings
+
+
+def _binding_for_worker(worker: Worker, bindings: Sequence[WorkerBinding]) -> WorkerBinding | None:
+    candidates = [binding for binding in bindings if binding.worker_id == worker.id]
+    if not candidates:
+        return None
+    exact = [binding for binding in candidates if binding.worker_fingerprint == worker.fingerprint]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def rehydrate_workers_from_bindings(
+    workers: Sequence[Worker],
+    current_bindings: Sequence[WorkerBinding] | None = None,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> list[Worker]:
+    """Attach private backend targets to workers from current, then stored bindings."""
+    current = list(current_bindings or [])
+    stored = list(stored_bindings or [])
+    rehydrated: list[Worker] = []
+    for worker in workers:
+        if isinstance(worker.backend_target, Mapping):
+            rehydrated.append(worker)
+            continue
+        binding = _binding_for_worker(worker, current)
+        if binding is None:
+            binding = _binding_for_worker(worker, stored)
+        if binding is None:
+            rehydrated.append(worker)
+        else:
+            rehydrated.append(_worker_with_backend_target(worker, binding.backend_target()))
+    return rehydrated
+
+
+def _workers_from_payload(
+    payload: Any,
+    config: Config | None = None,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> list[Worker]:
     """Extract neutral Worker objects from a herdr agent-list payload."""
     records: list[tuple[Worker, str]] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
-        records.append(_worker_record_from_item(item))
-    return _deduplicate_worker_records(records)
+        records.append(_worker_record_from_item(item, config))
+    return _deduplicate_worker_records(records, stored_bindings)
+
+
+def _workers_and_bindings_from_payload(
+    payload: Any,
+    config: Config,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> tuple[list[Worker], list[WorkerBinding]]:
+    records: list[tuple[Worker, str]] = []
+    for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
+        records.append(_worker_record_from_item(item, config))
+    return _workers_and_bindings_from_records(config, records, stored_bindings=stored_bindings)
 
 
 def _pane_has_agent(item: Mapping[str, Any]) -> bool:
@@ -915,14 +1143,31 @@ def _pane_has_agent(item: Mapping[str, Any]) -> bool:
     return False
 
 
-def _workers_from_pane_payload(payload: Any) -> list[Worker]:
+def _workers_from_pane_payload(
+    payload: Any,
+    config: Config | None = None,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> list[Worker]:
     """Extract worker objects from herdr pane list, only for agent-bearing panes."""
     records: list[tuple[Worker, str]] = []
     for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
         if not _pane_has_agent(item):
             continue
-        records.append(_worker_record_from_item(item))
-    return _deduplicate_worker_records(records)
+        records.append(_worker_record_from_item(item, config))
+    return _deduplicate_worker_records(records, stored_bindings)
+
+
+def _workers_and_bindings_from_pane_payload(
+    payload: Any,
+    config: Config,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> tuple[list[Worker], list[WorkerBinding]]:
+    records: list[tuple[Worker, str]] = []
+    for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
+        if not _pane_has_agent(item):
+            continue
+        records.append(_worker_record_from_item(item, config))
+    return _workers_and_bindings_from_records(config, records, stored_bindings=stored_bindings)
 
 
 def _probe_payload_variants(
@@ -964,7 +1209,10 @@ def _degraded_observation(outcome: str, message: str) -> HerdrCommandObservation
     )
 
 
-def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
+def fetch_herdr_command_observation(
+    config: Config,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+) -> HerdrCommandObservation:
     """Return Herdr observations plus health metadata for mutation safety."""
     try:
         if shutil.which(config.herdr_bin) is None:
@@ -1002,7 +1250,11 @@ def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
         )
 
     spaces = _spaces_from_payload(workspace_payload)
-    workers = _workers_from_payload(agent_payload)
+    workers, bindings = _workers_and_bindings_from_payload(
+        agent_payload,
+        config,
+        stored_bindings=stored_bindings,
+    )
     if not workers:
         try:
             pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
@@ -1013,23 +1265,44 @@ def fetch_herdr_command_observation(config: Config) -> HerdrCommandObservation:
                 pane_outcome,
                 "Herdr pane fallback observation is not healthy",
             )
-        workers = _workers_from_pane_payload(pane_payload)
+        workers, bindings = _workers_and_bindings_from_pane_payload(
+            pane_payload,
+            config,
+            stored_bindings=stored_bindings,
+        )
 
     return HerdrCommandObservation(
         spaces=spaces,
         workers=workers,
         status="healthy",
         outcome="healthy_non_empty" if spaces or workers else "empty_healthy",
+        bindings=bindings,
     )
 
 
-def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
+def _state_result(
+    spaces: list[Space],
+    workers: list[Worker],
+    bindings: list[WorkerBinding],
+    include_bindings: bool,
+) -> tuple[list[Space], list[Worker]] | tuple[list[Space], list[Worker], list[WorkerBinding]]:
+    if include_bindings:
+        return spaces, workers, bindings
+    return spaces, workers
+
+
+def fetch_herdr_state(
+    config: Config,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+    *,
+    include_bindings: bool = False,
+) -> tuple[list[Space], list[Worker]] | tuple[list[Space], list[Worker], list[WorkerBinding]]:
     """Return neutral spaces and workers from the Herdr CLI, or empty lists."""
     try:
         if shutil.which(config.herdr_bin) is None:
-            return [], []
+            return _state_result([], [], [], include_bindings)
     except (TypeError, ValueError, OSError):
-        return [], []
+        return _state_result([], [], [], include_bindings)
 
     budget = _ProbeBudget.from_config(config, planned_probes=5)
     workspace_outcome, workspace_payload = _probe_payload_variants(
@@ -1041,7 +1314,7 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
         budget,
     )
     if workspace_outcome == "timeout":
-        return [], []
+        return _state_result([], [], [], include_bindings)
 
     agent_outcome, agent_payload = _probe_payload_variants(
         [
@@ -1054,16 +1327,24 @@ def fetch_herdr_state(config: Config) -> tuple[list[Space], list[Worker]]:
 
     spaces = _spaces_from_payload(workspace_payload)
     if agent_outcome == "timeout":
-        return spaces, []
+        return _state_result(spaces, [], [], include_bindings)
 
-    workers = _workers_from_payload(agent_payload)
+    workers, bindings = _workers_and_bindings_from_payload(
+        agent_payload,
+        config,
+        stored_bindings=stored_bindings,
+    )
     if not workers:
         try:
             pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
         except TypeError:
             pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
         if pane_outcome != "ok":
-            return spaces, []
-        workers = _workers_from_pane_payload(pane_payload)
+            return _state_result(spaces, [], [], include_bindings)
+        workers, bindings = _workers_and_bindings_from_pane_payload(
+            pane_payload,
+            config,
+            stored_bindings=stored_bindings,
+        )
 
-    return spaces, workers
+    return _state_result(spaces, workers, bindings, include_bindings)

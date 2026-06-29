@@ -58,6 +58,13 @@ _FORBIDDEN_COMMAND_FIELDS = {
     "backend_target",
     "agent_session",
     "session_id",
+    "herdr_state",
+    "herdres_state",
+    "target_kind",
+    "target_value",
+    "turn_target_kind",
+    "turn_target_value",
+    "private_fingerprint",
 }
 
 
@@ -515,6 +522,13 @@ _COMMAND_RESULT_FORBIDDEN_KEYS = {
     "backend_target",
     "agent_session",
     "session_id",
+    "herdr_state",
+    "herdres_state",
+    "target_kind",
+    "target_value",
+    "turn_target_kind",
+    "turn_target_value",
+    "private_fingerprint",
 }
 
 

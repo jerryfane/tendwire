@@ -20,6 +20,7 @@ from tendwire.core.commands import (
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
 )
+from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_from_observations
 
 
@@ -39,6 +40,13 @@ _FORBIDDEN_FIELDS = {
     "backend_target",
     "agent_session",
     "session_id",
+    "herdr_state",
+    "herdres_state",
+    "target_kind",
+    "target_value",
+    "turn_target_kind",
+    "turn_target_value",
+    "private_fingerprint",
     "argv",
     "command",
     "shell",
@@ -390,6 +398,120 @@ def test_herdr_agent_public_id_and_private_backend_target_are_separate(monkeypat
     _assert_no_forbidden_fields(payload)
 
 
+def test_herdr_bindings_reuse_worker_id_by_private_fingerprint_and_update_moved_target(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    first_responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-before",
+                        "agent": "Coder",
+                        "agent_session": {"value": "sess-stable"},
+                        "terminal_id": "term-before",
+                        "pane_id": "pane-before",
+                        "workspace_id": "ws-1",
+                    }
+                ]
+            }
+        },
+    }
+    second_responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-after",
+                        "agent": "Coder",
+                        "agent_session": {"value": "sess-stable"},
+                        "terminal_id": "term-after",
+                        "pane_id": "pane-after",
+                        "workspace_id": "ws-1",
+                    }
+                ]
+            }
+        },
+    }
+    responses = [first_responses, second_responses]
+
+    def fake_run(args: Sequence[str], cfg: Config) -> subprocess.CompletedProcess[str] | None:
+        return _respond(args, responses[0])
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    _spaces, workers, bindings = fetch_herdr_state(config, include_bindings=True)
+    assert workers[0].id == "public-before"
+    assert bindings[0].worker_id == "public-before"
+    assert bindings[0].target_kind == "terminal_id"
+    assert bindings[0].target_value == "term-before"
+
+    responses.pop(0)
+    _spaces2, workers2, bindings2 = fetch_herdr_state(
+        config,
+        stored_bindings=bindings,
+        include_bindings=True,
+    )
+
+    assert workers2[0].id == "public-before"
+    assert bindings2[0].worker_id == "public-before"
+    assert bindings2[0].private_fingerprint == bindings[0].private_fingerprint
+    assert bindings2[0].target_kind == "terminal_id"
+    assert bindings2[0].target_value == "term-after"
+    payload = json.loads(project_from_observations(config, workers=workers2).to_json())
+    assert "term-after" not in json.dumps(payload)
+    assert "pane-after" not in json.dumps(payload)
+    _assert_no_forbidden_fields(payload)
+
+
+def test_herdr_reuses_worker_id_by_unique_backend_target_fallback(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    stored = [
+        WorkerBinding(
+            host_id="testhost",
+            worker_id="stored-public",
+            worker_fingerprint="stored-fp",
+            backend="herdr",
+            target_kind="agent_id",
+            target_value="agent-send",
+            sendable=True,
+            reason=None,
+            observed_at="2026-01-01T00:00:00+00:00",
+            expires_at="2026-01-02T00:00:00+00:00",
+            private_fingerprint="old-private",
+        )
+    ]
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "new-public",
+                        "agent_id": "agent-send",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    _spaces, workers, bindings = fetch_herdr_state(
+        config,
+        stored_bindings=stored,
+        include_bindings=True,
+    )
+
+    assert workers[0].id == "stored-public"
+    assert bindings[0].worker_id == "stored-public"
+    assert bindings[0].target_value == "agent-send"
+    assert bindings[0].private_fingerprint != "old-private"
+
+
 def test_herdr_backend_target_precedence_and_pane_fallback(monkeypatch) -> None:
     config = Config(host_id="testhost", herdr_bin="herdr")
     responses = {
@@ -463,6 +585,32 @@ def test_duplicate_sendable_backend_targets_are_marked_not_sendable(monkeypatch)
         for worker in workers
     )
     assert herdr_cli.assert_unique_sendable_backend_targets(workers) is True
+
+
+def test_duplicate_backend_targets_mark_bindings_unsendable(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {"worker_id": "public-a", "agent_id": "same-send", "agent": "A"},
+                    {"worker_id": "public-b", "agent_id": "same-send", "agent": "B"},
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    _spaces, workers, bindings = fetch_herdr_state(config, include_bindings=True)
+
+    assert {worker.id for worker in workers} == {"public-a", "public-b"}
+    assert len(bindings) == 2
+    assert all(binding.target_kind == "agent_id" for binding in bindings)
+    assert all(binding.target_value == "same-send" for binding in bindings)
+    assert all(binding.sendable is False for binding in bindings)
+    assert all(binding.reason == "duplicate_backend_target" for binding in bindings)
 
 
 def test_duplicate_final_send_tokens_across_backend_kinds_are_not_sendable(monkeypatch) -> None:

@@ -11,7 +11,13 @@ import json
 import sys
 from typing import Any
 
-from .backends.herdr_cli import diagnose_herdr, fetch_herdr_command_observation, fetch_herdr_state
+from .backends.herdr_cli import (
+    bindings_from_workers,
+    diagnose_herdr,
+    fetch_herdr_command_observation,
+    fetch_herdr_state,
+    rehydrate_workers_from_bindings,
+)
 from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
@@ -26,11 +32,18 @@ from .core.commands import (
     validate_request,
 )
 from .core.projector import project_from_observations
+from .core.models import WorkerBinding
 from .store.sqlite import (
     envelope_to_receipt_json,
+    expire_stale_worker_bindings,
+    list_worker_bindings,
     reserve_command_receipt,
     save_command_receipt,
+    upsert_worker_bindings,
 )
+
+
+_HERDR_BACKEND = "herdr"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -117,6 +130,74 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_worker_bindings(config: Config) -> list[WorkerBinding]:
+    if config.db_path is None:
+        return []
+    return list_worker_bindings(
+        config.db_path,
+        config.host_id,
+        backend=_HERDR_BACKEND,
+    )
+
+
+def _fetch_state_with_bindings(
+    config: Config,
+    stored_bindings: list[WorkerBinding],
+) -> tuple[list[Any], list[Any], list[WorkerBinding]]:
+    try:
+        result = fetch_herdr_state(
+            config,
+            stored_bindings=stored_bindings,
+            include_bindings=True,
+        )
+    except TypeError:
+        spaces, workers = fetch_herdr_state(config)
+        return spaces, workers, bindings_from_workers(config, workers)
+
+    if len(result) == 3:
+        spaces, workers, bindings = result
+        return spaces, workers, bindings
+    spaces, workers = result
+    return spaces, workers, bindings_from_workers(config, workers)
+
+
+def _fetch_command_observation_with_bindings(
+    config: Config,
+    stored_bindings: list[WorkerBinding],
+) -> Any:
+    try:
+        observation = fetch_herdr_command_observation(config, stored_bindings=stored_bindings)
+    except TypeError:
+        observation = fetch_herdr_command_observation(config)
+    bindings = getattr(observation, "bindings", None)
+    if bindings is None:
+        object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
+    elif not bindings:
+        object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
+    return observation
+
+
+def _persist_binding_observation(
+    config: Config,
+    bindings: list[WorkerBinding],
+    *,
+    observed_at: str,
+    workers_present: bool,
+) -> None:
+    if config.db_path is None:
+        return
+    if bindings:
+        upsert_worker_bindings(config.db_path, bindings)
+    if bindings or not workers_present:
+        expire_stale_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend=_HERDR_BACKEND,
+            current_private_fingerprints=[binding.private_fingerprint for binding in bindings],
+            now=observed_at,
+        )
+
+
 def cmd_snapshot(
     config: Config,
     *,
@@ -124,7 +205,8 @@ def cmd_snapshot(
     store_snapshot: bool = False,
 ) -> int:
     """Build and print a neutral snapshot."""
-    spaces, workers = fetch_herdr_state(config)
+    stored_bindings = _load_worker_bindings(config) if store_snapshot else []
+    spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
     snapshot = project_from_observations(
         config,
         spaces=spaces,
@@ -137,6 +219,12 @@ def cmd_snapshot(
         if config.db_path is None:
             raise RuntimeError("snapshot persistence requires a db path")
         save_snapshot(config.db_path, snapshot)
+        _persist_binding_observation(
+            config,
+            bindings,
+            observed_at=snapshot.updated_at,
+            workers_present=bool(workers),
+        )
 
     if json_output:
         print(snapshot.to_json(indent=2))
@@ -301,16 +389,37 @@ def cmd_command(
         print(receipt_envelope.to_json(indent=2))
         return 0 if receipt_envelope.ok else 1
 
+    stored_bindings: list[WorkerBinding] = []
     if request.action == "send_instruction" and not request.dry_run:
-        observation = fetch_herdr_command_observation(config)
+        stored_bindings = _load_worker_bindings(config)
+        observation = _fetch_command_observation_with_bindings(config, stored_bindings)
         observation_error = _command_observation_error(request, observation)
         if observation_error is not None:
             _save_command_receipt(config, request, observation_error)
             print(observation_error.to_json(indent=2))
             return 0 if observation_error.ok else 1
         spaces, workers = observation.spaces, observation.workers
+        current_bindings = list(getattr(observation, "bindings", []) or [])
+        _persist_binding_observation(
+            config,
+            current_bindings,
+            observed_at=current_bindings[0].observed_at if current_bindings else "",
+            workers_present=bool(workers),
+        )
+        stored_after_refresh = _load_worker_bindings(config)
+        workers = rehydrate_workers_from_bindings(
+            workers,
+            current_bindings,
+            stored_after_refresh or stored_bindings,
+        )
     else:
-        spaces, workers = fetch_herdr_state(config)
+        stored_bindings = _load_worker_bindings(config)
+        spaces, workers, current_bindings = _fetch_state_with_bindings(config, stored_bindings)
+        workers = rehydrate_workers_from_bindings(
+            workers,
+            current_bindings,
+            stored_bindings,
+        )
     snapshot = project_from_observations(
         config,
         spaces=spaces,

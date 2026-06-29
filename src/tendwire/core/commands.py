@@ -108,6 +108,13 @@ FORBIDDEN_REQUEST_FIELDS = frozenset(
         "backend_target",
         "agent_session",
         "session_id",
+        "herdr_state",
+        "herdres_state",
+        "target_kind",
+        "target_value",
+        "turn_target_kind",
+        "turn_target_value",
+        "private_fingerprint",
     }
 )
 
@@ -149,6 +156,13 @@ _COMMAND_RESULT_FORBIDDEN_FIELDS = frozenset(
         "backend_target",
         "agent_session",
         "session_id",
+        "herdr_state",
+        "herdres_state",
+        "target_kind",
+        "target_value",
+        "turn_target_kind",
+        "turn_target_value",
+        "private_fingerprint",
     }
 )
 _COMMAND_RESULT_FORBIDDEN_COMPACT = frozenset(

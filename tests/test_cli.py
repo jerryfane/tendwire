@@ -10,7 +10,7 @@ from pathlib import Path
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
-from tendwire.store.sqlite import latest_snapshot
+from tendwire.store.sqlite import latest_snapshot, list_worker_bindings
 
 
 def test_cli_snapshot_json_prints_contract_json_only(capsys) -> None:
@@ -65,6 +65,69 @@ def test_cli_snapshot_store_persists_printed_snapshot(tmp_path: Path, capsys) ->
     assert restored is not None
     assert restored.host_id == "cli-store"
     assert restored.content_fingerprint == payload["content_fingerprint"]
+
+
+def test_cli_snapshot_store_persists_private_bindings_outside_snapshot_payload(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "bindings.db"
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-worker",
+                        "agent_id": "agent-secret",
+                        "agent": "Worker",
+                        "pane_id": "pane-secret",
+                    }
+                ]
+            }
+        },
+    }
+
+    def _fake_run_herdr(args, cfg):
+        if tuple(args) in responses:
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout=json.dumps(responses[tuple(args)]),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=list(args), returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", _fake_run_herdr)
+
+    code = main(
+        [
+            "--host-id",
+            "cli-bindings",
+            "--herdr-bin",
+            "herdr",
+            "snapshot",
+            "--db-path",
+            str(db_path),
+            "--json",
+            "--store",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    bindings = list_worker_bindings(db_path, "cli-bindings", backend="herdr")
+
+    assert code == 0
+    assert len(bindings) == 1
+    assert bindings[0].worker_id == "public-worker"
+    assert bindings[0].target_kind == "agent_id"
+    assert bindings[0].target_value == "agent-secret"
+    encoded = json.dumps(payload)
+    assert "agent-secret" not in encoded
+    assert "pane-secret" not in encoded
+    assert "target_kind" not in encoded
 
 
 def test_cli_module_invocation() -> None:

@@ -16,6 +16,7 @@ from tendwire.core.commands import (
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
+    STATUS_BACKEND_UNSUPPORTED,
     STATUS_DRY_RUN,
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_REQUEST,
@@ -24,8 +25,8 @@ from tendwire.core.commands import (
     CommandEnvelope,
     CommandRequest,
 )
-from tendwire.core.models import Space, Worker
-from tendwire.store.sqlite import get_command_receipt
+from tendwire.core.models import Space, Worker, WorkerBinding
+from tendwire.store.sqlite import get_command_receipt, upsert_worker_bindings
 
 
 def _fake_herdr_state(config: Any) -> tuple[list[Space], list[Worker]]:
@@ -287,6 +288,155 @@ def test_cli_command_send_instruction_accepts_literal_false_for_mutation(
     assert payload["status"] == STATUS_ACCEPTED
     assert payload["dry_run"] is False
     assert len(calls) == 1
+
+
+def test_cli_command_rehydrates_private_target_from_unexpired_stored_binding(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stored-binding.db"
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id="cmd-host",
+                worker_id="w-1",
+                worker_fingerprint="old-fp",
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="agent-stored",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="stored-private",
+            )
+        ],
+    )
+    calls: list[tuple[Any, Any]] = []
+
+    def targetless_observation(config: Any) -> HerdrCommandObservation:
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[Worker(id="w-1", name="Alpha", status="active", space_id="s-1")],
+            status="healthy",
+            outcome="healthy_non_empty",
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "stored-binding",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert payload["status"] == STATUS_ACCEPTED
+    assert len(calls) == 1
+    assert calls[0][0]["backend_target"]["value"] == "agent-stored"
+    assert "agent-stored" not in json.dumps(payload)
+    _assert_no_command_public_forbidden_fields(payload)
+
+
+def test_cli_command_does_not_send_through_expired_stored_binding(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "expired-binding.db"
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id="cmd-host",
+                worker_id="w-1",
+                worker_fingerprint="old-fp",
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="agent-expired",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="2026-01-02T00:00:00+00:00",
+                private_fingerprint="expired-private",
+            )
+        ],
+    )
+    calls: list[tuple[Any, Any]] = []
+
+    def targetless_observation(config: Any) -> HerdrCommandObservation:
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[Worker(id="w-1", name="Alpha", status="active", space_id="s-1")],
+            status="healthy",
+            outcome="healthy_non_empty",
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "expired-binding",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_BACKEND_UNSUPPORTED
+    assert calls == []
+    assert "agent-expired" not in json.dumps(payload)
+    _assert_no_command_public_forbidden_fields(payload)
 
 
 @pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
@@ -866,6 +1016,13 @@ _COMMAND_PUBLIC_FORBIDDEN_KEYS = {
     "backend_target",
     "agent_session",
     "session_id",
+    "herdr_state",
+    "herdres_state",
+    "target_kind",
+    "target_value",
+    "turn_target_kind",
+    "turn_target_value",
+    "private_fingerprint",
 }
 
 

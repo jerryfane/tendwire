@@ -484,6 +484,13 @@ def test_public_result_contains_no_connector_fields() -> None:
                     "backend_target",
                     "agent_session",
                     "session_id",
+                    "herdr_state",
+                    "herdres_state",
+                    "target_kind",
+                    "target_value",
+                    "turn_target_kind",
+                    "turn_target_value",
+                    "private_fingerprint",
                 }, f"forbidden field {path}.{key}"
                 check(value[key], f"{path}.{key}")
         elif isinstance(value, list):

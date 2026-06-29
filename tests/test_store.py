@@ -9,15 +9,21 @@ from pathlib import Path
 
 from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
+from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store.sqlite import (
+    expire_stale_worker_bindings,
+    expire_worker_bindings,
     get_command_receipt,
     init_store,
     latest_snapshot,
     list_hosts,
+    list_worker_bindings,
     reserve_command_receipt,
+    resolve_worker_binding,
     save_command_receipt,
     save_snapshot,
+    upsert_worker_bindings,
 )
 
 
@@ -55,11 +61,36 @@ def test_store_initializes_v2_schema_with_content_fingerprint_indexes(tmp_path: 
 
     with sqlite3.connect(str(db_path)) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-        assert _user_version(conn) == 2
+        assert _user_version(conn) == 3
         assert {"host_id", "created_at", "payload", "content_fingerprint"} <= columns
         indexed = _indexed_columns(conn, "snapshots")
         assert "host_id" in indexed
         assert "content_fingerprint" in indexed
+        binding_columns = {row[1] for row in conn.execute("PRAGMA table_info(worker_bindings)")}
+        assert {
+            "host_id",
+            "worker_id",
+            "worker_fingerprint",
+            "backend",
+            "target_kind",
+            "target_value",
+            "turn_target_kind",
+            "turn_target_value",
+            "sendable",
+            "reason",
+            "observed_at",
+            "expires_at",
+            "private_fingerprint",
+        } <= binding_columns
+        binding_indexed = _indexed_columns(conn, "worker_bindings")
+        assert {
+            "worker_id",
+            "worker_fingerprint",
+            "private_fingerprint",
+            "target_kind",
+            "target_value",
+            "expires_at",
+        } <= binding_indexed
 
 
 def test_store_command_receipts_have_unique_logical_key_index(tmp_path: Path) -> None:
@@ -101,7 +132,7 @@ def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Pat
     save_snapshot(db_path, snapshot)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == 2
+        assert _user_version(conn) == 3
         row = conn.execute(
             "SELECT host_id, content_fingerprint, payload FROM snapshots ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -113,6 +144,163 @@ def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Pat
     assert restored is not None
     assert restored.host_id == "storehost"
     assert restored.content_fingerprint == snapshot.content_fingerprint
+
+
+def _worker_binding(
+    *,
+    worker_id: str = "worker-1",
+    worker_fingerprint: str = "fp-1",
+    target_kind: str = "pane_id",
+    target_value: str = "pane-1",
+    private_fingerprint: str = "priv-1",
+    sendable: bool = True,
+    reason: str | None = None,
+    observed_at: str = "2026-01-01T00:00:00+00:00",
+    expires_at: str = "2026-01-02T00:00:00+00:00",
+) -> WorkerBinding:
+    return WorkerBinding(
+        host_id="host-a",
+        worker_id=worker_id,
+        worker_fingerprint=worker_fingerprint,
+        backend="herdr",
+        target_kind=target_kind,
+        target_value=target_value,
+        turn_target_kind=None,
+        turn_target_value=None,
+        sendable=sendable,
+        reason=reason,
+        observed_at=observed_at,
+        expires_at=expires_at,
+        private_fingerprint=private_fingerprint,
+    )
+
+
+def test_store_worker_binding_upsert_list_resolve_and_expire(tmp_path: Path) -> None:
+    db_path = tmp_path / "bindings.db"
+    first = _worker_binding()
+    moved = _worker_binding(
+        target_value="pane-2",
+        observed_at="2026-01-01T00:10:00+00:00",
+    )
+
+    init_store(db_path)
+    assert upsert_worker_bindings(db_path, [first]) == 1
+    assert upsert_worker_bindings(db_path, [moved]) == 1
+
+    current = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="herdr",
+        now="2026-01-01T00:30:00+00:00",
+    )
+    assert len(current) == 1
+    assert current[0].target_value == "pane-2"
+    assert current[0].worker_id == "worker-1"
+    resolved = resolve_worker_binding(
+        db_path,
+        "host-a",
+        "worker-1",
+        worker_fingerprint="fp-1",
+        backend="herdr",
+        now="2026-01-01T00:30:00+00:00",
+    )
+    assert resolved is not None
+    assert resolved.target_value == "pane-2"
+
+    expired_count = expire_worker_bindings(
+        db_path,
+        "host-a",
+        backend="herdr",
+        private_fingerprints=["priv-1"],
+        now="2026-01-01T00:45:00+00:00",
+        reason="stale_target",
+    )
+    assert expired_count == 1
+    assert list_worker_bindings(db_path, "host-a", backend="herdr", now="2026-01-01T00:46:00+00:00") == []
+    history = list_worker_bindings(
+        db_path,
+        "host-a",
+        backend="herdr",
+        include_expired=True,
+        now="2026-01-01T00:46:00+00:00",
+    )
+    assert len(history) == 1
+    assert history[0].sendable is False
+    assert history[0].reason == "stale_target"
+    assert resolve_worker_binding(
+        db_path,
+        "host-a",
+        "worker-1",
+        backend="herdr",
+        now="2026-01-01T00:46:00+00:00",
+    ) is None
+
+
+def test_store_worker_bindings_allow_duplicate_targets_and_expire_stale(tmp_path: Path) -> None:
+    db_path = tmp_path / "duplicate-bindings.db"
+    binding_a = _worker_binding(
+        worker_id="worker-a",
+        worker_fingerprint="fp-a",
+        private_fingerprint="priv-a",
+        target_value="same-pane",
+        sendable=False,
+        reason="duplicate_backend_target",
+    )
+    binding_b = _worker_binding(
+        worker_id="worker-b",
+        worker_fingerprint="fp-b",
+        private_fingerprint="priv-b",
+        target_value="same-pane",
+        sendable=False,
+        reason="duplicate_backend_target",
+    )
+    upsert_worker_bindings(db_path, [binding_a, binding_b])
+
+    current = list_worker_bindings(db_path, "host-a", backend="herdr", now="2026-01-01T00:30:00+00:00")
+    assert len(current) == 2
+    assert {binding.target_value for binding in current} == {"same-pane"}
+    assert {binding.reason for binding in current} == {"duplicate_backend_target"}
+    assert resolve_worker_binding(
+        db_path,
+        "host-a",
+        "worker-a",
+        backend="herdr",
+        now="2026-01-01T00:30:00+00:00",
+    ) is None
+
+    expired_count = expire_stale_worker_bindings(
+        db_path,
+        "host-a",
+        backend="herdr",
+        current_private_fingerprints=["priv-a"],
+        now="2026-01-01T00:40:00+00:00",
+        reason="stale_observation",
+    )
+    assert expired_count == 1
+    remaining = list_worker_bindings(db_path, "host-a", backend="herdr", now="2026-01-01T00:41:00+00:00")
+    assert [binding.private_fingerprint for binding in remaining] == ["priv-a"]
+
+
+def test_store_snapshot_payload_does_not_contain_private_worker_bindings(tmp_path: Path) -> None:
+    db_path = tmp_path / "payload-clean.db"
+    config = Config(host_id="host-a", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    binding = _worker_binding(target_value="pane-secret", private_fingerprint="priv-secret")
+
+    save_snapshot(db_path, snapshot)
+    upsert_worker_bindings(db_path, [binding])
+
+    with sqlite3.connect(str(db_path)) as conn:
+        payload = conn.execute("SELECT payload FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()[0]
+        target_value = conn.execute("SELECT target_value FROM worker_bindings LIMIT 1").fetchone()[0]
+
+    assert target_value == "pane-secret"
+    assert "pane-secret" not in payload
+    assert "priv-secret" not in payload
+    assert "target_kind" not in payload
 
 
 def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:

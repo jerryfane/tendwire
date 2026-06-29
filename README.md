@@ -145,10 +145,18 @@ worker source time exists, the attention item serializes `updated_at` as `null`.
 
 The optional SQLite store keeps canonical snapshot JSON blobs in the `snapshots`
 table. Schema initialization and migration are idempotent, set
-`PRAGMA user_version = 2`, add `content_fingerprint` storage when migrating an
+`PRAGMA user_version = 3`, add `content_fingerprint` storage when migrating an
 existing milestone-1 table, and index `host_id`, `created_at`, and
 `content_fingerprint`. The existing `latest_snapshot` and `list_hosts` behavior
 is preserved.
+
+Private Herdr worker bindings are stored separately in the local
+`worker_bindings` table. These rows associate a stable public Tendwire
+`worker_id` with private backend target material such as Herdr agent, terminal,
+or pane identifiers. Bindings are local SQLite records only; they are not public
+snapshot fields, command request fields, command response fields, or stored
+snapshot payload fields. Expired bindings are retained for local history and
+debugging but ignored by command routing.
 
 ## Milestone 3 neutral command contract
 
@@ -201,7 +209,9 @@ Requests containing connector or low-level terminal fields are rejected before
 any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 `message_id`, `thread_id`, `route`, `delivery`, `token`, `bot_token`,
 `pane_id`, `terminal_id`, `backend_target`, `tty`, `pty`, `pid`, `tmux`,
-`screen_session`, `window_id`, `tab_id`, `argv`, `command`, and `shell`.
+`screen_session`, `window_id`, `tab_id`, `argv`, `command`, `shell`,
+`target_kind`, `target_value`, `turn_target_kind`, `turn_target_value`, and
+`private_fingerprint`.
 
 ### Command result/envelope shape v1
 

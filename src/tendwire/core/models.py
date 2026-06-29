@@ -105,9 +105,18 @@ FORBIDDEN_FIELD_NAMES = frozenset(
         "pane_id",
         "agent_session",
         "session_id",
+        "herdr_state",
+        "herdres_state",
+        "target_kind",
+        "target_value",
+        "turn_target_kind",
+        "turn_target_value",
+        "private_fingerprint",
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
+
+WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
 
 def _is_forbidden_field_name(key: Any) -> bool:
@@ -144,6 +153,40 @@ def stable_json_dumps(value: Any, *, indent: int | None = None) -> str:
 def stable_sha256(value: Any) -> str:
     """Return the SHA-256 hex digest of Tendwire's stable JSON encoding."""
     return hashlib.sha256(stable_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def private_stable_sha256(value: Any) -> str:
+    """Return a deterministic digest for private, non-public identity material."""
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def worker_binding_private_fingerprint(
+    *,
+    host_id: str,
+    backend: str,
+    identity_material: Any,
+    length: int = FINGERPRINT_HEX_CHARS,
+) -> str:
+    """Return a host/backend-scoped private binding identity fingerprint.
+
+    Unlike public snapshot fingerprints, this deliberately does not sanitize
+    backend identity material before hashing. Callers must not serialize the
+    returned value into public snapshot or command payloads.
+    """
+    return private_stable_sha256(
+        {
+            "host_id": str(host_id),
+            "backend": str(backend),
+            "identity": identity_material,
+        }
+    )[:length]
 
 
 def stable_fingerprint(value: Any, *, length: int = FINGERPRINT_HEX_CHARS) -> str:
@@ -706,3 +749,71 @@ class Snapshot:
     @classmethod
     def from_json(cls, payload: str) -> "Snapshot":
         return cls.from_dict(json.loads(payload))
+
+
+@dataclass(frozen=True)
+class WorkerBinding:
+    """Private local binding between a public worker and backend send target."""
+
+    host_id: str
+    worker_id: str
+    worker_fingerprint: str
+    backend: str
+    target_kind: str
+    target_value: str
+    turn_target_kind: str | None = None
+    turn_target_value: str | None = None
+    sendable: bool = False
+    reason: str | None = None
+    observed_at: str | None = None
+    expires_at: str | None = None
+    private_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        host_id = _string_value(self.host_id, "unknown")
+        worker_id = _string_value(self.worker_id, "unknown")
+        worker_fingerprint = _string_value(self.worker_fingerprint)
+        backend = _string_value(self.backend, "unknown")
+        target_kind = _string_value(self.target_kind)
+        target_value = _string_value(self.target_value)
+        turn_target_kind = _optional_string(self.turn_target_kind)
+        turn_target_value = _optional_string(self.turn_target_value)
+        observed_at = _string_value(_optional_timestamp(self.observed_at), utc_timestamp())
+        expires_at = _string_value(
+            _optional_timestamp(self.expires_at),
+            WORKER_BINDING_ACTIVE_EXPIRES_AT,
+        )
+        reason = _optional_string(self.reason)
+        private_fingerprint = _string_value(self.private_fingerprint) or worker_binding_private_fingerprint(
+            host_id=host_id,
+            backend=backend,
+            identity_material={
+                "target_kind": target_kind,
+                "target_value": target_value,
+                "turn_target_kind": turn_target_kind,
+                "turn_target_value": turn_target_value,
+            },
+        )
+
+        object.__setattr__(self, "host_id", host_id)
+        object.__setattr__(self, "worker_id", worker_id)
+        object.__setattr__(self, "worker_fingerprint", worker_fingerprint)
+        object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "target_kind", target_kind)
+        object.__setattr__(self, "target_value", target_value)
+        object.__setattr__(self, "turn_target_kind", turn_target_kind)
+        object.__setattr__(self, "turn_target_value", turn_target_value)
+        object.__setattr__(self, "sendable", bool(self.sendable))
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "expires_at", expires_at)
+        object.__setattr__(self, "private_fingerprint", private_fingerprint)
+
+    def backend_target(self) -> dict[str, Any]:
+        """Return the private in-memory backend target shape for command routing."""
+        return {
+            "kind": self.target_kind,
+            "value": self.target_value,
+            "sendable": self.sendable,
+            "reason": self.reason,
+        }
