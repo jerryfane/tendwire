@@ -245,10 +245,61 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
 
 
 def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -> None:
-    action = SuggestedAction.from_dict(
+    raw_actions = [
         {
             "label": "Run raw command",
             "command": "tendwire snapshot --json --token sentinel-command-token",
+            "terminal_id": "sentinel-terminal",
+            "backend_target": "sentinel-backend",
+            "session_id": "sentinel-session",
+            "params": {
+                "safe": "kept",
+                "commandLine": "sentinel-command-line",
+                "token": "sentinel-token",
+                "secret": "sentinel-secret",
+            },
+        },
+        {
+            "label": "Run safe-looking alias",
+            "command": "sentinel-safe-looking-command-alias",
+            "terminalId": "sentinel-camel-terminal",
+            "backendTarget": "sentinel-camel-backend",
+            "session-id": "sentinel-kebab-session",
+            "commandLine": "sentinel-top-level-command-line",
+            "params": {
+                "safe": "kept",
+                "nested": {
+                    "safe_nested": "kept",
+                    "terminal_id": "sentinel-nested-terminal",
+                    "commandLine": "sentinel-nested-command-line",
+                },
+            },
+        },
+    ]
+
+    for raw_action in raw_actions:
+        action = SuggestedAction.from_dict(raw_action)
+        payload = action.to_dict()
+        encoded = json.dumps(payload, sort_keys=True)
+
+        assert action.tendwire_action == ""
+        assert not action.has_public_tendwire_action
+        assert payload["label"] == raw_action["label"]
+        assert payload["tendwire_action"] == ""
+        assert "safe" in payload["params"]
+        assert "sentinel-" not in encoded
+        _assert_no_forbidden_fields(payload)
+
+
+def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> None:
+    action = SuggestedAction.from_dict(
+        {
+            "label": "Approve",
+            "command": "sentinel-forbidden-command-alias",
+            "tendwire_action": "approve",
+            "terminal_id": "sentinel-terminal",
+            "backend_target": "sentinel-backend",
+            "session_id": "sentinel-session",
             "params": {"safe": "kept", "commandLine": "sentinel-command-line"},
         }
     )
@@ -256,8 +307,9 @@ def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -
     payload = action.to_dict()
     encoded = json.dumps(payload, sort_keys=True)
 
-    assert payload["label"] == "Run raw command"
-    assert payload["tendwire_action"] == ""
+    assert action.tendwire_action == "approve"
+    assert action.has_public_tendwire_action
+    assert payload["tendwire_action"] == "approve"
     assert payload["params"] == {"safe": "kept"}
     assert "sentinel-" not in encoded
     _assert_no_forbidden_fields(payload)

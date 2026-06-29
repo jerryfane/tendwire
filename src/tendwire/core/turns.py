@@ -234,11 +234,17 @@ def _looks_like_raw_command(value: str) -> bool:
 
 def _public_choice_value(value: Any) -> Any | None:
     clean = sanitize_forbidden_fields(value)
-    if clean in ({}, []):
+    if clean in ({}, [], ""):
         return None
     if isinstance(clean, str):
         return None if _looks_like_raw_command(clean) else clean
     return clean
+
+
+def _public_suggested_action_value(action: Any) -> Any | None:
+    if not getattr(action, "has_public_tendwire_action", False):
+        return None
+    return _public_choice_value(getattr(action, "tendwire_action", ""))
 
 
 def _is_pending_routing_meta_key(key: Any) -> bool:
@@ -281,8 +287,9 @@ class InteractionChoice:
             "label": self.label,
             "params": sanitize_forbidden_fields(self.params),
         }
-        if self.value is not None:
-            payload["value"] = _public_choice_value(self.value)
+        public_value = _public_choice_value(self.value)
+        if public_value is not None:
+            payload["value"] = public_value
         if self.description is not None:
             payload["description"] = self.description
         return payload
@@ -602,7 +609,7 @@ def _signal_is_human_actionable(signal: AttentionSignal) -> bool:
 def _kind_from_signal(signal: AttentionSignal) -> str:
     text_parts = [signal.kind, signal.reason]
     for action in signal.suggested_actions:
-        public_action_value = _public_choice_value(action.tendwire_action)
+        public_action_value = _public_suggested_action_value(action)
         text_parts.append(action.label)
         if isinstance(public_action_value, str):
             text_parts.append(public_action_value)
@@ -626,7 +633,7 @@ def _kind_from_signal(signal: AttentionSignal) -> str:
 def _choices_from_signal(signal: AttentionSignal) -> list[InteractionChoice]:
     choices: list[InteractionChoice] = []
     for action in signal.suggested_actions:
-        public_value = _public_choice_value(action.tendwire_action)
+        public_value = _public_suggested_action_value(action)
         label = action.label or (public_value if isinstance(public_value, str) else "") or "Action"
         choice_id = action.action_id if public_value is not None else ""
         choices.append(

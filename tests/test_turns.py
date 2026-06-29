@@ -696,6 +696,137 @@ def test_pending_projection_omits_raw_command_suggested_action_material_before_f
     _assert_no_private_sentinels(wrapper_a)
 
 
+def test_pending_projection_omits_command_alias_values_before_public_fingerprints() -> None:
+    def _snapshot(raw_command: str, private_suffix: str) -> Snapshot:
+        return Snapshot(
+            host_id="command-alias-choice-host",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id="worker-1",
+                    name="Worker One",
+                    status="waiting",
+                    space_id="space-1",
+                    summary="waiting for action",
+                )
+            ],
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    suggested_actions=[
+                        {
+                            "label": "Run diagnostic",
+                            "command": raw_command,
+                            "terminal_id": f"sentinel-terminal-{private_suffix}",
+                            "backendTarget": f"sentinel-backend-{private_suffix}",
+                            "session-id": f"sentinel-session-{private_suffix}",
+                            "params": {
+                                "safe_choice": "kept",
+                                "commandLine": f"sentinel-command-line-{private_suffix}",
+                                "token": f"sentinel-token-{private_suffix}",
+                                "secret": f"sentinel-secret-{private_suffix}",
+                            },
+                        }
+                    ],
+                    meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
+                    host_id="command-alias-choice-host",
+                )
+            ],
+        )
+
+    snapshot_a = _snapshot("sentinel-safe-looking-command-alias-a", "a")
+    snapshot_b = _snapshot("sentinel-safe-looking-command-alias-b", "b")
+    pending_a = pending_from_snapshot(snapshot_a)[0]
+    pending_b = pending_from_snapshot(snapshot_b)[0]
+    wrapper_a = pending_payload_from_snapshot(snapshot_a)
+    wrapper_b = pending_payload_from_snapshot(snapshot_b)
+    payload = pending_a.to_dict()
+
+    assert pending_a.id == pending_b.id
+    assert pending_a.fingerprint == pending_b.fingerprint
+    assert wrapper_a["content_fingerprint"] == wrapper_b["content_fingerprint"]
+    assert payload["kind"] == "choice"
+    assert payload["choices"] == [
+        {
+            "choice_id": pending_b.choices[0].choice_id,
+            "label": "Run diagnostic",
+            "params": {"safe_choice": "kept"},
+        }
+    ]
+    assert "value" not in wrapper_a["pending_interactions"][0]["choices"][0]
+    _assert_no_forbidden_fields(payload)
+    _assert_no_forbidden_fields(wrapper_a)
+    _assert_no_private_sentinels(payload)
+    _assert_no_private_sentinels(wrapper_a)
+
+
+def test_pending_projection_keeps_safe_explicit_action_value_with_forbidden_command_alias() -> None:
+    snapshot = Snapshot(
+        host_id="explicit-action-choice-host",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[
+            Worker(
+                id="worker-1",
+                name="Worker One",
+                status="waiting",
+                space_id="space-1",
+                summary="approval required",
+            )
+        ],
+        attention=[
+            AttentionSignal(
+                kind="worker_status",
+                severity="warning",
+                status="waiting",
+                reason="Approval required before continuing",
+                source="worker:worker-1",
+                updated_at="2026-01-01T00:00:00+00:00",
+                suggested_actions=[
+                    {
+                        "action_id": "approve-action",
+                        "label": "Approve",
+                        "command": "sentinel-forbidden-command-alias",
+                        "tendwire_action": "approve",
+                        "terminal_id": "sentinel-terminal",
+                        "backendTarget": "sentinel-backend",
+                        "session-id": "sentinel-session",
+                        "params": {
+                            "safe_choice": "kept",
+                            "commandLine": "sentinel-command-line",
+                        },
+                    }
+                ],
+                meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
+                host_id="explicit-action-choice-host",
+            )
+        ],
+    )
+
+    pending = pending_from_snapshot(snapshot)[0]
+    wrapper = pending_payload_from_snapshot(snapshot)
+    payload = pending.to_dict()
+
+    assert payload["kind"] == "approval"
+    assert payload["choices"] == [
+        {
+            "choice_id": "approve-action",
+            "label": "Approve",
+            "params": {"safe_choice": "kept"},
+            "value": "approve",
+        }
+    ]
+    assert wrapper["pending_interactions"][0]["choices"][0]["value"] == "approve"
+    _assert_no_forbidden_fields(payload)
+    _assert_no_forbidden_fields(wrapper)
+    _assert_no_private_sentinels(payload)
+    _assert_no_private_sentinels(wrapper)
+
+
 def test_turn_pending_projectors_strip_pr5_metadata_and_keep_public_fingerprints_stable() -> None:
     dirty_worker_meta = {
         "origin_command_id": "cmd-public",

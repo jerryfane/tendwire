@@ -277,8 +277,16 @@ def test_cli_turns_and_pending_json_strip_raw_command_action_material(capsys, mo
                     updated_at="2026-01-01T00:00:00+00:00",
                     suggested_actions=[
                         SuggestedAction(
-                            command="tendwire snapshot --json --token sentinel-cli-command-token",
-                            params={"safe_choice": "kept", "commandLine": "sentinel-cli-command-line"},
+                            command="sentinel-cli-safe-looking-command-alias",
+                            params={
+                                "safe_choice": "kept",
+                                "commandLine": "sentinel-cli-command-line",
+                                "terminal_id": "sentinel-cli-terminal",
+                                "backendTarget": "sentinel-cli-backend",
+                                "session-id": "sentinel-cli-session",
+                                "token": "sentinel-cli-token",
+                                "secret": "sentinel-cli-secret",
+                            },
                         )
                     ],
                     meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},

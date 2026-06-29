@@ -587,6 +587,7 @@ class SuggestedAction:
         command: str | None = None,
     ) -> None:
         label = _string_value(label)
+        explicit_tendwire_action = bool(_string_value(tendwire_action))
         action_value = tendwire_action if tendwire_action or command is None else command
         tendwire_action = _string_value(action_value)
         params = sanitize_forbidden_fields(params if isinstance(params, Mapping) else {})
@@ -597,11 +598,17 @@ class SuggestedAction:
         object.__setattr__(self, "label", label)
         object.__setattr__(self, "tendwire_action", tendwire_action)
         object.__setattr__(self, "params", params)
+        object.__setattr__(self, "_explicit_tendwire_action", explicit_tendwire_action)
 
     @property
     def command(self) -> str:
         """Backward-compatible in-process alias; not serialized."""
         return self.tendwire_action
+
+    @property
+    def has_public_tendwire_action(self) -> bool:
+        """Whether tendwire_action came from the explicit public field."""
+        return bool(getattr(self, "_explicit_tendwire_action", False))
 
     def to_dict(self) -> dict[str, Any]:
         return {
