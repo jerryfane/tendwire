@@ -24,46 +24,124 @@ from tendwire.core.turns import (
 _FORBIDDEN_FIELDS = {
     "telegram",
     "chat_id",
+    "chat_ids",
     "topic_id",
+    "topic_ids",
     "message_id",
+    "message_ids",
     "thread_id",
+    "thread_ids",
     "token",
+    "tokens",
     "bot_token",
+    "bot_tokens",
+    "auth",
+    "auth_token",
+    "auth_tokens",
+    "authorization",
+    "authorization_header",
+    "authorization_headers",
+    "bearer_token",
+    "bearer_tokens",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
     "delivery",
+    "deliveries",
     "route",
+    "routes",
+    "connector",
+    "connectors",
     "herdres_delivery",
     "command",
+    "command_payload",
     "backend_target",
+    "backend_targets",
     "terminal_id",
+    "terminal_ids",
     "pane_id",
+    "pane_ids",
+    "tab_id",
+    "tab_ids",
+    "window_id",
+    "window_ids",
+    "tty",
+    "pty",
+    "pid",
+    "pids",
+    "process_id",
+    "process_ids",
+    "process",
+    "tmux",
+    "tmux_session",
+    "tmux_sessions",
+    "tmux_window",
+    "tmux_windows",
+    "tmux_pane",
+    "tmux_panes",
+    "screen",
+    "screen_session",
+    "screen_sessions",
+    "screen_window",
+    "screen_windows",
     "agent_session",
+    "agent_sessions",
     "session_id",
+    "session_ids",
     "herdr_state",
     "herdres_state",
     "target_kind",
     "target_value",
     "turn_target_kind",
     "turn_target_value",
+    "private",
+    "private_binding",
+    "private_bindings",
     "private_fingerprint",
+    "private_fingerprints",
     "argv",
+    "args",
     "env",
     "stderr",
     "stdout",
+    "stdin",
     "secret",
     "secrets",
     "password",
+    "passwords",
+    "api_keys",
     "api_key",
+    "raw_command",
+    "raw_payload",
+    "raw_control",
+    "terminal_control",
+    "control_sequence",
+    "escape_sequence",
+    "ansi_escape",
 }
+_FORBIDDEN_FIELD_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_FIELDS}
+
+
+def _is_forbidden_test_key(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return normalized in _FORBIDDEN_FIELDS or normalized.replace("_", "") in _FORBIDDEN_FIELD_COMPACT
 
 
 def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            assert key not in _FORBIDDEN_FIELDS, f"forbidden field {path}.{key}"
+            assert not _is_forbidden_test_key(key), f"forbidden field {path}.{key}"
             _assert_no_forbidden_fields(item, f"{path}.{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _assert_no_forbidden_fields(item, f"{path}[{index}]")
+
+
+def _assert_no_private_sentinels(value: Any) -> None:
+    encoded = json.dumps(value, sort_keys=True)
+    assert "sentinel-" not in encoded
+    assert "private-" not in encoded
 
 
 def test_turn_roundtrip_sanitizes_fields_and_ignores_volatile_timestamps() -> None:
@@ -181,6 +259,134 @@ def test_pending_interaction_roundtrip_sanitizes_choices_and_ignores_timestamps(
     assert pending.fingerprint == same_logical_pending.fingerprint
     assert PendingInteraction.from_json(pending.to_json()).to_dict() == payload
     _assert_no_forbidden_fields(payload)
+
+
+def test_turn_pending_and_choice_strip_pr5_private_fields_before_fingerprints() -> None:
+    dirty_meta = {
+        "safe": "kept",
+        "nested": {
+            "safe_nested": "kept",
+            "processId": "sentinel-nested-process",
+            "terminal-id": "sentinel-nested-terminal",
+        },
+        "tty": "sentinel-tty",
+        "pty": "sentinel-pty",
+        "pid": "sentinel-pid",
+        "process_id": "sentinel-process",
+        "tmux": "sentinel-tmux",
+        "screen_session": "sentinel-screen",
+        "window_id": "sentinel-window",
+        "tab_id": "sentinel-tab",
+        "pane_id": "sentinel-pane",
+        "terminal_id": "sentinel-terminal",
+        "backend_target": "sentinel-backend",
+        "session_id": "sentinel-session",
+        "messageIds": "sentinel-message-ids",
+        "terminalIds": "sentinel-terminal-ids",
+        "terminal": "sentinel-terminal-object",
+        "telegramMessageId": "sentinel-telegram-message",
+        "routeId": "sentinel-route-id",
+        "connectorId": "sentinel-connector-id",
+        "tmuxPaneId": "sentinel-tmux-pane-id",
+        "screenWindowId": "sentinel-screen-window-id",
+        "agentSessionId": "sentinel-agent-session-id",
+        "session": "sentinel-session-object",
+        "privateFingerprints": "sentinel-private-fingerprints",
+        "passwords": "sentinel-passwords",
+        "privateBinding": "sentinel-private-binding",
+        "authToken": "sentinel-auth",
+    }
+    clean_meta = {"safe": "kept", "nested": {"safe_nested": "kept"}}
+    dirty_turn = Turn(
+        host_id="pr5-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        status="waiting",
+        kind="task",
+        source="worker:worker-1",
+        origin_command_id="cmd-public",
+        meta=dirty_meta,
+    )
+    clean_turn = Turn(
+        host_id="pr5-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        status="waiting",
+        kind="task",
+        source="worker:worker-1",
+        origin_command_id="cmd-public",
+        meta=clean_meta,
+    )
+    dirty_choice = InteractionChoice(
+        label="Approve",
+        value={
+            "decision": "yes",
+            "backendTarget": "sentinel-choice-backend",
+            "nested": {"safe": "kept", "session-id": "sentinel-choice-session"},
+        },
+        description={"text": "safe description", "terminalId": "sentinel-description-terminal"},
+        params={
+            "safe": "kept",
+            "tty": "sentinel-choice-tty",
+            "nested": {"safe": "kept", "processId": "sentinel-choice-process"},
+        },
+    )
+    clean_choice = InteractionChoice(
+        label="Approve",
+        value={"decision": "yes", "nested": {"safe": "kept"}},
+        description={"text": "safe description"},
+        params={"safe": "kept", "nested": {"safe": "kept"}},
+    )
+    dirty_pending = PendingInteraction(
+        host_id="pr5-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        kind="approval",
+        question="Approve this action?",
+        choices=[dirty_choice],
+        meta={"source": "attention", **dirty_meta},
+    )
+    clean_pending = PendingInteraction(
+        host_id="pr5-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        kind="approval",
+        question="Approve this action?",
+        choices=[clean_choice],
+        meta={"source": "attention", **clean_meta},
+    )
+
+    turn_payload = json.loads(dirty_turn.to_json())
+    pending_payload = json.loads(dirty_pending.to_json())
+
+    assert turn_payload["host_id"] == "pr5-host"
+    assert turn_payload["worker_id"] == "worker-1"
+    assert turn_payload["worker_fingerprint"] == "worker-fp"
+    assert turn_payload["space_id"] == "space-1"
+    assert turn_payload["source"] == "worker:worker-1"
+    assert turn_payload["origin_command_id"] == "cmd-public"
+    assert turn_payload["meta"] == clean_meta
+    assert dirty_turn.id == clean_turn.id
+    assert dirty_turn.fingerprint == clean_turn.fingerprint
+    assert dirty_choice.choice_id == clean_choice.choice_id
+    assert dirty_choice.to_dict() == {
+        "choice_id": clean_choice.choice_id,
+        "label": "Approve",
+        "params": {"safe": "kept", "nested": {"safe": "kept"}},
+        "value": {"decision": "yes", "nested": {"safe": "kept"}},
+        "description": '{"text":"safe description"}',
+    }
+    assert dirty_pending.id == clean_pending.id
+    assert dirty_pending.fingerprint == clean_pending.fingerprint
+    assert pending_payload["meta"] == {"source": "attention", **clean_meta}
+    _assert_no_forbidden_fields(turn_payload)
+    _assert_no_forbidden_fields(pending_payload)
+    _assert_no_private_sentinels(turn_payload)
+    _assert_no_private_sentinels(pending_payload)
 
 
 def test_turn_projection_from_snapshot_is_public_safe_and_timestamp_stable() -> None:
@@ -332,6 +538,157 @@ def test_pending_projection_reuses_public_suggested_actions_as_choices() -> None
     assert payload["meta"]["needs_human"] is True
     assert "term-private" not in json.dumps(payload)
     _assert_no_forbidden_fields(payload)
+
+
+def test_turn_pending_projectors_strip_pr5_metadata_and_keep_public_fingerprints_stable() -> None:
+    dirty_worker_meta = {
+        "origin_command_id": "cmd-public",
+        "safe_worker": "kept",
+        "tty": "sentinel-worker-tty",
+        "pty": "sentinel-worker-pty",
+        "pid": "sentinel-worker-pid",
+        "process_id": "sentinel-worker-process",
+        "tmux": "sentinel-worker-tmux",
+        "screen_session": "sentinel-worker-screen",
+        "window_id": "sentinel-worker-window",
+        "tab_id": "sentinel-worker-tab",
+        "pane_id": "sentinel-worker-pane",
+        "terminal_id": "sentinel-worker-terminal",
+        "backend_target": "sentinel-worker-backend",
+        "session_id": "sentinel-worker-session",
+        "messageIds": "sentinel-worker-message-ids",
+        "terminalIds": "sentinel-worker-terminal-ids",
+        "terminal": "sentinel-worker-terminal-object",
+        "telegramMessageId": "sentinel-worker-telegram-message",
+        "routeId": "sentinel-worker-route-id",
+        "connectorId": "sentinel-worker-connector-id",
+        "tmuxPaneId": "sentinel-worker-tmux-pane-id",
+        "screenWindowId": "sentinel-worker-screen-window-id",
+        "agentSessionId": "sentinel-worker-agent-session-id",
+        "session": "sentinel-worker-session-object",
+        "privateFingerprints": "sentinel-worker-private-fingerprints",
+        "passwords": "sentinel-worker-passwords",
+        "privateBindings": "sentinel-worker-private-bindings",
+        "nested": {"safe": "kept", "backendTarget": "sentinel-worker-nested-backend"},
+    }
+    clean_worker_meta = {
+        "origin_command_id": "cmd-public",
+        "safe_worker": "kept",
+        "nested": {"safe": "kept"},
+    }
+    dirty_signal_meta = {
+        "workerId": "worker-1",
+        "space-id": "space-1",
+        "needs_human": True,
+        "safe_attention": "kept",
+        "processId": "sentinel-attention-process",
+        "tmux-session": "sentinel-attention-tmux",
+        "terminalid": "sentinel-attention-terminal",
+        "backendTarget": "sentinel-attention-backend",
+        "screenSession": "sentinel-attention-screen",
+        "session-id": "sentinel-attention-session",
+        "connector": "sentinel-attention-connector",
+    }
+    clean_signal_meta = {
+        "worker_id": "worker-1",
+        "space_id": "space-1",
+        "needs_human": True,
+        "safe_attention": "kept",
+    }
+    dirty_action_params = {
+        "safe_choice": "kept",
+        "route": "sentinel-choice-route",
+        "terminal-id": "sentinel-choice-terminal",
+        "processId": "sentinel-choice-process",
+        "authToken": "sentinel-choice-auth",
+    }
+    clean_action_params = {"safe_choice": "kept"}
+
+    def _snapshot(worker_meta: dict[str, Any], signal_meta: dict[str, Any], action_params: dict[str, Any]) -> Snapshot:
+        return Snapshot(
+            host_id="projector-pr5-host",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id="worker-1",
+                    name="Worker One",
+                    status="waiting",
+                    space_id="space-1",
+                    summary="human approval required",
+                    meta=worker_meta,
+                )
+            ],
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Approval required before continuing",
+                    source="worker:worker-1",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    suggested_actions=[
+                        SuggestedAction(
+                            label="Approve",
+                            tendwire_action="approve",
+                            params=action_params,
+                        )
+                    ],
+                    meta=signal_meta,
+                    host_id="projector-pr5-host",
+                )
+            ],
+            backend_health=[
+                {
+                    "name": "herdr",
+                    "status": "healthy",
+                    "outcome": "healthy_non_empty",
+                    "counts": {"workers": 1},
+                    "backendTarget": "sentinel-health-backend",
+                }
+            ],
+        )
+
+    dirty_snapshot = _snapshot(dirty_worker_meta, dirty_signal_meta, dirty_action_params)
+    clean_snapshot = _snapshot(clean_worker_meta, clean_signal_meta, clean_action_params)
+    dirty_turn = turns_from_snapshot(dirty_snapshot)[0]
+    clean_turn = turns_from_snapshot(clean_snapshot)[0]
+    dirty_pending = pending_from_snapshot(dirty_snapshot)[0]
+    clean_pending = pending_from_snapshot(clean_snapshot)[0]
+    turns_payload = turns_payload_from_snapshot(dirty_snapshot)
+    clean_turns_payload = turns_payload_from_snapshot(clean_snapshot)
+    pending_payload = pending_payload_from_snapshot(dirty_snapshot)
+    clean_pending_payload = pending_payload_from_snapshot(clean_snapshot)
+
+    assert dirty_turn.id == clean_turn.id
+    assert dirty_turn.fingerprint == clean_turn.fingerprint
+    assert dirty_pending.id == clean_pending.id
+    assert dirty_pending.fingerprint == clean_pending.fingerprint
+    assert turns_payload["content_fingerprint"] == clean_turns_payload["content_fingerprint"]
+    assert pending_payload["content_fingerprint"] == clean_pending_payload["content_fingerprint"]
+    assert dirty_turn.to_dict()["meta"] == clean_worker_meta
+    assert dirty_pending.to_dict()["meta"]["safe_attention"] == "kept"
+    assert "workerId" not in dirty_pending.to_dict()["meta"]
+    assert "space-id" not in dirty_pending.to_dict()["meta"]
+    assert dirty_pending.to_dict()["choices"][0]["params"] == {"safe_choice": "kept"}
+    assert turns_payload["host_id"] == "projector-pr5-host"
+    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
+    assert turns_payload["turns"][0]["space_id"] == "space-1"
+    assert turns_payload["turns"][0]["worker_fingerprint"] == clean_turn.worker_fingerprint
+    assert turns_payload["turns"][0]["origin_command_id"] == "cmd-public"
+    assert turns_payload["backend_health"][0]["name"] == "herdr"
+    assert pending_payload["pending_interactions"][0]["worker_id"] == "worker-1"
+    assert pending_payload["pending_interactions"][0]["space_id"] == "space-1"
+    assert pending_payload["pending_interactions"][0]["worker_fingerprint"] == clean_pending.worker_fingerprint
+    for payload in (
+        dirty_turn.to_dict(),
+        dirty_pending.to_dict(),
+        turns_payload,
+        pending_payload,
+        json.loads(payload_to_json(turns_payload)),
+        json.loads(payload_to_json(pending_payload)),
+    ):
+        _assert_no_forbidden_fields(payload)
+        _assert_no_private_sentinels(payload)
 
 
 def test_turn_and_pending_payload_fingerprints_ignore_wrapper_timestamps() -> None:
