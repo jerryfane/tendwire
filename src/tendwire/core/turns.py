@@ -162,6 +162,14 @@ def _clean_meta(value: Any) -> dict[str, Any]:
     return clean if isinstance(clean, dict) else {}
 
 
+def _normalized_key(value: Any) -> str:
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _compact_key(value: Any) -> str:
+    return _normalized_key(value).replace("_", "")
+
+
 def _strip_volatile(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -183,10 +191,25 @@ def _content_fingerprint(value: Any) -> str:
 
 
 def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
+    normalized_target = _normalized_key(normalized_key)
+    compact_target = normalized_target.replace("_", "")
     for key, value in meta.items():
-        if str(key).strip().lower().replace("-", "_") == normalized_key:
+        if _normalized_key(key) == normalized_target or _compact_key(key) == compact_target:
             return value
     return None
+
+
+def _optional_public_description(value: Any) -> str | None:
+    clean = sanitize_forbidden_fields(value)
+    if clean in ({}, []):
+        return None
+    if isinstance(clean, Mapping) or isinstance(clean, list):
+        return stable_json_dumps(clean)
+    return _optional_string(clean)
+
+
+def _is_pending_routing_meta_key(key: Any) -> bool:
+    return _compact_key(key) in {"workerid", "spaceid"}
 
 
 @dataclass(frozen=True)
@@ -201,7 +224,7 @@ class InteractionChoice:
 
     def __post_init__(self) -> None:
         label = _string_value(self.label)
-        description = _optional_string(self.description)
+        description = _optional_public_description(self.description)
         params = _clean_meta(self.params)
         value = sanitize_forbidden_fields(self.value)
         choice_id = _string_value(self.choice_id) or stable_fingerprint(
@@ -503,6 +526,7 @@ def turns_from_snapshot(snapshot: Snapshot) -> list[Turn]:
     """Derive deterministic public turns from public snapshot workers."""
     turns: list[Turn] = []
     for worker in snapshot.workers:
+        worker_meta = _clean_meta(worker.meta)
         turns.append(
             Turn(
                 host_id=snapshot.host_id,
@@ -516,7 +540,7 @@ def turns_from_snapshot(snapshot: Snapshot) -> list[Turn]:
                 updated_at=worker.last_seen_at,
                 source=f"worker:{worker.id}",
                 origin_command_id=_worker_origin_command_id(worker),
-                meta=worker.meta,
+                meta=worker_meta,
             )
         )
     return sorted(turns, key=lambda turn: (turn.id, turn.fingerprint))
@@ -590,6 +614,23 @@ def _pending_status_from_signal(signal: AttentionSignal) -> str:
     return "open"
 
 
+def _pending_public_meta_from_signal(signal: AttentionSignal) -> dict[str, Any]:
+    meta = _clean_meta(
+        {
+            "attention_id": signal.id,
+            "attention_kind": signal.kind,
+            "attention_severity": signal.severity,
+            "attention_status": signal.status,
+            "source": signal.source,
+        }
+    )
+    for key, value in _clean_meta(signal.meta).items():
+        if _is_pending_routing_meta_key(key):
+            continue
+        meta[str(key)] = value
+    return _clean_meta(meta)
+
+
 def pending_from_snapshot(snapshot: Snapshot) -> list[PendingInteraction]:
     """Derive deterministic public pending interactions from attention signals."""
     workers = {worker.id: worker for worker in snapshot.workers}
@@ -604,18 +645,7 @@ def pending_from_snapshot(snapshot: Snapshot) -> list[PendingInteraction]:
         space_id = _optional_string(_meta_value(signal.meta, "space_id"))
         if space_id is None and worker is not None:
             space_id = worker.space_id
-        meta = {
-            "attention_id": signal.id,
-            "attention_kind": signal.kind,
-            "attention_severity": signal.severity,
-            "attention_status": signal.status,
-            "source": signal.source,
-        }
-        for key, value in signal.meta.items():
-            normalized_key = str(key).strip().lower().replace("-", "_")
-            if normalized_key in {"worker_id", "space_id"}:
-                continue
-            meta[str(key)] = value
+        meta = _pending_public_meta_from_signal(signal)
         interactions.append(
             PendingInteraction(
                 host_id=snapshot.host_id,

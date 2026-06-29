@@ -18,6 +18,7 @@ from tendwire.core.models import (
     WorkerBinding,
     normalize_status,
     separate_duplicate_worker_bindings,
+    sanitize_forbidden_fields,
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
@@ -27,46 +28,199 @@ from tendwire.core.projector import project_empty, project_from_raw
 _FORBIDDEN_FIELDS = {
     "telegram",
     "chat_id",
+    "chat_ids",
     "topic_id",
+    "topic_ids",
     "message_id",
+    "message_ids",
     "thread_id",
+    "thread_ids",
     "token",
+    "tokens",
     "bot_token",
+    "bot_tokens",
+    "auth",
+    "auth_token",
+    "auth_tokens",
+    "authorization",
+    "authorization_header",
+    "authorization_headers",
+    "bearer_token",
+    "bearer_tokens",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
     "delivery",
+    "deliveries",
     "route",
+    "routes",
+    "connector",
+    "connectors",
     "herdres_delivery",
     "command",
+    "command_payload",
     "backend_target",
+    "backend_targets",
     "terminal_id",
+    "terminal_ids",
     "pane_id",
+    "pane_ids",
+    "tab_id",
+    "tab_ids",
+    "window_id",
+    "window_ids",
+    "tty",
+    "pty",
+    "pid",
+    "pids",
+    "process_id",
+    "process_ids",
+    "process",
+    "tmux",
+    "tmux_session",
+    "tmux_sessions",
+    "tmux_window",
+    "tmux_windows",
+    "tmux_pane",
+    "tmux_panes",
+    "screen",
+    "screen_session",
+    "screen_sessions",
+    "screen_window",
+    "screen_windows",
     "agent_session",
+    "agent_sessions",
     "session_id",
+    "session_ids",
     "herdr_state",
     "herdres_state",
     "target_kind",
     "target_value",
     "turn_target_kind",
     "turn_target_value",
+    "private",
+    "private_binding",
+    "private_bindings",
     "private_fingerprint",
+    "private_fingerprints",
     "argv",
+    "args",
     "env",
     "stderr",
     "stdout",
+    "stdin",
     "secret",
     "secrets",
     "password",
+    "passwords",
+    "api_keys",
     "api_key",
+    "raw_command",
+    "raw_payload",
+    "raw_control",
+    "terminal_control",
+    "control_sequence",
+    "escape_sequence",
+    "ansi_escape",
 }
+_FORBIDDEN_FIELD_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_FIELDS}
+
+
+def _is_forbidden_test_key(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return normalized in _FORBIDDEN_FIELDS or normalized.replace("_", "") in _FORBIDDEN_FIELD_COMPACT
 
 
 def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            assert key not in _FORBIDDEN_FIELDS, f"forbidden field {path}.{key}"
+            assert not _is_forbidden_test_key(key), f"forbidden field {path}.{key}"
             _assert_no_forbidden_fields(item, f"{path}.{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _assert_no_forbidden_fields(item, f"{path}[{index}]")
+
+
+def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
+    raw = {
+        "schema_version": 1,
+        "host_id": "host-public",
+        "worker_id": "worker-public",
+        "space_id": "space-public",
+        "worker_fingerprint": "worker-fp",
+        "id": "public-id",
+        "fingerprint": "public-fp",
+        "content_fingerprint": "content-fp",
+        "source": "snapshot",
+        "origin_command_id": "cmd-public",
+        "backend_health": [{"name": "herdr", "status": "healthy"}],
+        "safe": "kept",
+        "tty": "sentinel-tty",
+        "pty": "sentinel-pty",
+        "pid": "sentinel-pid",
+        "process_id": "sentinel-process",
+        "tmux": "sentinel-tmux",
+        "screen_session": "sentinel-screen",
+        "window_id": "sentinel-window",
+        "tab_id": "sentinel-tab",
+        "pane_id": "sentinel-pane",
+        "terminal_id": "sentinel-terminal",
+        "backend_target": "sentinel-backend",
+        "session_id": "sentinel-session",
+        "messageIds": "sentinel-message-ids",
+        "terminalIds": "sentinel-terminal-ids",
+        "terminal": "sentinel-terminal-object",
+        "telegramMessageId": "sentinel-telegram-message",
+        "routeId": "sentinel-route-id",
+        "connectorId": "sentinel-connector-id",
+        "tmuxPaneId": "sentinel-tmux-pane-id",
+        "screenWindowId": "sentinel-screen-window-id",
+        "agentSessionId": "sentinel-agent-session-id",
+        "session": "sentinel-session-object",
+        "privateFingerprints": "sentinel-private-fingerprints",
+        "passwords": "sentinel-passwords",
+        "nested": [
+            {
+                "safe_nested": "kept",
+                "processId": "sentinel-camel-process",
+                "tmux-session": "sentinel-kebab-tmux",
+                "terminalid": "sentinel-compact-terminal",
+                "backendTarget": "sentinel-camel-backend",
+                "screenSession": "sentinel-camel-screen",
+                "privateBinding": "sentinel-private-binding",
+                "telegramChatId": "sentinel-chat",
+                "authToken": "sentinel-auth",
+                "cookies": "sentinel-cookie",
+            }
+        ],
+        "tuple": (
+            {
+                "pane-id": "sentinel-kebab-pane",
+                "tabId": "sentinel-camel-tab",
+                "safe_tuple": "kept",
+            },
+        ),
+    }
+
+    sanitized = sanitize_forbidden_fields(raw)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    assert sanitized["host_id"] == "host-public"
+    assert sanitized["worker_id"] == "worker-public"
+    assert sanitized["space_id"] == "space-public"
+    assert sanitized["worker_fingerprint"] == "worker-fp"
+    assert sanitized["id"] == "public-id"
+    assert sanitized["fingerprint"] == "public-fp"
+    assert sanitized["content_fingerprint"] == "content-fp"
+    assert sanitized["source"] == "snapshot"
+    assert sanitized["origin_command_id"] == "cmd-public"
+    assert sanitized["backend_health"] == [{"name": "herdr", "status": "healthy"}]
+    assert sanitized["safe"] == "kept"
+    assert sanitized["nested"] == [{"safe_nested": "kept"}]
+    assert sanitized["tuple"] == [{"safe_tuple": "kept"}]
+    assert "sentinel-" not in encoded
+    _assert_no_forbidden_fields(sanitized)
 
 
 def _snapshot_payload(snapshot: Snapshot) -> dict[str, Any]:
