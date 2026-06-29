@@ -55,7 +55,15 @@ _FORBIDDEN_FIELDS = {
     "connectors",
     "herdres_delivery",
     "command",
+    "command_arg",
+    "command_args",
+    "command_argv",
+    "command_argvs",
+    "command_line",
+    "command_lines",
     "command_payload",
+    "command_text",
+    "command_texts",
     "backend_target",
     "backend_targets",
     "terminal_id",
@@ -103,6 +111,10 @@ _FORBIDDEN_FIELDS = {
     "argv",
     "args",
     "env",
+    "raw_arg",
+    "raw_args",
+    "raw_argv",
+    "raw_argvs",
     "stderr",
     "stdout",
     "stdin",
@@ -113,8 +125,12 @@ _FORBIDDEN_FIELDS = {
     "api_keys",
     "api_key",
     "raw_command",
+    "raw_command_line",
+    "raw_command_lines",
     "raw_payload",
     "raw_control",
+    "shell_command",
+    "shell_commands",
     "terminal_control",
     "control_sequence",
     "escape_sequence",
@@ -389,6 +405,83 @@ def test_turn_pending_and_choice_strip_pr5_private_fields_before_fingerprints() 
     _assert_no_private_sentinels(pending_payload)
 
 
+def test_turn_pending_recompute_supplied_ids_and_filter_raw_command_choice_values() -> None:
+    dirty_turn = Turn(
+        id="sentinel-private-turn-id",
+        fingerprint="sentinel-private-turn-fingerprint",
+        host_id="id-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        status="waiting",
+        kind="task",
+        source="worker:worker-1",
+        origin_command_id="cmd-public",
+        meta={"safe": "kept", "commandLine": "sentinel-command-line"},
+    )
+    clean_turn = Turn(
+        host_id="id-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        status="waiting",
+        kind="task",
+        source="worker:worker-1",
+        origin_command_id="cmd-public",
+        meta={"safe": "kept"},
+    )
+    dirty_choice = InteractionChoice(
+        label="Run diagnostic",
+        value="tendwire snapshot --json --token sentinel-choice-token",
+        params={"safe": "kept", "rawCommandLine": "sentinel-choice-command-line"},
+    )
+    clean_choice = InteractionChoice(
+        label="Run diagnostic",
+        params={"safe": "kept"},
+    )
+    dirty_pending = PendingInteraction(
+        id="sentinel-private-pending-id",
+        fingerprint="sentinel-private-pending-fingerprint",
+        host_id="id-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        kind="choice",
+        question="Choose next action",
+        choices=[dirty_choice],
+        meta={"source": "attention", "shellCommand": "sentinel-pending-shell-command"},
+    )
+    clean_pending = PendingInteraction(
+        host_id="id-host",
+        worker_id="worker-1",
+        worker_fingerprint="worker-fp",
+        space_id="space-1",
+        kind="choice",
+        question="Choose next action",
+        choices=[clean_choice],
+        meta={"source": "attention"},
+    )
+
+    turn_payload = dirty_turn.to_dict()
+    pending_payload = dirty_pending.to_dict()
+
+    assert dirty_turn.id == clean_turn.id
+    assert dirty_turn.fingerprint == clean_turn.fingerprint
+    assert turn_payload["id"] == clean_turn.id
+    assert turn_payload["fingerprint"] == clean_turn.fingerprint
+    assert dirty_choice.choice_id == clean_choice.choice_id
+    assert dirty_choice.to_dict() == clean_choice.to_dict()
+    assert dirty_pending.id == clean_pending.id
+    assert dirty_pending.fingerprint == clean_pending.fingerprint
+    assert pending_payload["id"] == clean_pending.id
+    assert pending_payload["fingerprint"] == clean_pending.fingerprint
+    assert "value" not in pending_payload["choices"][0]
+    _assert_no_forbidden_fields(turn_payload)
+    _assert_no_forbidden_fields(pending_payload)
+    _assert_no_private_sentinels(turn_payload)
+    _assert_no_private_sentinels(pending_payload)
+
+
 def test_turn_projection_from_snapshot_is_public_safe_and_timestamp_stable() -> None:
     config = Config(host_id="projection-host")
     snapshot = project_from_raw(
@@ -538,6 +631,69 @@ def test_pending_projection_reuses_public_suggested_actions_as_choices() -> None
     assert payload["meta"]["needs_human"] is True
     assert "term-private" not in json.dumps(payload)
     _assert_no_forbidden_fields(payload)
+
+
+def test_pending_projection_omits_raw_command_suggested_action_material_before_fingerprints() -> None:
+    def _snapshot(raw_command: str) -> Snapshot:
+        return Snapshot(
+            host_id="raw-command-choice-host",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id="worker-1",
+                    name="Worker One",
+                    status="waiting",
+                    space_id="space-1",
+                    summary="waiting for action",
+                )
+            ],
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    suggested_actions=[
+                        SuggestedAction(
+                            label="Run diagnostic",
+                            command=raw_command,
+                            params={
+                                "safe_choice": "kept",
+                                "commandLine": "sentinel-action-command-line",
+                            },
+                        )
+                    ],
+                    meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
+                    host_id="raw-command-choice-host",
+                )
+            ],
+        )
+
+    snapshot_a = _snapshot("tendwire snapshot --json --token sentinel-action-token-a")
+    snapshot_b = _snapshot("tendwire snapshot --json --token sentinel-action-token-b")
+    pending_a = pending_from_snapshot(snapshot_a)[0]
+    pending_b = pending_from_snapshot(snapshot_b)[0]
+    wrapper_a = pending_payload_from_snapshot(snapshot_a)
+    wrapper_b = pending_payload_from_snapshot(snapshot_b)
+    payload = pending_a.to_dict()
+
+    assert pending_a.id == pending_b.id
+    assert pending_a.fingerprint == pending_b.fingerprint
+    assert wrapper_a["content_fingerprint"] == wrapper_b["content_fingerprint"]
+    assert payload["kind"] == "choice"
+    assert payload["choices"] == [
+        {
+            "choice_id": pending_b.choices[0].choice_id,
+            "label": "Run diagnostic",
+            "params": {"safe_choice": "kept"},
+        }
+    ]
+    _assert_no_forbidden_fields(payload)
+    _assert_no_forbidden_fields(wrapper_a)
+    _assert_no_private_sentinels(payload)
+    _assert_no_private_sentinels(wrapper_a)
 
 
 def test_turn_pending_projectors_strip_pr5_metadata_and_keep_public_fingerprints_stable() -> None:

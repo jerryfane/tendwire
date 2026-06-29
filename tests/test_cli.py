@@ -11,7 +11,7 @@ from typing import Any
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
-from tendwire.core.models import Space, Worker
+from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
 from tendwire.store.sqlite import latest_snapshot, list_worker_bindings
 
 
@@ -49,6 +49,17 @@ _PUBLIC_JSON_FORBIDDEN_KEYS = {
     "deliveries",
     "connector",
     "connectors",
+    "command",
+    "command_args",
+    "command_argv",
+    "command_line",
+    "command_payload",
+    "command_text",
+    "raw_args",
+    "raw_argv",
+    "raw_command",
+    "raw_command_line",
+    "shell_command",
     "chat_id",
     "chat_ids",
     "topic_id",
@@ -236,6 +247,69 @@ def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeyp
     assert "pane-private" not in encoded_turns
     assert "agent-private" not in encoded_pending
     assert "pane-private" not in encoded_pending
+    assert "sentinel-cli-" not in encoded_turns
+    assert "sentinel-cli-" not in encoded_pending
+    _assert_no_public_json_forbidden(turns_payload)
+    _assert_no_public_json_forbidden(pending_payload)
+
+
+def test_cli_turns_and_pending_json_strip_raw_command_action_material(capsys, monkeypatch) -> None:
+    def _fake_snapshot(config):
+        return Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id="worker-1",
+                    name="Worker One",
+                    status="waiting",
+                    space_id="space-1",
+                    summary="waiting for action",
+                )
+            ],
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    suggested_actions=[
+                        SuggestedAction(
+                            command="tendwire snapshot --json --token sentinel-cli-command-token",
+                            params={"safe_choice": "kept", "commandLine": "sentinel-cli-command-line"},
+                        )
+                    ],
+                    meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
+                    host_id=config.host_id,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", _fake_snapshot)
+
+    turns_code = main(["--host-id", "raw-command-cli", "turns", "--json"])
+    turns_captured = capsys.readouterr()
+    pending_code = main(["--host-id", "raw-command-cli", "pending", "--json"])
+    pending_captured = capsys.readouterr()
+    turns_payload = json.loads(turns_captured.out)
+    pending_payload = json.loads(pending_captured.out)
+    encoded_turns = json.dumps(turns_payload, sort_keys=True)
+    encoded_pending = json.dumps(pending_payload, sort_keys=True)
+
+    assert turns_code == 0
+    assert pending_code == 0
+    assert turns_captured.err == ""
+    assert pending_captured.err == ""
+    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
+    assert pending_payload["pending_interactions"][0]["choices"] == [
+        {
+            "choice_id": pending_payload["pending_interactions"][0]["choices"][0]["choice_id"],
+            "label": "Action",
+            "params": {"safe_choice": "kept"},
+        }
+    ]
     assert "sentinel-cli-" not in encoded_turns
     assert "sentinel-cli-" not in encoded_pending
     _assert_no_public_json_forbidden(turns_payload)

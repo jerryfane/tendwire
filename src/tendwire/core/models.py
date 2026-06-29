@@ -204,15 +204,31 @@ FORBIDDEN_FIELD_NAMES = frozenset(
         "argv",
         "args",
         "command",
+        "command_arg",
+        "command_args",
+        "command_argv",
+        "command_argvs",
+        "command_line",
+        "command_lines",
         "command_payload",
         "command_payloads",
+        "command_text",
+        "command_texts",
         "env",
         "environment",
+        "raw_arg",
+        "raw_args",
+        "raw_argv",
+        "raw_argvs",
         "raw_command",
+        "raw_command_line",
+        "raw_command_lines",
         "raw_payload",
         "raw_payloads",
         "raw_control",
         "raw_controls",
+        "shell_command",
+        "shell_commands",
         "terminal_control",
         "terminal_controls",
         "control_sequence",
@@ -599,12 +615,11 @@ class SuggestedAction:
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
-        raw_command = data.get("command") if isinstance(data, Mapping) else None
         clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
-            tendwire_action=_string_value(clean.get("tendwire_action", raw_command)),
+            tendwire_action=_string_value(clean.get("tendwire_action")),
             params=clean.get("params", {}),
         )
 

@@ -59,7 +59,15 @@ _FORBIDDEN_FIELDS = {
     "connectors",
     "herdres_delivery",
     "command",
+    "command_arg",
+    "command_args",
+    "command_argv",
+    "command_argvs",
+    "command_line",
+    "command_lines",
     "command_payload",
+    "command_text",
+    "command_texts",
     "backend_target",
     "backend_targets",
     "terminal_id",
@@ -107,6 +115,10 @@ _FORBIDDEN_FIELDS = {
     "argv",
     "args",
     "env",
+    "raw_arg",
+    "raw_args",
+    "raw_argv",
+    "raw_argvs",
     "stderr",
     "stdout",
     "stdin",
@@ -117,8 +129,12 @@ _FORBIDDEN_FIELDS = {
     "api_keys",
     "api_key",
     "raw_command",
+    "raw_command_line",
+    "raw_command_lines",
     "raw_payload",
     "raw_control",
+    "shell_command",
+    "shell_commands",
     "terminal_control",
     "control_sequence",
     "escape_sequence",
@@ -156,6 +172,8 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
         "origin_command_id": "cmd-public",
         "backend_health": [{"name": "herdr", "status": "healthy"}],
         "safe": "kept",
+        "commandLine": "sentinel-command-line",
+        "command-text": "sentinel-command-text",
         "tty": "sentinel-tty",
         "pty": "sentinel-pty",
         "pid": "sentinel-pid",
@@ -192,12 +210,15 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
                 "telegramChatId": "sentinel-chat",
                 "authToken": "sentinel-auth",
                 "cookies": "sentinel-cookie",
+                "shellCommand": "sentinel-shell-command",
+                "rawArgs": "sentinel-raw-args",
             }
         ],
         "tuple": (
             {
                 "pane-id": "sentinel-kebab-pane",
                 "tabId": "sentinel-camel-tab",
+                "raw-command-line": "sentinel-raw-command-line",
                 "safe_tuple": "kept",
             },
         ),
@@ -221,6 +242,25 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
     assert sanitized["tuple"] == [{"safe_tuple": "kept"}]
     assert "sentinel-" not in encoded
     _assert_no_forbidden_fields(sanitized)
+
+
+def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -> None:
+    action = SuggestedAction.from_dict(
+        {
+            "label": "Run raw command",
+            "command": "tendwire snapshot --json --token sentinel-command-token",
+            "params": {"safe": "kept", "commandLine": "sentinel-command-line"},
+        }
+    )
+
+    payload = action.to_dict()
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert payload["label"] == "Run raw command"
+    assert payload["tendwire_action"] == ""
+    assert payload["params"] == {"safe": "kept"}
+    assert "sentinel-" not in encoded
+    _assert_no_forbidden_fields(payload)
 
 
 def _snapshot_payload(snapshot: Snapshot) -> dict[str, Any]:
