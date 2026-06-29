@@ -18,6 +18,7 @@ from ..core.models import (
     SCHEMA_VERSION,
     Snapshot,
     WorkerBinding,
+    separate_duplicate_worker_bindings,
     stable_fingerprint,
     stable_json_dumps,
     utc_timestamp,
@@ -419,7 +420,10 @@ def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> 
     changed backend target updates the private routing record while preserving
     the public worker identity associated with that private Herdr identity.
     """
-    binding_list = [binding if isinstance(binding, WorkerBinding) else WorkerBinding(**binding) for binding in bindings]
+    binding_list = separate_duplicate_worker_bindings(
+        binding if isinstance(binding, WorkerBinding) else WorkerBinding(**binding)
+        for binding in bindings
+    )
     if not binding_list:
         return 0
     _ensure_dir(db_path)

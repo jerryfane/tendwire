@@ -20,7 +20,7 @@ from tendwire.core.commands import (
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
 )
-from tendwire.core.models import WorkerBinding
+from tendwire.core.models import Worker, WorkerBinding, worker_binding_private_fingerprint
 from tendwire.core.projector import project_from_observations
 
 
@@ -611,6 +611,139 @@ def test_duplicate_backend_targets_mark_bindings_unsendable(monkeypatch) -> None
     assert all(binding.target_value == "same-send" for binding in bindings)
     assert all(binding.sendable is False for binding in bindings)
     assert all(binding.reason == "duplicate_backend_target" for binding in bindings)
+    assert len({binding.private_fingerprint for binding in bindings}) == 2
+
+
+def test_bindings_from_workers_marks_duplicate_targets_unsendable() -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    workers = [
+        Worker(
+            id="public-a",
+            name="A",
+            status="active",
+            backend_target={"kind": "agent_id", "value": "same-agent", "sendable": True, "reason": None},
+        ),
+        Worker(
+            id="public-b",
+            name="B",
+            status="active",
+            backend_target={"kind": "agent_id", "value": "same-agent", "sendable": True, "reason": None},
+        ),
+    ]
+
+    bindings = herdr_cli.bindings_from_workers(config, workers, observed_at="2026-01-01T00:00:00+00:00")
+
+    assert len(bindings) == 2
+    assert {binding.worker_id for binding in bindings} == {"public-a", "public-b"}
+    assert {binding.sendable for binding in bindings} == {False}
+    assert {binding.reason for binding in bindings} == {"duplicate_backend_target"}
+
+
+def test_duplicate_private_identity_bindings_stay_separate_across_reobserve(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-a",
+                        "agent_id": "same-agent",
+                        "agent": "A",
+                        "workspace_id": "ws-1",
+                    },
+                    {
+                        "worker_id": "public-b",
+                        "agent_id": "same-agent",
+                        "agent": "B",
+                        "workspace_id": "ws-1",
+                    },
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    _spaces, workers, bindings = fetch_herdr_state(config, include_bindings=True)
+    _spaces2, workers2, bindings2 = fetch_herdr_state(
+        config,
+        stored_bindings=bindings,
+        include_bindings=True,
+    )
+
+    assert {worker.id for worker in workers} == {"public-a", "public-b"}
+    assert {worker.id for worker in workers2} == {"public-a", "public-b"}
+    assert len(bindings) == 2
+    assert len(bindings2) == 2
+    assert {binding.sendable for binding in bindings} == {False}
+    assert {binding.reason for binding in bindings} == {"duplicate_backend_target"}
+    assert len({binding.private_fingerprint for binding in bindings}) == 2
+    assert {binding.private_fingerprint for binding in bindings2} == {
+        binding.private_fingerprint for binding in bindings
+    }
+
+
+def test_legacy_collapsed_private_identity_does_not_rewrite_duplicate_public_ids(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    original_private = worker_binding_private_fingerprint(
+        host_id="testhost",
+        backend="herdr",
+        identity_material={
+            "agent_id": "same-agent",
+            "agent_session": None,
+            "session_id": None,
+            "space_id": "ws-1",
+        },
+    )
+    stored = [
+        WorkerBinding(
+            host_id="testhost",
+            worker_id="collapsed-public",
+            worker_fingerprint="collapsed-fp",
+            backend="herdr",
+            target_kind="agent_id",
+            target_value="same-agent",
+            sendable=True,
+            reason=None,
+            observed_at="2026-01-01T00:00:00+00:00",
+            expires_at="2026-01-02T00:00:00+00:00",
+            private_fingerprint=original_private,
+        )
+    ]
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-a",
+                        "agent_id": "same-agent",
+                        "agent": "A",
+                        "workspace_id": "ws-1",
+                    },
+                    {
+                        "worker_id": "public-b",
+                        "agent_id": "same-agent",
+                        "agent": "B",
+                        "workspace_id": "ws-1",
+                    },
+                ]
+            }
+        },
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    _spaces, workers, bindings = fetch_herdr_state(
+        config,
+        stored_bindings=stored,
+        include_bindings=True,
+    )
+
+    assert {worker.id for worker in workers} == {"public-a", "public-b"}
+    assert "collapsed-public" not in {binding.worker_id for binding in bindings}
+    assert len({binding.private_fingerprint for binding in bindings}) == 2
 
 
 def test_duplicate_final_send_tokens_across_backend_kinds_are_not_sendable(monkeypatch) -> None:

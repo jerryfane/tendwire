@@ -26,6 +26,7 @@ from ..core.models import (
     Worker,
     WorkerBinding,
     normalize_status,
+    separate_duplicate_worker_bindings,
     stable_fingerprint,
     utc_timestamp,
     worker_binding_private_fingerprint,
@@ -34,6 +35,7 @@ from ..core.models import (
 
 _HERDR_TIMEOUT_SECONDS = 5.0
 _BACKEND_NAME = "herdr"
+_AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -868,6 +870,10 @@ def _binding_target_key(binding: WorkerBinding) -> tuple[str, str]:
     return (binding.target_kind, binding.target_value)
 
 
+def _safe_stored_binding_for_reuse(binding: WorkerBinding) -> bool:
+    return bool(binding.worker_id) and (binding.reason or "") not in _AMBIGUOUS_BINDING_REASONS
+
+
 def _worker_target_key(worker: Worker) -> tuple[str, str] | None:
     target = worker.backend_target
     if not isinstance(target, Mapping):
@@ -887,16 +893,18 @@ def _reuse_worker_ids_from_bindings(
     if not stored_bindings:
         return records
 
-    by_private: dict[str, WorkerBinding] = {}
+    by_private: dict[str, list[WorkerBinding]] = {}
     by_target: dict[tuple[str, str], list[WorkerBinding]] = {}
     for binding in stored_bindings:
         if binding.backend != _BACKEND_NAME:
             continue
-        by_private[binding.private_fingerprint] = binding
-        key = _binding_target_key(binding)
-        if key[0] and key[1]:
-            by_target.setdefault(key, []).append(binding)
+        by_private.setdefault(binding.private_fingerprint, []).append(binding)
+        if _safe_stored_binding_for_reuse(binding):
+            key = _binding_target_key(binding)
+            if key[0] and key[1]:
+                by_target.setdefault(key, []).append(binding)
 
+    current_private_counts = Counter(private_fingerprint for _worker, private_fingerprint in records)
     current_target_counts = Counter(
         key
         for key in (_worker_target_key(worker) for worker, _identity in records)
@@ -905,7 +913,14 @@ def _reuse_worker_ids_from_bindings(
 
     reused: list[tuple[Worker, str]] = []
     for worker, private_fingerprint in records:
-        matched = by_private.get(private_fingerprint)
+        matched = None
+        private_candidates = [
+            binding
+            for binding in by_private.get(private_fingerprint, [])
+            if _safe_stored_binding_for_reuse(binding)
+        ]
+        if current_private_counts[private_fingerprint] == 1 and len(private_candidates) == 1:
+            matched = private_candidates[0]
         if matched is None:
             key = _worker_target_key(worker)
             candidates = by_target.get(key or ("", ""), [])
@@ -1031,7 +1046,7 @@ def _workers_and_bindings_from_records(
         for worker, private_fingerprint in deduplicated
         if (binding := _binding_from_worker_record(config, worker, private_fingerprint, observed_at)) is not None
     ]
-    return workers, bindings
+    return workers, separate_duplicate_worker_bindings(bindings)
 
 
 def bindings_from_workers(
@@ -1042,6 +1057,7 @@ def bindings_from_workers(
 ) -> list[WorkerBinding]:
     """Build private Herdr bindings from in-memory workers when raw records are absent."""
     timestamp = observed_at or utc_timestamp()
+    workers = _mark_backend_sendability(list(workers))
     bindings: list[WorkerBinding] = []
     for worker in workers:
         target = worker.backend_target
@@ -1064,7 +1080,7 @@ def bindings_from_workers(
         binding = _binding_from_worker_record(config, worker, private_fingerprint, timestamp)
         if binding is not None:
             bindings.append(binding)
-    return bindings
+    return separate_duplicate_worker_bindings(bindings)
 
 
 def _binding_for_worker(worker: Worker, bindings: Sequence[WorkerBinding]) -> WorkerBinding | None:
@@ -1091,12 +1107,14 @@ def rehydrate_workers_from_bindings(
     stored = list(stored_bindings or [])
     rehydrated: list[Worker] = []
     for worker in workers:
+        binding = _binding_for_worker(worker, current)
+        if binding is not None:
+            rehydrated.append(_worker_with_backend_target(worker, binding.backend_target()))
+            continue
         if isinstance(worker.backend_target, Mapping):
             rehydrated.append(worker)
             continue
-        binding = _binding_for_worker(worker, current)
-        if binding is None:
-            binding = _binding_for_worker(worker, stored)
+        binding = _binding_for_worker(worker, stored)
         if binding is None:
             rehydrated.append(worker)
         else:

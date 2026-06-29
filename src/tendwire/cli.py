@@ -32,7 +32,7 @@ from .core.commands import (
     validate_request,
 )
 from .core.projector import project_from_observations
-from .core.models import WorkerBinding
+from .core.models import WorkerBinding, separate_duplicate_worker_bindings
 from .store.sqlite import (
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
@@ -183,9 +183,10 @@ def _persist_binding_observation(
     *,
     observed_at: str,
     workers_present: bool,
-) -> None:
+) -> list[WorkerBinding]:
+    bindings = separate_duplicate_worker_bindings(bindings)
     if config.db_path is None:
-        return
+        return bindings
     if bindings:
         upsert_worker_bindings(config.db_path, bindings)
     if bindings or not workers_present:
@@ -196,6 +197,7 @@ def _persist_binding_observation(
             current_private_fingerprints=[binding.private_fingerprint for binding in bindings],
             now=observed_at,
         )
+    return bindings
 
 
 def cmd_snapshot(
@@ -219,7 +221,7 @@ def cmd_snapshot(
         if config.db_path is None:
             raise RuntimeError("snapshot persistence requires a db path")
         save_snapshot(config.db_path, snapshot)
-        _persist_binding_observation(
+        bindings = _persist_binding_observation(
             config,
             bindings,
             observed_at=snapshot.updated_at,
@@ -400,7 +402,7 @@ def cmd_command(
             return 0 if observation_error.ok else 1
         spaces, workers = observation.spaces, observation.workers
         current_bindings = list(getattr(observation, "bindings", []) or [])
-        _persist_binding_observation(
+        current_bindings = _persist_binding_observation(
             config,
             current_bindings,
             observed_at=current_bindings[0].observed_at if current_bindings else "",

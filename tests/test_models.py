@@ -16,6 +16,7 @@ from tendwire.core.models import (
     Worker,
     WorkerBinding,
     normalize_status,
+    separate_duplicate_worker_bindings,
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
@@ -257,6 +258,62 @@ def test_worker_binding_is_private_and_not_snapshot_serialized() -> None:
     assert "pane-private" not in encoded
     assert private_fingerprint not in encoded
     _assert_no_forbidden_fields(payload)
+
+
+def test_separate_duplicate_worker_bindings_splits_colliding_private_identities() -> None:
+    binding_a = WorkerBinding(
+        host_id="host-a",
+        worker_id="public-a",
+        worker_fingerprint="worker-fp-a",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="same-agent",
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        private_fingerprint="colliding-private",
+    )
+    binding_b = WorkerBinding(
+        host_id="host-a",
+        worker_id="public-b",
+        worker_fingerprint="worker-fp-b",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="same-agent",
+        turn_target_kind="pane_id",
+        turn_target_value="pane-b",
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        private_fingerprint="colliding-private",
+    )
+
+    separated = separate_duplicate_worker_bindings([binding_a, binding_b])
+    separated_again = separate_duplicate_worker_bindings(separated)
+
+    assert separated == separated_again
+    assert {binding.worker_id for binding in separated} == {"public-a", "public-b"}
+    assert {binding.sendable for binding in separated} == {False}
+    assert {binding.reason for binding in separated} == {"duplicate_backend_target"}
+    assert "colliding-private" not in {binding.private_fingerprint for binding in separated}
+    assert len({binding.private_fingerprint for binding in separated}) == 2
+
+
+def test_separate_duplicate_worker_bindings_leaves_single_private_identity_unchanged() -> None:
+    binding = WorkerBinding(
+        host_id="host-a",
+        worker_id="public-a",
+        worker_fingerprint="worker-fp-a",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="agent-a",
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        private_fingerprint="private-a",
+    )
+
+    assert separate_duplicate_worker_bindings([binding]) == [binding]
 
 
 def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() -> None:

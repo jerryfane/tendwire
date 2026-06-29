@@ -817,3 +817,87 @@ class WorkerBinding:
             "sendable": self.sendable,
             "reason": self.reason,
         }
+
+
+def _worker_binding_duplicate_group_key(binding: WorkerBinding) -> tuple[str, str, str]:
+    return (binding.host_id, binding.backend, binding.private_fingerprint)
+
+
+def _worker_binding_private_row_key(
+    binding: WorkerBinding,
+) -> tuple[str, str, str, str, str | None, str | None]:
+    return (
+        binding.worker_id,
+        binding.worker_fingerprint,
+        binding.target_kind,
+        binding.target_value,
+        binding.turn_target_kind,
+        binding.turn_target_value,
+    )
+
+
+def _duplicate_worker_binding_private_fingerprint(binding: WorkerBinding) -> str:
+    return worker_binding_private_fingerprint(
+        host_id=binding.host_id,
+        backend=binding.backend,
+        identity_material={
+            "duplicate_backend_target": True,
+            "original_private_fingerprint": binding.private_fingerprint,
+            "worker_id": binding.worker_id,
+            "worker_fingerprint": binding.worker_fingerprint,
+            "target_kind": binding.target_kind,
+            "target_value": binding.target_value,
+            "turn_target_kind": binding.turn_target_kind,
+            "turn_target_value": binding.turn_target_value,
+            "host_id": binding.host_id,
+            "backend": binding.backend,
+        },
+    )
+
+
+def _duplicate_separated_worker_binding(binding: WorkerBinding) -> WorkerBinding:
+    private_fingerprint = _duplicate_worker_binding_private_fingerprint(binding)
+    if (
+        binding.private_fingerprint == private_fingerprint
+        and binding.sendable is False
+        and binding.reason == "duplicate_backend_target"
+    ):
+        return binding
+    return WorkerBinding(
+        host_id=binding.host_id,
+        worker_id=binding.worker_id,
+        worker_fingerprint=binding.worker_fingerprint,
+        backend=binding.backend,
+        target_kind=binding.target_kind,
+        target_value=binding.target_value,
+        turn_target_kind=binding.turn_target_kind,
+        turn_target_value=binding.turn_target_value,
+        sendable=False,
+        reason="duplicate_backend_target",
+        observed_at=binding.observed_at,
+        expires_at=binding.expires_at,
+        private_fingerprint=private_fingerprint,
+    )
+
+
+def separate_duplicate_worker_bindings(bindings: Iterable[WorkerBinding]) -> list[WorkerBinding]:
+    """Split colliding private binding identities into unsendable private rows."""
+    binding_list = list(bindings)
+    groups: dict[tuple[str, str, str], list[WorkerBinding]] = {}
+    for binding in binding_list:
+        groups.setdefault(_worker_binding_duplicate_group_key(binding), []).append(binding)
+
+    duplicate_keys = {
+        key
+        for key, group in groups.items()
+        if len({_worker_binding_private_row_key(binding) for binding in group}) > 1
+    }
+    if not duplicate_keys:
+        return binding_list
+
+    return [
+        _duplicate_separated_worker_binding(binding)
+        if _worker_binding_duplicate_group_key(binding) in duplicate_keys
+        else binding
+        for binding in binding_list
+    ]

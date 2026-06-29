@@ -26,7 +26,7 @@ from tendwire.core.commands import (
     CommandRequest,
 )
 from tendwire.core.models import Space, Worker, WorkerBinding
-from tendwire.store.sqlite import get_command_receipt, upsert_worker_bindings
+from tendwire.store.sqlite import get_command_receipt, list_worker_bindings, upsert_worker_bindings
 
 
 def _fake_herdr_state(config: Any) -> tuple[list[Space], list[Worker]]:
@@ -436,6 +436,178 @@ def test_cli_command_does_not_send_through_expired_stored_binding(
     assert payload["status"] == STATUS_BACKEND_UNSUPPORTED
     assert calls == []
     assert "agent-expired" not in json.dumps(payload)
+    _assert_no_command_public_forbidden_fields(payload)
+
+
+def test_cli_command_duplicate_current_binding_is_ambiguous_and_not_expired(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "current-duplicates.db"
+    calls: list[tuple[Any, Any]] = []
+
+    def duplicate_observation(config: Any) -> HerdrCommandObservation:
+        worker_a = Worker(
+            id="dup-a",
+            name="Duplicate A",
+            status="active",
+            backend_target={"kind": "agent_id", "value": "same-agent", "sendable": True, "reason": None},
+        )
+        worker_b = Worker(
+            id="dup-b",
+            name="Duplicate B",
+            status="active",
+            backend_target={"kind": "agent_id", "value": "same-agent", "sendable": True, "reason": None},
+        )
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[worker_a, worker_b],
+            status="healthy",
+            outcome="healthy_non_empty",
+            bindings=[
+                WorkerBinding(
+                    host_id="cmd-host",
+                    worker_id=worker_a.id,
+                    worker_fingerprint=worker_a.fingerprint,
+                    backend="herdr",
+                    target_kind="agent_id",
+                    target_value="same-agent",
+                    sendable=False,
+                    reason="duplicate_backend_target",
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    private_fingerprint="colliding-private",
+                ),
+                WorkerBinding(
+                    host_id="cmd-host",
+                    worker_id=worker_b.id,
+                    worker_fingerprint=worker_b.fingerprint,
+                    backend="herdr",
+                    target_kind="agent_id",
+                    target_value="same-agent",
+                    sendable=False,
+                    reason="duplicate_backend_target",
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    private_fingerprint="colliding-private",
+                ),
+            ],
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", duplicate_observation)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "current-duplicate",
+                    "dry_run": False,
+                    "target": {"worker_id": "dup-a"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
+
+    assert code == 1
+    assert payload["status"] == STATUS_AMBIGUOUS_BACKEND_TARGET
+    assert calls == []
+    assert len(current) == 2
+    assert {binding.reason for binding in current} == {"duplicate_backend_target"}
+    assert "colliding-private" not in {binding.private_fingerprint for binding in current}
+    assert len({binding.private_fingerprint for binding in current}) == 2
+    _assert_no_command_public_forbidden_fields(payload)
+
+
+def test_cli_command_stored_duplicate_binding_is_ambiguous_and_skips_backend(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stored-duplicate.db"
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id="cmd-host",
+                worker_id="dup-stored",
+                worker_fingerprint="old-fp",
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="same-agent",
+                sendable=False,
+                reason="duplicate_backend_target",
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="stored-duplicate",
+            )
+        ],
+    )
+    calls: list[tuple[Any, Any]] = []
+
+    def targetless_observation(config: Any) -> HerdrCommandObservation:
+        return HerdrCommandObservation(
+            spaces=[],
+            workers=[Worker(id="dup-stored", name="Duplicate", status="active", space_id="s-1")],
+            status="healthy",
+            outcome="healthy_non_empty",
+        )
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "stored-duplicate",
+                    "dry_run": False,
+                    "target": {"worker_id": "dup-stored"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--herdr-bin",
+            "herdr",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert payload["status"] == STATUS_AMBIGUOUS_BACKEND_TARGET
+    assert calls == []
+    assert "same-agent" not in json.dumps(payload)
     _assert_no_command_public_forbidden_fields(payload)
 
 

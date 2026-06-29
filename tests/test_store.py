@@ -281,6 +281,39 @@ def test_store_worker_bindings_allow_duplicate_targets_and_expire_stale(tmp_path
     assert [binding.private_fingerprint for binding in remaining] == ["priv-a"]
 
 
+def test_store_upsert_separates_colliding_duplicate_private_fingerprints(tmp_path: Path) -> None:
+    db_path = tmp_path / "colliding-bindings.db"
+    binding_a = _worker_binding(
+        worker_id="worker-a",
+        worker_fingerprint="fp-a",
+        target_value="same-agent",
+        private_fingerprint="colliding-private",
+    )
+    binding_b = _worker_binding(
+        worker_id="worker-b",
+        worker_fingerprint="fp-b",
+        target_value="same-agent",
+        private_fingerprint="colliding-private",
+    )
+
+    assert upsert_worker_bindings(db_path, [binding_a, binding_b]) == 2
+
+    current = list_worker_bindings(db_path, "host-a", backend="herdr", now="2026-01-01T00:30:00+00:00")
+    assert len(current) == 2
+    assert {binding.worker_id for binding in current} == {"worker-a", "worker-b"}
+    assert {binding.sendable for binding in current} == {False}
+    assert {binding.reason for binding in current} == {"duplicate_backend_target"}
+    assert "colliding-private" not in {binding.private_fingerprint for binding in current}
+    assert len({binding.private_fingerprint for binding in current}) == 2
+    assert resolve_worker_binding(
+        db_path,
+        "host-a",
+        "worker-a",
+        backend="herdr",
+        now="2026-01-01T00:30:00+00:00",
+    ) is None
+
+
 def test_store_snapshot_payload_does_not_contain_private_worker_bindings(tmp_path: Path) -> None:
     db_path = tmp_path / "payload-clean.db"
     config = Config(host_id="host-a", db_path=db_path)
