@@ -15,7 +15,9 @@ from .backends.herdr_cli import (
     bindings_from_workers,
     diagnose_herdr,
     fetch_herdr_command_observation,
+    fetch_herdr_snapshot_observation,
     fetch_herdr_state,
+    herdr_backend_health,
     rehydrate_workers_from_bindings,
 )
 from .backends.herdr_command import send_instruction as herdr_send_instruction
@@ -32,7 +34,7 @@ from .core.commands import (
     validate_request,
 )
 from .core.projector import project_from_observations
-from .core.models import WorkerBinding, separate_duplicate_worker_bindings
+from .core.models import BackendHealth, WorkerBinding, separate_duplicate_worker_bindings, utc_timestamp
 from .store.sqlite import (
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
@@ -44,6 +46,7 @@ from .store.sqlite import (
 
 
 _HERDR_BACKEND = "herdr"
+_DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -161,6 +164,41 @@ def _fetch_state_with_bindings(
     return spaces, workers, bindings_from_workers(config, workers)
 
 
+def _legacy_backend_health(spaces: list[Any], workers: list[Any]) -> list[BackendHealth]:
+    return [
+        herdr_backend_health(
+            "healthy_non_empty" if spaces or workers else "unknown",
+            spaces=spaces,
+            workers=workers,
+        )
+    ]
+
+
+def _fetch_snapshot_observation_with_bindings(
+    config: Config,
+    stored_bindings: list[WorkerBinding],
+) -> tuple[list[Any], list[Any], list[WorkerBinding], list[BackendHealth]]:
+    if fetch_herdr_state is not _DEFAULT_FETCH_HERDR_STATE:
+        spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
+        return spaces, workers, bindings, _legacy_backend_health(spaces, workers)
+    try:
+        observation = fetch_herdr_snapshot_observation(
+            config,
+            stored_bindings=stored_bindings,
+        )
+    except TypeError:
+        spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
+        return spaces, workers, bindings, _legacy_backend_health(spaces, workers)
+
+    spaces = list(getattr(observation, "spaces", []) or [])
+    workers = list(getattr(observation, "workers", []) or [])
+    bindings = list(getattr(observation, "bindings", []) or [])
+    backend_health = list(getattr(observation, "backend_health", []) or [])
+    if not backend_health:
+        backend_health = _legacy_backend_health(spaces, workers)
+    return spaces, workers, bindings, backend_health
+
+
 def _fetch_command_observation_with_bindings(
     config: Config,
     stored_bindings: list[WorkerBinding],
@@ -174,7 +212,48 @@ def _fetch_command_observation_with_bindings(
         object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
     elif not bindings:
         object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
+    backend_health = getattr(observation, "backend_health", None)
+    if backend_health is None or not backend_health:
+        object.__setattr__(
+            observation,
+            "backend_health",
+            [
+                herdr_backend_health(
+                    getattr(observation, "outcome", "unknown"),
+                    message=getattr(observation, "message", "") or None,
+                    spaces=getattr(observation, "spaces", []) or [],
+                    workers=getattr(observation, "workers", []) or [],
+                )
+            ],
+        )
     return observation
+
+
+def _herdr_health_from_items(items: list[BackendHealth]) -> BackendHealth:
+    for item in items:
+        if getattr(item, "name", "") == _HERDR_BACKEND:
+            return item
+    return herdr_backend_health("unknown")
+
+
+def _observation_health(observation: Any) -> BackendHealth:
+    health = getattr(observation, "health", None)
+    if isinstance(health, BackendHealth):
+        return health
+    items = getattr(observation, "backend_health", None)
+    if items:
+        return _herdr_health_from_items(list(items))
+    return herdr_backend_health(
+        getattr(observation, "outcome", "unknown"),
+        message=getattr(observation, "message", "") or None,
+        spaces=getattr(observation, "spaces", []) or [],
+        workers=getattr(observation, "workers", []) or [],
+    )
+
+
+def _health_observed_at(backend_health: list[BackendHealth]) -> str:
+    health = _herdr_health_from_items(backend_health)
+    return health.observed_at or utc_timestamp()
 
 
 def _persist_binding_observation(
@@ -183,13 +262,14 @@ def _persist_binding_observation(
     *,
     observed_at: str,
     workers_present: bool,
+    authoritative: bool = True,
 ) -> list[WorkerBinding]:
     bindings = separate_duplicate_worker_bindings(bindings)
     if config.db_path is None:
         return bindings
     if bindings:
         upsert_worker_bindings(config.db_path, bindings)
-    if bindings or not workers_present:
+    if authoritative and (bindings or not workers_present):
         expire_stale_worker_bindings(
             config.db_path,
             config.host_id,
@@ -208,11 +288,15 @@ def cmd_snapshot(
 ) -> int:
     """Build and print a neutral snapshot."""
     stored_bindings = _load_worker_bindings(config) if store_snapshot else []
-    spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
+    spaces, workers, bindings, backend_health = _fetch_snapshot_observation_with_bindings(
+        config,
+        stored_bindings,
+    )
     snapshot = project_from_observations(
         config,
         spaces=spaces,
         workers=workers,
+        backend_health=backend_health,
     )
 
     if store_snapshot:
@@ -226,6 +310,7 @@ def cmd_snapshot(
             bindings,
             observed_at=snapshot.updated_at,
             workers_present=bool(workers),
+            authoritative=_herdr_health_from_items(backend_health).status == "healthy",
         )
 
     if json_output:
@@ -338,21 +423,23 @@ def _command_observation_error(request: Any, observation: Any) -> CommandEnvelop
         return None
     if request.action != "send_instruction" or request.dry_run:
         return None
-    if observation.healthy:
+    health = _observation_health(observation)
+    if getattr(observation, "healthy", False) and health.status == "healthy":
         return None
-    if observation.status == "unavailable":
+    message = health.message or getattr(observation, "message", "")
+    if health.status == "unavailable" or getattr(observation, "status", "") == "unavailable":
         return CommandEnvelope.error(
             request,
             error_value(
                 STATUS_BACKEND_UNAVAILABLE,
-                observation.message or "Herdr backend is unavailable",
+                message or "Herdr backend is unavailable",
             ),
         )
     return CommandEnvelope.error(
         request,
         error_value(
             STATUS_REQUEST_STATE_UNCERTAIN,
-            observation.message or "Herdr observation state is uncertain",
+            message or "Herdr observation state is uncertain",
         ),
     )
 
@@ -400,13 +487,15 @@ def cmd_command(
             _save_command_receipt(config, request, observation_error)
             print(observation_error.to_json(indent=2))
             return 0 if observation_error.ok else 1
+        backend_health = list(getattr(observation, "backend_health", []) or [])
         spaces, workers = observation.spaces, observation.workers
         current_bindings = list(getattr(observation, "bindings", []) or [])
         current_bindings = _persist_binding_observation(
             config,
             current_bindings,
-            observed_at=current_bindings[0].observed_at if current_bindings else "",
+            observed_at=current_bindings[0].observed_at if current_bindings else _health_observed_at(backend_health),
             workers_present=bool(workers),
+            authoritative=_observation_health(observation).status == "healthy",
         )
         stored_after_refresh = _load_worker_bindings(config)
         workers = rehydrate_workers_from_bindings(
@@ -416,7 +505,10 @@ def cmd_command(
         )
     else:
         stored_bindings = _load_worker_bindings(config)
-        spaces, workers, current_bindings = _fetch_state_with_bindings(config, stored_bindings)
+        spaces, workers, current_bindings, backend_health = _fetch_snapshot_observation_with_bindings(
+            config,
+            stored_bindings,
+        )
         workers = rehydrate_workers_from_bindings(
             workers,
             current_bindings,
@@ -426,6 +518,7 @@ def cmd_command(
         config,
         spaces=spaces,
         workers=workers,
+        backend_health=backend_health,
     )
 
     def backend_sender(target: dict[str, Any], instruction: dict[str, Any]) -> CommandEnvelope:

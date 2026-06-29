@@ -170,4 +170,5 @@ def update_snapshot_attention(snapshot: Snapshot) -> Snapshot:
         spaces=list(snapshot.spaces),
         workers=list(snapshot.workers),
         attention=attention_from_snapshot(snapshot),
+        backend_health=list(snapshot.backend_health),
     )

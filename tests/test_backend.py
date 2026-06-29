@@ -49,6 +49,11 @@ _FORBIDDEN_FIELDS = {
     "private_fingerprint",
     "argv",
     "command",
+    "env",
+    "stderr",
+    "stdout",
+    "secret",
+    "secrets",
     "shell",
     "connector",
     "connectors",
@@ -830,6 +835,108 @@ def test_fetch_herdr_command_observation_reports_healthy_empty(monkeypatch) -> N
     assert observation.healthy is True
     assert observation.outcome == "empty_healthy"
     assert observation.workers == []
+    assert observation.backend_health[0].name == "herdr"
+    assert observation.backend_health[0].status == "healthy"
+    assert observation.backend_health[0].outcome == "empty_healthy"
+    assert observation.backend_health[0].counts == {"spaces": 0, "workers": 0}
+
+
+def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "Build"}]}},
+        ("agent", "list"): {"result": {"agents": [{"worker_id": "w-1", "agent_id": "agent-1", "agent": "Coder"}]}},
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    observation = herdr_cli.fetch_herdr_snapshot_observation(config)
+    health = observation.backend_health[0]
+
+    assert [space.id for space in observation.spaces] == ["ws-1"]
+    assert [worker.id for worker in observation.workers] == ["w-1"]
+    assert health.to_dict() == {
+        "name": "herdr",
+        "status": "healthy",
+        "outcome": "healthy_non_empty",
+        "observed_at": health.observed_at,
+        "message": "Herdr observation is healthy",
+        "counts": {"spaces": 1, "workers": 1},
+    }
+
+
+def test_fetch_herdr_snapshot_observation_reports_healthy_empty(monkeypatch) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {"result": {"agents": []}},
+        ("pane", "list"): {"result": {"panes": []}},
+    }
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
+
+    observation = herdr_cli.fetch_herdr_snapshot_observation(config)
+    health = observation.backend_health[0]
+
+    assert observation.spaces == []
+    assert observation.workers == []
+    assert health.status == "healthy"
+    assert health.outcome == "empty_healthy"
+    assert health.counts == {"spaces": 0, "workers": 0}
+
+
+def test_fetch_herdr_snapshot_observation_reports_missing_binary() -> None:
+    config = Config(host_id="testhost", herdr_bin="definitely-not-a-real-herdr-binary")
+
+    observation = herdr_cli.fetch_herdr_snapshot_observation(config)
+    health = observation.backend_health[0]
+
+    assert observation.spaces == []
+    assert observation.workers == []
+    assert health.status == "unavailable"
+    assert health.outcome == "missing_binary"
+
+
+@pytest.mark.parametrize(
+    ("probe_outcome", "expected_status", "expected_outcome"),
+    [
+        ("launch_error", "unavailable", "launch_error"),
+        ("timeout", "degraded", "timeout"),
+        ("deadline_exhausted", "degraded", "deadline_exhausted"),
+        ("malformed_json", "degraded", "malformed_json"),
+        ("nonzero", "degraded", "nonzero"),
+        ("unknown", "unknown", "unknown"),
+    ],
+)
+def test_fetch_herdr_snapshot_observation_maps_failure_outcomes(
+    monkeypatch,
+    probe_outcome: str,
+    expected_status: str,
+    expected_outcome: str,
+) -> None:
+    config = Config(host_id="testhost", herdr_bin="herdr")
+
+    def fake_probe(args: Sequence[str], cfg: Config) -> tuple[str, Any]:
+        return probe_outcome, None
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    observation = herdr_cli.fetch_herdr_snapshot_observation(config)
+    health = observation.backend_health[0]
+
+    assert observation.spaces == []
+    assert observation.workers == []
+    assert health.status == expected_status
+    assert health.outcome == expected_outcome
+    assert health.message
+
+
+def test_herdr_health_mapping_includes_socket_disconnect() -> None:
+    health = herdr_cli.herdr_backend_health("socket_disconnected")
+
+    assert health.status == "unavailable"
+    assert health.outcome == "socket_disconnected"
 
 
 def test_probe_payload_variants_stops_after_timeout(monkeypatch) -> None:
@@ -965,7 +1072,7 @@ def test_fetch_herdr_command_observation_stops_after_aggregate_deadline(monkeypa
 
     assert observation.healthy is False
     assert observation.status == "degraded"
-    assert observation.outcome == "timeout"
+    assert observation.outcome == "deadline_exhausted"
     assert calls == [("workspace", "list")]
 
 

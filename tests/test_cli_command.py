@@ -166,6 +166,8 @@ def test_cli_command_read_snapshot_neutral_result(capsys, monkeypatch) -> None:
     assert payload["ok"] is True
     assert payload["status"] == "snapshot"
     assert payload["result"]["snapshot"]["schema_version"] == 2
+    assert payload["result"]["snapshot"]["backend_health"][0]["status"] == "unavailable"
+    assert payload["result"]["snapshot"]["backend_health"][0]["outcome"] == "missing_binary"
     assert captured.err == ""
 
 
@@ -1431,6 +1433,24 @@ def test_cli_command_backend_unavailable_preserves_request_id(
 ) -> None:
     """Non-dry-run send_instruction preserves request_id in stdout and receipt."""
     db_path = tmp_path / "req.db"
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id="cmd-host",
+                worker_id="still-live",
+                worker_fingerprint="old-fp",
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="agent-still-live",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="still-live-private",
+            )
+        ],
+    )
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
     monkeypatch.setattr(
         "sys.stdin",
@@ -1471,12 +1491,32 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     cached = json.loads(receipt["result_json"])
     assert cached["request_id"] == "req-visible"
     assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
+    assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
 
 def test_cli_command_degraded_observation_returns_uncertain_not_not_found(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "degraded.db"
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id="cmd-host",
+                worker_id="still-live",
+                worker_fingerprint="old-fp",
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="agent-still-live",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="still-live-private",
+            )
+        ],
+    )
 
     def degraded_observation(config: Any) -> HerdrCommandObservation:
         return HerdrCommandObservation(
@@ -1528,6 +1568,8 @@ def test_cli_command_degraded_observation_returns_uncertain_not_not_found(
     receipt = get_command_receipt(db_path, "cmd-host", "degraded-1", "send_instruction")
     assert receipt is not None
     assert receipt["uncertain"] is True
+    current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
+    assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
 
 def test_cli_command_healthy_empty_observation_can_return_not_found(

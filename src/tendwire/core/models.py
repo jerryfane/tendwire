@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -112,9 +113,22 @@ FORBIDDEN_FIELD_NAMES = frozenset(
         "turn_target_kind",
         "turn_target_value",
         "private_fingerprint",
+        "argv",
+        "command",
+        "env",
+        "environment",
+        "stderr",
+        "stdout",
+        "shell",
+        "secret",
+        "secrets",
+        "password",
+        "api_key",
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_BACKEND_MESSAGE_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)?")
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -125,7 +139,31 @@ def _is_forbidden_field_name(key: Any) -> bool:
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
 
 
-_SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "content_fingerprint"})
+def _is_forbidden_backend_message_label(value: str) -> bool:
+    separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
+    normalized = "_".join(part for part in re.split(r"[\s_-]+", separated.lower()) if part)
+    compact = normalized.replace("_", "")
+    return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
+
+
+_SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "observed_at", "content_fingerprint"})
+
+BACKEND_HEALTH_STATUSES = frozenset({"healthy", "degraded", "unavailable", "unknown"})
+BACKEND_HEALTH_OUTCOMES = frozenset(
+    {
+        "healthy_non_empty",
+        "empty_healthy",
+        "missing_binary",
+        "launch_error",
+        "timeout",
+        "deadline_exhausted",
+        "nonzero",
+        "malformed_json",
+        "socket_disconnected",
+        "unknown",
+    }
+)
+BACKEND_HEALTH_COUNT_KEYS = frozenset({"spaces", "workers"})
 
 
 def _utc_now() -> datetime:
@@ -249,6 +287,77 @@ def _optional_timestamp(value: Any) -> str | None:
     if isinstance(value, datetime):
         return utc_timestamp(value)
     return str(value)
+
+
+def _public_safe_backend_name(value: Any) -> str:
+    text = _string_value(value, "unknown").strip().lower()
+    clean = "".join(char for char in text if char.isalnum() or char in {"_", "-"})
+    return clean[:40] or "unknown"
+
+
+def _public_safe_backend_message(value: Any) -> str:
+    text = _string_value(value)
+    if not text:
+        return ""
+    collapsed = " ".join(text.split())
+    for match in _BACKEND_MESSAGE_LABEL_RE.finditer(collapsed):
+        if _is_forbidden_backend_message_label(match.group(0)):
+            return "Backend health details redacted"
+    token_text = "".join(
+        char.lower() if char.isalnum() or char == "_" else " "
+        for char in collapsed
+    )
+    tokens = set(token_text.split())
+    sensitive_markers = {
+        "argv",
+        "env",
+        "environment",
+        "password",
+        "secret",
+        "secrets",
+        "stderr",
+        "stdout",
+        "token",
+    }
+    if tokens & sensitive_markers:
+        return "Backend health details redacted"
+    if tokens & (FORBIDDEN_FIELD_NAMES - {"command"}):
+        return "Backend health details redacted"
+    if len(collapsed) > 160:
+        return collapsed[:157].rstrip() + "..."
+    return collapsed
+
+
+def _backend_health_status(value: Any) -> str:
+    status = _string_value(value, "unknown").strip().lower().replace("-", "_")
+    return status if status in BACKEND_HEALTH_STATUSES else "unknown"
+
+
+def _backend_health_outcome(value: Any) -> str:
+    outcome = _string_value(value, "unknown").strip().lower().replace("-", "_")
+    return outcome if outcome in BACKEND_HEALTH_OUTCOMES else "unknown"
+
+
+def _backend_health_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        return {}
+    counts: dict[str, int] = {}
+    for key, item in value.items():
+        key_text = str(key).lower().strip().replace("-", "_")
+        if key_text not in BACKEND_HEALTH_COUNT_KEYS:
+            continue
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            count = item
+        elif isinstance(item, str) and item.isdigit():
+            count = int(item)
+        else:
+            continue
+        if count < 0:
+            continue
+        counts[key_text] = count
+    return counts
 
 
 def _status_and_meta(status: Any, meta: Any) -> tuple[str, dict[str, Any]]:
@@ -384,11 +493,12 @@ class SuggestedAction:
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
+        raw_command = data.get("command") if isinstance(data, Mapping) else None
         clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
-            tendwire_action=_string_value(clean.get("tendwire_action", clean.get("command"))),
+            tendwire_action=_string_value(clean.get("tendwire_action", raw_command)),
             params=clean.get("params", {}),
         )
 
@@ -666,6 +776,56 @@ class AttentionSignal:
 
 
 @dataclass(frozen=True)
+class BackendHealth:
+    """Public-safe backend observation health for a snapshot or command path."""
+
+    name: str
+    status: str
+    outcome: str
+    observed_at: str | None = None
+    message: str = ""
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _public_safe_backend_name(self.name))
+        object.__setattr__(self, "status", _backend_health_status(self.status))
+        object.__setattr__(self, "outcome", _backend_health_outcome(self.outcome))
+        object.__setattr__(self, "observed_at", _optional_timestamp(self.observed_at))
+        object.__setattr__(self, "message", _public_safe_backend_message(self.message))
+        object.__setattr__(self, "counts", _backend_health_counts(self.counts))
+
+    @property
+    def healthy(self) -> bool:
+        return self.status == "healthy"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "name": self.name,
+            "status": self.status,
+            "outcome": self.outcome,
+            "observed_at": self.observed_at,
+            "message": self.message,
+        }
+        if self.counts:
+            payload["counts"] = dict(self.counts)
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: "BackendHealth | Mapping[str, Any]") -> "BackendHealth":
+        if isinstance(data, BackendHealth):
+            return data
+        clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
+        return cls(
+            name=clean.get("name", "unknown"),
+            status=clean.get("status", "unknown"),
+            outcome=clean.get("outcome", "unknown"),
+            observed_at=clean.get("observed_at"),
+            message=clean.get("message", ""),
+            counts=clean.get("counts", {}),
+        )
+
+
+@dataclass(frozen=True)
 class Snapshot:
     """Device-neutral top-level snapshot shape."""
 
@@ -674,6 +834,7 @@ class Snapshot:
     spaces: list[Space] = field(default_factory=list)
     workers: list[Worker] = field(default_factory=list)
     attention: list[AttentionSignal] = field(default_factory=list)
+    backend_health: list[BackendHealth] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
     content_fingerprint: str = ""
 
@@ -695,12 +856,20 @@ class Snapshot:
             ),
             key=lambda signal: (signal.id, signal.fingerprint),
         )
+        backend_health = sorted(
+            (
+                health if isinstance(health, BackendHealth) else BackendHealth.from_dict(health)
+                for health in self.backend_health
+            ),
+            key=lambda health: (health.name, health.status, health.outcome),
+        )
 
         object.__setattr__(self, "host_id", host_id)
         object.__setattr__(self, "updated_at", updated_at)
         object.__setattr__(self, "spaces", list(spaces))
         object.__setattr__(self, "workers", list(workers))
         object.__setattr__(self, "attention", list(attention))
+        object.__setattr__(self, "backend_health", list(backend_health))
         object.__setattr__(self, "schema_version", SCHEMA_VERSION)
         object.__setattr__(self, "content_fingerprint", self.compute_content_fingerprint())
 
@@ -712,6 +881,7 @@ class Snapshot:
                 "spaces": [space.to_dict() for space in self.spaces],
                 "workers": [worker.to_dict() for worker in self.workers],
                 "attention": [signal.to_dict() for signal in self.attention],
+                "backend_health": [health.to_dict() for health in self.backend_health],
             }
         )
 
@@ -727,6 +897,7 @@ class Snapshot:
             "spaces": [space.to_dict() for space in self.spaces],
             "workers": [worker.to_dict() for worker in self.workers],
             "attention": [signal.to_dict() for signal in self.attention],
+            "backend_health": [health.to_dict() for health in self.backend_health],
             "content_fingerprint": self.content_fingerprint,
         }
 
@@ -742,6 +913,7 @@ class Snapshot:
             spaces=[Space.from_dict(space) for space in clean.get("spaces", [])],
             workers=[Worker.from_dict(worker) for worker in clean.get("workers", [])],
             attention=[AttentionSignal.from_dict(signal) for signal in clean.get("attention", [])],
+            backend_health=[BackendHealth.from_dict(health) for health in clean.get("backend_health", [])],
             schema_version=SCHEMA_VERSION,
             content_fingerprint=_string_value(clean.get("content_fingerprint")),
         )

@@ -32,13 +32,48 @@ def test_cli_snapshot_json_prints_contract_json_only(capsys) -> None:
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "cli-host"
     assert len(payload["content_fingerprint"]) == 24
-    assert {"updated_at", "spaces", "workers", "attention"} <= set(payload)
+    assert {"updated_at", "spaces", "workers", "attention", "backend_health"} <= set(payload)
+    assert payload["backend_health"][0]["name"] == "herdr"
+    assert payload["backend_health"][0]["status"] == "unavailable"
+    assert payload["backend_health"][0]["outcome"] == "missing_binary"
 
 
 def test_cli_snapshot_no_herdr_works() -> None:
     """Empty snapshot works even when herdr is not installed."""
     code = main(["--herdr-bin", "definitely-not-a-real-herdr-binary", "snapshot", "--json"])
     assert code == 0
+
+
+def test_cli_snapshot_json_reports_healthy_empty_herdr(capsys, monkeypatch) -> None:
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {"result": {"agents": []}},
+        ("pane", "list"): {"result": {"panes": []}},
+    }
+
+    def _fake_run_herdr(args, cfg):
+        if tuple(args) in responses:
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout=json.dumps(responses[tuple(args)]),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=list(args), returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", _fake_run_herdr)
+
+    code = main(["--host-id", "cli-empty", "--herdr-bin", "herdr", "snapshot", "--json"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert payload["spaces"] == []
+    assert payload["workers"] == []
+    assert payload["backend_health"][0]["status"] == "healthy"
+    assert payload["backend_health"][0]["outcome"] == "empty_healthy"
+    assert payload["backend_health"][0]["counts"] == {"spaces": 0, "workers": 0}
 
 
 def test_cli_snapshot_store_persists_printed_snapshot(tmp_path: Path, capsys) -> None:
@@ -219,5 +254,9 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
     assert len(payload["workers"]) == 1
     assert payload["workers"][0]["id"] == "CLI Agent"
     assert payload["workers"][0]["status"] == "active"
+    assert payload["backend_health"][0]["name"] == "herdr"
+    assert payload["backend_health"][0]["status"] == "healthy"
+    assert payload["backend_health"][0]["outcome"] == "healthy_non_empty"
+    assert payload["backend_health"][0]["counts"] == {"spaces": 1, "workers": 1}
     assert "agent_session" not in json.dumps(payload)
     assert "sess-cli" not in json.dumps(payload)

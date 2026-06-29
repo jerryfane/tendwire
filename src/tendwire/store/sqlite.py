@@ -144,7 +144,7 @@ def _strip_content_volatile(value: Any) -> Any:
         return {
             str(key): _strip_content_volatile(item)
             for key, item in value.items()
-            if str(key).lower() not in {"updated_at", "content_fingerprint"}
+            if str(key).lower() not in {"updated_at", "observed_at", "content_fingerprint"}
         }
     if isinstance(value, list | tuple):
         return [_strip_content_volatile(item) for item in value]

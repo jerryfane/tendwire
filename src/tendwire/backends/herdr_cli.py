@@ -22,6 +22,7 @@ from typing import Any
 
 from ..config import Config
 from ..core.models import (
+    BackendHealth,
     Space,
     Worker,
     WorkerBinding,
@@ -64,6 +65,23 @@ _BACKEND_TARGET_KINDS = frozenset(
     {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
 )
 _DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
+_UNAVAILABLE_HEALTH_OUTCOMES = frozenset({"missing_binary", "launch_error", "socket_disconnected"})
+_DEGRADED_HEALTH_OUTCOMES = frozenset(
+    {"timeout", "deadline_exhausted", "nonzero", "malformed_json"}
+)
+
+_HEALTH_MESSAGES = {
+    "healthy_non_empty": "Herdr observation is healthy",
+    "empty_healthy": "Herdr observation is healthy but empty",
+    "missing_binary": "Herdr binary is unavailable",
+    "launch_error": "Herdr launch failed",
+    "timeout": "Herdr observation timed out",
+    "deadline_exhausted": "Herdr observation deadline was exhausted",
+    "nonzero": "Herdr command returned nonzero status",
+    "malformed_json": "Herdr command returned malformed JSON",
+    "socket_disconnected": "Herdr socket disconnected",
+    "unknown": "Herdr observation state is unknown",
+}
 
 
 @dataclass(frozen=True)
@@ -96,6 +114,95 @@ class _ProbeBudget:
         return max(0.001, remaining)
 
 
+def herdr_health_status_for_outcome(outcome: str) -> str:
+    """Map a Herdr adapter outcome into the public backend health status."""
+    normalized = str(outcome or "unknown").strip().lower().replace("-", "_")
+    if normalized in {"healthy_non_empty", "empty_healthy"}:
+        return "healthy"
+    if normalized in _UNAVAILABLE_HEALTH_OUTCOMES:
+        return "unavailable"
+    if normalized in _DEGRADED_HEALTH_OUTCOMES:
+        return "degraded"
+    return "unknown"
+
+
+def herdr_backend_health(
+    outcome: str,
+    *,
+    observed_at: str | None = None,
+    message: str | None = None,
+    spaces: Sequence[Space] | None = None,
+    workers: Sequence[Worker] | None = None,
+) -> BackendHealth:
+    """Return the fixed public-safe health object for a Herdr observation."""
+    normalized_outcome = str(outcome or "unknown").strip().lower().replace("-", "_")
+    if normalized_outcome == "ok":
+        normalized_outcome = (
+            "healthy_non_empty"
+            if (spaces and len(spaces) > 0) or (workers and len(workers) > 0)
+            else "empty_healthy"
+        )
+    if normalized_outcome not in {
+        "healthy_non_empty",
+        "empty_healthy",
+        "missing_binary",
+        "launch_error",
+        "timeout",
+        "deadline_exhausted",
+        "nonzero",
+        "malformed_json",
+        "socket_disconnected",
+        "unknown",
+    }:
+        normalized_outcome = "unknown"
+    counts = {
+        "spaces": len(spaces or []),
+        "workers": len(workers or []),
+    }
+    return BackendHealth(
+        name=_BACKEND_NAME,
+        status=herdr_health_status_for_outcome(normalized_outcome),
+        outcome=normalized_outcome,
+        observed_at=observed_at or utc_timestamp(),
+        message=message if message is not None else _HEALTH_MESSAGES[normalized_outcome],
+        counts=counts,
+    )
+
+
+@dataclass(frozen=True)
+class HerdrSnapshotObservation:
+    """Snapshot observation plus public backend health and private bindings."""
+
+    spaces: list[Space]
+    workers: list[Worker]
+    bindings: list[WorkerBinding] = field(default_factory=list)
+    backend_health: list[BackendHealth] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        spaces = list(self.spaces)
+        workers = list(self.workers)
+        bindings = list(self.bindings)
+        backend_health = list(self.backend_health)
+        if not backend_health:
+            outcome = "healthy_non_empty" if spaces or workers else "empty_healthy"
+            backend_health = [herdr_backend_health(outcome, spaces=spaces, workers=workers)]
+        object.__setattr__(self, "spaces", spaces)
+        object.__setattr__(self, "workers", workers)
+        object.__setattr__(self, "bindings", bindings)
+        object.__setattr__(self, "backend_health", backend_health)
+
+    @property
+    def health(self) -> BackendHealth:
+        for item in self.backend_health:
+            if item.name == _BACKEND_NAME:
+                return item
+        return herdr_backend_health("unknown", spaces=self.spaces, workers=self.workers)
+
+    @property
+    def authoritative(self) -> bool:
+        return self.health.status == "healthy"
+
+
 @dataclass(frozen=True)
 class HerdrCommandObservation:
     """Command execution observation with health metadata."""
@@ -106,10 +213,37 @@ class HerdrCommandObservation:
     outcome: str
     message: str = ""
     bindings: list[WorkerBinding] = field(default_factory=list)
+    backend_health: list[BackendHealth] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        spaces = list(self.spaces)
+        workers = list(self.workers)
+        bindings = list(self.bindings)
+        backend_health = list(self.backend_health)
+        if not backend_health:
+            backend_health = [
+                herdr_backend_health(
+                    self.outcome,
+                    message=self.message or None,
+                    spaces=spaces,
+                    workers=workers,
+                )
+            ]
+        object.__setattr__(self, "spaces", spaces)
+        object.__setattr__(self, "workers", workers)
+        object.__setattr__(self, "bindings", bindings)
+        object.__setattr__(self, "backend_health", backend_health)
 
     @property
     def healthy(self) -> bool:
-        return self.status == "healthy"
+        return self.status == "healthy" and self.health.status == "healthy"
+
+    @property
+    def health(self) -> BackendHealth:
+        for item in self.backend_health:
+            if item.name == _BACKEND_NAME:
+                return item
+        return herdr_backend_health(self.outcome, message=self.message or None, spaces=self.spaces, workers=self.workers)
 
 
 _FORBIDDEN_CONNECTOR_FIELDS_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_CONNECTOR_FIELDS}
@@ -1205,7 +1339,7 @@ def _probe_payload_variants(
         if outcome == "ok":
             return outcome, payload
         if outcome in _DEADLINE_EXHAUSTED_OUTCOMES:
-            return "timeout", None
+            return outcome, None
         outcomes.append(outcome)
     if outcomes and all(outcome == "launch_error" for outcome in outcomes):
         return "launch_error", None
@@ -1217,13 +1351,36 @@ def _probe_payload_variants(
 
 
 def _degraded_observation(outcome: str, message: str) -> HerdrCommandObservation:
-    status = "unavailable" if outcome in {"missing_binary", "launch_error"} else "degraded"
+    health = herdr_backend_health(outcome, message=message)
     return HerdrCommandObservation(
         spaces=[],
         workers=[],
-        status=status,
+        status=health.status,
         outcome=outcome,
         message=message,
+        backend_health=[health],
+    )
+
+
+def _snapshot_observation(
+    spaces: list[Space],
+    workers: list[Worker],
+    bindings: list[WorkerBinding],
+    outcome: str,
+    *,
+    message: str | None = None,
+) -> HerdrSnapshotObservation:
+    health = herdr_backend_health(
+        outcome,
+        message=message,
+        spaces=spaces,
+        workers=workers,
+    )
+    return HerdrSnapshotObservation(
+        spaces=spaces,
+        workers=workers,
+        bindings=bindings,
+        backend_health=[health],
     )
 
 
@@ -1295,6 +1452,13 @@ def fetch_herdr_command_observation(
         status="healthy",
         outcome="healthy_non_empty" if spaces or workers else "empty_healthy",
         bindings=bindings,
+        backend_health=[
+            herdr_backend_health(
+                "healthy_non_empty" if spaces or workers else "empty_healthy",
+                spaces=spaces,
+                workers=workers,
+            )
+        ],
     )
 
 
@@ -1309,18 +1473,28 @@ def _state_result(
     return spaces, workers
 
 
-def fetch_herdr_state(
+def fetch_herdr_snapshot_observation(
     config: Config,
     stored_bindings: Sequence[WorkerBinding] | None = None,
-    *,
-    include_bindings: bool = False,
-) -> tuple[list[Space], list[Worker]] | tuple[list[Space], list[Worker], list[WorkerBinding]]:
-    """Return neutral spaces and workers from the Herdr CLI, or empty lists."""
+) -> HerdrSnapshotObservation:
+    """Return Herdr snapshot observations plus public backend health."""
     try:
         if shutil.which(config.herdr_bin) is None:
-            return _state_result([], [], [], include_bindings)
+            return _snapshot_observation(
+                [],
+                [],
+                [],
+                "missing_binary",
+                message=_HEALTH_MESSAGES["missing_binary"],
+            )
     except (TypeError, ValueError, OSError):
-        return _state_result([], [], [], include_bindings)
+        return _snapshot_observation(
+            [],
+            [],
+            [],
+            "launch_error",
+            message="Herdr binary could not be inspected",
+        )
 
     budget = _ProbeBudget.from_config(config, planned_probes=5)
     workspace_outcome, workspace_payload = _probe_payload_variants(
@@ -1331,8 +1505,14 @@ def fetch_herdr_state(
         config,
         budget,
     )
-    if workspace_outcome == "timeout":
-        return _state_result([], [], [], include_bindings)
+    if workspace_outcome in _DEADLINE_EXHAUSTED_OUTCOMES:
+        return _snapshot_observation(
+            [],
+            [],
+            [],
+            workspace_outcome,
+            message=_HEALTH_MESSAGES[workspace_outcome],
+        )
 
     agent_outcome, agent_payload = _probe_payload_variants(
         [
@@ -1344,25 +1524,73 @@ def fetch_herdr_state(
     )
 
     spaces = _spaces_from_payload(workspace_payload)
-    if agent_outcome == "timeout":
-        return _state_result(spaces, [], [], include_bindings)
+    if agent_outcome in _DEADLINE_EXHAUSTED_OUTCOMES:
+        return _snapshot_observation(
+            spaces,
+            [],
+            [],
+            agent_outcome,
+            message=_HEALTH_MESSAGES[agent_outcome],
+        )
 
     workers, bindings = _workers_and_bindings_from_payload(
         agent_payload,
         config,
         stored_bindings=stored_bindings,
     )
+    pane_outcome = "ok"
     if not workers:
         try:
             pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
         except TypeError:
             pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
         if pane_outcome != "ok":
-            return _state_result(spaces, [], [], include_bindings)
+            outcome = pane_outcome if pane_outcome in _DEADLINE_EXHAUSTED_OUTCOMES else pane_outcome
+            return _snapshot_observation(
+                spaces,
+                [],
+                [],
+                outcome,
+                message=_HEALTH_MESSAGES.get(outcome, _HEALTH_MESSAGES["unknown"]),
+            )
         workers, bindings = _workers_and_bindings_from_pane_payload(
             pane_payload,
             config,
             stored_bindings=stored_bindings,
         )
 
-    return _state_result(spaces, workers, bindings, include_bindings)
+    failed_outcomes = [
+        outcome
+        for outcome in (workspace_outcome, agent_outcome, pane_outcome)
+        if outcome not in {"ok"}
+    ]
+    if failed_outcomes:
+        outcome = failed_outcomes[0]
+        return _snapshot_observation(
+            spaces,
+            workers,
+            bindings,
+            outcome,
+            message=_HEALTH_MESSAGES.get(outcome, _HEALTH_MESSAGES["unknown"]),
+        )
+
+    return _snapshot_observation(
+        spaces,
+        workers,
+        bindings,
+        "healthy_non_empty" if spaces or workers else "empty_healthy",
+    )
+
+
+def fetch_herdr_state(
+    config: Config,
+    stored_bindings: Sequence[WorkerBinding] | None = None,
+    *,
+    include_bindings: bool = False,
+) -> tuple[list[Space], list[Worker]] | tuple[list[Space], list[Worker], list[WorkerBinding]]:
+    """Return neutral spaces and workers from the Herdr CLI, or empty lists."""
+    observation = fetch_herdr_snapshot_observation(
+        config,
+        stored_bindings=stored_bindings,
+    )
+    return _state_result(observation.spaces, observation.workers, observation.bindings, include_bindings)

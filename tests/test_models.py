@@ -10,6 +10,7 @@ from typing import Any
 from tendwire.config import Config
 from tendwire.core.models import (
     AttentionSignal,
+    BackendHealth,
     Snapshot,
     Space,
     SuggestedAction,
@@ -47,6 +48,14 @@ _FORBIDDEN_FIELDS = {
     "turn_target_kind",
     "turn_target_value",
     "private_fingerprint",
+    "argv",
+    "env",
+    "stderr",
+    "stdout",
+    "secret",
+    "secrets",
+    "password",
+    "api_key",
 }
 
 
@@ -76,7 +85,7 @@ def _strip_volatile_fingerprint_fields(value: Any) -> Any:
         return {
             key: _strip_volatile_fingerprint_fields(item)
             for key, item in value.items()
-            if key not in {"updated_at", "content_fingerprint"}
+            if key not in {"updated_at", "observed_at", "content_fingerprint"}
         }
     if isinstance(value, list):
         return [_strip_volatile_fingerprint_fields(item) for item in value]
@@ -88,7 +97,7 @@ def _expected_snapshot_fingerprint(payload: dict[str, Any]) -> str:
     content = _strip_volatile_fingerprint_fields(
         json.loads(json.dumps(payload, ensure_ascii=False))
     )
-    for collection in ("spaces", "workers", "attention"):
+    for collection in ("spaces", "workers", "attention", "backend_health"):
         content[collection] = sorted(content.get(collection, []), key=_stable_item_key)
     encoded = json.dumps(
         content,
@@ -377,6 +386,7 @@ def test_snapshot_json_has_schema_version_content_fingerprint_and_legacy_keys() 
         "spaces",
         "workers",
         "attention",
+        "backend_health",
     } <= set(payload)
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "testhost"
@@ -386,7 +396,143 @@ def test_snapshot_json_has_schema_version_content_fingerprint_and_legacy_keys() 
     assert isinstance(payload["spaces"], list)
     assert isinstance(payload["workers"], list)
     assert payload["attention"] == []
+    assert payload["backend_health"] == []
     _assert_no_forbidden_fields(payload)
+
+
+def test_backend_health_serialization_is_public_safe() -> None:
+    health = BackendHealth(
+        name="Herdr",
+        status="HEALTHY",
+        outcome="healthy_non_empty",
+        observed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        message="Herdr observation is healthy",
+        counts={
+            "spaces": 1,
+            "workers": "2",
+            "pane_id": 9,
+            "private_fingerprint": 10,
+            "other": 11,
+        },
+    )
+    payload = health.to_dict()
+
+    assert payload == {
+        "name": "herdr",
+        "status": "healthy",
+        "outcome": "healthy_non_empty",
+        "observed_at": "2026-01-01T00:00:00+00:00",
+        "message": "Herdr observation is healthy",
+        "counts": {"spaces": 1, "workers": 2},
+    }
+    _assert_no_forbidden_fields(payload)
+
+    redacted = BackendHealth.from_dict(
+        {
+            "name": "herdr",
+            "status": "not-real",
+            "outcome": "not-real",
+            "message": "stderr token pane_id secret should not leak",
+            "counts": {"workers": 1, "target_value": 1},
+        }
+    ).to_dict()
+
+    assert redacted["status"] == "unknown"
+    assert redacted["outcome"] == "unknown"
+    assert redacted["message"] == "Backend health details redacted"
+    assert redacted["counts"] == {"workers": 1}
+    assert "pane_id" not in json.dumps(redacted)
+
+
+def test_backend_health_message_redacts_secret_label_variants() -> None:
+    unsafe_messages = [
+        "apiKey=abc123 failed",
+        "api-key=abc123 failed",
+        "api_key=abc123 failed",
+        "api key=abc123 failed",
+        "botToken=abc123 failed",
+        "bot-token=abc123 failed",
+        "bot_token=abc123 failed",
+        "bot token=abc123 failed",
+        "token=abc123 failed",
+        "secret=abc123 failed",
+        "password=abc123 failed",
+        "Password=abc123 failed",
+        "PASSWORD=abc123 failed",
+        "env=PROD failed",
+        "stdout=abc123 failed",
+        "stderr=abc123 failed",
+        "stderr token pane_id secret",
+    ]
+
+    for message in unsafe_messages:
+        payload = BackendHealth.from_dict({"message": message}).to_dict()
+        encoded = json.dumps(payload)
+        assert payload["message"] == "Backend health details redacted"
+        assert "abc123" not in encoded
+        assert "PROD" not in encoded
+
+
+def test_backend_health_message_keeps_safe_fixed_messages() -> None:
+    safe_messages = [
+        "Herdr observation is healthy",
+        "Herdr observation is healthy but empty",
+        "Herdr command returned nonzero status",
+        "Herdr socket disconnected",
+    ]
+
+    for message in safe_messages:
+        assert BackendHealth.from_dict({"message": message}).to_dict()["message"] == message
+
+
+def test_snapshot_backend_health_roundtrip_and_fingerprint_ignore_observed_at() -> None:
+    config = Config(host_id="health-host")
+    snapshot_a = project_from_raw(
+        config,
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "empty_healthy",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+                "message": "Herdr observation is healthy but empty",
+                "counts": {"spaces": 0, "workers": 0},
+            }
+        ],
+    )
+    snapshot_b = project_from_raw(
+        config,
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "empty_healthy",
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "message": "Herdr observation is healthy but empty",
+                "counts": {"spaces": 0, "workers": 0},
+            }
+        ],
+    )
+    changed = project_from_raw(
+        config,
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "degraded",
+                "outcome": "malformed_json",
+                "observed_at": "2026-01-02T00:00:00+00:00",
+                "message": "Herdr command returned malformed JSON",
+                "counts": {"spaces": 0, "workers": 0},
+            }
+        ],
+    )
+
+    assert Snapshot.from_json(snapshot_a.to_json()) == snapshot_a
+    assert snapshot_a.content_fingerprint == snapshot_b.content_fingerprint
+    assert changed.content_fingerprint != snapshot_a.content_fingerprint
+    assert _snapshot_payload(snapshot_a)["content_fingerprint"] == _expected_snapshot_fingerprint(
+        _snapshot_payload(snapshot_a)
+    )
 
 
 def test_snapshot_from_json_roundtrip_preserves_fingerprints() -> None:

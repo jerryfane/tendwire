@@ -11,7 +11,7 @@ from typing import Any
 
 from ..config import Config
 from .attention import update_snapshot_attention
-from .models import Snapshot, Space, Worker, utc_timestamp
+from .models import BackendHealth, Snapshot, Space, Worker, utc_timestamp
 
 
 def project_empty(config: Config) -> Snapshot:
@@ -23,6 +23,7 @@ def project_empty(config: Config) -> Snapshot:
             spaces=[],
             workers=[],
             attention=[],
+            backend_health=[],
         )
     )
 
@@ -32,6 +33,7 @@ def project_from_observations(
     *,
     spaces: list[Space] | None = None,
     workers: list[Worker] | None = None,
+    backend_health: list[BackendHealth] | None = None,
     timestamp: datetime | None = None,
 ) -> Snapshot:
     """Build a neutral snapshot from backend-neutral observations."""
@@ -41,6 +43,7 @@ def project_from_observations(
         spaces=list(spaces or []),
         workers=list(workers or []),
         attention=[],
+        backend_health=list(backend_health or []),
     )
     return update_snapshot_attention(snapshot)
 
@@ -50,6 +53,7 @@ def project_from_raw(
     *,
     spaces: list[dict[str, Any]] | None = None,
     workers: list[dict[str, Any]] | None = None,
+    backend_health: list[dict[str, Any]] | None = None,
     timestamp: datetime | None = None,
 ) -> Snapshot:
     """Build a neutral snapshot from raw dict observations."""
@@ -59,5 +63,6 @@ def project_from_raw(
         spaces=[Space.from_dict(s) for s in (spaces or [])],
         workers=[Worker.from_dict(w) for w in (workers or [])],
         attention=[],
+        backend_health=[BackendHealth.from_dict(health) for health in (backend_health or [])],
     )
     return update_snapshot_attention(snapshot)

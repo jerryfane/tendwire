@@ -90,7 +90,20 @@ The `snapshot --json` output uses this device-neutral contract:
   "content_fingerprint": "14afa7e139f55770113291c1",
   "spaces": [],
   "workers": [],
-  "attention": []
+  "attention": [],
+  "backend_health": [
+    {
+      "name": "herdr",
+      "status": "healthy",
+      "outcome": "empty_healthy",
+      "observed_at": "2026-06-27T16:18:34+00:00",
+      "message": "Herdr observation is healthy but empty",
+      "counts": {
+        "spaces": 0,
+        "workers": 0
+      }
+    }
+  ]
 }
 ```
 
@@ -107,6 +120,9 @@ Top-level keys:
   `status`, optional `last_seen_at`/summary, per-item `fingerprint`, and `meta`.
 - `attention` — deterministic human-actionable attention signals derived from
   the snapshot.
+- `backend_health` — public-safe backend observation health. Tendwire includes
+  a Herdr entry with fixed fields `name`, `status`, `outcome`, `observed_at`,
+  `message`, and optional aggregate `counts` such as spaces and workers.
 
 Canonical statuses are `unknown`, `active`, `idle`, `waiting`, `blocked`,
 `warning`, `done`, `failed`, and `closed`. `done`, `complete`, `completed`, and
@@ -117,7 +133,19 @@ after connector-specific fields have been stripped.
 Snapshot hashing uses the Python standard library only:
 `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`, then
 SHA-256 with a fixed prefix. Spaces, workers, and attention entries are sorted by
-stable ID/fingerprint before the hash is computed.
+stable ID/fingerprint before the hash is computed. Volatile timestamps,
+including backend health `observed_at`, are excluded from the content
+fingerprint.
+
+Backend health `status` is one of `healthy`, `degraded`, `unavailable`, or
+`unknown`. A healthy non-empty Herdr observation reports
+`outcome: "healthy_non_empty"`; a healthy empty Herdr observation reports
+`outcome: "empty_healthy"`. Missing Herdr reports `missing_binary`, launch
+errors report `launch_error`, timeouts report `timeout` or
+`deadline_exhausted`, nonzero exits report `nonzero`, malformed JSON reports
+`malformed_json`, and unclassified results report `unknown`. Health messages are
+short sanitized public strings and do not expose private bindings, raw
+stdout/stderr, argv, environment values, or secrets.
 
 Attention signals expose deterministic `id` and `fingerprint` values plus
 `kind`, `severity`, `status`, `reason`, `source`, `updated_at`,
@@ -279,6 +307,10 @@ backend argv, or route/delivery fields.
   not projected into fake empty worker lists. They return `backend_unavailable`
   or `request_state_uncertain` and do not execute send. Only a healthy empty
   Herdr observation may produce final `not_found`.
+- Private Herdr binding expiration is guarded by authoritative healthy
+  observation. Healthy empty observations may expire stale bindings; degraded or
+  unavailable empty observations do not prune bindings as if Herdr were
+  authoritatively empty.
 - Instruction text is validated: it must be non-empty, no longer than 4096
   characters, and may include LF newlines and tab characters. It must not
   contain NUL, ESC/ANSI/CSI/OSC sequences, bracketed-paste sequences, carriage
