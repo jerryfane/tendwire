@@ -18,6 +18,7 @@ from tendwire.core.models import (
     WorkerBinding,
     normalize_status,
     separate_duplicate_worker_bindings,
+    sanitize_forbidden_fields,
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
@@ -27,46 +28,337 @@ from tendwire.core.projector import project_empty, project_from_raw
 _FORBIDDEN_FIELDS = {
     "telegram",
     "chat_id",
+    "chat_ids",
     "topic_id",
+    "topic_ids",
     "message_id",
+    "message_ids",
     "thread_id",
+    "thread_ids",
     "token",
+    "tokens",
     "bot_token",
+    "bot_tokens",
+    "auth",
+    "auth_token",
+    "auth_tokens",
+    "authorization",
+    "authorization_header",
+    "authorization_headers",
+    "bearer_token",
+    "bearer_tokens",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
     "delivery",
+    "deliveries",
     "route",
+    "routes",
+    "connector",
+    "connectors",
     "herdres_delivery",
     "command",
+    "command_arg",
+    "command_args",
+    "command_argv",
+    "command_argvs",
+    "command_line",
+    "command_lines",
+    "command_payload",
+    "command_text",
+    "command_texts",
     "backend_target",
+    "backend_targets",
     "terminal_id",
+    "terminal_ids",
     "pane_id",
+    "pane_ids",
+    "tab_id",
+    "tab_ids",
+    "window_id",
+    "window_ids",
+    "tty",
+    "pty",
+    "pid",
+    "pids",
+    "process_id",
+    "process_ids",
+    "process",
+    "tmux",
+    "tmux_session",
+    "tmux_sessions",
+    "tmux_window",
+    "tmux_windows",
+    "tmux_pane",
+    "tmux_panes",
+    "screen",
+    "screen_session",
+    "screen_sessions",
+    "screen_window",
+    "screen_windows",
     "agent_session",
+    "agent_sessions",
     "session_id",
+    "session_ids",
     "herdr_state",
     "herdres_state",
     "target_kind",
     "target_value",
     "turn_target_kind",
     "turn_target_value",
+    "private",
+    "private_binding",
+    "private_bindings",
     "private_fingerprint",
+    "private_fingerprints",
     "argv",
+    "args",
     "env",
+    "raw_arg",
+    "raw_args",
+    "raw_argv",
+    "raw_argvs",
     "stderr",
     "stdout",
+    "stdin",
     "secret",
     "secrets",
     "password",
+    "passwords",
+    "api_keys",
     "api_key",
+    "raw_command",
+    "raw_command_line",
+    "raw_command_lines",
+    "raw_payload",
+    "raw_control",
+    "shell_command",
+    "shell_commands",
+    "terminal_control",
+    "control_sequence",
+    "escape_sequence",
+    "ansi_escape",
 }
+_FORBIDDEN_FIELD_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_FIELDS}
+
+
+def _is_forbidden_test_key(key: Any) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return normalized in _FORBIDDEN_FIELDS or normalized.replace("_", "") in _FORBIDDEN_FIELD_COMPACT
 
 
 def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            assert key not in _FORBIDDEN_FIELDS, f"forbidden field {path}.{key}"
+            assert not _is_forbidden_test_key(key), f"forbidden field {path}.{key}"
             _assert_no_forbidden_fields(item, f"{path}.{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _assert_no_forbidden_fields(item, f"{path}[{index}]")
+
+
+def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
+    raw = {
+        "schema_version": 1,
+        "host_id": "host-public",
+        "worker_id": "worker-public",
+        "space_id": "space-public",
+        "worker_fingerprint": "worker-fp",
+        "id": "public-id",
+        "fingerprint": "public-fp",
+        "content_fingerprint": "content-fp",
+        "source": "snapshot",
+        "origin_command_id": "cmd-public",
+        "backend_health": [{"name": "herdr", "status": "healthy"}],
+        "safe": "kept",
+        "commandLine": "sentinel-command-line",
+        "command-text": "sentinel-command-text",
+        "tty": "sentinel-tty",
+        "pty": "sentinel-pty",
+        "pid": "sentinel-pid",
+        "process_id": "sentinel-process",
+        "tmux": "sentinel-tmux",
+        "screen_session": "sentinel-screen",
+        "window_id": "sentinel-window",
+        "tab_id": "sentinel-tab",
+        "pane_id": "sentinel-pane",
+        "terminal_id": "sentinel-terminal",
+        "backend_target": "sentinel-backend",
+        "session_id": "sentinel-session",
+        "messageIds": "sentinel-message-ids",
+        "terminalIds": "sentinel-terminal-ids",
+        "terminal": "sentinel-terminal-object",
+        "telegramMessageId": "sentinel-telegram-message",
+        "routeId": "sentinel-route-id",
+        "connectorId": "sentinel-connector-id",
+        "tmuxPaneId": "sentinel-tmux-pane-id",
+        "screenWindowId": "sentinel-screen-window-id",
+        "agentSessionId": "sentinel-agent-session-id",
+        "session": "sentinel-session-object",
+        "privateFingerprints": "sentinel-private-fingerprints",
+        "passwords": "sentinel-passwords",
+        "nested": [
+            {
+                "safe_nested": "kept",
+                "processId": "sentinel-camel-process",
+                "tmux-session": "sentinel-kebab-tmux",
+                "terminalid": "sentinel-compact-terminal",
+                "backendTarget": "sentinel-camel-backend",
+                "screenSession": "sentinel-camel-screen",
+                "privateBinding": "sentinel-private-binding",
+                "telegramChatId": "sentinel-chat",
+                "authToken": "sentinel-auth",
+                "cookies": "sentinel-cookie",
+                "shellCommand": "sentinel-shell-command",
+                "rawArgs": "sentinel-raw-args",
+            }
+        ],
+        "tuple": (
+            {
+                "pane-id": "sentinel-kebab-pane",
+                "tabId": "sentinel-camel-tab",
+                "raw-command-line": "sentinel-raw-command-line",
+                "safe_tuple": "kept",
+            },
+        ),
+    }
+
+    sanitized = sanitize_forbidden_fields(raw)
+    encoded = json.dumps(sanitized, sort_keys=True)
+
+    assert sanitized["host_id"] == "host-public"
+    assert sanitized["worker_id"] == "worker-public"
+    assert sanitized["space_id"] == "space-public"
+    assert sanitized["worker_fingerprint"] == "worker-fp"
+    assert sanitized["id"] == "public-id"
+    assert sanitized["fingerprint"] == "public-fp"
+    assert sanitized["content_fingerprint"] == "content-fp"
+    assert sanitized["source"] == "snapshot"
+    assert sanitized["origin_command_id"] == "cmd-public"
+    assert sanitized["backend_health"] == [{"name": "herdr", "status": "healthy"}]
+    assert sanitized["safe"] == "kept"
+    assert sanitized["nested"] == [{"safe_nested": "kept"}]
+    assert sanitized["tuple"] == [{"safe_tuple": "kept"}]
+    assert "sentinel-" not in encoded
+    _assert_no_forbidden_fields(sanitized)
+
+
+def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -> None:
+    raw_actions = [
+        {
+            "label": "Run raw command",
+            "command": "tendwire snapshot --json --token sentinel-command-token",
+            "terminal_id": "sentinel-terminal",
+            "backend_target": "sentinel-backend",
+            "session_id": "sentinel-session",
+            "params": {
+                "safe": "kept",
+                "commandLine": "sentinel-command-line",
+                "token": "sentinel-token",
+                "secret": "sentinel-secret",
+            },
+        },
+        {
+            "label": "Run safe-looking alias",
+            "command": "sentinel-safe-looking-command-alias",
+            "terminalId": "sentinel-camel-terminal",
+            "backendTarget": "sentinel-camel-backend",
+            "session-id": "sentinel-kebab-session",
+            "commandLine": "sentinel-top-level-command-line",
+            "params": {
+                "safe": "kept",
+                "nested": {
+                    "safe_nested": "kept",
+                    "terminal_id": "sentinel-nested-terminal",
+                    "commandLine": "sentinel-nested-command-line",
+                },
+            },
+        },
+    ]
+
+    for raw_action in raw_actions:
+        action = SuggestedAction.from_dict(raw_action)
+        payload = action.to_dict()
+        encoded = json.dumps(payload, sort_keys=True)
+
+        assert action.tendwire_action == ""
+        assert action.command == raw_action["command"]
+        assert not action.has_public_tendwire_action
+        assert payload["label"] == raw_action["label"]
+        assert "tendwire_action" not in payload
+        assert "safe" in payload["params"]
+        assert "sentinel-" not in encoded
+        _assert_no_forbidden_fields(payload)
+
+
+def test_suggested_action_command_alias_stays_internal_and_out_of_public_identity() -> None:
+    action_a = SuggestedAction(
+        label="Run diagnostic",
+        command="sentinel-safe-looking-command-alias-a",
+        params={"safe": "kept", "commandLine": "sentinel-command-line-a"},
+    )
+    action_b = SuggestedAction(
+        label="Run diagnostic",
+        command="sentinel-safe-looking-command-alias-b",
+        params={"safe": "kept", "commandLine": "sentinel-command-line-b"},
+    )
+
+    payload_a = action_a.to_dict()
+    payload_b = action_b.to_dict()
+
+    assert action_a.command == "sentinel-safe-looking-command-alias-a"
+    assert action_b.command == "sentinel-safe-looking-command-alias-b"
+    assert action_a.tendwire_action == ""
+    assert not action_a.has_public_tendwire_action
+    assert action_a.action_id == action_b.action_id
+    assert payload_a == payload_b == {
+        "action_id": action_a.action_id,
+        "label": "Run diagnostic",
+        "params": {"safe": "kept"},
+    }
+    assert "sentinel-" not in json.dumps(payload_a, sort_keys=True)
+    _assert_no_forbidden_fields(payload_a)
+
+
+def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> None:
+    action = SuggestedAction.from_dict(
+        {
+            "label": "Approve",
+            "command": "sentinel-forbidden-command-alias",
+            "tendwire_action": "approve",
+            "terminal_id": "sentinel-terminal",
+            "backend_target": "sentinel-backend",
+            "session_id": "sentinel-session",
+            "params": {"safe": "kept", "commandLine": "sentinel-command-line"},
+        }
+    )
+
+    payload = action.to_dict()
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert action.tendwire_action == "approve"
+    assert action.has_public_tendwire_action
+    assert payload["tendwire_action"] == "approve"
+    assert payload["params"] == {"safe": "kept"}
+    assert "sentinel-" not in encoded
+    _assert_no_forbidden_fields(payload)
+
+
+def test_suggested_action_omits_raw_explicit_tendwire_action_publicly() -> None:
+    action = SuggestedAction(
+        label="Run diagnostic",
+        tendwire_action="tendwire snapshot --json --token sentinel-action-token",
+        params={"safe": "kept"},
+    )
+
+    payload = action.to_dict()
+
+    assert action.command == "tendwire snapshot --json --token sentinel-action-token"
+    assert not action.has_public_tendwire_action
+    assert "tendwire_action" not in payload
+    assert "sentinel-" not in json.dumps(payload, sort_keys=True)
+    _assert_no_forbidden_fields(payload)
 
 
 def _snapshot_payload(snapshot: Snapshot) -> dict[str, Any]:
@@ -363,8 +655,75 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
         "worker_id": "worker-1",
         "safe": "kept",
     }
-    assert payload["suggested_actions"][0]["tendwire_action"] == "tendwire snapshot --json"
+    assert action.command == "tendwire snapshot --json"
+    assert "tendwire_action" not in payload["suggested_actions"][0]
     assert "command" not in payload["suggested_actions"][0]
+    _assert_no_forbidden_fields(payload)
+
+
+def test_snapshot_attention_public_fingerprint_ignores_command_aliases() -> None:
+    def snapshot(command: str) -> Snapshot:
+        action = SuggestedAction(
+            label="Run diagnostic",
+            command=command,
+            params={"safe": "kept"},
+        )
+        return Snapshot(
+            host_id="attention-command-host",
+            updated_at="2026-01-01T00:00:00+00:00",
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    suggested_actions=[action],
+                    host_id="attention-command-host",
+                )
+            ],
+        )
+
+    snapshot_a = snapshot("sentinel-safe-looking-command-alias-a")
+    snapshot_b = snapshot("sentinel-safe-looking-command-alias-b")
+    payload = snapshot_a.to_dict()
+
+    assert snapshot_a.content_fingerprint == snapshot_b.content_fingerprint
+    assert (
+        payload["attention"][0]["suggested_actions"]
+        == snapshot_b.to_dict()["attention"][0]["suggested_actions"]
+    )
+    assert "tendwire_action" not in payload["attention"][0]["suggested_actions"][0]
+    assert "sentinel-" not in json.dumps(payload, sort_keys=True)
+    _assert_no_forbidden_fields(payload)
+
+
+def test_attention_signal_preserves_explicit_safe_tendwire_action_publicly() -> None:
+    action = SuggestedAction(
+        action_id="approve-worker",
+        label="Approve",
+        tendwire_action="approve_interaction",
+        params={"safe": "kept", "telegram_message_id": "sentinel-message"},
+    )
+    signal = AttentionSignal(
+        kind="worker_status",
+        severity="warning",
+        status="waiting",
+        reason="Worker needs approval",
+        source="worker:worker-1",
+        updated_at="2026-01-01T00:00:00+00:00",
+        suggested_actions=[action],
+        host_id="attention-host",
+    )
+
+    payload = signal.to_dict()
+
+    assert payload["suggested_actions"][0] == {
+        "action_id": "approve-worker",
+        "label": "Approve",
+        "tendwire_action": "approve_interaction",
+        "params": {"safe": "kept"},
+    }
     _assert_no_forbidden_fields(payload)
 
 

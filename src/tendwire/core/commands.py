@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .models import (
+    FORBIDDEN_FIELD_NAMES,
     Snapshot,
     Worker,
     sanitize_forbidden_fields,
@@ -76,98 +77,13 @@ VALID_STATUSES = frozenset(
 TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
 
-# Connector and low-level terminal fields that are rejected anywhere in a request.
-FORBIDDEN_REQUEST_FIELDS = frozenset(
-    {
-        "telegram",
-        "chat_id",
-        "topic_id",
-        "message_id",
-        "thread_id",
-        "route",
-        "routes",
-        "delivery",
-        "deliveries",
-        "token",
-        "tokens",
-        "bot_token",
-        "pane_id",
-        "terminal_id",
-        "tty",
-        "pty",
-        "pid",
-        "tmux",
-        "screen_session",
-        "window_id",
-        "tab_id",
-        "argv",
-        "command",
-        "shell",
-        "connector",
-        "connectors",
-        "backend_target",
-        "agent_session",
-        "session_id",
-        "herdr_state",
-        "herdres_state",
-        "target_kind",
-        "target_value",
-        "turn_target_kind",
-        "turn_target_value",
-        "private_fingerprint",
-    }
-)
+# Connector, low-level terminal, routing, and private fields rejected anywhere in a request.
+FORBIDDEN_REQUEST_FIELDS = FORBIDDEN_FIELD_NAMES
 
 # Conservative forbidden-field matching including common case and separator variants.
 _FORBIDDEN_REQUEST_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_REQUEST_FIELDS)
 
 MAX_INSTRUCTION_LENGTH = 4096
-
-# Public command results use a stricter forbidden-field set than snapshots.
-_COMMAND_RESULT_FORBIDDEN_FIELDS = frozenset(
-    {
-        "telegram",
-        "chat_id",
-        "topic_id",
-        "message_id",
-        "thread_id",
-        "route",
-        "routes",
-        "delivery",
-        "deliveries",
-        "token",
-        "tokens",
-        "bot_token",
-        "pane_id",
-        "terminal_id",
-        "tty",
-        "pty",
-        "pid",
-        "tmux",
-        "screen_session",
-        "window_id",
-        "tab_id",
-        "argv",
-        "shell",
-        "command",
-        "connector",
-        "connectors",
-        "herdres_delivery",
-        "backend_target",
-        "agent_session",
-        "session_id",
-        "herdr_state",
-        "herdres_state",
-        "target_kind",
-        "target_value",
-        "turn_target_kind",
-        "turn_target_value",
-        "private_fingerprint",
-    }
-)
-_COMMAND_RESULT_FORBIDDEN_COMPACT = frozenset(
-    name.replace("_", "") for name in _COMMAND_RESULT_FORBIDDEN_FIELDS
-)
 
 # Workers that must not receive instructions.
 _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
@@ -183,34 +99,13 @@ def _is_forbidden_request_field(key: Any) -> bool:
     return normalized in FORBIDDEN_REQUEST_FIELDS or compact in _FORBIDDEN_REQUEST_COMPACT
 
 
-def _is_command_result_forbidden_field(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
-    compact = normalized.replace("_", "")
-    return normalized in _COMMAND_RESULT_FORBIDDEN_FIELDS or compact in _COMMAND_RESULT_FORBIDDEN_COMPACT
-
-
 def sanitize_command_result(value: Any) -> Any:
     """Return a JSON-safe value with command-public forbidden fields removed.
 
-    This is stricter than the snapshot sanitizer: it also strips raw terminal
-    identifiers (pane_id, terminal_id, pid, tty, ...) and any route/delivery/token
-    or connector variants. It preserves ordinary snapshot schema v2 output.
+    Command results share the same public forbidden-key superset as snapshots,
+    turns, and pending interactions so public JSON surfaces do not drift.
     """
-    if isinstance(value, Mapping):
-        sanitized: dict[str, Any] = {}
-        for key, item in value.items():
-            if _is_command_result_forbidden_field(key):
-                continue
-            sanitized[str(key)] = sanitize_command_result(item)
-        return sanitized
-    if isinstance(value, tuple | list):
-        return [sanitize_command_result(item) for item in value]
-    if isinstance(value, set | frozenset):
-        items = [sanitize_command_result(item) for item in value]
-        return sorted(items, key=stable_json_dumps)
-    if value is None or isinstance(value, str | int | float | bool):
-        return value
-    return str(value)
+    return sanitize_forbidden_fields(value)
 
 
 def _clean_mapping(value: Any) -> dict[str, Any] | None:

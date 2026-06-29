@@ -7,11 +7,93 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
-from tendwire.core.models import Space, Worker
+from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
 from tendwire.store.sqlite import latest_snapshot, list_worker_bindings
+
+
+_PUBLIC_JSON_FORBIDDEN_KEYS = {
+    "tty",
+    "pty",
+    "pid",
+    "pids",
+    "process_id",
+    "process_ids",
+    "tmux",
+    "tmux_session",
+    "tmux_sessions",
+    "screen_session",
+    "screen_sessions",
+    "window_id",
+    "window_ids",
+    "tab_id",
+    "tab_ids",
+    "pane_id",
+    "pane_ids",
+    "terminal_id",
+    "terminal_ids",
+    "backend_target",
+    "backend_targets",
+    "session_id",
+    "private",
+    "private_binding",
+    "private_bindings",
+    "private_fingerprint",
+    "private_fingerprints",
+    "route",
+    "routes",
+    "delivery",
+    "deliveries",
+    "connector",
+    "connectors",
+    "command",
+    "command_args",
+    "command_argv",
+    "command_line",
+    "command_payload",
+    "command_text",
+    "raw_args",
+    "raw_argv",
+    "raw_command",
+    "raw_command_line",
+    "shell_command",
+    "chat_id",
+    "chat_ids",
+    "topic_id",
+    "topic_ids",
+    "message_id",
+    "message_ids",
+    "token",
+    "tokens",
+    "secret",
+    "secrets",
+    "password",
+    "passwords",
+    "credentials",
+    "cookie",
+    "auth_token",
+    "auth_tokens",
+}
+_PUBLIC_JSON_FORBIDDEN_COMPACT = {
+    key.replace("_", "") for key in _PUBLIC_JSON_FORBIDDEN_KEYS
+}
+
+
+def _assert_no_public_json_forbidden(value: Any, path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            assert (
+                normalized not in _PUBLIC_JSON_FORBIDDEN_KEYS
+                and normalized.replace("_", "") not in _PUBLIC_JSON_FORBIDDEN_COMPACT
+            ), f"forbidden field {path}.{key}"
+            _assert_no_public_json_forbidden(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _assert_no_public_json_forbidden(item, f"{path}[{index}]")
 
 
 def test_cli_snapshot_json_prints_contract_json_only(capsys) -> None:
@@ -110,6 +192,31 @@ def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeyp
                     "needs_human": True,
                     "safe": "kept",
                     "pane_id": "pane-private",
+                    "tty": "sentinel-cli-tty",
+                    "pty": "sentinel-cli-pty",
+                    "pid": "sentinel-cli-pid",
+                    "processId": "sentinel-cli-process",
+                    "tmux-session": "sentinel-cli-tmux",
+                    "screenSession": "sentinel-cli-screen",
+                    "window_id": "sentinel-cli-window",
+                    "tabId": "sentinel-cli-tab",
+                    "terminalid": "sentinel-cli-terminal",
+                    "backendTarget": "sentinel-cli-backend",
+                    "session-id": "sentinel-cli-session",
+                    "messageIds": "sentinel-cli-message-ids",
+                    "terminalIds": "sentinel-cli-terminal-ids",
+                    "terminal": "sentinel-cli-terminal-object",
+                    "telegramMessageId": "sentinel-cli-telegram-message",
+                    "routeId": "sentinel-cli-route-id",
+                    "connectorId": "sentinel-cli-connector-id",
+                    "tmuxPaneId": "sentinel-cli-tmux-pane-id",
+                    "screenWindowId": "sentinel-cli-screen-window-id",
+                    "agentSessionId": "sentinel-cli-agent-session-id",
+                    "session": "sentinel-cli-session-object",
+                    "privateFingerprints": "sentinel-cli-private-fingerprints",
+                    "passwords": "sentinel-cli-passwords",
+                    "privateBinding": "sentinel-cli-private-binding",
+                    "authToken": "sentinel-cli-auth",
                 },
                 backend_target={"kind": "agent_id", "value": "agent-private", "sendable": True},
             )
@@ -140,6 +247,81 @@ def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeyp
     assert "pane-private" not in encoded_turns
     assert "agent-private" not in encoded_pending
     assert "pane-private" not in encoded_pending
+    assert "sentinel-cli-" not in encoded_turns
+    assert "sentinel-cli-" not in encoded_pending
+    _assert_no_public_json_forbidden(turns_payload)
+    _assert_no_public_json_forbidden(pending_payload)
+
+
+def test_cli_turns_and_pending_json_strip_raw_command_action_material(capsys, monkeypatch) -> None:
+    def _fake_snapshot(config):
+        return Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[
+                Worker(
+                    id="worker-1",
+                    name="Worker One",
+                    status="waiting",
+                    space_id="space-1",
+                    summary="waiting for action",
+                )
+            ],
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    suggested_actions=[
+                        SuggestedAction(
+                            command="sentinel-cli-safe-looking-command-alias",
+                            params={
+                                "safe_choice": "kept",
+                                "commandLine": "sentinel-cli-command-line",
+                                "terminal_id": "sentinel-cli-terminal",
+                                "backendTarget": "sentinel-cli-backend",
+                                "session-id": "sentinel-cli-session",
+                                "token": "sentinel-cli-token",
+                                "secret": "sentinel-cli-secret",
+                            },
+                        )
+                    ],
+                    meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
+                    host_id=config.host_id,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", _fake_snapshot)
+
+    turns_code = main(["--host-id", "raw-command-cli", "turns", "--json"])
+    turns_captured = capsys.readouterr()
+    pending_code = main(["--host-id", "raw-command-cli", "pending", "--json"])
+    pending_captured = capsys.readouterr()
+    turns_payload = json.loads(turns_captured.out)
+    pending_payload = json.loads(pending_captured.out)
+    encoded_turns = json.dumps(turns_payload, sort_keys=True)
+    encoded_pending = json.dumps(pending_payload, sort_keys=True)
+
+    assert turns_code == 0
+    assert pending_code == 0
+    assert turns_captured.err == ""
+    assert pending_captured.err == ""
+    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
+    assert pending_payload["pending_interactions"][0]["choices"] == [
+        {
+            "choice_id": pending_payload["pending_interactions"][0]["choices"][0]["choice_id"],
+            "label": "Action",
+            "params": {"safe_choice": "kept"},
+        }
+    ]
+    assert "sentinel-cli-" not in encoded_turns
+    assert "sentinel-cli-" not in encoded_pending
+    _assert_no_public_json_forbidden(turns_payload)
+    _assert_no_public_json_forbidden(pending_payload)
 
 
 def test_cli_snapshot_json_reports_healthy_empty_herdr(capsys, monkeypatch) -> None:

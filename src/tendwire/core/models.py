@@ -92,43 +92,173 @@ _SEVERITY_ALIASES = {
 FORBIDDEN_FIELD_NAMES = frozenset(
     {
         "telegram",
+        "telegram_chat_id",
+        "telegram_chat_ids",
+        "telegram_id",
+        "telegram_ids",
+        "telegram_message_id",
+        "telegram_message_ids",
+        "telegram_thread_id",
+        "telegram_thread_ids",
+        "telegram_topic_id",
+        "telegram_topic_ids",
         "chat_id",
+        "chat_ids",
         "topic_id",
+        "topic_ids",
         "message_id",
+        "message_ids",
         "thread_id",
+        "thread_ids",
         "token",
+        "tokens",
         "bot_token",
+        "bot_tokens",
+        "auth",
+        "auth_token",
+        "auth_tokens",
+        "authorization",
+        "authorization_header",
+        "authorization_headers",
+        "bearer_token",
+        "bearer_tokens",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
         "delivery",
+        "delivery_id",
+        "delivery_ids",
+        "deliveries",
         "route",
+        "route_id",
+        "route_ids",
+        "routes",
+        "connector",
+        "connector_id",
+        "connector_ids",
+        "connectors",
         "herdres_delivery",
         "backend_target",
+        "backend_target_id",
+        "backend_target_ids",
+        "backend_targets",
+        "terminal",
         "terminal_id",
+        "terminal_ids",
+        "terminals",
         "pane_id",
+        "pane_ids",
+        "tab_id",
+        "tab_ids",
+        "window_id",
+        "window_ids",
+        "tty",
+        "pty",
+        "pid",
+        "pids",
+        "process_id",
+        "process_ids",
+        "process",
+        "tmux",
+        "tmux_session",
+        "tmux_session_id",
+        "tmux_session_ids",
+        "tmux_sessions",
+        "tmux_window",
+        "tmux_window_id",
+        "tmux_window_ids",
+        "tmux_windows",
+        "tmux_pane",
+        "tmux_pane_id",
+        "tmux_pane_ids",
+        "tmux_panes",
+        "screen",
+        "screen_session",
+        "screen_session_id",
+        "screen_session_ids",
+        "screen_sessions",
+        "screen_window",
+        "screen_window_id",
+        "screen_window_ids",
+        "screen_windows",
         "agent_session",
+        "agent_session_id",
+        "agent_session_ids",
+        "agent_sessions",
+        "session",
         "session_id",
+        "session_ids",
+        "sessions",
         "herdr_state",
         "herdres_state",
         "target_kind",
         "target_value",
         "turn_target_kind",
         "turn_target_value",
+        "private",
+        "private_binding",
+        "private_bindings",
         "private_fingerprint",
+        "private_fingerprints",
         "argv",
+        "args",
         "command",
+        "command_arg",
+        "command_args",
+        "command_argv",
+        "command_argvs",
+        "command_line",
+        "command_lines",
+        "command_payload",
+        "command_payloads",
+        "command_text",
+        "command_texts",
         "env",
         "environment",
+        "raw_arg",
+        "raw_args",
+        "raw_argv",
+        "raw_argvs",
+        "raw_command",
+        "raw_command_line",
+        "raw_command_lines",
+        "raw_payload",
+        "raw_payloads",
+        "raw_control",
+        "raw_controls",
+        "shell_command",
+        "shell_commands",
+        "terminal_control",
+        "terminal_controls",
+        "control_sequence",
+        "control_sequences",
+        "escape_sequence",
+        "escape_sequences",
+        "ansi_escape",
+        "stdin",
         "stderr",
         "stdout",
         "shell",
         "secret",
         "secrets",
         "password",
+        "passwords",
+        "api_keys",
         "api_key",
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _BACKEND_MESSAGE_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)?")
+_RAW_COMMAND_HEAD_RE = re.compile(
+    r"^(?:sudo\s+)?(?:env\s+)?"
+    r"(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python\d*|node|npm|npx|git|gh|docker|"
+    r"kubectl|make|pytest|herdr|tendwire|tmux|screen)(?:\s|$)",
+    re.IGNORECASE,
+)
+_RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
+_SHELL_META_RE = re.compile(r"[;&|`$<>]")
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -144,6 +274,32 @@ def _is_forbidden_backend_message_label(value: str) -> bool:
     normalized = "_".join(part for part in re.split(r"[\s_-]+", separated.lower()) if part)
     compact = normalized.replace("_", "")
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
+
+
+def _looks_like_raw_command(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if any(ord(char) < 32 or 0x80 <= ord(char) <= 0x9F for char in text):
+        return True
+    if _SHELL_META_RE.search(text):
+        return True
+    if _RAW_COMMAND_HEAD_RE.search(text):
+        return True
+    if _RAW_COMMAND_OPTION_RE.search(text):
+        return True
+    first = text.split(maxsplit=1)[0]
+    return ("/" in first or first.endswith((".bat", ".cmd", ".exe", ".py", ".sh"))) and " " in text
+
+
+def _public_tendwire_action_value(value: Any) -> str | None:
+    clean = sanitize_forbidden_fields(value)
+    if not isinstance(clean, str):
+        return None
+    text = clean.strip()
+    if not text or _looks_like_raw_command(text):
+        return None
+    return text
 
 
 _SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "observed_at", "content_fingerprint"})
@@ -465,41 +621,54 @@ class SuggestedAction:
         command: str | None = None,
     ) -> None:
         label = _string_value(label)
-        action_value = tendwire_action if tendwire_action or command is None else command
-        tendwire_action = _string_value(action_value)
+        tendwire_action = _string_value(tendwire_action)
+        command_alias = _optional_string(command)
+        public_tendwire_action = _public_tendwire_action_value(tendwire_action)
+        explicit_tendwire_action = public_tendwire_action is not None
         params = sanitize_forbidden_fields(params if isinstance(params, Mapping) else {})
         action_id = _string_value(action_id) or stable_fingerprint(
-            {"label": label, "tendwire_action": tendwire_action, "params": params}
+            {"label": label, "tendwire_action": public_tendwire_action or "", "params": params}
         )
         object.__setattr__(self, "action_id", action_id)
         object.__setattr__(self, "label", label)
         object.__setattr__(self, "tendwire_action", tendwire_action)
         object.__setattr__(self, "params", params)
+        object.__setattr__(self, "_command", command_alias)
+        object.__setattr__(self, "_explicit_tendwire_action", explicit_tendwire_action)
 
     @property
     def command(self) -> str:
         """Backward-compatible in-process alias; not serialized."""
-        return self.tendwire_action
+        return getattr(self, "_command", None) or self.tendwire_action
+
+    @property
+    def has_public_tendwire_action(self) -> bool:
+        """Whether tendwire_action came from the explicit public field."""
+        return bool(getattr(self, "_explicit_tendwire_action", False))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "action_id": self.action_id,
             "label": self.label,
-            "tendwire_action": self.tendwire_action,
             "params": sanitize_forbidden_fields(self.params),
         }
+        public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
+        if self.has_public_tendwire_action and public_tendwire_action is not None:
+            payload["tendwire_action"] = public_tendwire_action
+        return payload
 
     @classmethod
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
-        raw_command = data.get("command") if isinstance(data, Mapping) else None
+        command = data.get("command") if isinstance(data, Mapping) else None
         clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
-            tendwire_action=_string_value(clean.get("tendwire_action", raw_command)),
+            tendwire_action=_string_value(clean.get("tendwire_action")),
             params=clean.get("params", {}),
+            command=_optional_string(command),
         )
 
 

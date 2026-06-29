@@ -126,6 +126,14 @@ _APPROVAL_RE = re.compile(r"\bapproval|approve|approved\b", re.IGNORECASE)
 _DESTRUCTIVE_RE = re.compile(r"\bdelete|destroy|destructive|irreversible|remove|wipe\b", re.IGNORECASE)
 _QUESTION_RE = re.compile(r"\?|question|\bask(?:ing)?\b|\binput\b", re.IGNORECASE)
 _REVIEW_RE = re.compile(r"\breview|inspect|manual\b", re.IGNORECASE)
+_RAW_COMMAND_HEAD_RE = re.compile(
+    r"^(?:sudo\s+)?(?:env\s+)?"
+    r"(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python\d*|node|npm|npx|git|gh|docker|"
+    r"kubectl|make|pytest|herdr|tendwire|tmux|screen)(?:\s|$)",
+    re.IGNORECASE,
+)
+_RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
+_SHELL_META_RE = re.compile(r"[;&|`$<>]")
 
 
 def _normalize_turn_kind(kind: Any) -> str:
@@ -162,6 +170,14 @@ def _clean_meta(value: Any) -> dict[str, Any]:
     return clean if isinstance(clean, dict) else {}
 
 
+def _normalized_key(value: Any) -> str:
+    return str(value).strip().lower().replace("-", "_")
+
+
+def _compact_key(value: Any) -> str:
+    return _normalized_key(value).replace("_", "")
+
+
 def _strip_volatile(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
@@ -183,10 +199,56 @@ def _content_fingerprint(value: Any) -> str:
 
 
 def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
+    normalized_target = _normalized_key(normalized_key)
+    compact_target = normalized_target.replace("_", "")
     for key, value in meta.items():
-        if str(key).strip().lower().replace("-", "_") == normalized_key:
+        if _normalized_key(key) == normalized_target or _compact_key(key) == compact_target:
             return value
     return None
+
+
+def _optional_public_description(value: Any) -> str | None:
+    clean = sanitize_forbidden_fields(value)
+    if clean in ({}, []):
+        return None
+    if isinstance(clean, Mapping) or isinstance(clean, list):
+        return stable_json_dumps(clean)
+    return _optional_string(clean)
+
+
+def _looks_like_raw_command(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if any(ord(char) < 32 or 0x80 <= ord(char) <= 0x9F for char in text):
+        return True
+    if _SHELL_META_RE.search(text):
+        return True
+    if _RAW_COMMAND_HEAD_RE.search(text):
+        return True
+    if _RAW_COMMAND_OPTION_RE.search(text):
+        return True
+    first = text.split(maxsplit=1)[0]
+    return ("/" in first or first.endswith((".bat", ".cmd", ".exe", ".py", ".sh"))) and " " in text
+
+
+def _public_choice_value(value: Any) -> Any | None:
+    clean = sanitize_forbidden_fields(value)
+    if clean in ({}, [], ""):
+        return None
+    if isinstance(clean, str):
+        return None if _looks_like_raw_command(clean) else clean
+    return clean
+
+
+def _public_suggested_action_value(action: Any) -> Any | None:
+    if not getattr(action, "has_public_tendwire_action", False):
+        return None
+    return _public_choice_value(getattr(action, "tendwire_action", ""))
+
+
+def _is_pending_routing_meta_key(key: Any) -> bool:
+    return _compact_key(key) in {"workerid", "spaceid"}
 
 
 @dataclass(frozen=True)
@@ -201,9 +263,9 @@ class InteractionChoice:
 
     def __post_init__(self) -> None:
         label = _string_value(self.label)
-        description = _optional_string(self.description)
+        description = _optional_public_description(self.description)
         params = _clean_meta(self.params)
-        value = sanitize_forbidden_fields(self.value)
+        value = _public_choice_value(self.value)
         choice_id = _string_value(self.choice_id) or stable_fingerprint(
             {
                 "label": label,
@@ -225,8 +287,9 @@ class InteractionChoice:
             "label": self.label,
             "params": sanitize_forbidden_fields(self.params),
         }
-        if self.value is not None:
-            payload["value"] = sanitize_forbidden_fields(self.value)
+        public_value = _public_choice_value(self.value)
+        if public_value is not None:
+            payload["value"] = public_value
         if self.description is not None:
             payload["description"] = self.description
         return payload
@@ -299,8 +362,8 @@ class Turn:
             "summary": summary,
             "meta": meta,
         }
-        turn_id = _string_value(self.id) or _stable_id("turn", identity_payload)
-        fingerprint = _string_value(self.fingerprint) or _content_fingerprint(content_payload)
+        turn_id = _stable_id("turn", identity_payload)
+        fingerprint = _content_fingerprint(content_payload)
 
         object.__setattr__(self, "schema_version", TURN_SCHEMA_VERSION)
         object.__setattr__(self, "id", turn_id)
@@ -426,8 +489,8 @@ class PendingInteraction:
             "status": status,
             "meta": meta,
         }
-        interaction_id = _string_value(self.id) or _stable_id("pending", identity_payload)
-        fingerprint = _string_value(self.fingerprint) or _content_fingerprint(content_payload)
+        interaction_id = _stable_id("pending", identity_payload)
+        fingerprint = _content_fingerprint(content_payload)
 
         object.__setattr__(self, "schema_version", TURN_SCHEMA_VERSION)
         object.__setattr__(self, "id", interaction_id)
@@ -503,6 +566,7 @@ def turns_from_snapshot(snapshot: Snapshot) -> list[Turn]:
     """Derive deterministic public turns from public snapshot workers."""
     turns: list[Turn] = []
     for worker in snapshot.workers:
+        worker_meta = _clean_meta(worker.meta)
         turns.append(
             Turn(
                 host_id=snapshot.host_id,
@@ -516,7 +580,7 @@ def turns_from_snapshot(snapshot: Snapshot) -> list[Turn]:
                 updated_at=worker.last_seen_at,
                 source=f"worker:{worker.id}",
                 origin_command_id=_worker_origin_command_id(worker),
-                meta=worker.meta,
+                meta=worker_meta,
             )
         )
     return sorted(turns, key=lambda turn: (turn.id, turn.fingerprint))
@@ -545,7 +609,10 @@ def _signal_is_human_actionable(signal: AttentionSignal) -> bool:
 def _kind_from_signal(signal: AttentionSignal) -> str:
     text_parts = [signal.kind, signal.reason]
     for action in signal.suggested_actions:
-        text_parts.extend([action.label, action.tendwire_action])
+        public_action_value = _public_suggested_action_value(action)
+        text_parts.append(action.label)
+        if isinstance(public_action_value, str):
+            text_parts.append(public_action_value)
     text = " ".join(part for part in text_parts if part)
     explicit_kind = _normalize_pending_kind(_meta_value(signal.meta, "interaction_kind"))
     if explicit_kind != "unknown":
@@ -566,12 +633,14 @@ def _kind_from_signal(signal: AttentionSignal) -> str:
 def _choices_from_signal(signal: AttentionSignal) -> list[InteractionChoice]:
     choices: list[InteractionChoice] = []
     for action in signal.suggested_actions:
-        label = action.label or action.tendwire_action or "Action"
+        public_value = _public_suggested_action_value(action)
+        label = action.label or (public_value if isinstance(public_value, str) else "") or "Action"
+        choice_id = action.action_id if public_value is not None else ""
         choices.append(
             InteractionChoice(
-                choice_id=action.action_id,
+                choice_id=choice_id,
                 label=label,
-                value=action.tendwire_action or None,
+                value=public_value,
                 params=action.params,
             )
         )
@@ -590,6 +659,23 @@ def _pending_status_from_signal(signal: AttentionSignal) -> str:
     return "open"
 
 
+def _pending_public_meta_from_signal(signal: AttentionSignal) -> dict[str, Any]:
+    meta = _clean_meta(
+        {
+            "attention_id": signal.id,
+            "attention_kind": signal.kind,
+            "attention_severity": signal.severity,
+            "attention_status": signal.status,
+            "source": signal.source,
+        }
+    )
+    for key, value in _clean_meta(signal.meta).items():
+        if _is_pending_routing_meta_key(key):
+            continue
+        meta[str(key)] = value
+    return _clean_meta(meta)
+
+
 def pending_from_snapshot(snapshot: Snapshot) -> list[PendingInteraction]:
     """Derive deterministic public pending interactions from attention signals."""
     workers = {worker.id: worker for worker in snapshot.workers}
@@ -604,18 +690,7 @@ def pending_from_snapshot(snapshot: Snapshot) -> list[PendingInteraction]:
         space_id = _optional_string(_meta_value(signal.meta, "space_id"))
         if space_id is None and worker is not None:
             space_id = worker.space_id
-        meta = {
-            "attention_id": signal.id,
-            "attention_kind": signal.kind,
-            "attention_severity": signal.severity,
-            "attention_status": signal.status,
-            "source": signal.source,
-        }
-        for key, value in signal.meta.items():
-            normalized_key = str(key).strip().lower().replace("-", "_")
-            if normalized_key in {"worker_id", "space_id"}:
-                continue
-            meta[str(key)] = value
+        meta = _pending_public_meta_from_signal(signal)
         interactions.append(
             PendingInteraction(
                 host_id=snapshot.host_id,
