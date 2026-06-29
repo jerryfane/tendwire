@@ -251,6 +251,14 @@ FORBIDDEN_FIELD_NAMES = frozenset(
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _BACKEND_MESSAGE_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)?")
+_RAW_COMMAND_HEAD_RE = re.compile(
+    r"^(?:sudo\s+)?(?:env\s+)?"
+    r"(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python\d*|node|npm|npx|git|gh|docker|"
+    r"kubectl|make|pytest|herdr|tendwire|tmux|screen)(?:\s|$)",
+    re.IGNORECASE,
+)
+_RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
+_SHELL_META_RE = re.compile(r"[;&|`$<>]")
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -266,6 +274,32 @@ def _is_forbidden_backend_message_label(value: str) -> bool:
     normalized = "_".join(part for part in re.split(r"[\s_-]+", separated.lower()) if part)
     compact = normalized.replace("_", "")
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
+
+
+def _looks_like_raw_command(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    if any(ord(char) < 32 or 0x80 <= ord(char) <= 0x9F for char in text):
+        return True
+    if _SHELL_META_RE.search(text):
+        return True
+    if _RAW_COMMAND_HEAD_RE.search(text):
+        return True
+    if _RAW_COMMAND_OPTION_RE.search(text):
+        return True
+    first = text.split(maxsplit=1)[0]
+    return ("/" in first or first.endswith((".bat", ".cmd", ".exe", ".py", ".sh"))) and " " in text
+
+
+def _public_tendwire_action_value(value: Any) -> str | None:
+    clean = sanitize_forbidden_fields(value)
+    if not isinstance(clean, str):
+        return None
+    text = clean.strip()
+    if not text or _looks_like_raw_command(text):
+        return None
+    return text
 
 
 _SNAPSHOT_CONTENT_IGNORED_KEYS = frozenset({"updated_at", "observed_at", "content_fingerprint"})
@@ -587,23 +621,25 @@ class SuggestedAction:
         command: str | None = None,
     ) -> None:
         label = _string_value(label)
-        explicit_tendwire_action = bool(_string_value(tendwire_action))
-        action_value = tendwire_action if tendwire_action or command is None else command
-        tendwire_action = _string_value(action_value)
+        tendwire_action = _string_value(tendwire_action)
+        command_alias = _optional_string(command)
+        public_tendwire_action = _public_tendwire_action_value(tendwire_action)
+        explicit_tendwire_action = public_tendwire_action is not None
         params = sanitize_forbidden_fields(params if isinstance(params, Mapping) else {})
         action_id = _string_value(action_id) or stable_fingerprint(
-            {"label": label, "tendwire_action": tendwire_action, "params": params}
+            {"label": label, "tendwire_action": public_tendwire_action or "", "params": params}
         )
         object.__setattr__(self, "action_id", action_id)
         object.__setattr__(self, "label", label)
         object.__setattr__(self, "tendwire_action", tendwire_action)
         object.__setattr__(self, "params", params)
+        object.__setattr__(self, "_command", command_alias)
         object.__setattr__(self, "_explicit_tendwire_action", explicit_tendwire_action)
 
     @property
     def command(self) -> str:
         """Backward-compatible in-process alias; not serialized."""
-        return self.tendwire_action
+        return getattr(self, "_command", None) or self.tendwire_action
 
     @property
     def has_public_tendwire_action(self) -> bool:
@@ -616,20 +652,23 @@ class SuggestedAction:
             "label": self.label,
             "params": sanitize_forbidden_fields(self.params),
         }
-        if self.has_public_tendwire_action:
-            payload["tendwire_action"] = self.tendwire_action
+        public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
+        if self.has_public_tendwire_action and public_tendwire_action is not None:
+            payload["tendwire_action"] = public_tendwire_action
         return payload
 
     @classmethod
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
+        command = data.get("command") if isinstance(data, Mapping) else None
         clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
             tendwire_action=_string_value(clean.get("tendwire_action")),
             params=clean.get("params", {}),
+            command=_optional_string(command),
         )
 
 

@@ -283,12 +283,42 @@ def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -
         encoded = json.dumps(payload, sort_keys=True)
 
         assert action.tendwire_action == ""
+        assert action.command == raw_action["command"]
         assert not action.has_public_tendwire_action
         assert payload["label"] == raw_action["label"]
         assert "tendwire_action" not in payload
         assert "safe" in payload["params"]
         assert "sentinel-" not in encoded
         _assert_no_forbidden_fields(payload)
+
+
+def test_suggested_action_command_alias_stays_internal_and_out_of_public_identity() -> None:
+    action_a = SuggestedAction(
+        label="Run diagnostic",
+        command="sentinel-safe-looking-command-alias-a",
+        params={"safe": "kept", "commandLine": "sentinel-command-line-a"},
+    )
+    action_b = SuggestedAction(
+        label="Run diagnostic",
+        command="sentinel-safe-looking-command-alias-b",
+        params={"safe": "kept", "commandLine": "sentinel-command-line-b"},
+    )
+
+    payload_a = action_a.to_dict()
+    payload_b = action_b.to_dict()
+
+    assert action_a.command == "sentinel-safe-looking-command-alias-a"
+    assert action_b.command == "sentinel-safe-looking-command-alias-b"
+    assert action_a.tendwire_action == ""
+    assert not action_a.has_public_tendwire_action
+    assert action_a.action_id == action_b.action_id
+    assert payload_a == payload_b == {
+        "action_id": action_a.action_id,
+        "label": "Run diagnostic",
+        "params": {"safe": "kept"},
+    }
+    assert "sentinel-" not in json.dumps(payload_a, sort_keys=True)
+    _assert_no_forbidden_fields(payload_a)
 
 
 def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> None:
@@ -312,6 +342,22 @@ def test_suggested_action_from_dict_prefers_safe_explicit_tendwire_action() -> N
     assert payload["tendwire_action"] == "approve"
     assert payload["params"] == {"safe": "kept"}
     assert "sentinel-" not in encoded
+    _assert_no_forbidden_fields(payload)
+
+
+def test_suggested_action_omits_raw_explicit_tendwire_action_publicly() -> None:
+    action = SuggestedAction(
+        label="Run diagnostic",
+        tendwire_action="tendwire snapshot --json --token sentinel-action-token",
+        params={"safe": "kept"},
+    )
+
+    payload = action.to_dict()
+
+    assert action.command == "tendwire snapshot --json --token sentinel-action-token"
+    assert not action.has_public_tendwire_action
+    assert "tendwire_action" not in payload
+    assert "sentinel-" not in json.dumps(payload, sort_keys=True)
     _assert_no_forbidden_fields(payload)
 
 
@@ -612,6 +658,43 @@ def test_attention_signal_direct_identity_and_dataclass_actions_are_neutral() ->
     assert action.command == "tendwire snapshot --json"
     assert "tendwire_action" not in payload["suggested_actions"][0]
     assert "command" not in payload["suggested_actions"][0]
+    _assert_no_forbidden_fields(payload)
+
+
+def test_snapshot_attention_public_fingerprint_ignores_command_aliases() -> None:
+    def snapshot(command: str) -> Snapshot:
+        action = SuggestedAction(
+            label="Run diagnostic",
+            command=command,
+            params={"safe": "kept"},
+        )
+        return Snapshot(
+            host_id="attention-command-host",
+            updated_at="2026-01-01T00:00:00+00:00",
+            attention=[
+                AttentionSignal(
+                    kind="worker_status",
+                    severity="warning",
+                    status="waiting",
+                    reason="Choose next action",
+                    source="worker:worker-1",
+                    suggested_actions=[action],
+                    host_id="attention-command-host",
+                )
+            ],
+        )
+
+    snapshot_a = snapshot("sentinel-safe-looking-command-alias-a")
+    snapshot_b = snapshot("sentinel-safe-looking-command-alias-b")
+    payload = snapshot_a.to_dict()
+
+    assert snapshot_a.content_fingerprint == snapshot_b.content_fingerprint
+    assert (
+        payload["attention"][0]["suggested_actions"]
+        == snapshot_b.to_dict()["attention"][0]["suggested_actions"]
+    )
+    assert "tendwire_action" not in payload["attention"][0]["suggested_actions"][0]
+    assert "sentinel-" not in json.dumps(payload, sort_keys=True)
     _assert_no_forbidden_fields(payload)
 
 
