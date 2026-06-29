@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Any
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
 from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
-from tendwire.store.sqlite import latest_snapshot, list_worker_bindings
+from tendwire.store.sqlite import init_store, latest_snapshot, list_worker_bindings
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -380,6 +382,146 @@ def test_cli_snapshot_store_persists_printed_snapshot(tmp_path: Path, capsys) ->
     assert restored is not None
     assert restored.host_id == "cli-store"
     assert restored.content_fingerprint == payload["content_fingerprint"]
+
+
+def test_cli_public_json_does_not_emit_connector_private_store_rows(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "connector-private.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "public-host",
+                "sentinel-connector-private",
+                "sentinel-delivery-key",
+                "queued",
+                '{"safe":"kept"}',
+                '{"chat_id":"sentinel-chat","route":"sentinel-route"}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        outbox_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                "public-host",
+                "sentinel-connector-private",
+                "sentinel-delivery-key",
+                1,
+                "delivered",
+                '{"ok":true}',
+                '{"message_id":"sentinel-message","token":"sentinel-token"}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+
+    payloads: list[dict[str, Any]] = []
+
+    snapshot_code = main(
+        [
+            "--host-id",
+            "public-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "snapshot",
+            "--json",
+            "--store",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    snapshot_captured = capsys.readouterr()
+    payloads.append(json.loads(snapshot_captured.out))
+
+    turns_code = main(
+        [
+            "--host-id",
+            "public-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "turns",
+            "--json",
+        ]
+    )
+    turns_captured = capsys.readouterr()
+    payloads.append(json.loads(turns_captured.out))
+
+    pending_code = main(
+        [
+            "--host-id",
+            "public-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "pending",
+            "--json",
+        ]
+    )
+    pending_captured = capsys.readouterr()
+    payloads.append(json.loads(pending_captured.out))
+
+    doctor_code = main(
+        [
+            "--host-id",
+            "public-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "doctor",
+            "--json",
+        ]
+    )
+    doctor_captured = capsys.readouterr()
+    payloads.append(json.loads(doctor_captured.out))
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"schema_version": 1, "action": "read_snapshot"})),
+    )
+    command_code = main(
+        [
+            "--host-id",
+            "public-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    command_captured = capsys.readouterr()
+    payloads.append(json.loads(command_captured.out))
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_counts = (
+            conn.execute("SELECT COUNT(*) FROM connector_outbox").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM connector_deliveries").fetchone()[0],
+        )
+
+    encoded = json.dumps(payloads, sort_keys=True)
+    assert snapshot_code == 0
+    assert turns_code == 0
+    assert pending_code == 0
+    assert doctor_code == 1
+    assert command_code == 0
+    assert private_counts == (1, 1)
+    assert "sentinel-" not in encoded
 
 
 def test_cli_snapshot_store_persists_private_bindings_outside_snapshot_payload(

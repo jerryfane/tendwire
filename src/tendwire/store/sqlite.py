@@ -23,6 +23,7 @@ from ..core.models import (
     stable_json_dumps,
     utc_timestamp,
 )
+from ..core.turns import pending_from_snapshot, turns_from_snapshot
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
@@ -107,9 +108,259 @@ CREATE_WORKER_BINDING_UNIQUE_INDEX = (
     "ON worker_bindings(host_id, backend, private_fingerprint)"
 )
 
+CREATE_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    aggregate_type TEXT NOT NULL DEFAULT '',
+    aggregate_id TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+"""
+
+CREATE_SPACES_TABLE = """
+CREATE TABLE IF NOT EXISTS spaces (
+    host_id TEXT NOT NULL,
+    space_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT,
+    fingerprint TEXT NOT NULL,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, space_id)
+);
+"""
+
+CREATE_WORKERS_TABLE = """
+CREATE TABLE IF NOT EXISTS workers (
+    host_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    worker_fingerprint TEXT NOT NULL,
+    space_id TEXT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_seen_at TEXT,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, worker_id)
+);
+"""
+
+CREATE_TURNS_TABLE = """
+CREATE TABLE IF NOT EXISTS turns (
+    host_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    worker_fingerprint TEXT,
+    space_id TEXT,
+    status TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    updated_at TEXT,
+    fingerprint TEXT NOT NULL,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, turn_id)
+);
+"""
+
+CREATE_PENDING_INTERACTIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS pending_interactions (
+    host_id TEXT NOT NULL,
+    pending_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    worker_fingerprint TEXT,
+    space_id TEXT,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT,
+    fingerprint TEXT NOT NULL,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, pending_id)
+);
+"""
+
+CREATE_ATTENTION_ITEMS_TABLE = """
+CREATE TABLE IF NOT EXISTS attention_items (
+    host_id TEXT NOT NULL,
+    attention_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT,
+    fingerprint TEXT NOT NULL,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, attention_id)
+);
+"""
+
+CREATE_COMMANDS_TABLE = """
+CREATE TABLE IF NOT EXISTS commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    uncertain INTEGER NOT NULL DEFAULT 0,
+    request_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    reserved_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL
+);
+"""
+
+CREATE_CONNECTOR_OUTBOX_TABLE = """
+CREATE TABLE IF NOT EXISTS connector_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    connector TEXT NOT NULL,
+    delivery_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    private_state_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    next_attempt_at TEXT
+);
+"""
+
+CREATE_CONNECTOR_DELIVERIES_TABLE = """
+CREATE TABLE IF NOT EXISTS connector_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbox_id INTEGER,
+    host_id TEXT NOT NULL,
+    connector TEXT NOT NULL,
+    delivery_key TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    response_json TEXT NOT NULL DEFAULT '{}',
+    private_state_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    delivered_at TEXT,
+    FOREIGN KEY (outbox_id) REFERENCES connector_outbox(id) ON DELETE SET NULL
+);
+"""
+
+CREATE_BACKEND_HEALTH_TABLE = """
+CREATE TABLE IF NOT EXISTS backend_health (
+    host_id TEXT NOT NULL,
+    backend_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    observed_at TEXT,
+    snapshot_content_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (host_id, backend_name)
+);
+"""
+
+CREATE_PR6_TABLES = (
+    CREATE_EVENTS_TABLE,
+    CREATE_SPACES_TABLE,
+    CREATE_WORKERS_TABLE,
+    CREATE_TURNS_TABLE,
+    CREATE_PENDING_INTERACTIONS_TABLE,
+    CREATE_ATTENTION_ITEMS_TABLE,
+    CREATE_COMMANDS_TABLE,
+    CREATE_CONNECTOR_OUTBOX_TABLE,
+    CREATE_CONNECTOR_DELIVERIES_TABLE,
+    CREATE_BACKEND_HEALTH_TABLE,
+)
+
+CREATE_PR6_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_events_host_observed_at ON events(host_id, observed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_events_host_type ON events(host_id, event_type)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_events_host_aggregate "
+        "ON events(host_id, aggregate_type, aggregate_id)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_spaces_host_status ON spaces(host_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_workers_host_status ON workers(host_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_workers_host_space ON workers(host_id, space_id)",
+    "CREATE INDEX IF NOT EXISTS idx_turns_host_worker ON turns(host_id, worker_id)",
+    "CREATE INDEX IF NOT EXISTS idx_turns_host_status ON turns(host_id, status)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_pending_interactions_host_worker "
+        "ON pending_interactions(host_id, worker_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_pending_interactions_host_status "
+        "ON pending_interactions(host_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_items_host_source "
+        "ON attention_items(host_id, source)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_items_host_status "
+        "ON attention_items(host_id, status)"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_commands_host_request_action "
+        "ON commands(host_id, request_id, action)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_commands_host_status ON commands(host_id, status)",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_connector_outbox_host_connector_key "
+        "ON connector_outbox(host_id, connector, delivery_key)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_connector_outbox_status ON connector_outbox(status)",
+    (
+        "CREATE INDEX IF NOT EXISTS idx_connector_deliveries_outbox "
+        "ON connector_deliveries(outbox_id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_connector_deliveries_host_connector "
+        "ON connector_deliveries(host_id, connector, delivery_key)"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_backend_health_host_status ON backend_health(host_id, status)",
+)
+
 
 def _ensure_dir(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _is_memory_db(db_path: Path) -> bool:
+    raw = str(db_path)
+    return raw == ":memory:" or (raw.startswith("file:") and "mode=memory" in raw)
+
+
+def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path) -> None:
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    if not _is_memory_db(db_path):
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
+def _connect(
+    db_path: Path,
+    *,
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=30.0,
+        isolation_level=isolation_level,
+    )
+    _apply_connection_pragmas(conn, db_path)
+    return conn
 
 
 def _canonical_json(data: Any) -> str:
@@ -291,6 +542,17 @@ def _table_columns(conn: sqlite3.Connection, table: str = "snapshots") -> set[st
     return {str(row[1]) for row in rows}
 
 
+def _ensure_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: Mapping[str, str],
+) -> None:
+    existing = _table_columns(conn, table)
+    for column, definition in columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def _backfill_content_fingerprints(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
@@ -329,6 +591,727 @@ def _backfill_content_fingerprints(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_command_receipt_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "command_receipts",
+        {
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "request_id": "TEXT NOT NULL DEFAULT ''",
+            "action": "TEXT NOT NULL DEFAULT ''",
+            "payload_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "result_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "completed_at": "TEXT",
+            "uncertain": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
+
+
+def _ensure_worker_binding_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "worker_bindings",
+        {
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "worker_id": "TEXT NOT NULL DEFAULT ''",
+            "worker_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "backend": "TEXT NOT NULL DEFAULT ''",
+            "target_kind": "TEXT NOT NULL DEFAULT ''",
+            "target_value": "TEXT NOT NULL DEFAULT ''",
+            "turn_target_kind": "TEXT",
+            "turn_target_value": "TEXT",
+            "sendable": "INTEGER NOT NULL DEFAULT 0",
+            "reason": "TEXT",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT NOT NULL DEFAULT '9999-12-31T23:59:59+00:00'",
+            "private_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+
+
+def _ensure_pr6_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "events",
+        {
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "event_type": "TEXT NOT NULL DEFAULT ''",
+            "aggregate_type": "TEXT NOT NULL DEFAULT ''",
+            "aggregate_id": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "spaces",
+        {
+            "name": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "updated_at": "TEXT",
+            "fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "workers",
+        {
+            "worker_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "space_id": "TEXT",
+            "name": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "last_seen_at": "TEXT",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "turns",
+        {
+            "worker_id": "TEXT NOT NULL DEFAULT ''",
+            "worker_fingerprint": "TEXT",
+            "space_id": "TEXT",
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "updated_at": "TEXT",
+            "fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "pending_interactions",
+        {
+            "worker_id": "TEXT NOT NULL DEFAULT ''",
+            "worker_fingerprint": "TEXT",
+            "space_id": "TEXT",
+            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "updated_at": "TEXT",
+            "fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "attention_items",
+        {
+            "source": "TEXT NOT NULL DEFAULT ''",
+            "kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "severity": "TEXT NOT NULL DEFAULT 'info'",
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "updated_at": "TEXT",
+            "fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "commands",
+        {
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "request_id": "TEXT NOT NULL DEFAULT ''",
+            "action": "TEXT NOT NULL DEFAULT ''",
+            "payload_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "dry_run": "INTEGER NOT NULL DEFAULT 0",
+            "uncertain": "INTEGER NOT NULL DEFAULT 0",
+            "request_json": "TEXT NOT NULL DEFAULT '{}'",
+            "result_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "reserved_at": "TEXT",
+            "completed_at": "TEXT",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "connector_outbox",
+        {
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "connector": "TEXT NOT NULL DEFAULT ''",
+            "delivery_key": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+            "private_state_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+            "next_attempt_at": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "connector_deliveries",
+        {
+            "outbox_id": "INTEGER",
+            "host_id": "TEXT NOT NULL DEFAULT ''",
+            "connector": "TEXT NOT NULL DEFAULT ''",
+            "delivery_key": "TEXT NOT NULL DEFAULT ''",
+            "attempt": "INTEGER NOT NULL DEFAULT 0",
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "response_json": "TEXT NOT NULL DEFAULT '{}'",
+            "private_state_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+            "delivered_at": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "backend_health",
+        {
+            "status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "outcome": "TEXT NOT NULL DEFAULT 'unknown'",
+            "observed_at": "TEXT",
+            "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "payload_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    )
+
+
+def _append_event_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    event_type: str,
+    payload: Mapping[str, Any],
+    aggregate_type: str = "",
+    aggregate_id: str = "",
+    observed_at: str | None = None,
+    content_fingerprint: str | None = None,
+) -> int:
+    payload_json = _canonical_json(payload)
+    fingerprint = content_fingerprint or stable_fingerprint(
+        {"event_type": event_type, "payload": payload}
+    )
+    cursor = conn.execute(
+        """
+        INSERT INTO events (
+            host_id,
+            event_type,
+            aggregate_type,
+            aggregate_id,
+            observed_at,
+            content_fingerprint,
+            payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(host_id),
+            str(event_type),
+            str(aggregate_type),
+            str(aggregate_id),
+            observed_at or utc_timestamp(),
+            str(fingerprint),
+            payload_json,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def append_event(
+    db_path: Path,
+    host_id: str,
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    aggregate_type: str = "",
+    aggregate_id: str = "",
+    observed_at: str | None = None,
+    content_fingerprint: str | None = None,
+) -> int:
+    """Append a private store event and return its row id."""
+    _ensure_dir(db_path)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        return _append_event_conn(
+            conn,
+            host_id=host_id,
+            event_type=event_type,
+            payload=payload,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            observed_at=observed_at,
+            content_fingerprint=content_fingerprint,
+        )
+
+
+def _prune_host_projection(
+    conn: sqlite3.Connection,
+    table: str,
+    key_column: str,
+    host_id: str,
+    keep_ids: Iterable[str],
+) -> None:
+    ids = sorted({str(value) for value in keep_ids})
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"DELETE FROM {table} WHERE host_id = ? AND {key_column} NOT IN ({placeholders})",
+            [str(host_id), *ids],
+        )
+    else:
+        conn.execute(f"DELETE FROM {table} WHERE host_id = ?", (str(host_id),))
+
+
+def _upsert_snapshot_projections(
+    conn: sqlite3.Connection,
+    snapshot: Snapshot,
+    payload_data: Mapping[str, Any],
+    *,
+    snapshot_id: int,
+    content_fingerprint: str,
+) -> None:
+    host_id = str(snapshot.host_id)
+    observed_at = str(snapshot.updated_at)
+
+    _append_event_conn(
+        conn,
+        host_id=host_id,
+        event_type="snapshot.saved",
+        aggregate_type="snapshot",
+        aggregate_id=str(content_fingerprint),
+        observed_at=observed_at,
+        content_fingerprint=str(content_fingerprint),
+        payload={
+            "snapshot_id": int(snapshot_id),
+            "content_fingerprint": str(content_fingerprint),
+            "snapshot": dict(payload_data),
+        },
+    )
+
+    space_ids: set[str] = set()
+    for item in payload_data.get("spaces", []):
+        if not isinstance(item, Mapping):
+            continue
+        space_id = str(item.get("id") or "unknown")
+        space_ids.add(space_id)
+        conn.execute(
+            """
+            INSERT INTO spaces (
+                host_id,
+                space_id,
+                name,
+                status,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, space_id) DO UPDATE SET
+                name = excluded.name,
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                space_id,
+                str(item.get("name") or space_id),
+                str(item.get("status") or "unknown"),
+                item.get("updated_at"),
+                str(item.get("fingerprint") or ""),
+                str(content_fingerprint),
+                observed_at,
+                _canonical_json(dict(item)),
+            ),
+        )
+    _prune_host_projection(conn, "spaces", "space_id", host_id, space_ids)
+
+    worker_ids: set[str] = set()
+    for item in payload_data.get("workers", []):
+        if not isinstance(item, Mapping):
+            continue
+        worker_id = str(item.get("id") or "unknown")
+        worker_ids.add(worker_id)
+        conn.execute(
+            """
+            INSERT INTO workers (
+                host_id,
+                worker_id,
+                worker_fingerprint,
+                space_id,
+                name,
+                status,
+                last_seen_at,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, worker_id) DO UPDATE SET
+                worker_fingerprint = excluded.worker_fingerprint,
+                space_id = excluded.space_id,
+                name = excluded.name,
+                status = excluded.status,
+                last_seen_at = excluded.last_seen_at,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                worker_id,
+                str(item.get("fingerprint") or ""),
+                item.get("space_id"),
+                str(item.get("name") or worker_id),
+                str(item.get("status") or "unknown"),
+                item.get("last_seen_at"),
+                str(content_fingerprint),
+                observed_at,
+                _canonical_json(dict(item)),
+            ),
+        )
+    _prune_host_projection(conn, "workers", "worker_id", host_id, worker_ids)
+
+    attention_ids: set[str] = set()
+    for item in payload_data.get("attention", []):
+        if not isinstance(item, Mapping):
+            continue
+        attention_id = str(item.get("id") or item.get("fingerprint") or "unknown")
+        attention_ids.add(attention_id)
+        conn.execute(
+            """
+            INSERT INTO attention_items (
+                host_id,
+                attention_id,
+                source,
+                kind,
+                severity,
+                status,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, attention_id) DO UPDATE SET
+                source = excluded.source,
+                kind = excluded.kind,
+                severity = excluded.severity,
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                attention_id,
+                str(item.get("source") or ""),
+                str(item.get("kind") or "unknown"),
+                str(item.get("severity") or "info"),
+                str(item.get("status") or "unknown"),
+                item.get("updated_at"),
+                str(item.get("fingerprint") or ""),
+                str(content_fingerprint),
+                observed_at,
+                _canonical_json(dict(item)),
+            ),
+        )
+    _prune_host_projection(conn, "attention_items", "attention_id", host_id, attention_ids)
+
+    turn_ids: set[str] = set()
+    for turn in turns_from_snapshot(snapshot):
+        item = turn.to_dict()
+        turn_id = str(item.get("id") or "unknown")
+        turn_ids.add(turn_id)
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id,
+                turn_id,
+                worker_id,
+                worker_fingerprint,
+                space_id,
+                status,
+                kind,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, turn_id) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                worker_fingerprint = excluded.worker_fingerprint,
+                space_id = excluded.space_id,
+                status = excluded.status,
+                kind = excluded.kind,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                turn_id,
+                str(item.get("worker_id") or ""),
+                item.get("worker_fingerprint"),
+                item.get("space_id"),
+                str(item.get("status") or "unknown"),
+                str(item.get("kind") or "unknown"),
+                item.get("updated_at"),
+                str(item.get("fingerprint") or ""),
+                str(content_fingerprint),
+                observed_at,
+                _canonical_json(item),
+            ),
+        )
+    _prune_host_projection(conn, "turns", "turn_id", host_id, turn_ids)
+
+    pending_ids: set[str] = set()
+    for pending in pending_from_snapshot(snapshot):
+        item = pending.to_dict()
+        pending_id = str(item.get("id") or "unknown")
+        pending_ids.add(pending_id)
+        conn.execute(
+            """
+            INSERT INTO pending_interactions (
+                host_id,
+                pending_id,
+                worker_id,
+                worker_fingerprint,
+                space_id,
+                kind,
+                status,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, pending_id) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                worker_fingerprint = excluded.worker_fingerprint,
+                space_id = excluded.space_id,
+                kind = excluded.kind,
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                pending_id,
+                str(item.get("worker_id") or ""),
+                item.get("worker_fingerprint"),
+                item.get("space_id"),
+                str(item.get("kind") or "unknown"),
+                str(item.get("status") or "unknown"),
+                item.get("updated_at"),
+                str(item.get("fingerprint") or ""),
+                str(content_fingerprint),
+                observed_at,
+                _canonical_json(item),
+            ),
+        )
+    _prune_host_projection(
+        conn,
+        "pending_interactions",
+        "pending_id",
+        host_id,
+        pending_ids,
+    )
+
+    backend_names: set[str] = set()
+    for item in payload_data.get("backend_health", []):
+        if not isinstance(item, Mapping):
+            continue
+        backend_name = str(item.get("name") or "unknown")
+        backend_names.add(backend_name)
+        conn.execute(
+            """
+            INSERT INTO backend_health (
+                host_id,
+                backend_name,
+                status,
+                outcome,
+                observed_at,
+                snapshot_content_fingerprint,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, backend_name) DO UPDATE SET
+                status = excluded.status,
+                outcome = excluded.outcome,
+                observed_at = excluded.observed_at,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                payload_json = excluded.payload_json
+            """,
+            (
+                host_id,
+                backend_name,
+                str(item.get("status") or "unknown"),
+                str(item.get("outcome") or "unknown"),
+                item.get("observed_at"),
+                str(content_fingerprint),
+                _canonical_json(dict(item)),
+            ),
+        )
+    _prune_host_projection(
+        conn,
+        "backend_health",
+        "backend_name",
+        host_id,
+        backend_names,
+    )
+
+
+def _upsert_command_audit(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    request_id: str,
+    action: str,
+    payload_fingerprint: str,
+    status: str,
+    result_json: str,
+    created_at: str | None = None,
+    reserved_at: str | None = None,
+    completed_at: str | None = None,
+    uncertain: bool = False,
+    dry_run: bool = False,
+    request_json: str = "{}",
+    updated_at: str | None = None,
+) -> None:
+    if not str(request_id):
+        return
+    now = utc_timestamp()
+    created = created_at or now
+    updated = updated_at or now
+    conn.execute(
+        """
+        INSERT INTO commands (
+            host_id,
+            request_id,
+            action,
+            payload_fingerprint,
+            status,
+            dry_run,
+            uncertain,
+            request_json,
+            result_json,
+            created_at,
+            reserved_at,
+            completed_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(host_id, request_id, action) DO UPDATE SET
+            payload_fingerprint = excluded.payload_fingerprint,
+            status = excluded.status,
+            uncertain = excluded.uncertain,
+            result_json = excluded.result_json,
+            completed_at = excluded.completed_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            str(host_id),
+            str(request_id),
+            str(action),
+            str(payload_fingerprint),
+            str(status),
+            int(dry_run),
+            int(uncertain),
+            str(request_json),
+            str(result_json),
+            created,
+            reserved_at,
+            completed_at,
+            updated,
+        ),
+    )
+
+
+def _command_audit_exists(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    request_id: str,
+    action: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM commands
+        WHERE host_id = ? AND request_id = ? AND action = ?
+        LIMIT 1
+        """,
+        (str(host_id), str(request_id), str(action)),
+    ).fetchone()
+    return row is not None
+
+
+def _upsert_command_audit_from_receipt_row(
+    conn: sqlite3.Connection,
+    row: Any,
+) -> None:
+    if _command_audit_exists(
+        conn,
+        host_id=str(row[0]),
+        request_id=str(row[1]),
+        action=str(row[2]),
+    ):
+        return
+    created_at = str(row[6] or utc_timestamp())
+    completed_at = row[7]
+    _upsert_command_audit(
+        conn,
+        host_id=str(row[0]),
+        request_id=str(row[1]),
+        action=str(row[2]),
+        payload_fingerprint=str(row[3]),
+        status=str(row[4]),
+        result_json=str(row[5]),
+        created_at=created_at,
+        reserved_at=created_at,
+        completed_at=completed_at,
+        uncertain=bool(row[8]),
+        updated_at=str(completed_at or created_at),
+    )
+
+
+def _backfill_command_audit(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT
+            host_id,
+            request_id,
+            action,
+            payload_fingerprint,
+            status,
+            result_json,
+            created_at,
+            completed_at,
+            uncertain
+        FROM command_receipts
+        WHERE request_id != ''
+        ORDER BY id
+        """
+    ).fetchall()
+    for row in rows:
+        _upsert_command_audit_from_receipt_row(conn, row)
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_SNAPSHOTS_TABLE)
     columns = _table_columns(conn)
@@ -341,21 +1324,29 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for statement in CREATE_INDEXES:
         conn.execute(statement)
     conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    _ensure_command_receipt_columns(conn)
     _dedupe_command_receipts(conn)
     for statement in CREATE_COMMAND_RECEIPT_INDEXES:
         conn.execute(statement)
     _ensure_command_receipt_unique_index(conn)
     conn.execute(CREATE_WORKER_BINDINGS_TABLE)
+    _ensure_worker_binding_columns(conn)
     for statement in CREATE_WORKER_BINDING_INDEXES:
         conn.execute(statement)
     conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
+    for statement in CREATE_PR6_TABLES:
+        conn.execute(statement)
+    _ensure_pr6_columns(conn)
+    for statement in CREATE_PR6_INDEXES:
+        conn.execute(statement)
+    _backfill_command_audit(conn)
     conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
 
 
 def init_store(db_path: Path) -> None:
     """Initialize or migrate the sqlite store to the current schema."""
     _ensure_dir(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
 
 
@@ -364,14 +1355,21 @@ def save_snapshot(db_path: Path, snapshot: Snapshot) -> None:
     data, fingerprint = _snapshot_payload(_snapshot_dict(snapshot))
     payload = _canonical_json(data)
     _ensure_dir(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO snapshots (host_id, created_at, content_fingerprint, payload)
             VALUES (?, ?, ?, ?)
             """,
             (snapshot.host_id, snapshot.updated_at, fingerprint, payload),
+        )
+        _upsert_snapshot_projections(
+            conn,
+            snapshot,
+            data,
+            snapshot_id=int(cursor.lastrowid),
+            content_fingerprint=fingerprint,
         )
 
 
@@ -379,7 +1377,7 @@ def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | Non
     """Return the latest snapshot globally, or scoped to host_id when provided."""
     if not db_path.exists():
         return None
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         if host_id is None:
             row = conn.execute(
@@ -405,7 +1403,7 @@ def list_hosts(db_path: Path) -> list[str]:
     """Return distinct host_ids seen in the store."""
     if not db_path.exists():
         return []
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
             "SELECT DISTINCT host_id FROM snapshots ORDER BY host_id"
@@ -427,7 +1425,7 @@ def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> 
     if not binding_list:
         return 0
     _ensure_dir(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         conn.executemany(
             """
@@ -501,7 +1499,7 @@ def list_worker_bindings(
         clauses.append("expires_at > ?")
         params.append(current_time)
     where = " AND ".join(clauses)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
             f"""
@@ -550,7 +1548,7 @@ def resolve_worker_binding(
         clauses.append("backend = ?")
         params.append(str(backend))
     where = " AND ".join(clauses)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
             f"""
@@ -607,7 +1605,7 @@ def expire_worker_bindings(
         params.extend(fingerprints)
     where = " AND ".join(clauses)
     _ensure_dir(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         cursor = conn.execute(
             f"""
@@ -635,7 +1633,7 @@ def expire_stale_worker_bindings(
     current_time = now or utc_timestamp()
     current = {str(value) for value in current_private_fingerprints}
     _ensure_dir(db_path)
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         if current:
             placeholders = ",".join("?" for _ in current)
@@ -690,7 +1688,7 @@ def get_command_receipt(
     """Return the latest command receipt for a host/request/action key, or None."""
     if not db_path.exists():
         return None
-    with sqlite3.connect(str(db_path)) as conn:
+    with _connect(db_path) as conn:
         _ensure_schema(conn)
         row = _latest_command_receipt_row(conn, host_id, request_id, action)
     if row is None:
@@ -715,12 +1713,13 @@ def reserve_command_receipt(
     existing latest receipt is returned and no new row is inserted.
     """
     _ensure_dir(db_path)
-    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    conn = _connect(db_path, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
         row = _latest_command_receipt_row(conn, host_id, request_id, action)
         if row is not None:
+            _upsert_command_audit_from_receipt_row(conn, row)
             conn.execute("COMMIT")
             return {"reserved": False, "receipt": _command_receipt_from_row(row)}
         now = utc_timestamp()
@@ -750,6 +1749,19 @@ def reserve_command_receipt(
                 1,
             ),
         )
+        _upsert_command_audit(
+            conn,
+            host_id=str(host_id),
+            request_id=str(request_id),
+            action=str(action),
+            payload_fingerprint=str(payload_fingerprint),
+            status=str(status),
+            result_json=str(pending_result_json),
+            created_at=now,
+            reserved_at=now,
+            completed_at=None,
+            uncertain=True,
+        )
         conn.execute("COMMIT")
         return {"reserved": True, "receipt": None}
     except Exception:
@@ -778,7 +1790,7 @@ def save_command_receipt(
     """
     _ensure_dir(db_path)
     now = utc_timestamp()
-    conn = sqlite3.connect(str(db_path), timeout=30.0, isolation_level=None)
+    conn = _connect(db_path, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
@@ -841,6 +1853,19 @@ def save_command_receipt(
                     int(uncertain),
                 ),
             )
+        _upsert_command_audit(
+            conn,
+            host_id=str(host_id),
+            request_id=str(request_id),
+            action=str(action),
+            payload_fingerprint=str(payload_fingerprint),
+            status=str(status),
+            result_json=str(result_json),
+            created_at=now,
+            reserved_at=now,
+            completed_at=completed_at,
+            uncertain=uncertain,
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

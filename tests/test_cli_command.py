@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,12 @@ from tendwire.core.commands import (
     CommandRequest,
 )
 from tendwire.core.models import Space, Worker, WorkerBinding
-from tendwire.store.sqlite import get_command_receipt, list_worker_bindings, upsert_worker_bindings
+from tendwire.store.sqlite import (
+    get_command_receipt,
+    init_store,
+    list_worker_bindings,
+    upsert_worker_bindings,
+)
 
 
 def _fake_herdr_state(config: Any) -> tuple[list[Space], list[Worker]]:
@@ -178,6 +184,7 @@ def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tm
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
     )
     db_path = tmp_path / "cmd.db"
+    init_store(db_path)
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -211,6 +218,8 @@ def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tm
     assert payload["dry_run"] is True
     # Dry-runs never create receipts.
     assert get_command_receipt(db_path, "cmd-host", "", "send_instruction") is None
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
 
 
 def test_cli_command_send_instruction_non_dry_run_requires_request_id(capsys, monkeypatch) -> None:
