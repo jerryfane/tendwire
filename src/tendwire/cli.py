@@ -35,6 +35,11 @@ from .core.commands import (
 )
 from .core.projector import project_from_observations
 from .core.models import BackendHealth, WorkerBinding, separate_duplicate_worker_bindings, utc_timestamp
+from .core.turns import (
+    payload_to_json,
+    pending_payload_from_snapshot,
+    turns_payload_from_snapshot,
+)
 from .store.sqlite import (
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
@@ -98,6 +103,30 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="db_path",
         default=None,
         help="SQLite database path to use with --store (default: config path).",
+    )
+
+    turns_parser = subparsers.add_parser(
+        "turns",
+        help="Print neutral public turns derived from the current snapshot.",
+    )
+    turns_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Print turns as JSON (default).",
+    )
+
+    pending_parser = subparsers.add_parser(
+        "pending",
+        help="Print neutral public pending interactions derived from the current snapshot.",
+    )
+    pending_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Print pending interactions as JSON (default).",
     )
 
     command_parser = subparsers.add_parser(
@@ -256,6 +285,19 @@ def _health_observed_at(backend_health: list[BackendHealth]) -> str:
     return health.observed_at or utc_timestamp()
 
 
+def _current_public_snapshot(config: Config) -> Any:
+    spaces, workers, _bindings, backend_health = _fetch_snapshot_observation_with_bindings(
+        config,
+        [],
+    )
+    return project_from_observations(
+        config,
+        spaces=spaces,
+        workers=workers,
+        backend_health=backend_health,
+    )
+
+
 def _persist_binding_observation(
     config: Config,
     bindings: list[WorkerBinding],
@@ -320,6 +362,34 @@ def cmd_snapshot(
         print("error: only --json output is supported", file=sys.stderr)
         return 2
 
+    return 0
+
+
+def cmd_turns(
+    config: Config,
+    *,
+    json_output: bool = True,
+) -> int:
+    """Build and print neutral public turns."""
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    snapshot = _current_public_snapshot(config)
+    print(payload_to_json(turns_payload_from_snapshot(snapshot), indent=2))
+    return 0
+
+
+def cmd_pending(
+    config: Config,
+    *,
+    json_output: bool = True,
+) -> int:
+    """Build and print neutral public pending interactions."""
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    snapshot = _current_public_snapshot(config)
+    print(payload_to_json(pending_payload_from_snapshot(snapshot), indent=2))
     return 0
 
 
@@ -559,6 +629,12 @@ def main(argv: list[str] | None = None) -> int:
             json_output=args.json_output,
             store_snapshot=args.store_snapshot,
         )
+
+    if args.command == "turns":
+        return cmd_turns(config, json_output=args.json_output)
+
+    if args.command == "pending":
+        return cmd_pending(config, json_output=args.json_output)
 
     if args.command == "command":
         return cmd_command(config, json_output=args.json_output)

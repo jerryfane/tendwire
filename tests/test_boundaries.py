@@ -13,6 +13,7 @@ _CORE_MODULE_NAMES = (
     "tendwire.core.attention",
     "tendwire.core.commands",
     "tendwire.core.actions",
+    "tendwire.core.turns",
 )
 
 _FORBIDDEN_PREFIXES = (
@@ -23,8 +24,13 @@ _FORBIDDEN_PREFIXES = (
     "tendwire.connectors",
     "tendwire.routing",
     "tendwire.delivery",
+    "tendwire.daemon",
+    "tendwire.outbox",
+    "tendwire.source",
+    "tendwire.source_mode",
 )
 _FORBIDDEN_EXACT = {"subprocess"}
+_TURN_MODULE_FORBIDDEN_EXACT = {"socket", "subprocess"}
 
 
 def _loaded_modules_after_import(module_name: str) -> set[str]:
@@ -58,9 +64,12 @@ for name in sorted(after - before):
 def test_core_modules_do_not_load_connector_or_process_modules() -> None:
     for module_name in _CORE_MODULE_NAMES:
         loaded = _loaded_modules_after_import(module_name)
+        forbidden_exact = _FORBIDDEN_EXACT
+        if module_name == "tendwire.core.turns":
+            forbidden_exact = _TURN_MODULE_FORBIDDEN_EXACT
         for name in loaded:
             lower = name.lower()
-            if name in _FORBIDDEN_EXACT or lower.startswith(_FORBIDDEN_PREFIXES):
+            if name in forbidden_exact or lower.startswith(_FORBIDDEN_PREFIXES):
                 raise AssertionError(
                     f"{module_name} transitively loads forbidden module {name}"
                 )

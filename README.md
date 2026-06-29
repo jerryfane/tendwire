@@ -37,6 +37,17 @@ python -m tendwire.cli snapshot --json
 Both print a neutral JSON snapshot to stdout and exit successfully, even when no
 Herdr data is available. Stdout is JSON-only for snapshot output.
 
+Snapshot-adjacent public turn and pending-interaction views are also available:
+
+```bash
+tendwire turns --json
+tendwire pending --json
+```
+
+These commands derive conservative public data from the current Tendwire
+snapshot and also exit successfully with empty collections when no Herdr data is
+available.
+
 To inspect why Herdr data is absent without changing the snapshot contract, use
 the read-only diagnostic command:
 
@@ -168,6 +179,36 @@ Worker-derived attention `updated_at` uses a source worker timestamp when one is
 available, such as `last_seen_at` or a backend `updated_at` normalized into
 `last_seen_at`. It does not fall back to the snapshot `updated_at`; when no
 worker source time exists, the attention item serializes `updated_at` as `null`.
+
+## Public turn and pending-interaction contract
+
+The `turns --json` and `pending --json` outputs are public snapshot-adjacent
+views, not routing or private binding surfaces. They must not expose Telegram
+IDs, chat IDs, topic IDs, message IDs, raw pane IDs, terminal IDs, backend
+targets, private bindings, session IDs, private fingerprints, raw command
+payloads, raw terminal controls, or secrets.
+
+`turns --json` prints a schema-v1 wrapper with `host_id`, `updated_at`,
+`content_fingerprint`, public-safe `backend_health`, and `turns`. Each turn has
+`schema_version`, deterministic `id`, `host_id`, `worker_id`, optional
+`worker_fingerprint`, optional `space_id`, canonical `status`, bounded `kind`,
+optional `title`/`summary`/timestamps, `source`, optional
+`origin_command_id`, deterministic `fingerprint`, and sanitized `meta`.
+
+`pending --json` prints a schema-v1 wrapper with `host_id`, `updated_at`,
+`content_fingerprint`, public-safe `backend_health`, and
+`pending_interactions`. Each pending interaction has deterministic `id`,
+`host_id`, `worker_id`, optional `worker_fingerprint`, optional `space_id`,
+bounded `kind`, `question`, finite public-safe `choices`, neutral `status`,
+optional timestamps, optional `fingerprint`, and sanitized `meta`. Choices use
+`choice_id`, `label`, optional `value`, optional `description`, and sanitized
+`params`.
+
+Turn and pending IDs/fingerprints are computed from sanitized public content and
+exclude volatile observation timestamps. Pending interactions are derived only
+from explicit human-actionable public attention signals or public suggested
+actions; generic waiting or pending worker status alone does not create a
+pending interaction.
 
 ## SQLite store
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
+from tendwire.core.models import Space, Worker
 from tendwire.store.sqlite import latest_snapshot, list_worker_bindings
 
 
@@ -42,6 +43,103 @@ def test_cli_snapshot_no_herdr_works() -> None:
     """Empty snapshot works even when herdr is not installed."""
     code = main(["--herdr-bin", "definitely-not-a-real-herdr-binary", "snapshot", "--json"])
     assert code == 0
+
+
+def test_cli_turns_json_no_herdr_prints_public_empty_collection(capsys) -> None:
+    code = main(
+        [
+            "--host-id",
+            "turns-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "turns",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["schema_version"] == 1
+    assert payload["host_id"] == "turns-host"
+    assert payload["turns"] == []
+    assert len(payload["content_fingerprint"]) == 24
+    assert payload["backend_health"][0]["name"] == "herdr"
+    assert payload["backend_health"][0]["status"] == "unavailable"
+    assert payload["backend_health"][0]["outcome"] == "missing_binary"
+
+
+def test_cli_pending_json_no_herdr_prints_public_empty_collection(capsys) -> None:
+    code = main(
+        [
+            "--host-id",
+            "pending-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "pending",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["schema_version"] == 1
+    assert payload["host_id"] == "pending-host"
+    assert payload["pending_interactions"] == []
+    assert len(payload["content_fingerprint"]) == 24
+    assert payload["backend_health"][0]["name"] == "herdr"
+    assert payload["backend_health"][0]["status"] == "unavailable"
+    assert payload["backend_health"][0]["outcome"] == "missing_binary"
+
+
+def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeypatch) -> None:
+    def _fake_herdr_state(config):
+        return [
+            Space(id="space-1", name="Space One", status="active"),
+        ], [
+            Worker(
+                id="worker-1",
+                name="Worker One",
+                status="pending",
+                space_id="space-1",
+                summary="human approval required before continuing",
+                meta={
+                    "needs_human": True,
+                    "safe": "kept",
+                    "pane_id": "pane-private",
+                },
+                backend_target={"kind": "agent_id", "value": "agent-private", "sendable": True},
+            )
+        ]
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+
+    turns_code = main(["--host-id", "projection-cli", "--herdr-bin", "herdr", "turns", "--json"])
+    turns_captured = capsys.readouterr()
+    turns_payload = json.loads(turns_captured.out)
+    pending_code = main(["--host-id", "projection-cli", "--herdr-bin", "herdr", "pending", "--json"])
+    pending_captured = capsys.readouterr()
+    pending_payload = json.loads(pending_captured.out)
+
+    encoded_turns = json.dumps(turns_payload)
+    encoded_pending = json.dumps(pending_payload)
+    assert turns_code == 0
+    assert pending_code == 0
+    assert turns_captured.err == ""
+    assert pending_captured.err == ""
+    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
+    assert turns_payload["turns"][0]["status"] == "waiting"
+    assert turns_payload["turns"][0]["kind"] == "task"
+    assert pending_payload["pending_interactions"][0]["worker_id"] == "worker-1"
+    assert pending_payload["pending_interactions"][0]["kind"] == "approval"
+    assert pending_payload["pending_interactions"][0]["status"] == "open"
+    assert "agent-private" not in encoded_turns
+    assert "pane-private" not in encoded_turns
+    assert "agent-private" not in encoded_pending
+    assert "pane-private" not in encoded_pending
 
 
 def test_cli_snapshot_json_reports_healthy_empty_herdr(capsys, monkeypatch) -> None:
