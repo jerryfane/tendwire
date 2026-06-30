@@ -48,6 +48,7 @@ class DaemonHooks:
     init_store: Callable[[Path], None] = _default_init_store
     observe_initial_snapshot: Callable[[Config], Snapshot] = _default_observe_initial_snapshot
     submit_command: Callable[[Config, str], CommandEnvelope | Mapping[str, Any]] = _default_submit_command
+    event_backend_factory: Callable[[Config, threading.Event], Any] | None = None
 
 
 class TendwireDaemon:
@@ -68,6 +69,7 @@ class TendwireDaemon:
         self.started_at = utc_timestamp()
         self._snapshot: Snapshot | None = None
         self._server: UnixSocketJSONServer | None = None
+        self._event_backend: Any | None = None
 
     @property
     def snapshot(self) -> Snapshot | None:
@@ -81,7 +83,10 @@ class TendwireDaemon:
         if self.config.db_path is None:
             raise RuntimeError("daemon requires a sqlite db path")
         self.hooks.init_store(Path(self.config.db_path))
-        self._snapshot = self.hooks.observe_initial_snapshot(self.config)
+        if self.config.herdr_backend == "socket":
+            self._snapshot = self._start_socket_event_backend()
+        else:
+            self._snapshot = self.hooks.observe_initial_snapshot(self.config)
 
         api = TendwireDaemonAPI(
             get_snapshot=self.get_snapshot,
@@ -105,8 +110,34 @@ class TendwireDaemon:
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self._event_backend is not None:
+            self._event_backend.stop()
         if self._server is not None:
             self._server.close()
+
+    def _start_socket_event_backend(self) -> Snapshot:
+        if self.hooks.event_backend_factory is None:
+            from .backends.herdr_events import HerdrEventBackend
+
+            backend = HerdrEventBackend(self.config, stop_event=self.stop_event)
+        else:
+            backend = self.hooks.event_backend_factory(self.config, self.stop_event)
+        self._event_backend = backend
+        backend.start(wait_for_reconcile=True)
+        from .store.sqlite import latest_snapshot, save_snapshot
+
+        snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
+        if snapshot is not None:
+            return snapshot
+        from .backends.herdr_cli import herdr_backend_health
+        from .core.projector import project_from_observations
+
+        snapshot = project_from_observations(
+            self.config,
+            backend_health=[herdr_backend_health("unknown")],
+        )
+        save_snapshot(Path(self.config.db_path), snapshot)
+        return snapshot
 
     def get_snapshot(self) -> Snapshot:
         if self.config.db_path is not None:

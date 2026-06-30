@@ -12,6 +12,8 @@ import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
+HERDR_BACKENDS = frozenset({"cli", "socket"})
+
 
 @dataclass(frozen=True)
 class Config:
@@ -23,6 +25,7 @@ class Config:
     db_path: Path | None = None
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
+    herdr_backend: str = "cli"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "herdr_bin", os.path.expanduser(self.herdr_bin))
@@ -39,6 +42,11 @@ class Config:
             object.__setattr__(self, "socket_path", Path(self.socket_path).expanduser())
         if self.herdr_timeout_seconds <= 0:
             raise ValueError("herdr_timeout_seconds must be positive")
+        backend = str(self.herdr_backend or "").strip().lower()
+        if backend not in HERDR_BACKENDS:
+            allowed = ", ".join(sorted(HERDR_BACKENDS))
+            raise ValueError(f"herdr_backend must be one of: {allowed}")
+        object.__setattr__(self, "herdr_backend", backend)
 
 
 def load_config(
@@ -49,6 +57,7 @@ def load_config(
     db_path: str | Path | None = None,
     socket_path: str | Path | None = None,
     herdr_timeout_seconds: float | str | None = None,
+    herdr_backend: str | None = None,
 ) -> Config:
     """Build a Config from explicit args, then environment, then defaults."""
     env_host_id = os.environ.get("TENDWIRE_HOST_ID")
@@ -57,6 +66,7 @@ def load_config(
     env_db_path = os.environ.get("TENDWIRE_DB_PATH")
     env_socket_path = os.environ.get("TENDWIRE_SOCKET_PATH")
     env_herdr_timeout_seconds = os.environ.get("TENDWIRE_HERDR_TIMEOUT_SECONDS")
+    env_herdr_backend = os.environ.get("TENDWIRE_HERDR_BACKEND")
 
     resolved_host_id = host_id or env_host_id or (platform.node() or "unknown")
     resolved_herdr_bin = herdr_bin or env_herdr_bin or "herdr"
@@ -93,6 +103,12 @@ def load_config(
         except (TypeError, ValueError) as exc:
             raise ValueError("herdr timeout must be a positive number") from exc
 
+    resolved_herdr_backend = herdr_backend
+    if resolved_herdr_backend is None:
+        resolved_herdr_backend = env_herdr_backend
+    if resolved_herdr_backend is None:
+        resolved_herdr_backend = "cli"
+
     return Config(
         host_id=resolved_host_id,
         herdr_bin=resolved_herdr_bin,
@@ -100,4 +116,5 @@ def load_config(
         db_path=resolved_db_path,
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
+        herdr_backend=resolved_herdr_backend,
     )
