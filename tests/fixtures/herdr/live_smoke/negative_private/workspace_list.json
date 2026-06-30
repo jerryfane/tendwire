@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "items": [
+    {
+      "id": "workspace-a",
+      "label": "Alpha workspace",
+      "state": "closed"
+    }
+  ],
+  "count": 1
+}

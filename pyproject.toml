@@ -47,3 +47,6 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "herdr_live: opt-in live Herdr smoke checks that require an isolated Herdr session",
+]
