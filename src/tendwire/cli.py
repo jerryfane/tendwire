@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 from .backends.herdr_cli import (
@@ -56,7 +58,24 @@ from .store.sqlite import (
 
 _HERDR_BACKEND = "herdr"
 _DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
-_DAEMON_CLIENT_TIMEOUT_SECONDS = 0.35
+_DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 0.35
+_DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS = 2.0
+_DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS = 0.5
+
+
+@dataclass(frozen=True)
+class _DaemonAttempt:
+    result: dict[str, Any] | None = None
+    error_kind: str | None = None
+
+
+def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
+    if method == "command.submit":
+        return max(
+            _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS,
+            float(config.herdr_timeout_seconds) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS,
+        )
+    return _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -409,33 +428,49 @@ def _current_public_snapshot(config: Config) -> Any:
     return observe_public_snapshot(config)
 
 
-def _try_daemon_result(
+def _try_daemon_attempt(
     config: Config,
     method: str,
     params: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
+) -> _DaemonAttempt:
     """Return a daemon result when a Tendwire daemon socket is reachable."""
     socket_path = config.socket_path
     if socket_path is None:
         socket_path = config.data_dir / "tendwire.sock"
         if not socket_path.exists():
-            return None
+            return _DaemonAttempt(error_kind="unavailable")
 
     try:
-        from .daemon_api import DaemonAPIClient, DaemonAPIError
+        from .daemon_api import DaemonAPIClient, DaemonAPIError, DaemonUnavailable
     except Exception:
-        return None
+        return _DaemonAttempt(error_kind="unavailable")
     try:
         response = DaemonAPIClient(
             socket_path,
-            timeout_seconds=_DAEMON_CLIENT_TIMEOUT_SECONDS,
+            timeout_seconds=_daemon_client_timeout_seconds(config, method),
         ).request(method, params or {})
+    except DaemonUnavailable as exc:
+        cause = exc.__cause__
+        if isinstance(cause, (TimeoutError, socket.timeout)):
+            return _DaemonAttempt(error_kind="timeout")
+        return _DaemonAttempt(error_kind="unavailable")
     except DaemonAPIError:
-        return None
+        return _DaemonAttempt(error_kind="protocol")
     if not response.get("ok"):
-        return None
+        return _DaemonAttempt(error_kind="protocol")
     result = response.get("result")
-    return result if isinstance(result, dict) else None
+    if isinstance(result, dict):
+        return _DaemonAttempt(result=result)
+    return _DaemonAttempt(error_kind="protocol")
+
+
+def _try_daemon_result(
+    config: Config,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return only a daemon result, preserving read-only fallback behavior."""
+    return _try_daemon_attempt(config, method, params).result
 
 
 def _persist_binding_observation(
@@ -749,6 +784,50 @@ def _command_exit_code(envelope: CommandEnvelope) -> int:
     return 0 if envelope.ok else 1
 
 
+def _requires_daemon_for_mutating_command(config: Config, payload: str) -> Any | None:
+    """Return the validated mutating request that must not fall back to Herdr CLI."""
+    if config.socket_path is None and config.herdr_backend != "socket":
+        return None
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None:
+        return None
+    validation_error = validate_request(request)
+    if validation_error is not None:
+        return None
+    if request.action == "send_instruction" and not request.dry_run:
+        return request
+    return None
+
+
+def _daemon_backend_failure_envelope(
+    config: Config,
+    request: Any,
+    attempt: _DaemonAttempt,
+) -> CommandEnvelope:
+    receipt_envelope = _reserve_command_receipt(config, request)
+    if receipt_envelope is not None:
+        return receipt_envelope
+    if attempt.error_kind in {"timeout", "protocol"}:
+        envelope = CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_REQUEST_STATE_UNCERTAIN,
+                "Tendwire daemon command state is uncertain",
+            ),
+        )
+        _save_command_receipt(config, request, envelope)
+        return envelope
+    envelope = CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_BACKEND_UNAVAILABLE,
+            "Tendwire daemon backend is unavailable",
+        ),
+    )
+    _save_command_receipt(config, request, envelope)
+    return envelope
+
+
 def cmd_command(
     config: Config,
     *,
@@ -761,12 +840,21 @@ def cmd_command(
             request_payload = json.loads(payload)
         except (json.JSONDecodeError, TypeError, ValueError):
             request_payload = None
+        daemon_required_request = _requires_daemon_for_mutating_command(config, payload)
         if isinstance(request_payload, dict):
-            daemon_result = _try_daemon_result(config, "command.submit", request_payload)
+            daemon_attempt = _try_daemon_attempt(config, "command.submit", request_payload)
+            daemon_result = daemon_attempt.result
             if daemon_result is not None:
                 print(stable_json_dumps(daemon_result, indent=2))
                 return 0 if bool(daemon_result.get("ok")) else 1
-
+            if daemon_required_request is not None:
+                envelope = _daemon_backend_failure_envelope(
+                    config,
+                    daemon_required_request,
+                    daemon_attempt,
+                )
+                print(envelope.to_json(indent=2))
+                return _command_exit_code(envelope)
     envelope = command_envelope_from_payload(config, payload)
     print(envelope.to_json(indent=2))
     return _command_exit_code(envelope)

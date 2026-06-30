@@ -43,7 +43,15 @@ from .herdr_cli import (
     _workers_and_bindings_from_records,
     herdr_backend_health,
 )
-from .herdr_protocol import HerdrEnvelopeError, HerdrMalformedLineError, HerdrProtocolError
+from .herdr_protocol import (
+    HERDR_EVENTS_SUBSCRIBE_METHOD,
+    HERDR_OFFICIAL_EVENT_NAME_SET,
+    HERDR_OFFICIAL_EVENT_NAMES,
+    HerdrEnvelopeError,
+    HerdrMalformedLineError,
+    HerdrProtocolError,
+    build_events_subscribe_params,
+)
 from .herdr_socket import (
     HerdrSocketClient,
     HerdrSocketConnectionError,
@@ -53,7 +61,7 @@ from .herdr_socket import (
 
 
 BACKEND_NAME = "herdr"
-DEFAULT_SUBSCRIBE_METHOD = "event.subscribe"
+DEFAULT_SUBSCRIBE_METHOD = HERDR_EVENTS_SUBSCRIBE_METHOD
 DEFAULT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_DEDUPE_SIZE = 512
 DEFAULT_MAX_BATCH_SIZE = 64
@@ -61,23 +69,19 @@ DEFAULT_RECONNECT_DELAY_SECONDS = 0.25
 
 _AGENT_PAYLOAD_KEYS = ("agents", "workers", "data", "items", "results", "result")
 _PANE_PAYLOAD_KEYS = ("panes", "items", "data", "results", "result")
-_SUPPORTED_EVENT_NAMES = (
-    "agent.detected",
-    "agent.status_changed",
-    "pane.closed",
-    "pane.exited",
-    "pane.moved",
-    "pane.observed",
-    "workspace.closed",
-    "workspace.observed",
-    "workspace.updated",
-    "worktree.closed",
-    "worktree.observed",
-    "worktree.updated",
-)
+_SUPPORTED_EVENT_NAMES = HERDR_OFFICIAL_EVENT_NAMES
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
-_SPACE_EVENT_NAMES = frozenset({"workspace.observed", "workspace.updated", "workspace.closed"})
-_WORKTREE_EVENT_NAMES = frozenset({"worktree.observed", "worktree.updated", "worktree.closed"})
+_SPACE_EVENT_NAMES = frozenset(
+    {
+        "workspace.created",
+        "workspace.updated",
+        "workspace.renamed",
+        "workspace.closed",
+        "workspace.focused",
+    }
+)
+_WORKTREE_EVENT_NAMES = frozenset({"worktree.created", "worktree.opened", "worktree.removed"})
+_PANE_WORKER_EVENT_NAMES = frozenset({"pane.created", "pane.focused"})
 
 
 class HerdrEventBackendError(Exception):
@@ -150,21 +154,49 @@ def _safe_mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _entity_payload(payload: Mapping[str, Any], *entity_names: str) -> dict[str, Any]:
-    """Return a single object for an event entity while preserving scalar hints."""
+def _entity_payload_with_source(payload: Mapping[str, Any], *entity_names: str) -> tuple[dict[str, Any], str | None]:
+    """Return an event entity object plus the nested entity name selected."""
     merged: dict[str, Any] = {}
     nested_entity_keys: set[str] = set()
+    selected_entity: str | None = None
     for entity_name in entity_names:
         nested = _field_value(payload, entity_name)
         if isinstance(nested, Mapping):
             merged.update(dict(nested))
-            nested_entity_keys.add(_compact_key(entity_name))
+            compact_name = _compact_key(entity_name)
+            nested_entity_keys.add(compact_name)
+            selected_entity = compact_name
             break
     for key, value in payload.items():
         if _compact_key(key) in nested_entity_keys:
             continue
         merged.setdefault(str(key), value)
-    return merged
+    return merged, selected_entity
+
+
+def _entity_payload(payload: Mapping[str, Any], *entity_names: str) -> dict[str, Any]:
+    """Return a single object for an event entity while preserving scalar hints."""
+    item, _selected_entity = _entity_payload_with_source(payload, *entity_names)
+    return item
+
+
+def _privatize_pane_event_id(item: dict[str, Any]) -> dict[str, Any]:
+    """Treat generic ``id`` on pane events as a private pane identifier."""
+    raw_id = _first_text(item, ("id",))
+    if raw_id and _first_text(item, ("pane_id", "paneId")) is None:
+        item["pane_id"] = raw_id
+    for key in list(item):
+        if _compact_key(key) == "id":
+            item.pop(key, None)
+    return item
+
+
+def _pane_event_payload(payload: Mapping[str, Any], *entity_names: str) -> dict[str, Any]:
+    """Return a pane-event item without exposing pane ``id`` as public worker id."""
+    item, selected_entity = _entity_payload_with_source(payload, *entity_names)
+    if selected_entity in {None, "pane"}:
+        return _privatize_pane_event_id(item)
+    return item
 
 
 def _event_alias_key(name: str) -> str:
@@ -174,30 +206,29 @@ def _event_alias_key(name: str) -> str:
 def _canonical_event_name(raw_name: Any) -> str | None:
     if not isinstance(raw_name, str) or not raw_name.strip():
         return None
-    aliases = {
-        "agent_detected": "agent.detected",
-        "agent_observed": "agent.detected",
-        "agent_status_changed": "agent.status_changed",
-        "agent_status_updated": "agent.status_changed",
-        "pane_observed": "pane.observed",
-        "pane_detected": "pane.observed",
-        "pane_closed": "pane.closed",
-        "pane_exited": "pane.exited",
-        "pane_moved": "pane.moved",
-        "workspace_observed": "workspace.observed",
-        "workspace_detected": "workspace.observed",
-        "workspace_updated": "workspace.updated",
-        "workspace_closed": "workspace.closed",
-        "worktree_observed": "worktree.observed",
-        "worktree_detected": "worktree.observed",
-        "worktree_created": "worktree.observed",
-        "worktree_updated": "worktree.updated",
-        "worktree_changed": "worktree.updated",
-        "worktree_closed": "worktree.closed",
-        "worktree_deleted": "worktree.closed",
-        "worktree_removed": "worktree.closed",
-    }
-    return aliases.get(_event_alias_key(raw_name))
+    event_name = raw_name.strip()
+    if event_name in HERDR_OFFICIAL_EVENT_NAME_SET:
+        return event_name
+    aliases = {_event_alias_key(name): name for name in HERDR_OFFICIAL_EVENT_NAMES}
+    aliases.update(
+        {
+            "agent_detected": "pane.agent_detected",
+            "agent_observed": "pane.agent_detected",
+            "agent_status_changed": "pane.agent_status_changed",
+            "agent_status_updated": "pane.agent_status_changed",
+            "pane_observed": "pane.created",
+            "pane_detected": "pane.created",
+            "workspace_observed": "workspace.updated",
+            "workspace_detected": "workspace.created",
+            "worktree_observed": "worktree.opened",
+            "worktree_detected": "worktree.created",
+            "worktree_updated": "worktree.opened",
+            "worktree_changed": "worktree.opened",
+            "worktree_closed": "worktree.removed",
+            "worktree_deleted": "worktree.removed",
+        }
+    )
+    return aliases.get(_event_alias_key(event_name))
 
 
 def _server_sequence_key(envelope: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
@@ -340,6 +371,13 @@ def _new_move_target(item: Mapping[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def _has_public_worker_identity(item: Mapping[str, Any]) -> bool:
+    return (
+        _first_text(item, ("worker_id", "id", "slug", "agent_id", "agent", "name", "label", "title"))
+        is not None
+    )
+
+
 class HerdrEventBackend:
     """Maintain Tendwire projections from Herdr socket reconcile and events."""
 
@@ -357,7 +395,10 @@ class HerdrEventBackend:
     ) -> None:
         self.config = config
         self.client_factory = client_factory or self._default_client_factory
-        self.subscribe_method = str(subscribe_method or DEFAULT_SUBSCRIBE_METHOD)
+        requested_subscribe_method = str(subscribe_method or DEFAULT_SUBSCRIBE_METHOD)
+        if requested_subscribe_method != HERDR_EVENTS_SUBSCRIBE_METHOD:
+            raise HerdrEventBackendError("Herdr event backend requires events.subscribe")
+        self.subscribe_method = HERDR_EVENTS_SUBSCRIBE_METHOD
         self.debounce_seconds = max(0.0, float(debounce_seconds))
         self.dedupe_size = max(1, int(dedupe_size))
         self.max_batch_size = max(1, int(max_batch_size))
@@ -461,12 +502,7 @@ class HerdrEventBackend:
                     self._ready.set()
                     if self.stop_event.is_set():
                         break
-                    stream = client.subscribe(
-                        self.subscribe_method,
-                        {"events": list(_SUPPORTED_EVENT_NAMES)},
-                        timeout=self.config.herdr_timeout_seconds,
-                        event_timeout=self.config.herdr_timeout_seconds,
-                    )
+                    stream = self._subscribe_event_stream(client)
                     self._read_event_stream(client, stream.subscription_id)
                 finally:
                     if hasattr(client, "close"):
@@ -612,6 +648,27 @@ class HerdrEventBackend:
         except TypeError:
             return method()
 
+    def _subscribe_event_stream(self, client: Any) -> Any:
+        if self.subscribe_method == HERDR_EVENTS_SUBSCRIBE_METHOD and hasattr(client, "events_subscribe"):
+            try:
+                return client.events_subscribe(
+                    _SUPPORTED_EVENT_NAMES,
+                    timeout=self.config.herdr_timeout_seconds,
+                    event_timeout=self.config.herdr_timeout_seconds,
+                )
+            except TypeError:
+                return client.events_subscribe(_SUPPORTED_EVENT_NAMES)
+        params = build_events_subscribe_params(_SUPPORTED_EVENT_NAMES)
+        try:
+            return client.subscribe(
+                self.subscribe_method,
+                params,
+                timeout=self.config.herdr_timeout_seconds,
+                event_timeout=self.config.herdr_timeout_seconds,
+            )
+        except TypeError:
+            return client.subscribe(self.subscribe_method, params)
+
     def _workers_with_closed_missing(
         self,
         previous_workers: Sequence[Worker],
@@ -665,34 +722,43 @@ class HerdrEventBackend:
             status = "closed" if event.name == "workspace.closed" else None
             return self._apply_space_event(event.payload, status=status)
         if event.name in _WORKTREE_EVENT_NAMES:
-            status = "closed" if event.name == "worktree.closed" else None
+            status = "closed" if event.name == "worktree.removed" else None
             return self._apply_worktree_event(event.payload, status=status)
-        if event.name == "agent.detected":
-            item = _entity_payload(event.payload, "agent", "worker")
+        if event.name in _PANE_WORKER_EVENT_NAMES:
+            item = _pane_event_payload(event.payload, "pane", "agent", "worker")
+            if not _pane_has_agent(item) and self._match_binding(item) is None:
+                return False
             return self._upsert_worker_from_item(item)
-        if event.name == "agent.status_changed":
-            item = _entity_payload(event.payload, "agent", "worker")
+        if event.name == "pane.agent_detected":
+            item = _pane_event_payload(event.payload, "agent", "worker", "pane")
+            return self._upsert_worker_from_item(item)
+        if event.name == "pane.agent_status_changed":
+            item = _pane_event_payload(event.payload, "agent", "worker", "pane")
             raw_status = _first_text(item, ("status", "agent_status", "state", "phase"))
             return self._upsert_worker_from_item(
                 item,
                 status=normalize_status(raw_status),
                 update_binding=False,
             )
-        if event.name == "pane.observed":
-            item = _entity_payload(event.payload, "pane")
-            if not _pane_has_agent(item) and self._match_binding(item) is None:
-                return False
-            return self._upsert_worker_from_item(item)
         if event.name == "pane.moved":
-            item = _entity_payload(event.payload, "pane")
+            item = _pane_event_payload(event.payload, "pane")
             return self._apply_pane_moved(item)
         if event.name in _CLOSED_EVENT_NAMES:
-            item = _entity_payload(event.payload, "pane")
+            item = _pane_event_payload(event.payload, "pane")
             return self._apply_pane_closed(item, reason=event.name.replace(".", "_"))
+        if event.name == "pane.output_matched":
+            return False
         return False
 
     def _apply_space_event(self, payload: Mapping[str, Any], *, status: str | None = None) -> bool:
         item = _entity_payload(payload, "workspace", "space")
+        direct_name_hint = _first_text(item, ("label", "name", "title"))
+        rename_hint = _first_text(item, ("new_name", "newName"))
+        if _first_text(item, ("workspace_id", "space_id", "id", "slug", "name", "label", "title")) is None:
+            return False
+        name_hint = direct_name_hint or rename_hint
+        if rename_hint and direct_name_hint is None:
+            item["name"] = rename_hint
         if status is not None:
             item["status"] = status
         spaces = _spaces_from_payload([item] if item else [])
@@ -705,7 +771,7 @@ class HerdrEventBackend:
             meta.update(space.meta)
             space = Space(
                 id=existing.id,
-                name=space.name or existing.name,
+                name=space.name if name_hint else existing.name,
                 status=space.status,
                 meta=meta,
                 updated_at=space.updated_at or utc_timestamp(),
@@ -716,10 +782,12 @@ class HerdrEventBackend:
 
     def _apply_worktree_event(self, payload: Mapping[str, Any], *, status: str | None = None) -> bool:
         item = _entity_payload(payload, "workspace", "space", "worktree")
+        workspace_id = _first_text(item, ("workspace_id", "space_id"))
+        if workspace_id is None or workspace_id not in self._spaces:
+            return False
+        item.setdefault("id", workspace_id)
         if status is not None:
             item["status"] = status
-        if not _first_text(item, ("workspace_id", "space_id", "id", "slug", "name")):
-            return False
         return self._apply_space_event({"workspace": item}, status=status)
 
     def _event_worker_and_binding(
@@ -754,6 +822,8 @@ class HerdrEventBackend:
         update_binding: bool = True,
     ) -> bool:
         if not item:
+            return False
+        if not _has_public_worker_identity(item) and self._match_binding(item) is None:
             return False
         worker, binding, matched_binding = self._event_worker_and_binding(item, status=status)
         if worker is None:
@@ -842,6 +912,8 @@ class HerdrEventBackend:
         if binding is not None:
             worker = self._workers.get(binding.worker_id)
         if worker is None:
+            if binding is None and not _has_public_worker_identity(item):
+                return False
             observed_worker, _event_binding, matched_binding = self._event_worker_and_binding(item, status="closed")
             if matched_binding is not None:
                 binding = matched_binding

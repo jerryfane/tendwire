@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -220,6 +221,257 @@ def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tm
     assert get_command_receipt(db_path, "cmd-host", "", "send_instruction") is None
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("mode", ["cli_socket_path", "env_socket_path", "env_backend_socket"])
+def test_cli_command_socket_mode_mutation_unavailable_does_not_fallback(
+    mode: str,
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def guarded_fetch(*args: Any, **kwargs: Any) -> HerdrCommandObservation:
+        calls.append("fetch")
+        raise AssertionError("explicit daemon/socket mode must not fall back to Herdr observation")
+
+    def guarded_send(*args: Any, **kwargs: Any) -> CommandEnvelope:
+        calls.append("send")
+        raise AssertionError("explicit daemon/socket mode must not send through Herdr CLI")
+
+    monkeypatch.delenv("TENDWIRE_SOCKET_PATH", raising=False)
+    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
+    monkeypatch.delenv("TENDWIRE_DATA_DIR", raising=False)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_fetch)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+
+    socket_path = tmp_path / f"{mode}.sock"
+    data_dir = tmp_path / "data"
+    args = [
+        "--host-id",
+        "cmd-host",
+        "--herdr-bin",
+        "definitely-not-a-real-herdr-binary",
+    ]
+    forbidden_fragments = [str(socket_path)]
+    if mode == "cli_socket_path":
+        args.extend(["--socket-path", str(socket_path)])
+    elif mode == "env_socket_path":
+        monkeypatch.setenv("TENDWIRE_SOCKET_PATH", str(socket_path))
+    elif mode == "env_backend_socket":
+        monkeypatch.setenv("TENDWIRE_HERDR_BACKEND", "socket")
+        monkeypatch.setenv("TENDWIRE_DATA_DIR", str(data_dir))
+        forbidden_fragments.extend([str(data_dir), "tendwire.sock"])
+    else:
+        raise AssertionError(f"unexpected mode {mode}")
+
+    db_path = tmp_path / f"{mode}.db"
+    request_id = f"daemon-unavailable-{mode}"
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": request_id,
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            *args,
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    serialized = json.dumps(payload)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert payload["request_id"] == request_id
+    assert calls == []
+    for fragment in forbidden_fragments:
+        assert fragment not in serialized
+    _assert_no_command_public_forbidden_fields(payload)
+
+    receipt = get_command_receipt(db_path, "cmd-host", request_id, "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is False
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert cached["request_id"] == request_id
+
+
+def test_cli_daemon_client_uses_method_specific_timeouts(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, float]] = []
+
+    class FakeDaemonAPIClient:
+        def __init__(self, socket_path: Any, *, timeout_seconds: float, max_response_bytes: int = 1024 * 1024):
+            self.timeout_seconds = timeout_seconds
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            calls.append((method, self.timeout_seconds))
+            if method == "snapshot.get":
+                return {"ok": True, "result": {"schema_version": 2, "spaces": [], "workers": []}}
+            return {
+                "ok": True,
+                "result": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": STATUS_ACCEPTED,
+                    "action": "send_instruction",
+                },
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    socket_path = tmp_path / "daemon.sock"
+
+    assert (
+        main(
+            [
+                "--host-id",
+                "cmd-host",
+                "--socket-path",
+                str(socket_path),
+                "snapshot",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "daemon-timeout-method",
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+    assert (
+        main(
+            [
+                "--host-id",
+                "cmd-host",
+                "--socket-path",
+                str(socket_path),
+                "command",
+                "--json",
+                "--db-path",
+                str(tmp_path / "cmd.db"),
+            ]
+        )
+        == 0
+    )
+
+    assert calls[0] == ("snapshot.get", 0.35)
+    assert calls[1][0] == "command.submit"
+    assert calls[1][1] > calls[0][1]
+    assert calls[1][1] >= 5.0
+
+
+def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def guarded_fetch(*args: Any, **kwargs: Any) -> HerdrCommandObservation:
+        calls.append("fetch")
+        raise AssertionError("explicit daemon/socket mode must not fall back to Herdr observation")
+
+    def guarded_send(*args: Any, **kwargs: Any) -> CommandEnvelope:
+        calls.append("send")
+        raise AssertionError("explicit daemon/socket mode must not send through Herdr CLI")
+
+    class TimeoutDaemonAPIClient:
+        def __init__(self, socket_path: Any, *, timeout_seconds: float, max_response_bytes: int = 1024 * 1024):
+            self.timeout_seconds = timeout_seconds
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            from tendwire.daemon_api import DaemonUnavailable
+
+            try:
+                raise socket.timeout("timed out")
+            except socket.timeout as exc:
+                raise DaemonUnavailable("timed out") from exc
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_fetch)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", TimeoutDaemonAPIClient)
+
+    db_path = tmp_path / "timeout.db"
+    request_id = "daemon-timeout-uncertain"
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": request_id,
+                    "dry_run": False,
+                    "target": {"worker_id": "w-1"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["status"] == STATUS_REQUEST_STATE_UNCERTAIN
+    assert payload["request_id"] == request_id
+    assert calls == []
+    _assert_no_command_public_forbidden_fields(payload)
+
+    receipt = get_command_receipt(db_path, "cmd-host", request_id, "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is True
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_REQUEST_STATE_UNCERTAIN
 
 
 @pytest.mark.parametrize(
