@@ -12,6 +12,7 @@ from typing import Any
 
 from tendwire.backends.herdr_events import HerdrEventBackend
 from tendwire.backends.herdr_socket import HerdrSocketClient
+from tendwire.backends.herdr_socket import HerdrSocketTimeoutError
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Worker
 from tendwire.core.projector import project_from_observations
@@ -377,6 +378,62 @@ def test_debounce_batches_until_flush_and_shutdown_flushes(tmp_path: Path) -> No
     assert flushed.workers[0].status == "blocked"
 
 
+def test_idle_event_timeout_keeps_polling_without_marking_backend_unhealthy(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "idle-timeout")
+    backend.reconcile_once(client=_initial_pane_client())
+
+    class IdleThenEventClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read_event(self, subscription_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                raise HerdrSocketTimeoutError("idle")
+            backend.stop_event.set()
+            return {
+                "id": subscription_id,
+                "event": "agent_status_changed",
+                "payload": {"agent": "Agent One", "status": "blocked"},
+            }
+
+    client = IdleThenEventClient()
+    backend._read_event_stream(client, "sub-1")
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.workers[0].status == "blocked"
+    assert snapshot.backend_health[0].status == "healthy"
+    assert client.calls == 2
+
+
+def test_mark_unhealthy_safe_sets_ready_even_when_persist_fails(tmp_path: Path, monkeypatch: Any) -> None:
+    backend = _backend(tmp_path, "ready-on-error")
+
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr("tendwire.backends.herdr_events.save_snapshot", boom)
+
+    try:
+        backend._mark_unhealthy_safe("protocol_error")
+    except RuntimeError:
+        pass
+
+    assert backend.ready is True
+
+
+def test_protocol_error_health_is_degraded_and_specific(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "protocol-health")
+
+    backend._mark_unhealthy("protocol_error")
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.backend_health[0].status == "degraded"
+    assert snapshot.backend_health[0].outcome == "protocol_error"
+
+
 def test_daemon_starts_socket_backend_only_when_configured(tmp_path: Path) -> None:
     db_path = tmp_path / "daemon-socket.db"
     socket_path = tmp_path / "daemon.sock"
@@ -432,3 +489,39 @@ def test_daemon_starts_socket_backend_only_when_configured(tmp_path: Path) -> No
         daemon.stop()
 
     assert "stop" in calls
+
+
+def test_daemon_socket_fallback_uses_backend_health_when_snapshot_missing(tmp_path: Path) -> None:
+    db_path = tmp_path / "daemon-fallback.db"
+    socket_path = tmp_path / "daemon-fallback.sock"
+    config = Config(
+        host_id="daemon-fallback",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+        herdr_backend="socket",
+    )
+
+    class FakeBackend:
+        def __init__(self, config: Config, stop_event: threading.Event) -> None:
+            self.config = config
+            self.stop_event = stop_event
+            self.health = HerdrEventBackend(config)._health_for("protocol_error")
+
+        def start(self, *, wait_for_reconcile: bool = True) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(event_backend_factory=lambda cfg, stop_event: FakeBackend(cfg, stop_event)),
+    )
+    daemon.start()
+    try:
+        snapshot = daemon.get_snapshot()
+        assert snapshot.backend_health[0].status == "degraded"
+        assert snapshot.backend_health[0].outcome == "protocol_error"
+    finally:
+        daemon.stop()

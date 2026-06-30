@@ -315,6 +315,7 @@ BACKEND_HEALTH_OUTCOMES = frozenset(
         "deadline_exhausted",
         "nonzero",
         "malformed_json",
+        "protocol_error",
         "socket_disconnected",
         "unknown",
     }

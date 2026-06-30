@@ -472,17 +472,13 @@ class HerdrEventBackend:
                     if hasattr(client, "close"):
                         client.close()
             except HerdrSocketTimeoutError:
-                self._mark_unhealthy("timeout")
-                self._ready.set()
+                self._mark_unhealthy_safe("timeout")
             except (HerdrSocketDisconnectedError, HerdrSocketConnectionError):
-                self._mark_unhealthy("socket_disconnected")
-                self._ready.set()
+                self._mark_unhealthy_safe("socket_disconnected")
             except (HerdrMalformedLineError, HerdrEnvelopeError, HerdrProtocolError, ValueError, TypeError):
-                self._mark_unhealthy("malformed_json")
-                self._ready.set()
+                self._mark_unhealthy_safe("protocol_error")
             except Exception:
-                self._mark_unhealthy("unknown")
-                self._ready.set()
+                self._mark_unhealthy_safe("unknown")
             if self.stop_event.is_set():
                 break
             if self.reconnect_delay_seconds:
@@ -490,13 +486,16 @@ class HerdrEventBackend:
 
     def _read_event_stream(self, client: Any, subscription_id: str) -> None:
         while not self.stop_event.is_set():
-            envelope = client.read_event(subscription_id, timeout=self.config.herdr_timeout_seconds)
+            try:
+                envelope = client.read_event(subscription_id, timeout=self.config.herdr_timeout_seconds)
+            except HerdrSocketTimeoutError:
+                continue
             self.queue_event_envelope(envelope)
             disconnected = False
             deadline = time.monotonic() + self.debounce_seconds
             while (
                 self.debounce_seconds > 0
-                and len(self._pending_events) < self.max_batch_size
+                and self._pending_event_count() < self.max_batch_size
                 and not self.stop_event.is_set()
             ):
                 remaining = deadline - time.monotonic()
@@ -513,6 +512,10 @@ class HerdrEventBackend:
             self.flush()
             if disconnected:
                 raise HerdrSocketDisconnectedError("Herdr socket disconnected during event drain")
+
+    def _pending_event_count(self) -> int:
+        with self._lock:
+            return len(self._pending_events)
 
     def _current_bindings(self) -> list[WorkerBinding]:
         return list(self._bindings.values())
@@ -910,3 +913,9 @@ class HerdrEventBackend:
             self._spaces = {space.id: space for space in snapshot.spaces}
             self._workers = {worker.id: worker for worker in snapshot.workers}
             return snapshot
+
+    def _mark_unhealthy_safe(self, outcome: str) -> Snapshot | None:
+        try:
+            return self._mark_unhealthy(outcome)
+        finally:
+            self._ready.set()

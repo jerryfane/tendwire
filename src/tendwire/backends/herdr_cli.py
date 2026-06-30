@@ -67,7 +67,7 @@ _BACKEND_TARGET_KINDS = frozenset(
 _DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
 _UNAVAILABLE_HEALTH_OUTCOMES = frozenset({"missing_binary", "launch_error", "socket_disconnected"})
 _DEGRADED_HEALTH_OUTCOMES = frozenset(
-    {"timeout", "deadline_exhausted", "nonzero", "malformed_json"}
+    {"timeout", "deadline_exhausted", "nonzero", "malformed_json", "protocol_error"}
 )
 
 _HEALTH_MESSAGES = {
@@ -79,6 +79,7 @@ _HEALTH_MESSAGES = {
     "deadline_exhausted": "Herdr observation deadline was exhausted",
     "nonzero": "Herdr command returned nonzero status",
     "malformed_json": "Herdr command returned malformed JSON",
+    "protocol_error": "Herdr protocol returned an invalid envelope",
     "socket_disconnected": "Herdr socket disconnected",
     "unknown": "Herdr observation state is unknown",
 }
@@ -151,6 +152,7 @@ def herdr_backend_health(
         "deadline_exhausted",
         "nonzero",
         "malformed_json",
+        "protocol_error",
         "socket_disconnected",
         "unknown",
     }:

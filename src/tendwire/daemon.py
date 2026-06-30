@@ -132,9 +132,14 @@ class TendwireDaemon:
         from .backends.herdr_cli import herdr_backend_health
         from .core.projector import project_from_observations
 
+        backend_health = (
+            backend.health.to_backend_health()
+            if hasattr(backend, "health")
+            else herdr_backend_health("unknown")
+        )
         snapshot = project_from_observations(
             self.config,
-            backend_health=[herdr_backend_health("unknown")],
+            backend_health=[backend_health],
         )
         save_snapshot(Path(self.config.db_path), snapshot)
         return snapshot
