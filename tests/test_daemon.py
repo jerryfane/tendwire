@@ -25,6 +25,7 @@ from tendwire.core.projector import project_from_raw
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI
 from tendwire.store.sqlite import (
+    attention_payload_from_store,
     get_command_receipt,
     init_store,
     latest_snapshot,
@@ -175,6 +176,57 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     assert calls[0]["tty"] == "sentinel-private-tty"
     assert "sentinel-private" not in json.dumps(command_response)
     _assert_no_public_json_forbidden(command_response)
+
+
+def test_daemon_api_attention_list_uses_store_lifecycle_payload(tmp_path: Path) -> None:
+    db_path = tmp_path / "attention-api.db"
+    config = Config(host_id="daemon-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "status": "blocked",
+                "meta": {
+                    "safe": "kept",
+                    "pane_id": "sentinel-private-pane",
+                    "backendTarget": "sentinel-private-backend",
+                    "authToken": "sentinel-private-token",
+                },
+            }
+        ],
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+                "counts": {"workers": 1},
+            }
+        ],
+    )
+    save_snapshot(db_path, snapshot)
+    daemon = TendwireDaemon(config)
+    api = TendwireDaemonAPI(
+        get_snapshot=daemon.get_snapshot,
+        get_health=daemon.get_health,
+        submit_command=daemon.submit_command,
+        get_attention=daemon.get_attention,
+    )
+
+    response = api.dispatch({"method": "attention.list"})
+    payload = response["result"]
+
+    assert response["ok"] is True
+    assert payload["host_id"] == "daemon-host"
+    assert payload["attention"][0]["lifecycle_status"] == "open"
+    assert payload["attention"][0]["first_seen_at"] == snapshot.updated_at
+    assert payload["attention"][0]["last_seen_at"] == snapshot.updated_at
+    assert payload["attention"][0]["signal_count"] == 1
+    assert attention_payload_from_store(db_path, "daemon-host") == payload
+    assert "sentinel-private" not in json.dumps(response, sort_keys=True)
+    _assert_no_public_json_forbidden(response)
 
 
 def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Path) -> None:

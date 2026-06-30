@@ -94,6 +94,11 @@ snapshot/projections through the existing store APIs, and then serves these
 methods: `ping`, `health.get`, `snapshot.get`, `attention.list`, `turn.list`,
 `pending.list`, and `command.submit`.
 
+`attention.list` returns the current public attention inbox from the SQLite
+store when lifecycle rows are available, including neutral lifecycle fields
+such as first seen, last seen, changed, resolved, and signal count. Without a
+store-backed row it falls back to deterministic snapshot attention.
+
 Existing CLI commands remain one-shot by default. When `--socket-path` or
 `TENDWIRE_SOCKET_PATH` explicitly points a CLI command at a daemon, unreachable,
 stale, or timed-out sockets fall back to the existing one-shot path with the
@@ -112,10 +117,11 @@ stdout:
 ```bash
 tendwire snapshot --json --store
 tendwire snapshot --json --store --db-path /path/to/tendwire.db
+tendwire attention --json --db-path /path/to/tendwire.db
 ```
 
 Without `--store`, the CLI does not write the database. `--db-path` overrides
-the configured database path only for persistence.
+the configured database path for persistence and store-backed public views.
 
 ## Milestone 2 neutral snapshot contract
 

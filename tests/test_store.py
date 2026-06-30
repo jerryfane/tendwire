@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
@@ -13,11 +15,13 @@ from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
+    attention_payload_from_store,
     expire_stale_worker_bindings,
     expire_worker_bindings,
     get_command_receipt,
     init_store,
     latest_snapshot,
+    list_attention_items,
     list_hosts,
     list_worker_bindings,
     reserve_command_receipt,
@@ -80,7 +84,7 @@ def _unique_index_columns(conn: sqlite3.Connection, table: str) -> dict[str, tup
     return indexes
 
 
-def test_store_initializes_v3_pr6_schema_with_content_fingerprint_indexes(tmp_path: Path) -> None:
+def test_store_initializes_v4_pr6_schema_with_attention_lifecycle_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
 
     init_store(db_path)
@@ -88,7 +92,7 @@ def test_store_initializes_v3_pr6_schema_with_content_fingerprint_indexes(tmp_pa
     with sqlite3.connect(str(db_path)) as conn:
         assert _PR6_TABLES <= _table_names(conn)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-        assert _user_version(conn) == 3
+        assert _user_version(conn) == 4
         assert {"host_id", "created_at", "payload", "content_fingerprint"} <= columns
         indexed = _indexed_columns(conn, "snapshots")
         assert "host_id" in indexed
@@ -128,6 +132,20 @@ def test_store_initializes_v3_pr6_schema_with_content_fingerprint_indexes(tmp_pa
             "result_json",
             "uncertain",
         } <= command_columns
+        attention_columns = {row[1] for row in conn.execute("PRAGMA table_info(attention_items)")}
+        assert {
+            "attention_id",
+            "fingerprint",
+            "first_seen_at",
+            "last_seen_at",
+            "last_changed_at",
+            "resolved_at",
+            "lifecycle_status",
+            "resolved_reason",
+            "signal_count",
+        } <= attention_columns
+        attention_indexed = _indexed_columns(conn, "attention_items")
+        assert {"lifecycle_status", "last_seen_at", "fingerprint"} <= attention_indexed
 
 
 def test_store_connections_apply_wal_busy_timeout_and_foreign_keys(tmp_path: Path) -> None:
@@ -181,7 +199,7 @@ def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Pat
     save_snapshot(db_path, snapshot)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == 3
+        assert _user_version(conn) == 4
         row = conn.execute(
             "SELECT host_id, content_fingerprint, payload FROM snapshots ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -298,7 +316,7 @@ def test_store_migrates_partial_v3_db_with_legacy_data_idempotently(tmp_path: Pa
 
     with sqlite3.connect(str(db_path)) as conn:
         assert _PR6_TABLES <= _table_names(conn)
-        assert _user_version(conn) == 3
+        assert _user_version(conn) == 4
         assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM worker_bindings").fetchone()[0] == 1
@@ -313,6 +331,351 @@ def test_store_migrates_partial_v3_db_with_legacy_data_idempotently(tmp_path: Pa
         ).fetchone()
 
     assert command == (STATUS_ACCEPTED, "legacy-fp", '{"status":"accepted"}')
+
+
+def _snapshot_with_worker_status(
+    config: Config,
+    *,
+    status: str | None,
+    observed_at: str,
+    health_status: str = "healthy",
+    outcome: str = "healthy_non_empty",
+) -> Any:
+    workers = []
+    if status is not None:
+        workers = [
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "status": status,
+                "meta": {
+                    "safe": "kept",
+                    "pane_id": "sentinel-private-pane",
+                    "terminalId": "sentinel-private-terminal",
+                    "backendTarget": "sentinel-private-backend",
+                    "authToken": "sentinel-private-token",
+                },
+            }
+        ]
+    return project_from_raw(
+        config,
+        workers=workers,
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": health_status,
+                "outcome": outcome,
+                "observed_at": observed_at,
+                "counts": {"workers": len(workers)},
+            }
+        ],
+        timestamp=datetime.fromisoformat(observed_at),
+    )
+
+
+def _connector_outbox_rows(db_path: Path) -> list[tuple[str, str, str]]:
+    with sqlite3.connect(str(db_path)) as conn:
+        return conn.execute(
+            """
+            SELECT connector, delivery_key, payload_json
+            FROM connector_outbox
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def test_store_migrates_legacy_attention_rows_with_lifecycle_backfill(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-attention.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE attention_items (
+                host_id TEXT NOT NULL,
+                attention_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT,
+                fingerprint TEXT NOT NULL,
+                snapshot_content_fingerprint TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (host_id, attention_id)
+            );
+            INSERT INTO attention_items (
+                host_id, attention_id, source, kind, severity, status,
+                updated_at, fingerprint, snapshot_content_fingerprint,
+                observed_at, payload_json
+            ) VALUES (
+                'legacy-host', 'attn-legacy', 'worker:legacy', 'worker_status',
+                'warning', 'blocked', NULL, 'fp-legacy', 'snapshot-fp',
+                '2026-01-01T00:00:00+00:00',
+                '{"id":"attn-legacy","kind":"worker_status","severity":"warning","status":"blocked","source":"worker:legacy","fingerprint":"fp-legacy"}'
+            );
+            PRAGMA user_version = 3;
+            """
+        )
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(attention_items)")}
+        row = conn.execute(
+            """
+            SELECT first_seen_at, last_seen_at, last_changed_at,
+                   resolved_at, lifecycle_status, resolved_reason, signal_count,
+                   payload_json
+            FROM attention_items
+            WHERE host_id = 'legacy-host' AND attention_id = 'attn-legacy'
+            """
+        ).fetchone()
+
+    assert {
+        "first_seen_at",
+        "last_seen_at",
+        "last_changed_at",
+        "resolved_at",
+        "lifecycle_status",
+        "resolved_reason",
+        "signal_count",
+    } <= columns
+    assert row[:7] == (
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:00:00+00:00",
+        None,
+        "open",
+        None,
+        1,
+    )
+    assert json.loads(row[7])["id"] == "attn-legacy"
+
+
+def test_store_attention_lifecycle_repeats_update_seen_without_duplicate_rows_or_outbox(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "attention-repeat.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    first = _snapshot_with_worker_status(
+        config,
+        status="blocked",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    repeated = _snapshot_with_worker_status(
+        config,
+        status="blocked",
+        observed_at="2026-01-01T00:05:00+00:00",
+    )
+
+    save_snapshot(db_path, first)
+    first_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    save_snapshot(db_path, repeated)
+    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    payload = attention_payload_from_store(db_path, "attention-host")
+    outbox_rows = _connector_outbox_rows(db_path)
+
+    assert len(first_rows) == 1
+    assert len(rows) == 1
+    assert rows[0]["id"] == first_rows[0]["id"]
+    assert rows[0]["fingerprint"] == first_rows[0]["fingerprint"]
+    assert rows[0]["lifecycle_status"] == "open"
+    assert rows[0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+    assert rows[0]["last_seen_at"] == "2026-01-01T00:05:00+00:00"
+    assert rows[0]["last_changed_at"] == "2026-01-01T00:00:00+00:00"
+    assert rows[0]["resolved_at"] is None
+    assert rows[0]["signal_count"] == 2
+    assert payload is not None
+    assert payload["attention"][0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0][0] == "attention"
+    assert "attention_created" in outbox_rows[0][1]
+    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
+    assert "sentinel-private" not in outbox_rows[0][2]
+
+
+def test_store_attention_payload_synthesizes_snapshot_attention_without_lifecycle_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "attention-snapshot-only.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    snapshot = _snapshot_with_worker_status(
+        config,
+        status="blocked",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    save_snapshot(db_path, snapshot)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM attention_items WHERE host_id = ?", ("attention-host",))
+
+    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    payload = attention_payload_from_store(db_path, "attention-host")
+
+    assert rows == []
+    assert payload is not None
+    assert len(payload["attention"]) == 1
+    item = payload["attention"][0]
+    assert item["id"] == snapshot.attention[0].id
+    assert item["fingerprint"] == snapshot.attention[0].fingerprint
+    assert item["status"] == "blocked"
+    assert item["lifecycle_status"] == "open"
+    assert item["first_seen_at"] == snapshot.updated_at
+    assert item["last_seen_at"] == snapshot.updated_at
+    assert item["last_changed_at"] == snapshot.updated_at
+    assert item["signal_count"] == 1
+    assert item["resolved_at"] is None
+    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
+
+
+def test_store_attention_escalation_resolves_old_signal_and_dedups_repeats(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "attention-escalation.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="blocked",
+            observed_at="2026-01-01T00:00:00+00:00",
+        ),
+    )
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="failed",
+            observed_at="2026-01-01T00:10:00+00:00",
+        ),
+    )
+    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    current = list_attention_items(db_path, "attention-host")
+    outbox_rows = _connector_outbox_rows(db_path)
+
+    assert len(rows) == 2
+    assert len(current) == 1
+    assert current[0]["severity"] == "critical"
+    assert current[0]["status"] == "failed"
+    assert current[0]["first_seen_at"] == "2026-01-01T00:10:00+00:00"
+    assert current[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
+    resolved = [row for row in rows if row["lifecycle_status"] == "resolved"]
+    assert len(resolved) == 1
+    assert resolved[0]["severity"] == "warning"
+    assert resolved[0]["status"] == "blocked"
+    assert resolved[0]["resolved_at"] == "2026-01-01T00:10:00+00:00"
+    assert resolved[0]["resolved_reason"] == "gone"
+    assert len(outbox_rows) == 2
+    assert "attention_created" in outbox_rows[0][1]
+    assert "attention_escalated" in outbox_rows[1][1]
+
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="failed",
+            observed_at="2026-01-01T00:20:00+00:00",
+        ),
+    )
+    repeated_current = list_attention_items(db_path, "attention-host")
+    assert repeated_current[0]["signal_count"] == 2
+    assert repeated_current[0]["last_seen_at"] == "2026-01-01T00:20:00+00:00"
+    assert repeated_current[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
+    assert len(_connector_outbox_rows(db_path)) == 2
+
+
+def test_store_attention_disappearance_resolves_only_from_authoritative_healthy_snapshot(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "attention-disappearance.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="blocked",
+            observed_at="2026-01-01T00:00:00+00:00",
+        ),
+    )
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status=None,
+            observed_at="2026-01-01T00:05:00+00:00",
+            health_status="degraded",
+            outcome="malformed_json",
+        ),
+    )
+    degraded_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+
+    assert len(degraded_rows) == 1
+    assert degraded_rows[0]["lifecycle_status"] == "open"
+    assert degraded_rows[0]["last_changed_at"] == "2026-01-01T00:00:00+00:00"
+    assert degraded_rows[0]["resolved_at"] is None
+
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status=None,
+            observed_at="2026-01-01T00:10:00+00:00",
+            outcome="empty_healthy",
+        ),
+    )
+    resolved_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    current_rows = list_attention_items(db_path, "attention-host")
+
+    assert current_rows == []
+    assert len(resolved_rows) == 1
+    assert resolved_rows[0]["lifecycle_status"] == "resolved"
+    assert resolved_rows[0]["resolved_at"] == "2026-01-01T00:10:00+00:00"
+    assert resolved_rows[0]["resolved_reason"] == "gone"
+    assert resolved_rows[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
+
+
+def test_store_attention_recreate_enqueues_new_lifecycle_delivery(tmp_path: Path) -> None:
+    db_path = tmp_path / "attention-recreate.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="blocked",
+            observed_at="2026-01-01T00:00:00+00:00",
+        ),
+    )
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status=None,
+            observed_at="2026-01-01T00:05:00+00:00",
+            outcome="empty_healthy",
+        ),
+    )
+    save_snapshot(
+        db_path,
+        _snapshot_with_worker_status(
+            config,
+            status="blocked",
+            observed_at="2026-01-01T00:10:00+00:00",
+        ),
+    )
+
+    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    outbox_rows = _connector_outbox_rows(db_path)
+    delivery_keys = [row[1] for row in outbox_rows]
+
+    assert len(rows) == 1
+    assert rows[0]["lifecycle_status"] == "open"
+    assert rows[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
+    assert len(outbox_rows) == 2
+    assert len(set(delivery_keys)) == 2
+    assert all("attention_created" in key for key in delivery_keys)
+    assert all("sentinel-private" not in row[2] for row in outbox_rows)
 
 
 def _worker_binding(

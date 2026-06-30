@@ -18,7 +18,9 @@ from ..core.models import (
     SCHEMA_VERSION,
     Snapshot,
     WorkerBinding,
+    normalize_severity,
     separate_duplicate_worker_bindings,
+    sanitize_forbidden_fields,
     stable_fingerprint,
     stable_json_dumps,
     utc_timestamp,
@@ -27,7 +29,12 @@ from ..core.turns import pending_from_snapshot, turns_from_snapshot
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
+ATTENTION_LIFECYCLE_OPEN = "open"
+ATTENTION_LIFECYCLE_RESOLVED = "resolved"
+ATTENTION_RESOLVED_REASON_GONE = "gone"
+ATTENTION_OUTBOX_CONNECTOR = "attention"
+_ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
 CREATE_SNAPSHOTS_TABLE = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -200,6 +207,13 @@ CREATE TABLE IF NOT EXISTS attention_items (
     fingerprint TEXT NOT NULL,
     snapshot_content_fingerprint TEXT NOT NULL,
     observed_at TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL DEFAULT '',
+    last_seen_at TEXT NOT NULL DEFAULT '',
+    last_changed_at TEXT NOT NULL DEFAULT '',
+    resolved_at TEXT,
+    lifecycle_status TEXT NOT NULL DEFAULT 'open',
+    resolved_reason TEXT,
+    signal_count INTEGER NOT NULL DEFAULT 1,
     payload_json TEXT NOT NULL,
     PRIMARY KEY (host_id, attention_id)
 );
@@ -309,6 +323,18 @@ CREATE_PR6_INDEXES = (
     (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_status "
         "ON attention_items(host_id, status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_items_host_lifecycle_status "
+        "ON attention_items(host_id, lifecycle_status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_items_host_last_seen "
+        "ON attention_items(host_id, last_seen_at)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_items_host_fingerprint "
+        "ON attention_items(host_id, fingerprint)"
     ),
     (
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_commands_host_request_action "
@@ -716,6 +742,13 @@ def _ensure_pr6_columns(conn: sqlite3.Connection) -> None:
             "fingerprint": "TEXT NOT NULL DEFAULT ''",
             "snapshot_content_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "observed_at": "TEXT NOT NULL DEFAULT ''",
+            "first_seen_at": "TEXT NOT NULL DEFAULT ''",
+            "last_seen_at": "TEXT NOT NULL DEFAULT ''",
+            "last_changed_at": "TEXT NOT NULL DEFAULT ''",
+            "resolved_at": "TEXT",
+            "lifecycle_status": "TEXT NOT NULL DEFAULT 'open'",
+            "resolved_reason": "TEXT",
+            "signal_count": "INTEGER NOT NULL DEFAULT 1",
             "payload_json": "TEXT NOT NULL DEFAULT '{}'",
         },
     )
@@ -867,6 +900,387 @@ def _prune_host_projection(
         conn.execute(f"DELETE FROM {table} WHERE host_id = ?", (str(host_id),))
 
 
+def _attention_id_from_item(item: Mapping[str, Any]) -> str:
+    return str(item.get("id") or item.get("fingerprint") or "unknown")
+
+
+def _attention_lifecycle_payload(
+    item: Mapping[str, Any],
+    *,
+    attention_id: str,
+    observed_at: str,
+    first_seen_at: str,
+    last_seen_at: str,
+    last_changed_at: str,
+    lifecycle_status: str,
+    signal_count: int,
+    resolved_at: str | None = None,
+    resolved_reason: str | None = None,
+) -> dict[str, Any]:
+    payload = dict(item)
+    payload.setdefault("id", attention_id)
+    payload.setdefault("source", "")
+    payload.setdefault("kind", "unknown")
+    payload.setdefault("severity", "info")
+    payload.setdefault("status", "unknown")
+    payload.setdefault("fingerprint", "")
+    payload["observed_at"] = observed_at
+    payload["first_seen_at"] = first_seen_at
+    payload["last_seen_at"] = last_seen_at
+    payload["last_changed_at"] = last_changed_at
+    payload["lifecycle_status"] = lifecycle_status
+    payload["resolved_at"] = resolved_at
+    if resolved_reason is not None:
+        payload["resolved_reason"] = resolved_reason
+    payload["signal_count"] = max(1, int(signal_count))
+    return sanitize_forbidden_fields(payload)
+
+
+def _snapshot_attention_is_authoritative_healthy(payload_data: Mapping[str, Any]) -> bool:
+    health_items = payload_data.get("backend_health", [])
+    if not isinstance(health_items, list) or not health_items:
+        return False
+    for item in health_items:
+        if not isinstance(item, Mapping):
+            return False
+        if str(item.get("status") or "unknown") != "healthy":
+            return False
+    return True
+
+
+def _attention_severity_rank(value: Any) -> int:
+    return _ATTENTION_SEVERITY_RANK.get(normalize_severity(value), 0)
+
+
+def _attention_transition_event_type(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    attention_id: str,
+    source: str,
+    kind: str,
+    severity: str,
+) -> str:
+    rows = conn.execute(
+        """
+        SELECT severity
+        FROM attention_items
+        WHERE host_id = ?
+          AND source = ?
+          AND kind = ?
+          AND attention_id != ?
+          AND lifecycle_status = ?
+        """,
+        (
+            str(host_id),
+            str(source),
+            str(kind),
+            str(attention_id),
+            ATTENTION_LIFECYCLE_OPEN,
+        ),
+    ).fetchall()
+    new_rank = _attention_severity_rank(severity)
+    if any(new_rank > _attention_severity_rank(row[0]) for row in rows):
+        return "attention_escalated"
+    return "attention_created"
+
+
+def _enqueue_attention_lifecycle_job_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    event_type: str,
+    attention_id: str,
+    attention_payload: Mapping[str, Any],
+    transition_at: str,
+) -> None:
+    lifecycle_key = stable_fingerprint(
+        {
+            "event_type": event_type,
+            "attention_id": attention_id,
+            "transition_at": transition_at,
+        }
+    )[:16]
+    delivery_key = f"attention:{event_type}:{attention_id}:{lifecycle_key}"
+    payload = sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "event_type": event_type,
+            "host_id": str(host_id),
+            "attention": dict(attention_payload),
+            "transition_at": transition_at,
+        }
+    )
+    conn.execute(
+        """
+        INSERT INTO connector_outbox (
+            host_id,
+            connector,
+            delivery_key,
+            status,
+            payload_json,
+            private_state_json,
+            created_at,
+            updated_at,
+            next_attempt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
+        """,
+        (
+            str(host_id),
+            ATTENTION_OUTBOX_CONNECTOR,
+            delivery_key,
+            "queued",
+            _canonical_json(payload),
+            "{}",
+            transition_at,
+            transition_at,
+            None,
+        ),
+    )
+
+
+def _upsert_attention_item_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    item: Mapping[str, Any],
+    content_fingerprint: str,
+    observed_at: str,
+) -> str:
+    attention_id = _attention_id_from_item(item)
+    source = str(item.get("source") or "")
+    kind = str(item.get("kind") or "unknown")
+    severity = str(item.get("severity") or "info")
+    signal_status = str(item.get("status") or "unknown")
+    updated_at = item.get("updated_at")
+    fingerprint = str(item.get("fingerprint") or "")
+    payload_json = _canonical_json(dict(item))
+    existing = conn.execute(
+        """
+        SELECT
+            fingerprint,
+            lifecycle_status,
+            signal_count,
+            last_changed_at,
+            severity,
+            status
+        FROM attention_items
+        WHERE host_id = ? AND attention_id = ?
+        """,
+        (str(host_id), attention_id),
+    ).fetchone()
+
+    if existing is None:
+        transition_event = _attention_transition_event_type(
+            conn,
+            host_id=host_id,
+            attention_id=attention_id,
+            source=source,
+            kind=kind,
+            severity=severity,
+        )
+        conn.execute(
+            """
+            INSERT INTO attention_items (
+                host_id,
+                attention_id,
+                source,
+                kind,
+                severity,
+                status,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                first_seen_at,
+                last_seen_at,
+                last_changed_at,
+                resolved_at,
+                lifecycle_status,
+                resolved_reason,
+                signal_count,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(host_id),
+                attention_id,
+                source,
+                kind,
+                severity,
+                signal_status,
+                updated_at,
+                fingerprint,
+                str(content_fingerprint),
+                observed_at,
+                observed_at,
+                observed_at,
+                observed_at,
+                None,
+                ATTENTION_LIFECYCLE_OPEN,
+                None,
+                1,
+                payload_json,
+            ),
+        )
+        _enqueue_attention_lifecycle_job_conn(
+            conn,
+            host_id=host_id,
+            event_type=transition_event,
+            attention_id=attention_id,
+            attention_payload=_attention_lifecycle_payload(
+                item,
+                attention_id=attention_id,
+                observed_at=observed_at,
+                first_seen_at=observed_at,
+                last_seen_at=observed_at,
+                last_changed_at=observed_at,
+                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+                signal_count=1,
+            ),
+            transition_at=observed_at,
+        )
+        return attention_id
+
+    previous_fingerprint = str(existing[0] or "")
+    previous_lifecycle_status = str(existing[1] or ATTENTION_LIFECYCLE_OPEN)
+    previous_signal_count = int(existing[2] or 0)
+    previous_last_changed_at = str(existing[3] or observed_at)
+    previous_severity = str(existing[4] or "info")
+    previous_signal_status = str(existing[5] or "unknown")
+    changed = (
+        previous_lifecycle_status != ATTENTION_LIFECYCLE_OPEN
+        or previous_fingerprint != fingerprint
+        or previous_severity != severity
+        or previous_signal_status != signal_status
+    )
+    last_changed_at = observed_at if changed else previous_last_changed_at
+    signal_count = max(0, previous_signal_count) + 1
+    conn.execute(
+        """
+        UPDATE attention_items
+        SET
+            source = ?,
+            kind = ?,
+            severity = ?,
+            status = ?,
+            updated_at = ?,
+            fingerprint = ?,
+            snapshot_content_fingerprint = ?,
+            observed_at = ?,
+            last_seen_at = ?,
+            last_changed_at = ?,
+            resolved_at = NULL,
+            lifecycle_status = ?,
+            resolved_reason = NULL,
+            signal_count = ?,
+            payload_json = ?
+        WHERE host_id = ? AND attention_id = ?
+        """,
+        (
+            source,
+            kind,
+            severity,
+            signal_status,
+            updated_at,
+            fingerprint,
+            str(content_fingerprint),
+            observed_at,
+            observed_at,
+            last_changed_at,
+            ATTENTION_LIFECYCLE_OPEN,
+            signal_count,
+            payload_json,
+            str(host_id),
+            attention_id,
+        ),
+    )
+    if previous_lifecycle_status != ATTENTION_LIFECYCLE_OPEN:
+        _enqueue_attention_lifecycle_job_conn(
+            conn,
+            host_id=host_id,
+            event_type="attention_created",
+            attention_id=attention_id,
+            attention_payload=_attention_lifecycle_payload(
+                item,
+                attention_id=attention_id,
+                observed_at=observed_at,
+                first_seen_at=observed_at,
+                last_seen_at=observed_at,
+                last_changed_at=last_changed_at,
+                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+                signal_count=signal_count,
+            ),
+            transition_at=observed_at,
+        )
+    return attention_id
+
+
+def _resolve_missing_attention_items_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    current_attention_ids: Iterable[str],
+    content_fingerprint: str,
+    observed_at: str,
+    authoritative: bool,
+) -> int:
+    if not authoritative:
+        return 0
+    current = sorted({str(value) for value in current_attention_ids})
+    if current:
+        placeholders = ",".join("?" for _ in current)
+        cursor = conn.execute(
+            f"""
+            UPDATE attention_items
+            SET
+                lifecycle_status = ?,
+                resolved_at = ?,
+                resolved_reason = ?,
+                last_changed_at = ?,
+                snapshot_content_fingerprint = ?
+            WHERE host_id = ?
+              AND lifecycle_status = ?
+              AND attention_id NOT IN ({placeholders})
+            """,
+            [
+                ATTENTION_LIFECYCLE_RESOLVED,
+                observed_at,
+                ATTENTION_RESOLVED_REASON_GONE,
+                observed_at,
+                str(content_fingerprint),
+                str(host_id),
+                ATTENTION_LIFECYCLE_OPEN,
+                *current,
+            ],
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE attention_items
+            SET
+                lifecycle_status = ?,
+                resolved_at = ?,
+                resolved_reason = ?,
+                last_changed_at = ?,
+                snapshot_content_fingerprint = ?
+            WHERE host_id = ?
+              AND lifecycle_status = ?
+            """,
+            (
+                ATTENTION_LIFECYCLE_RESOLVED,
+                observed_at,
+                ATTENTION_RESOLVED_REASON_GONE,
+                observed_at,
+                str(content_fingerprint),
+                str(host_id),
+                ATTENTION_LIFECYCLE_OPEN,
+            ),
+        )
+    return int(cursor.rowcount or 0)
+
+
 def _upsert_snapshot_projections(
     conn: sqlite3.Connection,
     snapshot: Snapshot,
@@ -984,49 +1398,22 @@ def _upsert_snapshot_projections(
     for item in payload_data.get("attention", []):
         if not isinstance(item, Mapping):
             continue
-        attention_id = str(item.get("id") or item.get("fingerprint") or "unknown")
-        attention_ids.add(attention_id)
-        conn.execute(
-            """
-            INSERT INTO attention_items (
-                host_id,
-                attention_id,
-                source,
-                kind,
-                severity,
-                status,
-                updated_at,
-                fingerprint,
-                snapshot_content_fingerprint,
-                observed_at,
-                payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, attention_id) DO UPDATE SET
-                source = excluded.source,
-                kind = excluded.kind,
-                severity = excluded.severity,
-                status = excluded.status,
-                updated_at = excluded.updated_at,
-                fingerprint = excluded.fingerprint,
-                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
-                observed_at = excluded.observed_at,
-                payload_json = excluded.payload_json
-            """,
-            (
-                host_id,
-                attention_id,
-                str(item.get("source") or ""),
-                str(item.get("kind") or "unknown"),
-                str(item.get("severity") or "info"),
-                str(item.get("status") or "unknown"),
-                item.get("updated_at"),
-                str(item.get("fingerprint") or ""),
-                str(content_fingerprint),
-                observed_at,
-                _canonical_json(dict(item)),
-            ),
+        attention_id = _upsert_attention_item_conn(
+            conn,
+            host_id=host_id,
+            item=item,
+            content_fingerprint=content_fingerprint,
+            observed_at=observed_at,
         )
-    _prune_host_projection(conn, "attention_items", "attention_id", host_id, attention_ids)
+        attention_ids.add(attention_id)
+    _resolve_missing_attention_items_conn(
+        conn,
+        host_id=host_id,
+        current_attention_ids=attention_ids,
+        content_fingerprint=content_fingerprint,
+        observed_at=observed_at,
+        authoritative=_snapshot_attention_is_authoritative_healthy(payload_data),
+    )
 
     turn_ids: set[str] = set()
     for turn in turns_from_snapshot(snapshot):
@@ -1312,6 +1699,40 @@ def _backfill_command_audit(conn: sqlite3.Connection) -> None:
         _upsert_command_audit_from_receipt_row(conn, row)
 
 
+def _backfill_attention_lifecycle(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE attention_items
+        SET
+            first_seen_at = CASE
+                WHEN first_seen_at IS NULL OR first_seen_at = ''
+                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
+                ELSE first_seen_at
+            END,
+            last_seen_at = CASE
+                WHEN last_seen_at IS NULL OR last_seen_at = ''
+                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
+                ELSE last_seen_at
+            END,
+            last_changed_at = CASE
+                WHEN last_changed_at IS NULL OR last_changed_at = ''
+                THEN COALESCE(NULLIF(observed_at, ''), updated_at, '')
+                ELSE last_changed_at
+            END,
+            lifecycle_status = CASE
+                WHEN lifecycle_status IS NULL OR lifecycle_status = ''
+                THEN 'open'
+                ELSE lifecycle_status
+            END,
+            signal_count = CASE
+                WHEN signal_count IS NULL OR signal_count < 1
+                THEN 1
+                ELSE signal_count
+            END
+        """
+    )
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_SNAPSHOTS_TABLE)
     columns = _table_columns(conn)
@@ -1337,6 +1758,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for statement in CREATE_PR6_TABLES:
         conn.execute(statement)
     _ensure_pr6_columns(conn)
+    _backfill_attention_lifecycle(conn)
     for statement in CREATE_PR6_INDEXES:
         conn.execute(statement)
     _backfill_command_audit(conn)
@@ -1397,6 +1819,181 @@ def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | Non
     if row is None:
         return None
     return Snapshot.from_json(row[0])
+
+
+def _attention_rows_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    *,
+    include_resolved: bool = False,
+) -> list[Any]:
+    clauses = ["host_id = ?"]
+    params: list[Any] = [str(host_id)]
+    if not include_resolved:
+        clauses.append("lifecycle_status = ?")
+        params.append(ATTENTION_LIFECYCLE_OPEN)
+    where = " AND ".join(clauses)
+    return conn.execute(
+        f"""
+        SELECT
+            attention_id,
+            source,
+            kind,
+            severity,
+            status,
+            updated_at,
+            fingerprint,
+            snapshot_content_fingerprint,
+            observed_at,
+            payload_json,
+            first_seen_at,
+            last_seen_at,
+            last_changed_at,
+            resolved_at,
+            lifecycle_status,
+            resolved_reason,
+            signal_count
+        FROM attention_items
+        WHERE {where}
+        ORDER BY
+            CASE lifecycle_status WHEN 'open' THEN 0 ELSE 1 END,
+            last_changed_at DESC,
+            attention_id
+        """,
+        params,
+    ).fetchall()
+
+
+def _attention_item_from_row(row: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(row[9] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        parsed = {}
+    payload = dict(parsed) if isinstance(parsed, Mapping) else {}
+    payload.update(
+        {
+            "id": str(row[0] or ""),
+            "source": str(row[1] or ""),
+            "kind": str(row[2] or "unknown"),
+            "severity": str(row[3] or "info"),
+            "status": str(row[4] or "unknown"),
+            "updated_at": row[5],
+            "fingerprint": str(row[6] or ""),
+        }
+    )
+    return _attention_lifecycle_payload(
+        payload,
+        attention_id=str(row[0] or ""),
+        observed_at=str(row[8] or row[11] or ""),
+        first_seen_at=str(row[10] or row[8] or ""),
+        last_seen_at=str(row[11] or row[8] or ""),
+        last_changed_at=str(row[12] or row[8] or ""),
+        resolved_at=row[13],
+        lifecycle_status=str(row[14] or ATTENTION_LIFECYCLE_OPEN),
+        resolved_reason=row[15],
+        signal_count=int(row[16] or 1),
+    )
+
+
+def list_attention_items(
+    db_path: Path,
+    host_id: str,
+    *,
+    include_resolved: bool = False,
+) -> list[dict[str, Any]]:
+    """Return public-safe persisted attention items for a host."""
+    if not db_path.exists():
+        return []
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = _attention_rows_conn(
+            conn,
+            host_id,
+            include_resolved=include_resolved,
+        )
+    return [_attention_item_from_row(row) for row in rows]
+
+
+def attention_payload_from_store(
+    db_path: Path,
+    host_id: str,
+    *,
+    include_resolved: bool = False,
+) -> dict[str, Any] | None:
+    """Return a public attention.list payload from lifecycle rows or snapshot fallback."""
+    if not db_path.exists():
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = _attention_rows_conn(
+            conn,
+            host_id,
+            include_resolved=include_resolved,
+        )
+        snapshot_row = conn.execute(
+            """
+            SELECT payload
+            FROM snapshots
+            WHERE host_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(host_id),),
+        ).fetchone()
+        attention_row_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM attention_items WHERE host_id = ?",
+                (str(host_id),),
+            ).fetchone()[0]
+        )
+
+    if snapshot_row is None and not rows:
+        return None
+
+    snapshot: Snapshot | None = None
+    if snapshot_row is not None:
+        try:
+            snapshot = Snapshot.from_json(snapshot_row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = None
+
+    attention = [_attention_item_from_row(row) for row in rows]
+    backend_health = [health.to_dict() for health in snapshot.backend_health] if snapshot is not None else []
+    updated_at = snapshot.updated_at if snapshot is not None else utc_timestamp()
+    if not attention and attention_row_count == 0 and snapshot is not None and snapshot.attention:
+        attention = []
+        for signal in snapshot.attention:
+            item = signal.to_dict()
+            attention.append(
+                _attention_lifecycle_payload(
+                    item,
+                    attention_id=_attention_id_from_item(item),
+                    observed_at=updated_at,
+                    first_seen_at=updated_at,
+                    last_seen_at=updated_at,
+                    last_changed_at=updated_at,
+                    lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+                    signal_count=1,
+                )
+            )
+    if snapshot is None and attention:
+        updated_at = str(attention[0].get("last_seen_at") or attention[0].get("observed_at") or updated_at)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "host_id": str(host_id),
+        "updated_at": updated_at,
+        "attention": attention,
+        "backend_health": backend_health,
+    }
+    payload["content_fingerprint"] = stable_fingerprint(
+        {
+            "schema_version": payload["schema_version"],
+            "host_id": payload["host_id"],
+            "attention": attention,
+            "backend_health": backend_health,
+        }
+    )
+    return sanitize_forbidden_fields(payload)
 
 
 def list_hosts(db_path: Path) -> list[str]:

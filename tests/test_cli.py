@@ -8,13 +8,16 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from tendwire.backends import herdr_cli
 from tendwire.cli import main
+from tendwire.config import Config
 from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
-from tendwire.store.sqlite import init_store, latest_snapshot, list_worker_bindings
+from tendwire.core.projector import project_from_raw
+from tendwire.store.sqlite import init_store, latest_snapshot, list_worker_bindings, save_snapshot
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -382,6 +385,111 @@ def test_cli_snapshot_store_persists_printed_snapshot(tmp_path: Path, capsys) ->
     assert restored is not None
     assert restored.host_id == "cli-store"
     assert restored.content_fingerprint == payload["content_fingerprint"]
+
+
+def test_cli_attention_json_reads_store_backed_lifecycle(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    db_path = tmp_path / "attention.db"
+    socket_path = tmp_path / "absent.sock"
+    config = Config(host_id="cli-attention", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "status": "blocked",
+                "meta": {
+                    "safe": "kept",
+                    "pane_id": "sentinel-private-pane",
+                    "terminalId": "sentinel-private-terminal",
+                    "backendTarget": "sentinel-private-backend",
+                    "authToken": "sentinel-private-token",
+                },
+            }
+        ],
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+                "counts": {"workers": 1},
+            }
+        ],
+        timestamp=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
+    )
+    save_snapshot(db_path, snapshot)
+
+    code = main(
+        [
+            "--host-id",
+            "cli-attention",
+            "--socket-path",
+            str(socket_path),
+            "attention",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["host_id"] == "cli-attention"
+    assert payload["attention"][0]["lifecycle_status"] == "open"
+    assert payload["attention"][0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
+    assert payload["attention"][0]["signal_count"] == 1
+    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
+    _assert_no_public_json_forbidden(payload)
+
+
+def test_cli_attention_json_falls_back_to_snapshot_when_store_is_unavailable(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "missing.db"
+    socket_path = tmp_path / "absent.sock"
+
+    def _fake_herdr_state(config):
+        return [], [
+            Worker(
+                id="worker-1",
+                name="Worker One",
+                status="blocked",
+                meta={"pane_id": "sentinel-private-pane"},
+            )
+        ]
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+
+    code = main(
+        [
+            "--host-id",
+            "cli-attention-fallback",
+            "--socket-path",
+            str(socket_path),
+            "attention",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert captured.err == ""
+    assert len(payload["attention"]) == 1
+    assert payload["attention"][0]["status"] == "blocked"
+    assert "first_seen_at" not in payload["attention"][0]
+    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
+    _assert_no_public_json_forbidden(payload)
 
 
 def test_cli_public_json_does_not_emit_connector_private_store_rows(

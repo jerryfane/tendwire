@@ -11,11 +11,11 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from .core.attention import attention_payload_from_snapshot
 from .core.commands import CommandEnvelope, STATUS_INVALID_REQUEST, error_value
 from .core.models import (
     Snapshot,
     sanitize_forbidden_fields,
-    stable_fingerprint,
     stable_json_dumps,
 )
 from .core.turns import pending_payload_from_snapshot, turns_payload_from_snapshot
@@ -85,27 +85,6 @@ def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:
     return sanitize_forbidden_fields(snapshot.to_dict())
 
 
-def _attention_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
-    attention = [signal.to_dict() for signal in snapshot.attention]
-    backend_health = [health.to_dict() for health in snapshot.backend_health]
-    payload = {
-        "schema_version": snapshot.schema_version,
-        "host_id": snapshot.host_id,
-        "updated_at": snapshot.updated_at,
-        "attention": attention,
-        "backend_health": backend_health,
-    }
-    payload["content_fingerprint"] = stable_fingerprint(
-        {
-            "schema_version": payload["schema_version"],
-            "host_id": payload["host_id"],
-            "attention": attention,
-            "backend_health": backend_health,
-        }
-    )
-    return sanitize_forbidden_fields(payload)
-
-
 def _command_result(value: Any) -> dict[str, Any]:
     if isinstance(value, CommandEnvelope):
         return value.to_dict()
@@ -133,10 +112,12 @@ class TendwireDaemonAPI:
         get_snapshot: Callable[[], Snapshot],
         get_health: Callable[[], Mapping[str, Any]],
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
+        get_attention: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._get_snapshot = get_snapshot
         self._get_health = get_health
         self._submit_command = submit_command
+        self._get_attention = get_attention
 
     def dispatch(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, Mapping):
@@ -190,7 +171,9 @@ class TendwireDaemonAPI:
             if method == "snapshot.get":
                 return success_response(_snapshot_dict(self._get_snapshot()), request_id=request_id)
             if method == "attention.list":
-                return success_response(_attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
+                if self._get_attention is not None:
+                    return success_response(self._get_attention(), request_id=request_id)
+                return success_response(attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "turn.list":
                 return success_response(turns_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "pending.list":

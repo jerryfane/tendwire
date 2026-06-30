@@ -23,6 +23,7 @@ from .backends.herdr_cli import (
 from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
+from .core.attention import attention_payload_from_snapshot
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DUPLICATE_REQUEST,
@@ -43,6 +44,7 @@ from .core.turns import (
 )
 from .core.models import stable_json_dumps
 from .store.sqlite import (
+    attention_payload_from_store,
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
     list_worker_bindings,
@@ -112,6 +114,31 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="db_path",
         default=None,
         help="SQLite database path to use with --store (default: config path).",
+    )
+
+    attention_parser = subparsers.add_parser(
+        "attention",
+        help="Print neutral public attention items.",
+    )
+    attention_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=True,
+        help="Print attention as JSON (default).",
+    )
+    attention_parser.add_argument(
+        "--store",
+        dest="store_snapshot",
+        action="store_true",
+        default=False,
+        help="Persist a fresh snapshot before listing store-backed attention.",
+    )
+    attention_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="SQLite database path for store-backed attention (default: config path).",
     )
 
     turns_parser = subparsers.add_parser(
@@ -443,6 +470,33 @@ def cmd_turns(
     return 0
 
 
+def cmd_attention(
+    config: Config,
+    *,
+    json_output: bool = True,
+    store_snapshot: bool = False,
+) -> int:
+    """Print neutral public attention items."""
+    if not json_output:
+        print("error: only --json output is supported", file=sys.stderr)
+        return 2
+    if not store_snapshot:
+        daemon_result = _try_daemon_result(config, "attention.list")
+        if daemon_result is not None:
+            print(stable_json_dumps(daemon_result, indent=2))
+            return 0
+    if store_snapshot:
+        observe_public_snapshot(config, store_snapshot=True)
+    if config.db_path is not None:
+        payload = attention_payload_from_store(config.db_path, config.host_id)
+        if payload is not None:
+            print(stable_json_dumps(payload, indent=2))
+            return 0
+    snapshot = _current_public_snapshot(config)
+    print(stable_json_dumps(attention_payload_from_snapshot(snapshot), indent=2))
+    return 0
+
+
 def cmd_pending(
     config: Config,
     *,
@@ -711,6 +765,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "snapshot":
         return cmd_snapshot(
+            config,
+            json_output=args.json_output,
+            store_snapshot=args.store_snapshot,
+        )
+
+    if args.command == "attention":
+        return cmd_attention(
             config,
             json_output=args.json_output,
             store_snapshot=args.store_snapshot,
