@@ -354,8 +354,13 @@ def _try_daemon_result(
     method: str,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Return a daemon result when explicitly configured and reachable."""
-    if config.socket_path is None:
+    """Return a daemon result when a Tendwire daemon socket is reachable."""
+    socket_path = config.socket_path
+    if socket_path is None:
+        socket_path = config.data_dir / "tendwire.sock"
+        if not socket_path.exists():
+            return None
+    if socket_path is None:
         return None
     try:
         from .daemon_api import DaemonAPIClient, DaemonAPIError
@@ -363,7 +368,7 @@ def _try_daemon_result(
         return None
     try:
         response = DaemonAPIClient(
-            config.socket_path,
+            socket_path,
             timeout_seconds=_DAEMON_CLIENT_TIMEOUT_SECONDS,
         ).request(method, params or {})
     except DaemonAPIError:

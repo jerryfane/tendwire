@@ -9,7 +9,6 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from tendwire.backends.herdr_cli import HerdrCommandObservation
 from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.commands import STATUS_ACCEPTED, STATUS_INVALID_REQUEST, CommandEnvelope
@@ -24,7 +23,13 @@ from tendwire.core.models import (
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.daemon_api import DaemonAPIClient, TendwireDaemonAPI
-from tendwire.store.sqlite import get_command_receipt, init_store, latest_snapshot, save_snapshot
+from tendwire.store.sqlite import (
+    get_command_receipt,
+    init_store,
+    latest_snapshot,
+    save_snapshot,
+    upsert_worker_bindings,
+)
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -225,9 +230,15 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
 ) -> None:
     db_path = tmp_path / "commands.db"
     socket_path = tmp_path / "commands.sock"
-    config = Config(host_id="cmd-host", data_dir=tmp_path, db_path=db_path, socket_path=socket_path)
+    config = Config(
+        host_id="cmd-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+        herdr_backend="socket",
+    )
     init_store(db_path)
-    calls: list[tuple[Any, Any]] = []
+    calls: list[dict[str, Any]] = []
     worker = Worker(id="w-1", name="Alpha", status="active")
     binding = WorkerBinding(
         host_id="cmd-host",
@@ -242,40 +253,54 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         private_fingerprint="private-binding",
     )
 
-    def observe(config: Config) -> Snapshot:
-        snapshot = project_from_raw(
-            config,
-            workers=[{"id": "w-1", "name": "Alpha", "status": "active"}],
-        )
-        save_snapshot(db_path, snapshot)
-        return snapshot
+    class FakeHealth:
+        def to_backend_health(self) -> BackendHealth:
+            return BackendHealth(
+                name="herdr",
+                status="healthy",
+                outcome="healthy_non_empty",
+                observed_at="2026-01-01T00:00:00+00:00",
+                counts={"workers": 1},
+            )
 
-    def command_observation(config: Config, stored_bindings: list[WorkerBinding] | None = None) -> HerdrCommandObservation:
-        return HerdrCommandObservation(
-            spaces=[],
-            workers=[worker],
-            status="healthy",
-            outcome="healthy_non_empty",
-            bindings=[binding],
-        )
+    class FakeEventBackend:
+        health = FakeHealth()
 
-    def send_instruction(config: Config, target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append((target, instruction))
-        return CommandEnvelope(
-            ok=True,
-            status=STATUS_ACCEPTED,
-            action="send_instruction",
-            request_id=None,
-            dry_run=False,
-            result={"target": {"worker_id": target["worker_id"]}},
-        )
+        def __init__(self, config: Config, stop_event: threading.Event) -> None:
+            self.config = config
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", command_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", send_instruction)
+        def start(self, *, wait_for_reconcile: bool = True) -> None:
+            snapshot = Snapshot(
+                host_id="cmd-host",
+                updated_at="2026-01-01T00:00:00+00:00",
+                workers=[worker],
+                backend_health=[self.health.to_backend_health()],
+            )
+            save_snapshot(db_path, snapshot)
+            upsert_worker_bindings(db_path, [binding])
+
+        def stop(self) -> None:
+            return None
+
+    class FakeHerdrSocketClient:
+        def connect(self) -> "FakeHerdrSocketClient":
+            return self
+
+        def agent_send(self, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+            calls.append(dict(params))
+            return {"accepted": True}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        lambda config: FakeHerdrSocketClient(),
+    )
 
     daemon = TendwireDaemon(
         config,
-        hooks=DaemonHooks(observe_initial_snapshot=observe),
+        hooks=DaemonHooks(event_backend_factory=lambda config, stop_event: FakeEventBackend(config, stop_event)),
     )
     daemon.start()
     thread = threading.Thread(target=daemon.serve_forever)
@@ -297,7 +322,7 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         assert first["result"]["status"] == STATUS_ACCEPTED
         assert second["ok"] is True
         assert second["result"]["status"] == STATUS_ACCEPTED
-        assert len(calls) == 1
+        assert calls == [{"agent_id": "agent-private", "text": "hello"}]
         assert get_command_receipt(db_path, "cmd-host", "req-1", "send_instruction") is not None
         assert "agent-private" not in json.dumps(first)
         _assert_no_public_json_forbidden(first)

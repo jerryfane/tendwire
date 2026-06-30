@@ -1,0 +1,570 @@
+"""Authoritative daemon command submission path for Tendwire."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from .config import Config
+from .core.actions import CommandContext, execute_command
+from .core.commands import (
+    STATUS_ACCEPTED,
+    STATUS_AMBIGUOUS_BACKEND_TARGET,
+    STATUS_AMBIGUOUS_TARGET,
+    STATUS_BACKEND_FAILED,
+    STATUS_BACKEND_UNAVAILABLE,
+    STATUS_BACKEND_UNSUPPORTED,
+    STATUS_DUPLICATE_REQUEST,
+    STATUS_NOT_FOUND,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    STATUS_REQUEST_STATE_UNCERTAIN,
+    STATUS_RESOLVED,
+    STATUS_STALE_TARGET,
+    CommandEnvelope,
+    CommandRequest,
+    error_value,
+    parse_command_request,
+    resolve_target,
+    validate_request,
+    worker_candidate,
+)
+from .core.models import BackendHealth, Snapshot, Worker, WorkerBinding, stable_json_dumps
+from .core.projector import project_from_observations
+from .store.sqlite import (
+    append_event,
+    envelope_to_receipt_json,
+    latest_snapshot,
+    list_worker_bindings,
+    reserve_command_receipt,
+    save_command_receipt,
+)
+
+
+HERDR_BACKEND = "herdr"
+_DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
+_AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
+_AGENT_SEND_TARGET_PARAMS = {
+    "agent_id": "agent_id",
+    "agent": "agent",
+    "name": "name",
+    "label": "label",
+    "terminal_id": "terminal_id",
+    "pane_id": "pane_id",
+}
+
+SocketClientFactory = Callable[[Config], Any]
+
+
+@dataclass(frozen=True)
+class ResolvedCommandTarget:
+    worker: Worker
+    binding: WorkerBinding
+
+
+def _raw_payload_from_mapping(params: Mapping[str, Any]) -> str:
+    return json.dumps(
+        dict(params),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _request_json(request: CommandRequest) -> str:
+    return stable_json_dumps(request.to_dict())
+
+
+def _default_socket_client_factory(config: Config) -> Any:
+    from .backends.herdr_socket import HerdrSocketClient
+
+    return HerdrSocketClient(timeout=config.herdr_timeout_seconds)
+
+
+def _safe_event_payload(
+    request: CommandRequest,
+    *,
+    status: str,
+    envelope: CommandEnvelope | None = None,
+    target_worker_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "action": request.action,
+        "request_id": request.request_id,
+        "dry_run": request.dry_run,
+        "status": status,
+    }
+    if target_worker_id:
+        payload["target"] = {"worker_id": target_worker_id}
+    if envelope is not None:
+        payload["envelope"] = envelope.to_dict()
+    return payload
+
+
+def _append_command_event(
+    config: Config,
+    event_type: str,
+    request: CommandRequest,
+    *,
+    status: str,
+    envelope: CommandEnvelope | None = None,
+    target_worker_id: str | None = None,
+) -> None:
+    if config.db_path is None or not request.request_id:
+        return
+    append_event(
+        config.db_path,
+        config.host_id,
+        event_type,
+        _safe_event_payload(
+            request,
+            status=status,
+            envelope=envelope,
+            target_worker_id=target_worker_id,
+        ),
+        aggregate_type="command",
+        aggregate_id=request.request_id,
+    )
+
+
+def _backend_health(snapshot: Snapshot) -> BackendHealth:
+    for health in snapshot.backend_health:
+        if health.name == HERDR_BACKEND:
+            return health
+    return BackendHealth(name=HERDR_BACKEND, status="unknown", outcome="unknown")
+
+
+def _current_snapshot(config: Config) -> Snapshot:
+    if config.db_path is not None:
+        snapshot = latest_snapshot(config.db_path, config.host_id)
+        if snapshot is not None:
+            return snapshot
+    return project_from_observations(config)
+
+
+def _backend_unavailable(
+    request: CommandRequest,
+    message: str,
+    *,
+    health: BackendHealth | None = None,
+) -> CommandEnvelope:
+    details: dict[str, Any] = {}
+    if health is not None:
+        details["backend"] = {
+            "name": health.name,
+            "status": health.status,
+            "outcome": health.outcome,
+        }
+    return CommandEnvelope.error(
+        request,
+        error_value(STATUS_BACKEND_UNAVAILABLE, message, details=details),
+    )
+
+
+def _backend_health_error(config: Config, request: CommandRequest, snapshot: Snapshot) -> CommandEnvelope | None:
+    if config.herdr_backend != "socket":
+        return _backend_unavailable(
+            request,
+            "Herdr socket backend is not enabled",
+        )
+    health = _backend_health(snapshot)
+    if health.status != "healthy":
+        return _backend_unavailable(
+            request,
+            "Herdr socket backend is not healthy",
+            health=health,
+        )
+    return None
+
+
+def _target_resolution_error(
+    request: CommandRequest,
+    status: str,
+    candidates: list[dict[str, Any]],
+) -> CommandEnvelope:
+    if status == STATUS_STALE_TARGET:
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_STALE_TARGET,
+            result={"candidates": candidates},
+            error=error_value(
+                STATUS_STALE_TARGET,
+                "target worker fingerprint does not match the current worker",
+            ),
+        )
+    if status == STATUS_AMBIGUOUS_TARGET:
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_AMBIGUOUS_TARGET,
+            result={"candidates": candidates},
+            error=error_value(STATUS_AMBIGUOUS_TARGET, "target matches more than one worker"),
+        )
+    if status == STATUS_REJECTED:
+        message = "target worker status does not allow instructions"
+        if candidates:
+            message = f"target worker status does not allow instructions: {candidates[0]['status']!r}"
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_REJECTED,
+            result={"candidates": candidates},
+            error=error_value(STATUS_REJECTED, message),
+        )
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_NOT_FOUND,
+        result={"candidates": []},
+        error=error_value(STATUS_NOT_FOUND, "no worker matches the target"),
+    )
+
+
+def _binding_error(request: CommandRequest, status: str, message: str) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=status,
+        error=error_value(status, message),
+    )
+
+
+def _binding_for_worker(
+    request: CommandRequest,
+    worker: Worker,
+    bindings: list[WorkerBinding],
+) -> ResolvedCommandTarget | CommandEnvelope:
+    worker_bindings = [
+        binding
+        for binding in bindings
+        if binding.backend == HERDR_BACKEND and binding.worker_id == worker.id
+    ]
+    if not worker_bindings:
+        return _binding_error(
+            request,
+            STATUS_BACKEND_UNSUPPORTED,
+            "target has no backend-owned sendable private binding",
+        )
+
+    exact = [binding for binding in worker_bindings if binding.worker_fingerprint == worker.fingerprint]
+    if not exact:
+        return _binding_error(
+            request,
+            STATUS_STALE_TARGET,
+            "target private binding is stale for the current worker",
+        )
+    if len(exact) != 1:
+        return _binding_error(
+            request,
+            STATUS_AMBIGUOUS_BACKEND_TARGET,
+            "target resolves to an ambiguous backend send target",
+        )
+
+    binding = exact[0]
+    if (
+        not binding.sendable
+        or not binding.target_value
+        or binding.target_kind not in _AGENT_SEND_TARGET_PARAMS
+    ):
+        if (binding.reason or "") in _AMBIGUOUS_BINDING_REASONS:
+            return _binding_error(
+                request,
+                STATUS_AMBIGUOUS_BACKEND_TARGET,
+                "target resolves to an ambiguous backend send target",
+            )
+        return _binding_error(
+            request,
+            STATUS_BACKEND_UNSUPPORTED,
+            "target has no backend-owned sendable private binding",
+        )
+
+    return ResolvedCommandTarget(worker=worker, binding=binding)
+
+
+def _resolve_authoritative_target(
+    request: CommandRequest,
+    snapshot: Snapshot,
+    bindings: list[WorkerBinding],
+) -> ResolvedCommandTarget | CommandEnvelope:
+    resolved, candidates, status = resolve_target(
+        request.target,
+        list(snapshot.workers),
+        allow_disallowed_status=True,
+        include_backend_target=False,
+    )
+    if status != STATUS_RESOLVED:
+        return _target_resolution_error(request, status, candidates)
+
+    worker = next((item for item in snapshot.workers if item.id == (resolved or {}).get("worker_id")), None)
+    if worker is None:
+        return _target_resolution_error(request, STATUS_NOT_FOUND, [])
+    if worker.status in _DISALLOWED_SEND_STATUSES:
+        return _target_resolution_error(request, STATUS_REJECTED, [worker_candidate(worker)])
+
+    return _binding_for_worker(request, worker, bindings)
+
+
+def _agent_send_params(binding: WorkerBinding, instruction_text: str) -> dict[str, Any]:
+    key = _AGENT_SEND_TARGET_PARAMS[binding.target_kind]
+    return {key: binding.target_value, "text": instruction_text}
+
+
+def _socket_send_envelope(
+    config: Config,
+    request: CommandRequest,
+    resolved: ResolvedCommandTarget,
+    *,
+    socket_client_factory: SocketClientFactory | None = None,
+) -> CommandEnvelope:
+    instruction = request.instruction or {}
+    instruction_text = instruction.get("text")
+    if not isinstance(instruction_text, str) or not instruction_text:
+        return CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=STATUS_BACKEND_FAILED,
+            error=error_value(STATUS_BACKEND_FAILED, "instruction text is missing after validation"),
+        )
+
+    factory = socket_client_factory or _default_socket_client_factory
+    client = factory(config)
+    try:
+        if hasattr(client, "connect"):
+            client.connect()
+    except Exception as exc:  # noqa: BLE001
+        from .backends.herdr_socket import HerdrSocketConnectionError
+
+        if isinstance(exc, HerdrSocketConnectionError | OSError):
+            return _backend_unavailable(request, "Herdr socket could not be reached")
+        raise
+
+    _append_command_event(
+        config,
+        "command.send_started",
+        request,
+        status=STATUS_PENDING,
+        target_worker_id=resolved.worker.id,
+    )
+    try:
+        client.agent_send(
+            _agent_send_params(resolved.binding, instruction_text),
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
+        from .backends.herdr_socket import (
+            HerdrSocketConnectionError,
+            HerdrSocketDisconnectedError,
+            HerdrSocketTimeoutError,
+        )
+
+        if isinstance(exc, HerdrErrorResponse):
+            return CommandEnvelope.from_result(
+                request,
+                ok=False,
+                status=STATUS_BACKEND_FAILED,
+                error=error_value(
+                    STATUS_BACKEND_FAILED,
+                    "Herdr socket agent.send returned an error response",
+                ),
+            )
+        if isinstance(
+            exc,
+            HerdrSocketConnectionError
+            | HerdrSocketTimeoutError
+            | HerdrSocketDisconnectedError
+            | HerdrProtocolError,
+        ):
+            return CommandEnvelope.from_result(
+                request,
+                ok=False,
+                status=STATUS_REQUEST_STATE_UNCERTAIN,
+                error=error_value(
+                    STATUS_REQUEST_STATE_UNCERTAIN,
+                    "Herdr socket agent.send state is uncertain after send start",
+                ),
+            )
+        if isinstance(exc, OSError):
+            return CommandEnvelope.from_result(
+                request,
+                ok=False,
+                status=STATUS_REQUEST_STATE_UNCERTAIN,
+                error=error_value(
+                    STATUS_REQUEST_STATE_UNCERTAIN,
+                    "Herdr socket agent.send state is uncertain after send start",
+                ),
+            )
+        raise
+    finally:
+        if hasattr(client, "close"):
+            client.close()
+
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result={"target": {"worker_id": resolved.worker.id}},
+    )
+
+
+def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) -> CommandEnvelope:
+    if receipt.get("payload_fingerprint") != request.payload_fingerprint():
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_DUPLICATE_REQUEST,
+                "request_id reused with a different payload",
+            ),
+        )
+    if receipt.get("uncertain"):
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_REQUEST_STATE_UNCERTAIN,
+                "previous request state is uncertain; not retrying mutation",
+            ),
+        )
+    try:
+        data = json.loads(str(receipt.get("result_json") or "{}"))
+    except json.JSONDecodeError:
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_REQUEST_STATE_UNCERTAIN,
+                "previous request result is unreadable; not retrying mutation",
+            ),
+        )
+    if not isinstance(data, dict):
+        return CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_REQUEST_STATE_UNCERTAIN,
+                "previous request result is unreadable; not retrying mutation",
+            ),
+        )
+    return CommandEnvelope.from_dict(data)
+
+
+def _reserve_mutating_request(config: Config, request: CommandRequest) -> CommandEnvelope | None:
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return None
+    if config.db_path is None:
+        return _backend_unavailable(request, "command receipt store is unavailable")
+
+    pending = CommandEnvelope.error(
+        request,
+        error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            "request is pending backend mutation",
+        ),
+    )
+    reservation = reserve_command_receipt(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id,
+        action=request.action,
+        payload_fingerprint=request.payload_fingerprint(),
+        pending_result_json=envelope_to_receipt_json(pending),
+        status=STATUS_PENDING,
+        request_json=_request_json(request),
+    )
+    if reservation["reserved"]:
+        _append_command_event(config, "command.reserved", request, status=STATUS_PENDING)
+        return None
+
+    envelope = _envelope_from_receipt(request, reservation["receipt"])
+    event_type = "command.cached"
+    if envelope.status == STATUS_DUPLICATE_REQUEST:
+        event_type = "command.duplicate"
+    elif envelope.status == STATUS_REQUEST_STATE_UNCERTAIN:
+        event_type = "command.uncertain"
+    _append_command_event(config, event_type, request, status=envelope.status, envelope=envelope)
+    return envelope
+
+
+def _save_mutating_result(config: Config, request: CommandRequest, envelope: CommandEnvelope) -> None:
+    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+        return
+    if config.db_path is None:
+        return
+    save_command_receipt(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id,
+        action=request.action,
+        payload_fingerprint=request.payload_fingerprint(),
+        status=envelope.status,
+        result_json=envelope_to_receipt_json(envelope),
+        uncertain=envelope.status in {STATUS_BACKEND_UNAVAILABLE, STATUS_REQUEST_STATE_UNCERTAIN},
+    )
+    _append_command_event(
+        config,
+        "command.submitted",
+        request,
+        status=envelope.status,
+        envelope=envelope,
+    )
+
+
+def _execute_non_mutating(config: Config, request: CommandRequest) -> CommandEnvelope:
+    if request.action == "noop":
+        return execute_command(request, CommandContext(host_id=config.host_id, workers=[]))
+    snapshot = _current_snapshot(config)
+    return execute_command(
+        request,
+        CommandContext(
+            host_id=config.host_id,
+            workers=list(snapshot.workers),
+            snapshot=snapshot,
+        ),
+    )
+
+
+def submit_command(
+    config: Config,
+    params: Mapping[str, Any] | str,
+    *,
+    socket_client_factory: SocketClientFactory | None = None,
+) -> CommandEnvelope:
+    """Submit one command through the authoritative daemon/socket path."""
+    payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None:
+        if request is not None:
+            return CommandEnvelope.error(request, parse_error)
+        return CommandEnvelope.error(None, parse_error)
+
+    validation_error = validate_request(request)
+    if validation_error is not None:
+        return CommandEnvelope.error(request, validation_error)
+
+    if request.action != "send_instruction" or request.dry_run:
+        return _execute_non_mutating(config, request)
+
+    receipt_envelope = _reserve_mutating_request(config, request)
+    if receipt_envelope is not None:
+        return receipt_envelope
+
+    snapshot = _current_snapshot(config)
+    envelope = _backend_health_error(config, request, snapshot)
+    if envelope is None:
+        bindings = []
+        if config.db_path is not None:
+            bindings = list_worker_bindings(config.db_path, config.host_id, backend=HERDR_BACKEND)
+        resolved = _resolve_authoritative_target(request, snapshot, bindings)
+        if isinstance(resolved, CommandEnvelope):
+            envelope = resolved
+        else:
+            envelope = _socket_send_envelope(
+                config,
+                request,
+                resolved,
+                socket_client_factory=socket_client_factory,
+            )
+
+    _save_mutating_result(config, request, envelope)
+    return envelope

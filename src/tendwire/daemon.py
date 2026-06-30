@@ -36,9 +36,9 @@ def _default_observe_initial_snapshot(config: Config) -> Snapshot:
 
 
 def _default_submit_command(config: Config, payload: str) -> CommandEnvelope:
-    from .cli import command_envelope_from_payload
+    from .command_submission import submit_command
 
-    return command_envelope_from_payload(config, payload)
+    return submit_command(config, payload)
 
 
 @dataclass(frozen=True)

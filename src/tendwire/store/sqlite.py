@@ -1705,6 +1705,7 @@ def reserve_command_receipt(
     pending_result_json: str,
     *,
     status: str = "pending",
+    request_json: str = "{}",
 ) -> dict[str, Any]:
     """Atomically reserve a mutating command receipt key if it is unused.
 
@@ -1761,6 +1762,7 @@ def reserve_command_receipt(
             reserved_at=now,
             completed_at=None,
             uncertain=True,
+            request_json=str(request_json),
         )
         conn.execute("COMMIT")
         return {"reserved": True, "receipt": None}
