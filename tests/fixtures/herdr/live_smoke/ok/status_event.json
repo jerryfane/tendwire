@@ -1,0 +1,14 @@
+{
+  "status": "ok",
+  "events": [
+    {
+      "kind": "started",
+      "worker": "alpha-worker"
+    },
+    {
+      "kind": "ready",
+      "worker": "alpha-worker"
+    }
+  ],
+  "count": 2
+}

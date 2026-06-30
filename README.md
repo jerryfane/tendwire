@@ -78,6 +78,89 @@ Snapshot, command-observation, and doctor probe chains also use an aggregate
 deadline derived from the per-probe timeout and planned probes; remaining
 subprocess timeouts are capped by the time left in that budget.
 
+### Live Herdr smoke harness
+
+The live Herdr smoke harness is an **opt-in Tendwire-only check** for the
+boundary between Tendwire's public contracts and Herdr's high-level CLI. It is
+not part of normal `tendwire` commands, does not run during ordinary pytest, and
+does not add Herdres, source polling, connector delivery, outbox processing, or
+low-level terminal integration.
+
+Safe live command:
+
+```bash
+python3 scripts/herdr_smoke.py --live
+```
+
+The optional `scripts/live_herdr_smoke.sh` wrapper is the same opt-in live
+entrypoint in shell form.
+
+The command above starts live mode explicitly and gives child Herdr commands an
+isolated default `HERDR_SESSION=tendwire-smoke` when the caller has not already
+chosen a session. That default is intentional: the smoke suite must never target
+a daily Herdr session unless you explicitly configure it to do so.
+
+Two override paths are available and both should be treated as deliberate risk:
+
+- `python3 scripts/herdr_smoke.py --live --session VALUE` sets the child
+  `HERDR_SESSION` to `VALUE`.
+- Running with an existing caller `HERDR_SESSION` preserves that value as an
+  explicit caller override.
+
+The smoke output never prints the actual session value. If you prefer an
+environment opt-in instead of the flag, this is equivalent to `--live`:
+
+```bash
+TENDWIRE_HERDR_LIVE_SMOKE=1 python3 scripts/herdr_smoke.py
+```
+
+Without `--live`, without `TENDWIRE_HERDR_LIVE_SMOKE=1`, and without fixture
+replay, the harness prints a valid JSON skip summary and makes no Herdr
+subprocess or socket calls. For deterministic offline replay, pass a fixture
+directory:
+
+```bash
+python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
+```
+
+Fixture mode validates the same public summary shape as live mode but reads only
+fixture files, so normal offline pytest can import and exercise the harness
+without contacting Herdr. Any future live pytest coverage must be explicitly
+selected by maintainers rather than running by default.
+
+Live prerequisites are intentionally narrow:
+
+- The `herdr` binary is on `PATH`, or `--herdr-bin /path/to/herdr` points at it.
+- Herdr supports the high-level workspace, agent, and agent-send surfaces used by
+  Tendwire's command boundary.
+- You are willing to create temporary smoke workers in the selected Herdr
+  session and review the neutral evidence JSON afterward.
+- The selected session is a disposable/sandbox session unless you intentionally
+  override the isolated default.
+
+The smoke suite checks Tendwire assumptions rather than broad Herdr behavior:
+workspace listing, agent listing, the public worker surface, high-level send
+addressing, name ambiguity handling, routing resolution, status/event
+observation, closed or moved worker observations, and public JSON safety.
+
+Stdout is a public-safe JSON evidence artifact. Its top-level shape is limited
+to neutral fields such as `schema_version`, `ok`, `mode`, `status`, `summary`,
+`default_isolated_session`, `explicit_session`, `checks`, and `failures`.
+Individual check records use aggregate fields such as `name`, `status`,
+`required`, `ok`, `exit_code`, `json_status`, `item_count`, `variants`, and
+`detail`. The public smoke summary is recursively sanitized and rejects
+forbidden private keys or values; it must not expose Telegram, Herdres, raw pane
+or terminal data, sockets, backend targets, session values, private bindings,
+connector/outbox/delivery state, argv/env/stdout/stderr, tokens, secrets, or
+private fingerprints.
+
+Non-goals:
+
+- No Herdres import, mutation, connector bridge, or delivery integration.
+- No Tendwire source-mode or connector/outbox processing.
+- No raw Herdr pane, socket, terminal, PTY, shell, or low-level command control.
+- No default contact with live Herdr from ordinary CLI usage or normal pytest.
+
 ### Daemon skeleton
 
 Tendwire also exposes a stdlib-only local daemon skeleton:

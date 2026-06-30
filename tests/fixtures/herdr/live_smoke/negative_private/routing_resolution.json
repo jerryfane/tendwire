@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "routes": [
+    {
+      "from": "alpha-worker",
+      "to": "beta-worker",
+      "resolved": true
+    }
+  ],
+  "count": 1
+}
