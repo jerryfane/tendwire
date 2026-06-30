@@ -30,6 +30,7 @@ from .core.commands import (
     STATUS_PENDING,
     CommandEnvelope,
     error_value,
+    has_nonblank_request_id,
     parse_command_request,
     validate_request,
 )
@@ -360,8 +361,7 @@ def _try_daemon_result(
         socket_path = config.data_dir / "tendwire.sock"
         if not socket_path.exists():
             return None
-    if socket_path is None:
-        return None
+
     try:
         from .daemon_api import DaemonAPIClient, DaemonAPIError
     except Exception:
@@ -504,7 +504,7 @@ def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | 
 
     if not isinstance(request, CommandRequest):
         return None
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
         return None
     if config.db_path is None:
         return None
@@ -536,12 +536,9 @@ def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelop
         return
     if config.db_path is None:
         return
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
         return
-    uncertain = envelope.status in {
-        STATUS_REQUEST_STATE_UNCERTAIN,
-        STATUS_BACKEND_UNAVAILABLE,
-    }
+    uncertain = envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
     save_command_receipt(
         config.db_path,
         host_id=config.host_id,

@@ -7,7 +7,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from tendwire.backends.herdr_socket import HerdrSocketTimeoutError
+import pytest
+
+from tendwire.backends.herdr_protocol import HerdrProtocolError
+from tendwire.backends.herdr_socket import (
+    HerdrSocketDisconnectedError,
+    HerdrSocketTimeoutError,
+)
 from tendwire.command_submission import submit_command
 from tendwire.config import Config
 from tendwire.core.commands import (
@@ -16,6 +22,7 @@ from tendwire.core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_DUPLICATE_REQUEST,
+    STATUS_INVALID_REQUEST,
     STATUS_NOT_FOUND,
     STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_STALE_TARGET,
@@ -159,6 +166,148 @@ def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None
         return _FakeSocketClient(calls, raises=raises)
 
     return make_client
+
+@pytest.mark.parametrize(
+    ("request_id", "include_request_id"),
+    [
+        (None, False),
+        (None, True),
+        ("", True),
+        ("   \t", True),
+    ],
+)
+def test_submit_command_rejects_invalid_request_id_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_id: Any,
+    include_request_id: bool,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    init_store(config.db_path)
+    calls: list[str] = []
+
+    def guarded_observation(config: Config) -> Snapshot:
+        calls.append("observe")
+        raise AssertionError("invalid request_id must not observe")
+
+    def guarded_socket_factory(config: Config) -> _FakeSocketClient:
+        calls.append("socket")
+        raise AssertionError("invalid request_id must not construct a socket client")
+
+    monkeypatch.setattr("tendwire.command_submission.project_from_observations", guarded_observation)
+    payload = _request()
+    if include_request_id:
+        payload["request_id"] = request_id
+    else:
+        del payload["request_id"]
+
+    envelope = submit_command(config, payload, socket_client_factory=guarded_socket_factory)
+
+    assert envelope.status == STATUS_INVALID_REQUEST
+    assert envelope.error is not None
+    assert envelope.error["code"] == STATUS_INVALID_REQUEST
+    assert calls == []
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("label", "factory_exception", "connect_exception"),
+    [
+        ("factory", RuntimeError("raw setup failure with private detail"), None),
+        ("path", ValueError("bad socket path /private/herdr.sock"), None),
+        ("missing", None, FileNotFoundError("missing /private/herdr.sock")),
+        ("refused", None, ConnectionRefusedError("refused /private/herdr.sock")),
+        ("permission", None, PermissionError("denied /private/herdr.sock")),
+    ],
+)
+def test_submit_command_socket_setup_failures_are_backend_unavailable(
+    tmp_path: Path,
+    label: str,
+    factory_exception: BaseException | None,
+    connect_exception: BaseException | None,
+) -> None:
+    config = _config(tmp_path / label)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    class SetupFailsClient:
+        def connect(self) -> "SetupFailsClient":
+            assert connect_exception is not None
+            raise connect_exception
+
+        def agent_send(self, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+            calls.append(dict(params))
+            raise AssertionError("agent_send must not run before setup succeeds")
+
+        def close(self) -> None:
+            return None
+
+    def make_client(config: Config) -> SetupFailsClient:
+        if factory_exception is not None:
+            raise factory_exception
+        return SetupFailsClient()
+
+    envelope = submit_command(
+        config,
+        _request(request_id=f"setup-{label}"),
+        socket_client_factory=make_client,
+    )
+
+    assert envelope.status == STATUS_BACKEND_UNAVAILABLE
+    assert envelope.error is not None
+    assert envelope.error["code"] == STATUS_BACKEND_UNAVAILABLE
+    assert "private" not in json.dumps(envelope.to_dict())
+    assert calls == []
+    assert envelope.status != STATUS_NOT_FOUND
+    assert envelope.status != STATUS_REQUEST_STATE_UNCERTAIN
+    assert config.db_path is not None
+    receipt = get_command_receipt(config.db_path, "cmd-host", f"setup-{label}", "send_instruction")
+    assert receipt is not None
+    assert receipt["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert receipt["uncertain"] is False
+    with sqlite3.connect(str(config.db_path)) as conn:
+        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "command.send_started" not in events
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        HerdrSocketDisconnectedError("disconnected"),
+        HerdrProtocolError("malformed response"),
+        OSError("transport failed after write"),
+    ],
+)
+def test_submit_command_post_send_transport_failures_are_uncertain(
+    tmp_path: Path,
+    exc: BaseException,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _request(request_id=f"uncertain-{type(exc).__name__}"),
+        socket_client_factory=_factory(calls, raises=exc),
+    )
+
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert envelope.status != STATUS_BACKEND_UNAVAILABLE
+    assert calls == [{"agent_id": "agent-secret", "text": "hello"}]
+    assert config.db_path is not None
+    receipt = get_command_receipt(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is True
+    with sqlite3.connect(str(config.db_path)) as conn:
+        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert "command.send_started" in events
+    assert "command.submitted" in events
 
 
 def test_submit_command_uses_socket_agent_send_once_and_caches_result(tmp_path: Path) -> None:

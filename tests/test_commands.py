@@ -422,9 +422,11 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
     assert error["code"] == STATUS_INVALID_REQUEST
 
 
-def test_validate_send_instruction_non_dry_run_requires_request_id() -> None:
+@pytest.mark.parametrize("request_id", [None, "", "   \t"])
+def test_validate_send_instruction_non_dry_run_requires_nonblank_request_id(request_id: str | None) -> None:
     request = CommandRequest(
         action="send_instruction",
+        request_id=request_id,
         dry_run=False,
         target={"worker_id": "w-1"},
         instruction={"text": "ok"},

@@ -26,6 +26,7 @@ from .core.commands import (
     CommandEnvelope,
     CommandRequest,
     error_value,
+    has_nonblank_request_id,
     parse_command_request,
     resolve_target,
     validate_request,
@@ -113,7 +114,7 @@ def _append_command_event(
     envelope: CommandEnvelope | None = None,
     target_worker_id: str | None = None,
 ) -> None:
-    if config.db_path is None or not request.request_id:
+    if config.db_path is None or not has_nonblank_request_id(request.request_id):
         return
     append_event(
         config.db_path,
@@ -331,16 +332,20 @@ def _socket_send_envelope(
         )
 
     factory = socket_client_factory or _default_socket_client_factory
-    client = factory(config)
+    client: Any | None = None
     try:
+        client = factory(config)
+        if not hasattr(client, "agent_send"):
+            raise TypeError("socket client does not expose agent_send")
         if hasattr(client, "connect"):
             client.connect()
-    except Exception as exc:  # noqa: BLE001
-        from .backends.herdr_socket import HerdrSocketConnectionError
-
-        if isinstance(exc, HerdrSocketConnectionError | OSError):
-            return _backend_unavailable(request, "Herdr socket could not be reached")
-        raise
+    except Exception:  # noqa: BLE001
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
+        return _backend_unavailable(request, "Herdr socket could not be reached")
 
     _append_command_event(
         config,
@@ -450,7 +455,7 @@ def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) 
 
 
 def _reserve_mutating_request(config: Config, request: CommandRequest) -> CommandEnvelope | None:
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
         return None
     if config.db_path is None:
         return _backend_unavailable(request, "command receipt store is unavailable")
@@ -487,7 +492,7 @@ def _reserve_mutating_request(config: Config, request: CommandRequest) -> Comman
 
 
 def _save_mutating_result(config: Config, request: CommandRequest, envelope: CommandEnvelope) -> None:
-    if request.action != "send_instruction" or request.dry_run or not request.request_id:
+    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
         return
     if config.db_path is None:
         return
@@ -499,7 +504,7 @@ def _save_mutating_result(config: Config, request: CommandRequest, envelope: Com
         payload_fingerprint=request.payload_fingerprint(),
         status=envelope.status,
         result_json=envelope_to_receipt_json(envelope),
-        uncertain=envelope.status in {STATUS_BACKEND_UNAVAILABLE, STATUS_REQUEST_STATE_UNCERTAIN},
+        uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
     )
     _append_command_event(
         config,

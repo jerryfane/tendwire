@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import socket
 import threading
 from pathlib import Path
@@ -330,6 +331,55 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         daemon.stop()
         thread.join(timeout=2)
 
+
+def test_daemon_command_submit_rejects_blank_request_id_before_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "invalid-request-id.db"
+    config = Config(
+        host_id="cmd-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        herdr_backend="socket",
+    )
+    init_store(db_path)
+    calls: list[str] = []
+
+    def guarded_socket_factory(config: Config) -> Any:
+        calls.append("socket")
+        raise AssertionError("invalid request_id must not construct Herdr socket client")
+
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        guarded_socket_factory,
+    )
+    daemon = TendwireDaemon(config)
+    request = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "request_id": "   \t",
+        "dry_run": False,
+        "target": {"worker_id": "w-1"},
+        "instruction": {"text": "hello"},
+    }
+
+    direct = daemon.submit_command(request)
+    api = TendwireDaemonAPI(
+        get_snapshot=_public_snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=daemon.submit_command,
+    )
+    response = api.dispatch({"method": "command.submit", "params": request})
+
+    assert isinstance(direct, CommandEnvelope)
+    assert direct.status == STATUS_INVALID_REQUEST
+    assert response["ok"] is True
+    assert response["result"]["status"] == STATUS_INVALID_REQUEST
+    assert calls == []
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 def test_cli_snapshot_falls_back_when_configured_socket_is_absent(
     tmp_path: Path,

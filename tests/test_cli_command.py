@@ -222,21 +222,44 @@ def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tm
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
 
 
-def test_cli_command_send_instruction_non_dry_run_requires_request_id(capsys, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "action": "send_instruction",
-                    "dry_run": False,
-                    "target": {"worker_id": "w-1"},
-                    "instruction": {"text": "hello"},
-                }
-            )
-        ),
-    )
+@pytest.mark.parametrize(
+    ("request_id", "include_request_id"),
+    [
+        (None, False),
+        (None, True),
+        ("", True),
+        ("   \t", True),
+    ],
+)
+def test_cli_command_send_instruction_non_dry_run_requires_request_id(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+    request_id: Any,
+    include_request_id: bool,
+) -> None:
+    calls: list[str] = []
+
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        calls.append("called")
+        raise AssertionError("invalid request_id must stop before backend or store mutation")
+
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded)
+    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded)
+    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded)
+    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded)
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "action": "send_instruction",
+        "dry_run": False,
+        "target": {"worker_id": "w-1"},
+        "instruction": {"text": "hello"},
+    }
+    if include_request_id:
+        payload["request_id"] = request_id
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    db_path = tmp_path / "invalid-request-id.db"
+
     code = main(
         [
             "--host-id",
@@ -245,14 +268,18 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(capsys, mo
             "definitely-not-a-real-herdr-binary",
             "command",
             "--json",
+            "--db-path",
+            str(db_path),
         ]
     )
+
     captured = capsys.readouterr()
     assert code == 1
-    payload = json.loads(captured.out)
-    assert payload["ok"] is False
-    assert payload["status"] == STATUS_INVALID_REQUEST
-
+    payload_out = json.loads(captured.out)
+    assert payload_out["ok"] is False
+    assert payload_out["status"] == STATUS_INVALID_REQUEST
+    assert calls == []
+    assert not db_path.exists()
 
 def test_cli_command_send_instruction_accepts_literal_false_for_mutation(
     capsys, monkeypatch, tmp_path: Path
@@ -1496,7 +1523,7 @@ def test_cli_command_backend_unavailable_preserves_request_id(
 
     receipt = get_command_receipt(db_path, "cmd-host", "req-visible", "send_instruction")
     assert receipt is not None
-    assert receipt["uncertain"] is True
+    assert receipt["uncertain"] is False
     cached = json.loads(receipt["result_json"])
     assert cached["request_id"] == "req-visible"
     assert cached["status"] == STATUS_BACKEND_UNAVAILABLE

@@ -218,6 +218,11 @@ def _target_has_explicit_selector(target: dict[str, Any] | None) -> bool:
     return any(_string_value(target.get(field)) for field in TARGET_ALLOWED_FIELDS)
 
 
+def has_nonblank_request_id(value: str | None) -> bool:
+    """Return True when request_id is present and not only whitespace."""
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _validate_instruction_shape(instruction: dict[str, Any] | None) -> dict[str, Any] | None:
     if instruction is None:
         return None
@@ -349,7 +354,7 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                 "send_instruction requires instruction.text",
                 details={"field": "instruction.text"},
             )
-        if not request.dry_run and not request.request_id:
+        if not request.dry_run and not has_nonblank_request_id(request.request_id):
             return error_value(
                 STATUS_INVALID_REQUEST,
                 "non-dry-run send_instruction requires request_id",
