@@ -58,6 +58,7 @@ _FORBIDDEN_FIELDS = {
     "connector",
     "connectors",
 }
+_FORBIDDEN_FIELDS_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_FIELDS}
 
 
 def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -85,7 +86,13 @@ def _respond(args: Sequence[str], responses: dict[tuple[str, ...], Any]) -> subp
 def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            assert key not in _FORBIDDEN_FIELDS, f"forbidden field {path}.{key}"
+            normalized = str(key).lower().replace("-", "_").replace(".", "_")
+            compact = normalized.replace("_", "")
+            segments = {part for part in normalized.split("_") if part}
+            assert (
+                normalized not in _FORBIDDEN_FIELDS and compact not in _FORBIDDEN_FIELDS_COMPACT
+                and not (segments & _FORBIDDEN_FIELDS)
+            ), f"forbidden field {path}.{key}"
             _assert_no_forbidden_fields(item, f"{path}.{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -357,6 +364,33 @@ def test_sample_herdr_projection_is_neutral_and_fingerprinted(monkeypatch) -> No
     assert payload["attention"][0]["source"] == "worker:worker-1"
     assert payload["attention"][0]["fingerprint"]
     _assert_no_forbidden_fields(payload)
+
+
+def test_herdr_cli_strip_connector_fields_drops_dot_separated_aliases() -> None:
+    raw = {
+        "safe": "kept",
+        "backend.target": "sentinel-private-backend",
+        "message.id": "sentinel-private-message",
+        "bot.token": "sentinel-private-token",
+        "herdres.delivery": {"message.id": "sentinel-private-delivery"},
+        "delivery.route": "sentinel-private-route",
+        "telegram.message.id": "sentinel-private-telegram",
+        "children": [
+            {
+                "safe_child": "kept",
+                "topic.id": "sentinel-private-topic",
+            }
+        ],
+    }
+
+    stripped = herdr_cli._strip_connector_fields(raw)
+
+    assert stripped == {"safe": "kept", "children": [{"safe_child": "kept"}]}
+    assert "sentinel-private" not in json.dumps(stripped, sort_keys=True)
+    _assert_no_forbidden_fields(stripped)
+    assert herdr_cli._safe_text_sample("failed backend.target=sentinel-private-backend") is None
+    assert herdr_cli._safe_text_sample("failed bot.token=sentinel-private-token") is None
+    assert herdr_cli._safe_text_sample("plain diagnostic text") == "plain diagnostic text"
 
 
 def test_herdr_agent_public_id_and_private_backend_target_are_separate(monkeypatch) -> None:
@@ -1409,6 +1443,9 @@ def test_forbidden_connector_fields_stripped_in_herdr_070(monkeypatch) -> None:
                         "agent_status": "idle",
                         "telegram": "leaked",
                         "chat_id": 123,
+                        "bot.token": "leaked",
+                        "message.id": "leaked",
+                        "backend.target": "leaked",
                     }
                 ]
             }
@@ -1424,6 +1461,9 @@ def test_forbidden_connector_fields_stripped_in_herdr_070(monkeypatch) -> None:
                         "route": "telegram",
                         "delivery": {"topic_id": 456},
                         "herdres_delivery": {"message_id": 789},
+                        "herdres.delivery": {"message.id": 789},
+                        "delivery.route": "telegram",
+                        "telegram.message.id": "leaked",
                     }
                 ]
             }

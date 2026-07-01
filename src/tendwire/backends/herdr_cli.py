@@ -49,6 +49,7 @@ _FORBIDDEN_CONNECTOR_FIELDS = {
     "delivery",
     "route",
     "herdres_delivery",
+    "backend_target",
 }
 
 _STATUS_KEYS = (
@@ -262,7 +263,7 @@ _FORBIDDEN_CONNECTOR_FIELDS_COMPACT = {field.replace("_", "") for field in _FORB
 
 def _compact_field_name(key: object) -> str:
     """Normalize field names for conservative connector/status-key matching."""
-    return str(key).lower().replace("-", "_").replace("_", "")
+    return str(key).lower().replace("-", "_").replace(".", "_").replace("_", "")
 
 
 def _field_matches(key: object, expected: str) -> bool:
@@ -283,8 +284,23 @@ def _private_fingerprint(value: Any) -> str:
 
 def _is_forbidden_connector_field(key: object) -> bool:
     """Return True for forbidden connector fields, including common case variants."""
+    normalized = str(key).lower().replace("-", "_").replace(".", "_")
     compact = _compact_field_name(key)
-    return str(key).lower().replace("-", "_") in _FORBIDDEN_CONNECTOR_FIELDS or compact in _FORBIDDEN_CONNECTOR_FIELDS_COMPACT
+    segments = {part for part in normalized.split("_") if part}
+    return (
+        normalized in _FORBIDDEN_CONNECTOR_FIELDS
+        or compact in _FORBIDDEN_CONNECTOR_FIELDS_COMPACT
+        or bool(segments & _FORBIDDEN_CONNECTOR_FIELDS)
+    )
+
+
+def _contains_forbidden_connector_text(value: object) -> bool:
+    """Return True when diagnostic text names connector/private delivery fields."""
+    normalized = str(value).lower().replace("-", "_").replace(".", "_")
+    compact = normalized.replace("_", "")
+    return any(field in normalized for field in _FORBIDDEN_CONNECTOR_FIELDS) or any(
+        field in compact for field in _FORBIDDEN_CONNECTOR_FIELDS_COMPACT
+    )
 
 
 def _run_herdr(
@@ -379,7 +395,7 @@ def _safe_text_sample(value: str | None) -> str | None:
     if not sample:
         return None
     lowered = sample.lower()
-    if any(field in lowered for field in _FORBIDDEN_CONNECTOR_FIELDS):
+    if _contains_forbidden_connector_text(lowered):
         return None
     redacted_words: list[str] = []
     for word in sample.split():
