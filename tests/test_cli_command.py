@@ -533,7 +533,7 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(
     assert calls == []
     assert not db_path.exists()
 
-def test_cli_command_send_instruction_accepts_literal_false_for_mutation(
+def test_cli_command_send_instruction_requires_socket_backend_for_mutation(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "literal-false.db"
@@ -574,13 +574,19 @@ def test_cli_command_send_instruction_accepts_literal_false_for_mutation(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
-    assert payload["status"] == STATUS_ACCEPTED
+    assert code == 1
+    _assert_socket_backend_required_payload(payload, request_id="literal-false")
     assert payload["dry_run"] is False
-    assert len(calls) == 1
+    assert calls == []
+
+    receipt = get_command_receipt(db_path, "cmd-host", "literal-false", "send_instruction")
+    assert receipt is not None
+    assert receipt["uncertain"] is False
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
 
 
-def test_cli_command_rehydrates_private_target_from_unexpired_stored_binding(
+def test_cli_command_default_backend_does_not_rehydrate_private_stored_binding(
     capsys,
     monkeypatch,
     tmp_path: Path,
@@ -647,11 +653,12 @@ def test_cli_command_rehydrates_private_target_from_unexpired_stored_binding(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
-    assert payload["status"] == STATUS_ACCEPTED
-    assert len(calls) == 1
-    assert calls[0][0]["backend_target"]["value"] == "agent-stored"
-    assert "agent-stored" not in json.dumps(payload)
+    assert code == 1
+    _assert_socket_backend_required_payload(payload, request_id="stored-binding")
+    assert calls == []
+    serialized = json.dumps(payload)
+    assert "agent-stored" not in serialized
+    assert "stored-private" not in serialized
     _assert_no_command_public_forbidden_fields(payload)
 
 
@@ -723,7 +730,7 @@ def test_cli_command_does_not_send_through_expired_stored_binding(
     payload = json.loads(captured.out)
 
     assert code == 1
-    assert payload["status"] == STATUS_BACKEND_UNSUPPORTED
+    _assert_socket_backend_required_payload(payload, request_id="expired-binding")
     assert calls == []
     assert "agent-expired" not in json.dumps(payload)
     _assert_no_command_public_forbidden_fields(payload)
@@ -818,12 +825,10 @@ def test_cli_command_duplicate_current_binding_is_ambiguous_and_not_expired(
     current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
 
     assert code == 1
-    assert payload["status"] == STATUS_AMBIGUOUS_BACKEND_TARGET
+    _assert_socket_backend_required_payload(payload, request_id="current-duplicate")
     assert calls == []
-    assert len(current) == 2
-    assert {binding.reason for binding in current} == {"duplicate_backend_target"}
-    assert "colliding-private" not in {binding.private_fingerprint for binding in current}
-    assert len({binding.private_fingerprint for binding in current}) == 2
+    assert current == []
+    assert "colliding-private" not in json.dumps(payload)
     _assert_no_command_public_forbidden_fields(payload)
 
 
@@ -847,7 +852,7 @@ def test_cli_command_stored_duplicate_binding_is_ambiguous_and_skips_backend(
                 reason="duplicate_backend_target",
                 observed_at="2026-01-01T00:00:00+00:00",
                 expires_at="9999-12-31T23:59:59+00:00",
-                private_fingerprint="stored-duplicate",
+                private_fingerprint="private-duplicate-fingerprint",
             )
         ],
     )
@@ -895,9 +900,11 @@ def test_cli_command_stored_duplicate_binding_is_ambiguous_and_skips_backend(
     payload = json.loads(captured.out)
 
     assert code == 1
-    assert payload["status"] == STATUS_AMBIGUOUS_BACKEND_TARGET
+    _assert_socket_backend_required_payload(payload, request_id="stored-duplicate")
     assert calls == []
-    assert "same-agent" not in json.dumps(payload)
+    serialized = json.dumps(payload)
+    assert "same-agent" not in serialized
+    assert "private-duplicate-fingerprint" not in serialized
     _assert_no_command_public_forbidden_fields(payload)
 
 
@@ -1072,14 +1079,16 @@ def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, mo
         ]
     )
     captured1 = capsys.readouterr()
-    assert code1 == 0
+    assert code1 == 1
     result1 = json.loads(captured1.out)
-    assert result1["status"] == STATUS_ACCEPTED
+    _assert_socket_backend_required_payload(result1, request_id="dup-1")
 
     receipt = get_command_receipt(db_path, "cmd-host", "dup-1", "send_instruction")
     assert receipt is not None
     assert receipt["uncertain"] is False
     assert receipt["completed_at"] is not None
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
 
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     code2 = main(
@@ -1095,11 +1104,11 @@ def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, mo
         ]
     )
     captured2 = capsys.readouterr()
-    assert code2 == 0
+    assert code2 == 1
     result2 = json.loads(captured2.out)
-    assert result2["status"] == STATUS_ACCEPTED
+    assert result2["status"] == STATUS_BACKEND_UNAVAILABLE
     assert result2 == result1
-    assert len(calls) == 1
+    assert calls == []
 
 
 def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -1146,7 +1155,7 @@ def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monk
         ]
     )
     capsys.readouterr()
-    assert code1 == 0
+    assert code1 == 1
 
     monkeypatch.setattr("sys.stdin", io.StringIO(payload2))
     code = main(
@@ -1165,7 +1174,7 @@ def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monk
     assert code == 1
     result = json.loads(captured.out)
     assert result["status"] == STATUS_DUPLICATE_REQUEST
-    assert len(calls) == 1
+    assert calls == []
 
 
 def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, tmp_path: Path) -> None:
@@ -1386,15 +1395,19 @@ def test_cli_command_rejects_control_sequence_instruction_as_json_only(capsys, m
     _assert_no_command_public_forbidden_fields(payload)
 
 
-def test_cli_command_backend_result_and_receipt_are_sanitized(capsys, monkeypatch, tmp_path: Path) -> None:
+def test_cli_command_legacy_backend_guard_and_receipt_are_sanitized(
+    capsys, monkeypatch, tmp_path: Path
+) -> None:
     db_path = tmp_path / "cmd.db"
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_command_observation",
         _fake_herdr_command_observation,
     )
+    calls: list[tuple[Any, Any]] = []
 
     def leaky_backend(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
+        calls.append((target, instruction))
         return CommandEnvelope(
             ok=False,
             status=STATUS_BACKEND_FAILED,
@@ -1442,14 +1455,15 @@ def test_cli_command_backend_result_and_receipt_are_sanitized(capsys, monkeypatc
     captured = capsys.readouterr()
     assert code == 1
     payload = json.loads(captured.out)
-    assert payload["status"] == STATUS_BACKEND_FAILED
-    assert payload["result"]["nested"]["safe"] == "kept"
-    assert payload["error"]["details"] == {"safe": "kept"}
+    _assert_socket_backend_required_payload(payload, request_id="sanitize-1")
+    assert calls == []
     _assert_no_command_public_forbidden_fields(payload)
 
     receipt = get_command_receipt(db_path, "cmd-host", "sanitize-1", "send_instruction")
     assert receipt is not None
+    assert receipt["uncertain"] is False
     cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
     _assert_no_command_public_forbidden_fields(cached)
     assert captured.err == ""
 
@@ -1496,6 +1510,15 @@ def _assert_no_command_public_forbidden_fields(value: Any, path: str = "$") -> N
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _assert_no_command_public_forbidden_fields(item, f"{path}[{index}]")
+
+
+def _assert_socket_backend_required_payload(value: dict[str, Any], *, request_id: str) -> None:
+    assert value["ok"] is False
+    assert value["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert value["request_id"] == request_id
+    assert value["error"]["code"] == STATUS_BACKEND_UNAVAILABLE
+    assert value["error"]["message"] == "Herdr socket backend is not enabled"
+    _assert_no_command_public_forbidden_fields(value)
 
 
 def _fake_herdr_state_with_terminal(config: Any) -> tuple[list[Space], list[Worker]]:
@@ -1799,7 +1822,7 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
 
-def test_cli_command_degraded_observation_returns_uncertain_not_not_found(
+def test_cli_command_default_backend_blocks_degraded_observation_send(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "degraded.db"
@@ -1868,15 +1891,17 @@ def test_cli_command_degraded_observation_returns_uncertain_not_not_found(
     payload = json.loads(captured.out)
 
     assert code == 1
-    assert payload["status"] == STATUS_REQUEST_STATE_UNCERTAIN
+    _assert_socket_backend_required_payload(payload, request_id="degraded-1")
     receipt = get_command_receipt(db_path, "cmd-host", "degraded-1", "send_instruction")
     assert receipt is not None
-    assert receipt["uncertain"] is True
+    assert receipt["uncertain"] is False
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
     current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
     assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
 
-def test_cli_command_healthy_empty_observation_can_return_not_found(
+def test_cli_command_default_backend_blocks_healthy_empty_observation_send(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "empty.db"
@@ -1926,7 +1951,9 @@ def test_cli_command_healthy_empty_observation_can_return_not_found(
     payload = json.loads(captured.out)
 
     assert code == 1
-    assert payload["status"] == STATUS_NOT_FOUND
+    _assert_socket_backend_required_payload(payload, request_id="empty-1")
     receipt = get_command_receipt(db_path, "cmd-host", "empty-1", "send_instruction")
     assert receipt is not None
     assert receipt["uncertain"] is False
+    cached = json.loads(receipt["result_json"])
+    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE

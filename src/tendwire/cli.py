@@ -764,6 +764,17 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
     if receipt_envelope is not None:
         return receipt_envelope
 
+    if request.action == "send_instruction" and not request.dry_run and config.herdr_backend != "socket":
+        envelope = CommandEnvelope.error(
+            request,
+            error_value(
+                STATUS_BACKEND_UNAVAILABLE,
+                "Herdr socket backend is not enabled",
+            ),
+        )
+        _save_command_receipt(config, request, envelope)
+        return envelope
+
     stored_bindings: list[WorkerBinding] = []
     if request.action == "send_instruction" and not request.dry_run:
         stored_bindings = _load_worker_bindings(config)
