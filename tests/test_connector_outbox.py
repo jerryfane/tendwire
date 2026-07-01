@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from tendwire.connectors import ConnectorOutboxAPI
-from tendwire.store.sqlite import init_store, reclaim_expired_connector_leases
+from tendwire.store.sqlite import (
+    fail_connector_delivery,
+    init_store,
+    poll_connector_outbox,
+    reclaim_expired_connector_leases,
+)
 
 
 FORBIDDEN = {
@@ -114,6 +120,32 @@ def test_poll_leases_sanitized_item_and_skips_duplicate_live_lease(tmp_path: Pat
     _assert_no_forbidden(first)
 
 
+def test_poll_uses_configured_default_lease_and_explicit_lease_wins(tmp_path: Path) -> None:
+    db_path = tmp_path / "lease-default.db"
+    _enqueue(db_path, key="default-lease")
+    default_api = ConnectorOutboxAPI(db_path, "host-a", default_lease_seconds=3600)
+    default_item = default_api.poll({"name": "attention"})["items"][0]
+    default_delta = (
+        datetime.fromisoformat(default_item["leased_until"])
+        - datetime.fromisoformat(default_item["available_at"])
+    ).total_seconds()
+
+    reclaim_expired_connector_leases(
+        db_path,
+        "host-a",
+        "attention",
+        now="9999-01-01T00:00:00+00:00",
+    )
+    explicit_item = default_api.poll({"name": "attention", "lease_seconds": 5})["items"][0]
+    explicit_delta = (
+        datetime.fromisoformat(explicit_item["leased_until"])
+        - datetime.fromisoformat(explicit_item["available_at"])
+    ).total_seconds()
+
+    assert default_delta == 3600
+    assert explicit_delta == 5
+
+
 def test_reclaim_allows_fresh_ref_and_rejects_stale_ref(tmp_path: Path) -> None:
     db_path = tmp_path / "reclaim.db"
     _enqueue(db_path)
@@ -212,6 +244,92 @@ def test_fail_and_defer_schedule_future_availability(tmp_path: Path) -> None:
     assert blocked_defer["items"] == []
     _assert_no_forbidden(failed)
     _assert_no_forbidden(deferred)
+
+
+def test_max_outbox_attempts_dead_letters_exhausted_failures(tmp_path: Path) -> None:
+    db_path = tmp_path / "attempts.db"
+    _enqueue(db_path, key="attempt-job")
+    api = ConnectorOutboxAPI(db_path, "host-a", max_attempts=2)
+    first_ref = api.poll({"name": "attention"})["items"][0]["ref"]
+    first_fail = api.fail({"name": "attention", "ref": first_ref, "delay_seconds": 0})
+
+    second = api.poll({"name": "attention"})["items"][0]
+    exhausted = api.fail({"name": "attention", "ref": second["ref"], "delay_seconds": 0})
+    after = api.poll({"name": "attention"})
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_status, next_attempt_at = conn.execute(
+            "SELECT status, next_attempt_at FROM connector_outbox WHERE delivery_key = ?",
+            ("attempt-job",),
+        ).fetchone()
+
+    assert first_fail["status"] == "retry_scheduled"
+    assert second["attempt"] == 2
+    assert exhausted["status"] == "attempts_exhausted"
+    assert "available_at" not in exhausted
+    assert outbox_status == "dead_letter"
+    assert next_attempt_at is None
+    assert after["items"] == []
+    _assert_no_forbidden(exhausted)
+
+
+def test_poll_dead_letters_expired_lease_at_max_attempts_before_repoll(tmp_path: Path) -> None:
+    db_path = tmp_path / "expired-max-attempt.db"
+    _enqueue(db_path, key="expired-max")
+    first = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "attention",
+        lease_seconds=1,
+        max_attempts=2,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="attention",
+        ref=first["ref"],
+        delay_seconds=0,
+        max_attempts=2,
+        now="2026-01-01T00:00:01+00:00",
+    )
+    second = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "attention",
+        lease_seconds=1,
+        max_attempts=2,
+        now="2026-01-01T00:00:02+00:00",
+    )["items"][0]
+
+    after = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "attention",
+        lease_seconds=1,
+        max_attempts=2,
+        now="2026-01-01T00:00:04+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_status = conn.execute(
+            "SELECT status FROM connector_outbox WHERE delivery_key = ?",
+            ("expired-max",),
+        ).fetchone()[0]
+        attempts = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(MAX(attempt), 0)
+            FROM connector_deliveries
+            WHERE delivery_key = ?
+            """,
+            ("expired-max",),
+        ).fetchone()
+
+    assert first["attempt"] == 1
+    assert second["attempt"] == 2
+    assert after["items"] == []
+    assert outbox_status == "dead_letter"
+    assert attempts == (2, 2)
 
 
 def test_invalid_wrong_host_and_wrong_name_refs_do_not_mutate(tmp_path: Path) -> None:

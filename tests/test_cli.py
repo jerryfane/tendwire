@@ -17,7 +17,7 @@ from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
 from tendwire.core.projector import project_from_raw
-from tendwire.store.sqlite import init_store, latest_snapshot, list_worker_bindings, save_snapshot
+from tendwire.store.sqlite import append_event, init_store, latest_snapshot, list_worker_bindings, save_snapshot
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -180,6 +180,90 @@ def test_cli_pending_json_no_herdr_prints_public_empty_collection(capsys) -> Non
     assert payload["backend_health"][0]["name"] == "herdr"
     assert payload["backend_health"][0]["status"] == "unavailable"
     assert payload["backend_health"][0]["outcome"] == "missing_binary"
+
+
+def test_cli_store_hooks_print_json_only_and_support_dry_run(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "store-cli.db"
+    init_store(db_path)
+    append_event(
+        db_path,
+        "store-cli",
+        "private.event",
+        {"pane_id": "sentinel-private-pane", "raw_payload": "sentinel-private-raw"},
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    append_event(
+        db_path,
+        "store-cli",
+        "public.event",
+        {"safe": "kept"},
+        observed_at="9999-01-09T00:00:00+00:00",
+    )
+
+    status_code = main(["--host-id", "store-cli", "store", "status", "--db-path", str(db_path)])
+    status_captured = capsys.readouterr()
+    status_payload = json.loads(status_captured.out)
+
+    tail_code = main(
+        [
+            "--host-id",
+            "store-cli",
+            "store",
+            "events-tail",
+            "--db-path",
+            str(db_path),
+            "--limit",
+            "5",
+        ]
+    )
+    tail_captured = capsys.readouterr()
+    tail_payload = json.loads(tail_captured.out)
+
+    cleanup_code = main(
+        [
+            "--host-id",
+            "store-cli",
+            "store",
+            "cleanup",
+            "--db-path",
+            str(db_path),
+            "--retention-days",
+            "7",
+            "--dry-run",
+        ]
+    )
+    cleanup_captured = capsys.readouterr()
+    cleanup_payload = json.loads(cleanup_captured.out)
+
+    missing_code = main(
+        [
+            "--host-id",
+            "store-cli",
+            "store",
+            "status",
+            "--db-path",
+            str(tmp_path / "missing.db"),
+        ]
+    )
+    missing_captured = capsys.readouterr()
+    missing_payload = json.loads(missing_captured.out)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        event_count = conn.execute("SELECT COUNT(*) FROM events WHERE host_id = ?", ("store-cli",)).fetchone()[0]
+
+    assert status_code == 0
+    assert tail_code == 0
+    assert cleanup_code == 0
+    assert missing_code == 1
+    assert status_captured.err == tail_captured.err == cleanup_captured.err == missing_captured.err == ""
+    assert status_payload["counts"]["events"] == 2
+    assert tail_payload["events"]
+    assert "sentinel-private" not in json.dumps(tail_payload)
+    assert "payload_json" not in json.dumps(tail_payload)
+    assert cleanup_payload["dry_run"] is True
+    assert cleanup_payload["retention"]["deleted"] == 1
+    assert event_count == 2
+    assert missing_payload["status"] == "store_unavailable"
 
 
 def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeypatch) -> None:

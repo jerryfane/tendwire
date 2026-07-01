@@ -51,7 +51,10 @@ from .store.sqlite import (
     expire_stale_worker_bindings,
     list_worker_bindings,
     reserve_command_receipt,
+    run_store_maintenance,
     save_command_receipt,
+    store_status,
+    tail_event_metadata,
     upsert_worker_bindings,
 )
 
@@ -231,9 +234,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print diagnostics as JSON (default).",
     )
 
+    _add_store_parser(subparsers)
     _add_connector_parser(subparsers)
 
     return parser
+
+
+def _add_store_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    store_parser = subparsers.add_parser(
+        "store",
+        help="Run bounded public-safe store operations with JSON-only output.",
+    )
+    actions = store_parser.add_subparsers(dest="store_action", required=True)
+
+    def add_common(action_parser: argparse.ArgumentParser) -> None:
+        action_parser.add_argument("--db-path", dest="db_path", default=None)
+
+    status_parser = actions.add_parser("status", help="Print host-scoped store status.")
+    add_common(status_parser)
+
+    tail_parser = actions.add_parser("events-tail", help="Print bounded event metadata.")
+    add_common(tail_parser)
+    tail_parser.add_argument("--limit", type=int, default=20)
+
+    cleanup_parser = actions.add_parser("cleanup", help="Run bounded maintenance cleanup.")
+    add_common(cleanup_parser)
+    cleanup_parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
+    cleanup_parser.add_argument("--retention-days", dest="retention_days", type=int, default=None)
+    cleanup_parser.add_argument("--max-outbox-attempts", dest="max_outbox_attempts", type=int, default=None)
 
 
 def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -250,7 +278,7 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     poll_parser = actions.add_parser("poll", help="Lease due connector outbox items.")
     add_common(poll_parser)
     poll_parser.add_argument("--limit", type=int, default=1)
-    poll_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=60)
+    poll_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
 
     reclaim_parser = actions.add_parser("reclaim", help="Expire stale connector leases.")
     add_common(reclaim_parser)
@@ -864,7 +892,8 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
     params: dict[str, Any] = {"name": args.name}
     if args.connector_action == "poll":
         params["limit"] = args.limit
-        params["lease_seconds"] = args.lease_seconds
+        if args.lease_seconds is not None:
+            params["lease_seconds"] = args.lease_seconds
     if args.connector_action in {"ack", "fail", "defer"}:
         params["ref"] = args.ref
         if args.response_json:
@@ -909,7 +938,54 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
     from .store.sqlite import init_store
 
     init_store(config.db_path)
-    payload = ConnectorOutboxAPI(config.db_path, config.host_id).dispatch(method, params)
+    payload = ConnectorOutboxAPI(
+        config.db_path,
+        config.host_id,
+        default_lease_seconds=config.connector_claim_ttl_seconds,
+        max_attempts=config.max_outbox_attempts,
+    ).dispatch(method, params)
+    print(stable_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
+
+
+def cmd_store(config: Config, args: argparse.Namespace) -> int:
+    """Run a bounded store operation and print one JSON object."""
+    if config.db_path is None:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": config.host_id,
+            "error": {
+                "code": "store_unavailable",
+                "message": "command requires --db-path or a configured store",
+            },
+        }
+        print(stable_json_dumps(payload, indent=2))
+        return 1
+    if args.store_action == "status":
+        payload = store_status(config.db_path, config.host_id)
+    elif args.store_action == "events-tail":
+        payload = tail_event_metadata(config.db_path, config.host_id, limit=args.limit)
+    elif args.store_action == "cleanup":
+        payload = run_store_maintenance(
+            config.db_path,
+            config.host_id,
+            retention_days=args.retention_days
+            if args.retention_days is not None
+            else config.event_retention_days,
+            max_outbox_attempts=args.max_outbox_attempts
+            if args.max_outbox_attempts is not None
+            else config.max_outbox_attempts,
+            dry_run=args.dry_run,
+        )
+    else:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "invalid_params",
+            "host_id": config.host_id,
+        }
     print(stable_json_dumps(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
@@ -962,6 +1038,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "connector":
         return cmd_connector(config, args)
+
+    if args.command == "store":
+        return cmd_store(config, args)
 
     if args.command == "daemon":
         return cmd_daemon(config)

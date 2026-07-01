@@ -12,7 +12,7 @@ from typing import Any
 
 from .config import Config
 from .core.commands import CommandEnvelope
-from .core.models import Snapshot, utc_timestamp
+from .core.models import Snapshot, sanitize_forbidden_fields, utc_timestamp
 from .daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
 
 
@@ -160,26 +160,72 @@ class TendwireDaemon:
 
     def get_health(self) -> dict[str, Any]:
         snapshot = self.get_snapshot()
-        store_status = "healthy"
-        if self.config.db_path is None or not Path(self.config.db_path).exists():
-            store_status = "unavailable"
-        return {
+        store_payload: dict[str, Any] = {
             "schema_version": 1,
-            "status": "ok" if store_status == "healthy" else "degraded",
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": self.config.host_id,
+            "counts": {},
+            "outbox": {"pending": 0, "leased": 0, "terminal": 0, "by_status": {}},
+        }
+        if self.config.db_path is not None:
+            from .store.sqlite import store_status
+
+            store_payload = store_status(Path(self.config.db_path), self.config.host_id)
+        store_ok = bool(store_payload.get("ok"))
+        backend_runtime: dict[str, Any] = {}
+        if self._event_backend is not None and hasattr(self._event_backend, "operational_status"):
+            status_value = getattr(self._event_backend, "operational_status")
+            if isinstance(status_value, Mapping):
+                backend_runtime = dict(status_value)
+        last_event_at = backend_runtime.get("last_event_at") or store_payload.get("last_event_at")
+        last_snapshot_at = backend_runtime.get("last_snapshot_at") or store_payload.get("last_snapshot_at") or snapshot.updated_at
+        payload = {
+            "schema_version": 1,
+            "status": "ok" if store_ok else "degraded",
             "host_id": self.config.host_id,
             "daemon": {
                 "status": "healthy",
                 "started_at": self.started_at,
             },
             "store": {
-                "status": store_status,
+                "status": "healthy" if store_ok else "unavailable",
+                "counts": store_payload.get("counts", {}),
+                "outbox": store_payload.get("outbox", {}),
+                "last_event_at": store_payload.get("last_event_at"),
+                "last_snapshot_at": store_payload.get("last_snapshot_at"),
             },
             "snapshot": {
                 "updated_at": snapshot.updated_at,
                 "content_fingerprint": snapshot.content_fingerprint,
             },
+            "timestamps": {
+                "last_snapshot_at": last_snapshot_at,
+                "last_event_at": last_event_at,
+                "last_reconcile_at": backend_runtime.get("last_reconcile_at"),
+            },
+            "backend": {
+                "status": backend_runtime.get("status"),
+                "outcome": backend_runtime.get("outcome"),
+                "ready": backend_runtime.get("ready"),
+                "running": backend_runtime.get("running"),
+                "reconcile_enabled": backend_runtime.get(
+                    "reconcile_enabled",
+                    self.config.reconcile_interval_seconds > 0,
+                ),
+            },
+            "limits": {
+                "event_debounce_seconds": self.config.event_debounce_seconds,
+                "reconcile_interval_seconds": self.config.reconcile_interval_seconds,
+                "event_retention_days": self.config.event_retention_days,
+                "output_excerpt_chars": self.config.output_excerpt_chars,
+                "max_workers": self.config.max_workers,
+                "max_outbox_attempts": self.config.max_outbox_attempts,
+                "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
+            },
             "backend_health": [health.to_dict() for health in snapshot.backend_health],
         }
+        return sanitize_forbidden_fields(payload)
 
     def get_attention(self) -> Mapping[str, Any]:
         if self.config.db_path is not None:
@@ -210,7 +256,12 @@ class TendwireDaemon:
             }
         from .connectors import ConnectorOutboxAPI
 
-        return ConnectorOutboxAPI(Path(self.config.db_path), self.config.host_id).dispatch(method, params)
+        return ConnectorOutboxAPI(
+            Path(self.config.db_path),
+            self.config.host_id,
+            default_lease_seconds=self.config.connector_claim_ttl_seconds,
+            max_attempts=self.config.max_outbox_attempts,
+        ).dispatch(method, params)
 
     def submit_command(self, params: Mapping[str, Any]) -> CommandEnvelope | Mapping[str, Any]:
         # Preserve the submitted keys exactly so the existing command parser can

@@ -67,7 +67,14 @@ _BACKEND_TARGET_KINDS = frozenset(
 _DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
 _UNAVAILABLE_HEALTH_OUTCOMES = frozenset({"missing_binary", "launch_error", "socket_disconnected"})
 _DEGRADED_HEALTH_OUTCOMES = frozenset(
-    {"timeout", "deadline_exhausted", "nonzero", "malformed_json", "protocol_error"}
+    {
+        "timeout",
+        "deadline_exhausted",
+        "nonzero",
+        "malformed_json",
+        "protocol_error",
+        "worker_cap_exceeded",
+    }
 )
 
 _HEALTH_MESSAGES = {
@@ -81,6 +88,7 @@ _HEALTH_MESSAGES = {
     "malformed_json": "Herdr command returned malformed JSON",
     "protocol_error": "Herdr protocol returned an invalid envelope",
     "socket_disconnected": "Herdr socket disconnected",
+    "worker_cap_exceeded": "Herdr observation exceeded the configured worker cap",
     "unknown": "Herdr observation state is unknown",
 }
 
@@ -154,6 +162,7 @@ def herdr_backend_health(
         "malformed_json",
         "protocol_error",
         "socket_disconnected",
+        "worker_cap_exceeded",
         "unknown",
     }:
         normalized_outcome = "unknown"
@@ -916,8 +925,46 @@ def _worker_from_item(item: Mapping[str, Any]) -> Worker:
     )
 
 
+def _output_excerpt_limit(config: Config | None) -> int | None:
+    if config is None:
+        return None
+    try:
+        limit = int(getattr(config, "output_excerpt_chars"))
+    except (TypeError, ValueError):
+        return None
+    return max(1, limit)
+
+
+def _bounded_excerpt(value: str | None, limit: int | None) -> str | None:
+    if value is None or limit is None:
+        return value
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
+
+
+def _worker_with_summary(worker: Worker, summary: str | None) -> Worker:
+    if summary == worker.summary:
+        return worker
+    return Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta=worker.meta,
+        last_seen_at=worker.last_seen_at,
+        summary=summary,
+        backend_target=worker.backend_target,
+    )
+
+
 def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = None) -> tuple[Worker, str]:
-    return _worker_from_item(item), _private_identity_from_item(item, config)
+    worker = _worker_from_item(item)
+    worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
+    return worker, _private_identity_from_item(item, config)
 
 
 def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] | None) -> Worker:

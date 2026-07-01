@@ -809,6 +809,283 @@ def test_healthy_empty_reconnect_closes_missing_workers_and_expires_bindings(tmp
     assert list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr") == []
 
 
+def test_worker_cap_exceeded_preserves_previous_authoritative_snapshot(tmp_path: Path) -> None:
+    config = Config(
+        host_id="worker-cap",
+        data_dir=tmp_path,
+        db_path=tmp_path / "worker-cap.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.5,
+        max_workers=1,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    backend.reconcile_once(client=_initial_pane_client())
+
+    capped = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "space-1", "name": "Build"}],
+            panes=[
+                {"pane_id": "pane-1", "agent": "Agent One", "workspace_id": "space-1"},
+                {"pane_id": "pane-2", "agent": "Agent Two", "workspace_id": "space-1"},
+            ],
+        )
+    )
+    latest = latest_snapshot(backend.db_path, backend.config.host_id)
+
+    assert latest is not None
+    assert capped.content_fingerprint == latest.content_fingerprint
+    assert [worker.name for worker in capped.workers] == ["Agent One"]
+    assert capped.backend_health[0].status == "degraded"
+    assert capped.backend_health[0].outcome == "worker_cap_exceeded"
+    assert list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")
+    _assert_no_public_json_forbidden(json.loads(capped.to_json()))
+
+
+def test_output_excerpt_limit_bounds_public_worker_summary(tmp_path: Path) -> None:
+    config = Config(
+        host_id="output-excerpt",
+        data_dir=tmp_path,
+        db_path=tmp_path / "output-excerpt.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.5,
+        output_excerpt_chars=12,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    long_summary = "x" * 40
+
+    snapshot = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "space-1", "name": "Build"}],
+            panes=[
+                {
+                    "pane_id": "pane-1",
+                    "agent": "Agent One",
+                    "workspace_id": "space-1",
+                    "description": long_summary,
+                }
+            ],
+        )
+    )
+    binding = list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")[0]
+
+    assert snapshot.workers[0].summary == "xxxxxxxxx..."
+    assert len(snapshot.workers[0].summary or "") == 12
+    assert latest_snapshot(backend.db_path, backend.config.host_id).workers[0].summary == "xxxxxxxxx..."
+    assert binding.worker_fingerprint == snapshot.workers[0].fingerprint
+    assert long_summary not in snapshot.to_json()
+
+
+def test_incremental_event_over_worker_cap_is_ignored_with_degraded_health(tmp_path: Path) -> None:
+    config = Config(
+        host_id="event-worker-cap",
+        data_dir=tmp_path,
+        db_path=tmp_path / "event-worker-cap.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.5,
+        max_workers=1,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    backend.reconcile_once(client=_initial_pane_client())
+
+    backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "agent_id": "agent-2",
+                    "name": "Agent Two",
+                    "workspace_id": "space-1",
+                    "pane_id": "pane-2",
+                }
+            },
+        }
+    )
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+
+    assert snapshot is not None
+    assert [worker.name for worker in snapshot.workers] == ["Agent One"]
+    assert snapshot.backend_health[0].status == "degraded"
+    assert snapshot.backend_health[0].outcome == "worker_cap_exceeded"
+
+
+def test_closed_worker_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -> None:
+    config = Config(
+        host_id="event-worker-cap-reactivate",
+        data_dir=tmp_path,
+        db_path=tmp_path / "event-worker-cap-reactivate.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.5,
+        max_workers=1,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    backend.reconcile_once(client=_initial_pane_client())
+
+    backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "payload": {"pane": {"pane_id": "pane-1", "agent": "Agent One", "workspace_id": "space-1"}},
+        }
+    )
+    backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "agent_id": "agent-2",
+                    "name": "Agent Two",
+                    "workspace_id": "space-1",
+                    "pane_id": "pane-2",
+                    "status": "running",
+                }
+            },
+        }
+    )
+
+    before_reactivation = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert before_reactivation is not None
+    assert {worker.name: worker.status for worker in before_reactivation.workers} == {
+        "Agent One": "closed",
+        "Agent Two": "active",
+    }
+
+    backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "agent": "Agent One",
+                    "workspace_id": "space-1",
+                    "pane_id": "pane-3",
+                    "status": "running",
+                }
+            },
+        }
+    )
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+
+    assert snapshot is not None
+    assert {worker.name: worker.status for worker in snapshot.workers} == {
+        "Agent One": "closed",
+        "Agent Two": "active",
+    }
+    assert snapshot.backend_health[0].status == "degraded"
+    assert snapshot.backend_health[0].outcome == "worker_cap_exceeded"
+
+
+def test_pane_moved_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -> None:
+    config = Config(
+        host_id="event-worker-cap-moved-reactivate",
+        data_dir=tmp_path,
+        db_path=tmp_path / "event-worker-cap-moved-reactivate.db",
+        herdr_backend="socket",
+        herdr_timeout_seconds=0.5,
+        max_workers=1,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    first = backend.reconcile_once(client=_initial_pane_client())
+    first_worker = first.workers[0]
+    closed_worker = Worker(
+        id=first_worker.id,
+        name=first_worker.name,
+        status="closed",
+        space_id=first_worker.space_id,
+        meta=first_worker.meta,
+        last_seen_at=first_worker.last_seen_at,
+        summary=first_worker.summary,
+        backend_target=first_worker.backend_target,
+    )
+    backend._workers[closed_worker.id] = closed_worker
+    save_snapshot(
+        backend.db_path,
+        project_from_observations(
+            backend.config,
+            spaces=first.spaces,
+            workers=[closed_worker],
+            backend_health=first.backend_health,
+        ),
+    )
+
+    backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "agent_id": "agent-2",
+                    "name": "Agent Two",
+                    "workspace_id": "space-1",
+                    "pane_id": "pane-2",
+                    "status": "running",
+                }
+            },
+        }
+    )
+    before_move = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert before_move is not None
+    assert {worker.name: worker.status for worker in before_move.workers} == {
+        "Agent One": "closed",
+        "Agent Two": "active",
+    }
+
+    backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                "old_pane_id": "pane-1",
+                "pane_id": "pane-3",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "status": "running",
+            },
+        }
+    )
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+
+    assert snapshot is not None
+    assert {worker.name: worker.status for worker in snapshot.workers} == {
+        "Agent One": "closed",
+        "Agent Two": "active",
+    }
+    assert snapshot.backend_health[0].status == "degraded"
+    assert snapshot.backend_health[0].outcome == "worker_cap_exceeded"
+
+
+def test_periodic_reconcile_uses_config_and_zero_disables_it(tmp_path: Path) -> None:
+    disabled_config = Config(
+        host_id="periodic-disabled",
+        data_dir=tmp_path,
+        db_path=tmp_path / "periodic-disabled.db",
+        herdr_backend="socket",
+        reconcile_interval_seconds=0,
+    )
+    init_store(Path(disabled_config.db_path))
+    disabled = HerdrEventBackend(disabled_config, debounce_seconds=0)
+    disabled_client = _initial_pane_client()
+    disabled._next_reconcile_monotonic = time.monotonic() - 1
+    disabled._run_periodic_reconcile_if_due(disabled_client)
+
+    enabled_config = Config(
+        host_id="periodic-enabled",
+        data_dir=tmp_path,
+        db_path=tmp_path / "periodic-enabled.db",
+        herdr_backend="socket",
+        reconcile_interval_seconds=0.001,
+    )
+    init_store(Path(enabled_config.db_path))
+    enabled = HerdrEventBackend(enabled_config, debounce_seconds=0)
+    enabled_client = _initial_pane_client()
+    enabled._next_reconcile_monotonic = time.monotonic() - 1
+    enabled._run_periodic_reconcile_if_due(enabled_client)
+
+    assert disabled_client.calls == []
+    assert enabled_client.calls == ["workspace.list", "tab.list", "pane.list", "agent.list"]
+    assert enabled.operational_status["last_reconcile_at"] is not None
+
+
 def test_debounce_batches_until_flush_and_shutdown_flushes(tmp_path: Path) -> None:
     backend = _backend(tmp_path, "debounce", debounce_seconds=60)
     backend.reconcile_once(client=_initial_pane_client())

@@ -317,6 +317,7 @@ BACKEND_HEALTH_OUTCOMES = frozenset(
         "malformed_json",
         "protocol_error",
         "socket_disconnected",
+        "worker_cap_exceeded",
         "unknown",
     }
 )

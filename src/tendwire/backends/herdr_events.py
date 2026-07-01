@@ -387,7 +387,10 @@ class HerdrEventBackend:
         *,
         client_factory: Callable[[Config], HerdrSocketClient] | None = None,
         subscribe_method: str = DEFAULT_SUBSCRIBE_METHOD,
-        debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
+        debounce_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = None,
+        max_workers: int | None = None,
+        output_excerpt_chars: int | None = None,
         dedupe_size: int = DEFAULT_DEDUPE_SIZE,
         max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
         reconnect_delay_seconds: float = DEFAULT_RECONNECT_DELAY_SECONDS,
@@ -399,7 +402,19 @@ class HerdrEventBackend:
         if requested_subscribe_method != HERDR_EVENTS_SUBSCRIBE_METHOD:
             raise HerdrEventBackendError("Herdr event backend requires events.subscribe")
         self.subscribe_method = HERDR_EVENTS_SUBSCRIBE_METHOD
-        self.debounce_seconds = max(0.0, float(debounce_seconds))
+        configured_debounce = config.event_debounce_seconds if debounce_seconds is None else debounce_seconds
+        configured_reconcile = (
+            config.reconcile_interval_seconds
+            if reconcile_interval_seconds is None
+            else reconcile_interval_seconds
+        )
+        self.debounce_seconds = max(0.0, float(configured_debounce))
+        self.reconcile_interval_seconds = max(0.0, float(configured_reconcile))
+        self.max_workers = max(1, int(config.max_workers if max_workers is None else max_workers))
+        self.output_excerpt_chars = max(
+            1,
+            int(config.output_excerpt_chars if output_excerpt_chars is None else output_excerpt_chars),
+        )
         self.dedupe_size = max(1, int(dedupe_size))
         self.max_batch_size = max(1, int(max_batch_size))
         self.reconnect_delay_seconds = max(0.0, float(reconnect_delay_seconds))
@@ -413,6 +428,11 @@ class HerdrEventBackend:
         self._workers: dict[str, Worker] = {}
         self._bindings: dict[str, WorkerBinding] = {}
         self._health = self._health_for("unknown")
+        self._last_event_at: str | None = None
+        self._last_reconcile_at: str | None = None
+        self._last_snapshot_at: str | None = None
+        self._last_cap_status_at: str | None = None
+        self._next_reconcile_monotonic: float | None = None
         self._load_existing_state()
 
     @staticmethod
@@ -429,6 +449,21 @@ class HerdrEventBackend:
     def health(self) -> HerdrEventBackendHealth:
         with self._lock:
             return self._health
+
+    @property
+    def operational_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "status": self._health.status,
+                "outcome": self._health.outcome,
+                "ready": self.ready,
+                "running": self.running,
+                "last_event_at": self._last_event_at,
+                "last_reconcile_at": self._last_reconcile_at,
+                "last_snapshot_at": self._last_snapshot_at,
+                "last_cap_status_at": self._last_cap_status_at,
+                "reconcile_enabled": self.reconcile_interval_seconds > 0,
+            }
 
     @property
     def ready(self) -> bool:
@@ -456,6 +491,7 @@ class HerdrEventBackend:
         if snapshot is not None:
             self._spaces = {space.id: space for space in snapshot.spaces}
             self._workers = {worker.id: worker for worker in snapshot.workers}
+            self._last_snapshot_at = snapshot.updated_at
             for health in snapshot.backend_health:
                 if health.name == BACKEND_NAME:
                     self._health = HerdrEventBackendHealth(
@@ -522,9 +558,11 @@ class HerdrEventBackend:
 
     def _read_event_stream(self, client: Any, subscription_id: str) -> None:
         while not self.stop_event.is_set():
+            self._run_periodic_reconcile_if_due(client)
             try:
                 envelope = client.read_event(subscription_id, timeout=self.config.herdr_timeout_seconds)
             except HerdrSocketTimeoutError:
+                self._run_periodic_reconcile_if_due(client)
                 continue
             self.queue_event_envelope(envelope)
             disconnected = False
@@ -546,8 +584,26 @@ class HerdrEventBackend:
                     break
                 self.queue_event_envelope(extra, flush=False)
             self.flush()
+            self._run_periodic_reconcile_if_due(client)
             if disconnected:
                 raise HerdrSocketDisconnectedError("Herdr socket disconnected during event drain")
+
+    def _schedule_next_reconcile(self) -> None:
+        if self.reconcile_interval_seconds <= 0:
+            self._next_reconcile_monotonic = None
+            return
+        self._next_reconcile_monotonic = time.monotonic() + self.reconcile_interval_seconds
+
+    def _run_periodic_reconcile_if_due(self, client: Any) -> None:
+        if self.reconcile_interval_seconds <= 0:
+            return
+        due_at = self._next_reconcile_monotonic
+        if due_at is None:
+            self._schedule_next_reconcile()
+            return
+        if time.monotonic() < due_at:
+            return
+        self.reconcile_once(client=client)
 
     def _pending_event_count(self) -> int:
         with self._lock:
@@ -601,6 +657,8 @@ class HerdrEventBackend:
                     records,
                     stored_bindings=stored_bindings,
                 )
+                if _observed_worker_count(workers) > self.max_workers:
+                    return self._mark_worker_cap_exceeded_locked(_observed_worker_count(workers))
                 outcome = "healthy_non_empty" if spaces or workers else "empty_healthy"
                 health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
                 previous = latest_snapshot(self.db_path, self.config.host_id)
@@ -615,6 +673,9 @@ class HerdrEventBackend:
                     backend_health=[health],
                 )
                 save_snapshot(self.db_path, snapshot)
+                self._last_reconcile_at = snapshot.updated_at
+                self._last_snapshot_at = snapshot.updated_at
+                self._schedule_next_reconcile()
                 if bindings:
                     upsert_worker_bindings(self.db_path, bindings)
                 expire_stale_worker_bindings(
@@ -690,6 +751,7 @@ class HerdrEventBackend:
             if self._seen_duplicate(event.dedupe_key):
                 return False
             self._pending_events.append(event)
+            self._last_event_at = utc_timestamp()
             should_flush = self.debounce_seconds <= 0 if flush is None else flush
         if should_flush:
             self.flush()
@@ -834,6 +896,9 @@ class HerdrEventBackend:
         if matched_binding is not None:
             worker = _worker_copy(worker, worker_id=matched_binding.worker_id)
         worker = _merge_worker_update(existing, worker, status=status)
+        if self._would_exceed_worker_cap(worker, existing=existing):
+            self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
+            return False
         self._workers[worker.id] = worker
         if update_binding and binding is not None:
             if matched_binding is not None and binding.private_fingerprint != matched_binding.private_fingerprint:
@@ -885,6 +950,9 @@ class HerdrEventBackend:
             worker = _merge_worker_update(worker, _worker_copy(observed_worker, worker_id=worker.id))
         if worker is None:
             return False
+        if self._would_exceed_worker_cap(worker, existing=self._workers.get(worker.id)):
+            self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
+            return False
         target_kind, target_value = new_target
         moved_binding = WorkerBinding(
             host_id=old_binding.host_id,
@@ -919,6 +987,9 @@ class HerdrEventBackend:
                 binding = matched_binding
             worker = observed_worker
         if worker is None:
+            return False
+        if binding is None and self._would_exceed_worker_cap(worker, existing=self._workers.get(worker.id)):
+            self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
             return False
         closed = _closed_worker(worker)
         self._workers[closed.id] = closed
@@ -955,12 +1026,54 @@ class HerdrEventBackend:
             backend_health=[health],
         )
         save_snapshot(self.db_path, snapshot)
+        self._last_snapshot_at = snapshot.updated_at
         self._health = HerdrEventBackendHealth(
             status=health.status,
             outcome=health.outcome,
             observed_at=health.observed_at or snapshot.updated_at,
             message=health.message,
         )
+        return snapshot
+
+    def _would_exceed_worker_cap(self, worker: Worker, *, existing: Worker | None = None) -> bool:
+        if worker.status == "closed":
+            return False
+        previous = existing if existing is not None else self._workers.get(worker.id)
+        if previous is not None and previous.status != "closed":
+            return False
+        return _observed_worker_count(list(self._workers.values())) + 1 > self.max_workers
+
+    def _mark_worker_cap_exceeded_locked(self, observed_workers: int) -> Snapshot:
+        now = utc_timestamp()
+        previous = latest_snapshot(self.db_path, self.config.host_id)
+        spaces = list(previous.spaces) if previous is not None else list(self._spaces.values())
+        workers = list(previous.workers) if previous is not None else list(self._workers.values())
+        health = herdr_backend_health(
+            "worker_cap_exceeded",
+            observed_at=now,
+            message="Herdr observation exceeded the configured worker cap",
+            spaces=spaces,
+            workers=workers,
+        )
+        snapshot = project_from_observations(
+            self.config,
+            spaces=spaces,
+            workers=workers,
+            backend_health=[health],
+        )
+        save_snapshot(self.db_path, snapshot)
+        self._spaces = {space.id: space for space in snapshot.spaces}
+        self._workers = {worker.id: worker for worker in snapshot.workers}
+        self._health = HerdrEventBackendHealth(
+            status=health.status,
+            outcome=health.outcome,
+            observed_at=health.observed_at or now,
+            message=health.message,
+        )
+        self._last_cap_status_at = now
+        self._last_reconcile_at = now
+        self._last_snapshot_at = snapshot.updated_at
+        self._schedule_next_reconcile()
         return snapshot
 
     def _mark_unhealthy(self, outcome: str) -> Snapshot:
@@ -982,6 +1095,7 @@ class HerdrEventBackend:
                 backend_health=[health],
             )
             save_snapshot(self.db_path, snapshot)
+            self._last_snapshot_at = snapshot.updated_at
             self._spaces = {space.id: space for space in snapshot.spaces}
             self._workers = {worker.id: worker for worker in snapshot.workers}
             return snapshot

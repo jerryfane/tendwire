@@ -15,19 +15,27 @@ from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
+    append_event,
     attention_payload_from_store,
+    cleanup_event_retention,
+    exhaust_connector_retries,
     expire_stale_worker_bindings,
     expire_worker_bindings,
+    fail_connector_delivery,
     get_command_receipt,
     init_store,
     latest_snapshot,
     list_attention_items,
     list_hosts,
     list_worker_bindings,
+    poll_connector_outbox,
     reserve_command_receipt,
     resolve_worker_binding,
+    run_store_maintenance,
     save_command_receipt,
     save_snapshot,
+    store_status,
+    tail_event_metadata,
     upsert_worker_bindings,
 )
 
@@ -173,6 +181,250 @@ def test_store_command_receipts_have_unique_logical_key_index(tmp_path: Path) ->
         "request_id",
         "action",
     )
+
+
+def test_store_status_tail_and_retention_cleanup_are_host_scoped_and_bounded(tmp_path: Path) -> None:
+    db_path = tmp_path / "maintenance.db"
+    config = Config(host_id="storehost", db_path=db_path)
+    snapshot = project_from_raw(config, workers=[{"id": "worker-1", "name": "Worker One"}])
+    save_snapshot(db_path, snapshot)
+    append_event(
+        db_path,
+        "storehost",
+        "private.event",
+        {"pane_id": "sentinel-private-pane", "raw_payload": "sentinel-private-raw"},
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    append_event(
+        db_path,
+        "storehost",
+        "public.event",
+        {"safe": "kept"},
+        observed_at="2026-01-09T00:00:00+00:00",
+    )
+    append_event(
+        db_path,
+        "otherhost",
+        "other.event",
+        {"safe": "kept"},
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attention",
+                "job-1",
+                "queued",
+                '{"safe":"kept"}',
+                '{"token":"sentinel-private-token"}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    before = store_status(db_path, "storehost")
+    tail = tail_event_metadata(db_path, "storehost", limit=2)
+    dry_run = cleanup_event_retention(
+        db_path,
+        "storehost",
+        retention_days=7,
+        now="2026-01-10T00:00:00+00:00",
+        dry_run=True,
+    )
+    after_dry_run_count = store_status(db_path, "storehost")["counts"]["events"]
+    cleanup = cleanup_event_retention(
+        db_path,
+        "storehost",
+        retention_days=7,
+        now="2026-01-10T00:00:00+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        host_events = conn.execute("SELECT COUNT(*) FROM events WHERE host_id = ?", ("storehost",)).fetchone()[0]
+        other_events = conn.execute("SELECT COUNT(*) FROM events WHERE host_id = ?", ("otherhost",)).fetchone()[0]
+        snapshots = conn.execute("SELECT COUNT(*) FROM snapshots WHERE host_id = ?", ("storehost",)).fetchone()[0]
+        outbox_rows = conn.execute("SELECT COUNT(*) FROM connector_outbox WHERE host_id = ?", ("storehost",)).fetchone()[0]
+
+    assert before["ok"] is True
+    assert before["outbox"]["pending"] == 1
+    assert len(tail["events"]) == 2
+    assert "payload_json" not in json.dumps(tail)
+    assert "sentinel-private" not in json.dumps(tail)
+    assert dry_run["deleted"] == 1
+    assert after_dry_run_count == before["counts"]["events"]
+    assert cleanup["deleted"] == 1
+    assert host_events == before["counts"]["events"] - 1
+    assert other_events == 1
+    assert snapshots == 1
+    assert outbox_rows == 1
+
+
+def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "outbox-maintenance.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attention",
+                "job-1",
+                "retry",
+                '{"safe":"kept"}',
+                '{}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        outbox_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                "storehost",
+                "attention",
+                "job-1",
+                3,
+                "failed",
+                '{}',
+                '{"token":"sentinel-private-token"}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:01:00+00:00",
+            ),
+        )
+
+    dry_run = run_store_maintenance(
+        db_path,
+        "storehost",
+        retention_days=7,
+        max_outbox_attempts=3,
+        dry_run=True,
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        dry_status = conn.execute("SELECT status FROM connector_outbox").fetchone()[0]
+    real = run_store_maintenance(
+        db_path,
+        "storehost",
+        retention_days=7,
+        max_outbox_attempts=3,
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        real_status, private_state = conn.execute(
+            "SELECT status, private_state_json FROM connector_outbox"
+        ).fetchone()
+
+    assert dry_run["outbox"]["updated"] == 1
+    assert dry_status == "retry"
+    assert real["outbox"]["updated"] == 1
+    assert real_status == "dead_letter"
+    assert json.loads(private_state) == {}
+
+
+def test_exhaust_connector_retries_reclaims_expired_leases_before_dead_letter(tmp_path: Path) -> None:
+    db_path = tmp_path / "expired-maintenance.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attention",
+                "leased-job",
+                "queued",
+                '{"safe":"kept"}',
+                "{}",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    first = poll_connector_outbox(
+        db_path,
+        "storehost",
+        "attention",
+        lease_seconds=1,
+        max_attempts=2,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    fail_connector_delivery(
+        db_path,
+        host_id="storehost",
+        name="attention",
+        ref=first["ref"],
+        delay_seconds=0,
+        max_attempts=2,
+        now="2026-01-01T00:00:01+00:00",
+    )
+    second = poll_connector_outbox(
+        db_path,
+        "storehost",
+        "attention",
+        lease_seconds=1,
+        max_attempts=2,
+        now="2026-01-01T00:00:02+00:00",
+    )["items"][0]
+
+    dry_run = exhaust_connector_retries(
+        db_path,
+        "storehost",
+        max_attempts=2,
+        now="2026-01-01T00:00:04+00:00",
+        dry_run=True,
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        dry_run_status = conn.execute(
+            "SELECT status FROM connector_outbox WHERE delivery_key = ?",
+            ("leased-job",),
+        ).fetchone()[0]
+    result = exhaust_connector_retries(
+        db_path,
+        "storehost",
+        max_attempts=2,
+        now="2026-01-01T00:00:04+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_status = conn.execute(
+            "SELECT status FROM connector_outbox WHERE delivery_key = ?",
+            ("leased-job",),
+        ).fetchone()[0]
+        attempt_count, max_attempt = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(MAX(attempt), 0)
+            FROM connector_deliveries
+            WHERE delivery_key = ?
+            """,
+            ("leased-job",),
+        ).fetchone()
+
+    assert first["attempt"] == 1
+    assert second["attempt"] == 2
+    assert dry_run["updated"] == 1
+    assert dry_run_status == "leased"
+    assert result["updated"] == 1
+    assert outbox_status == "dead_letter"
+    assert (attempt_count, max_attempt) == (2, 2)
 
 
 def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Path) -> None:

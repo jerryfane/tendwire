@@ -288,6 +288,41 @@ resubscribe to the same official event set. Daemon start/stop are idempotent and
 bounded: stopping closes the event backend and local Tendwire socket without
 adding connector, UI, source-mode, or raw terminal integration.
 
+PR16 adds conservative daemon/runtime tuning knobs for 24/7 and Raspberry Pi
+use. They are available as `Config` constructor arguments and environment
+variables:
+
+| Config field | Environment variable | Default | Validation |
+| --- | --- | --- | --- |
+| `event_debounce_seconds` | `TENDWIRE_EVENT_DEBOUNCE_SECONDS` | `0.05` | non-negative float |
+| `reconcile_interval_seconds` | `TENDWIRE_RECONCILE_INTERVAL_SECONDS` | `300.0` | non-negative float; `0` disables periodic reconcile |
+| `event_retention_days` | `TENDWIRE_EVENT_RETENTION_DAYS` | `7` | integer >= 1 |
+| `output_excerpt_chars` | `TENDWIRE_OUTPUT_EXCERPT_CHARS` | `200` | integer >= 1 |
+| `max_workers` | `TENDWIRE_MAX_WORKERS` | `512` | integer >= 1 |
+| `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
+| `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
+
+The socket/event backend uses `event_debounce_seconds` for event batching and
+`reconcile_interval_seconds` for bounded periodic full reconciles. Set
+`TENDWIRE_RECONCILE_INTERVAL_SECONDS=0` on very small hosts if periodic
+reconcile is not wanted. `max_workers` is an operational cap only; it does not
+create any public worker ID surface. If a healthy reconcile observes more
+workers than the cap, Tendwire reports a degraded
+`worker_cap_exceeded` backend health state and preserves the previous public
+snapshot/projections instead of publishing a truncated authoritative snapshot.
+Incremental events that would add workers over the cap are ignored with the
+same public-safe degraded evidence.
+
+`health.get` remains schema-version 1 and now includes public-safe operational
+fields: daemon status and `started_at`; store status/counts and outbox counts;
+snapshot and last event/snapshot/reconcile timestamps when available; backend
+runtime readiness when the socket backend is active; backend health; and numeric
+`limits` for debounce, reconcile, retention, output excerpt, worker cap, outbox
+attempt cap, and outbox claim TTL. It does not expose daemon socket paths,
+database paths, Herdr binary paths, backend targets, raw Herdr payloads,
+private bindings, private fingerprints, connector private state, tokens,
+argv/env/stdout/stderr, or low-level terminal identifiers.
+
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
 
@@ -366,9 +401,10 @@ Backend health `status` is one of `healthy`, `degraded`, `unavailable`, or
 `outcome: "empty_healthy"`. Missing Herdr reports `missing_binary`, launch
 errors report `launch_error`, timeouts report `timeout` or
 `deadline_exhausted`, nonzero exits report `nonzero`, malformed JSON reports
-`malformed_json`, and unclassified results report `unknown`. Health messages are
-short sanitized public strings and do not expose private bindings, raw
-stdout/stderr, argv, environment values, or secrets.
+`malformed_json`, worker cap safety stops report `worker_cap_exceeded`, and
+unclassified results report `unknown`. Health messages are short sanitized
+public strings and do not expose private bindings, raw stdout/stderr, argv,
+environment values, or secrets.
 
 Attention signals expose deterministic `id` and `fingerprint` values plus
 `kind`, `severity`, `status`, `reason`, `source`, `updated_at`,
@@ -449,6 +485,25 @@ a multi-service event bus and does not persist raw Herdr event payloads, socket
 paths, terminal streams, argv/env/stdout/stderr, or connector-specific routing
 state.
 
+Bounded operational store hooks are JSON-only:
+
+```bash
+tendwire store status --db-path /path/to/tendwire.db
+tendwire store events-tail --limit 20 --db-path /path/to/tendwire.db
+tendwire store cleanup --dry-run --db-path /path/to/tendwire.db
+tendwire store cleanup --retention-days 14 --max-outbox-attempts 5 --db-path /path/to/tendwire.db
+```
+
+`store status` returns host-scoped counts, last event/snapshot timestamps, and
+outbox counts by neutral status. `store events-tail` returns only bounded event
+metadata such as row id, event type, aggregate type, timestamp, and content
+fingerprint; it never returns `payload_json` or raw event payloads. `store
+cleanup` is idempotent and host scoped. Event retention deletes only old rows
+from the `events` history table. It does not delete snapshots, projections,
+command receipts, private worker bindings, active outbox rows, active leases,
+deliveries, or private state. `--dry-run` reports the same counts without
+deleting or updating rows.
+
 ## Neutral connector outbox boundary
 
 Tendwire exposes a Tendwire-only connector delivery boundary above the SQLite
@@ -481,6 +536,13 @@ delivered. `connector.fail` records sanitized failure data and schedules retry
 availability. `connector.defer` records sanitized defer data and schedules future
 availability without treating the item as delivered. Stale, expired,
 wrong-host, wrong-name, and superseded refs fail closed with neutral errors.
+When callers omit `lease_seconds`, the daemon and CLI use
+`connector_claim_ttl_seconds` from config, defaulting to 60 seconds; an explicit
+public `lease_seconds` value still wins. `max_outbox_attempts` prevents
+unbounded retry loops. Once a failed job reaches the configured cap, Tendwire
+moves the outbox item to a neutral terminal `dead_letter` state and returns the
+public status `attempts_exhausted` without exposing private outbox or delivery
+state.
 
 Connector payloads are generic Tendwire jobs such as `attention_created` and
 `attention_escalated`; the existing attention lifecycle writer continues to

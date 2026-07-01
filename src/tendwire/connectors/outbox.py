@@ -121,9 +121,18 @@ def _ref(value: Any) -> str:
 class ConnectorOutboxAPI:
     """Public-neutral facade for connector.poll/ack/fail/defer."""
 
-    def __init__(self, db_path: str | Path | None, host_id: str) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None,
+        host_id: str,
+        *,
+        default_lease_seconds: int = 60,
+        max_attempts: int = 10,
+    ) -> None:
         self.db_path = Path(db_path) if db_path is not None else None
         self.host_id = str(host_id)
+        self.default_lease_seconds = max(1, int(default_lease_seconds))
+        self.max_attempts = max(1, int(max_attempts))
 
     def _require_store(self, name: str = "") -> dict[str, Any] | None:
         if self.db_path is None:
@@ -144,7 +153,13 @@ class ConnectorOutboxAPI:
             self.host_id,
             name,
             limit=_int(data.get("limit"), 1, minimum=1, maximum=100),
-            lease_seconds=_int(data.get("lease_seconds"), 60, minimum=1, maximum=86400),
+            lease_seconds=_int(
+                data.get("lease_seconds"),
+                self.default_lease_seconds,
+                minimum=1,
+                maximum=86400,
+            ),
+            max_attempts=self.max_attempts,
         )
         items: list[dict[str, Any]] = []
         for item in store_result.get("items", []):
@@ -241,7 +256,7 @@ class ConnectorOutboxAPI:
             else None,
         }
         if action == "fail":
-            return fail_connector_delivery(self.db_path, **kwargs)
+            return fail_connector_delivery(self.db_path, max_attempts=self.max_attempts, **kwargs)
         return defer_connector_delivery(self.db_path, **kwargs)
 
     def dispatch(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:

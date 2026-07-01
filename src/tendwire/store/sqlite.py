@@ -397,6 +397,7 @@ def _canonical_json(data: Any) -> str:
 _CONNECTOR_LEASE_STATUS = "leased"
 _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
+_CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_PUBLIC_DROP = object()
 _CONNECTOR_FORBIDDEN_PUBLIC_TEXT = (
@@ -456,6 +457,12 @@ def _connector_now(value: str | None = None) -> str:
 
 def _connector_add_seconds(now: str, seconds: int) -> str:
     return _connector_iso(_connector_datetime(now) + timedelta(seconds=max(0, int(seconds))))
+
+
+def _utc_cutoff(*, retention_days: int, now: str | None = None) -> str:
+    current = _connector_datetime(now or utc_timestamp())
+    cutoff = current - timedelta(days=max(1, int(retention_days)))
+    return _connector_iso(cutoff)
 
 
 def _connector_public_ref() -> str:
@@ -645,6 +652,57 @@ def _connector_reclaim_expired_leases_conn(
     return reclaimed
 
 
+def _connector_exhaust_retryable_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str | None = None,
+    max_attempts: int,
+    now: str,
+    dry_run: bool = False,
+) -> int:
+    clauses = [
+        "host_id = ?",
+        "status IN ('queued', 'deferred', 'retry')",
+        """
+        (
+            SELECT COALESCE(MAX(d.attempt), 0)
+            FROM connector_deliveries d
+            WHERE d.outbox_id = connector_outbox.id
+        ) >= ?
+        """,
+    ]
+    params: list[Any] = [str(host_id), max(1, int(max_attempts))]
+    if name is not None:
+        clauses.insert(1, "connector = ?")
+        params.insert(1, str(name))
+    where_sql = " AND ".join(clauses)
+    if dry_run:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM connector_outbox WHERE {where_sql}",
+            params,
+        ).fetchone()
+        return int(row[0] or 0)
+
+    cursor = conn.execute(
+        f"""
+        UPDATE connector_outbox
+        SET status = ?,
+            next_attempt_at = NULL,
+            updated_at = ?,
+            private_state_json = ?
+        WHERE {where_sql}
+        """,
+        [
+            _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+            now,
+            "{}",
+            *params,
+        ],
+    )
+    return int(cursor.rowcount or 0)
+
+
 def reclaim_expired_connector_leases(
     db_path: Path,
     host_id: str,
@@ -689,6 +747,78 @@ def reclaim_expired_connector_leases(
     )
 
 
+def exhaust_connector_retries(
+    db_path: Path,
+    host_id: str,
+    *,
+    max_attempts: int,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Move host-scoped retryable outbox rows beyond max attempts to a neutral terminal state."""
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "updated": 0,
+        }
+    current_time = _connector_now(now)
+    attempt_limit = max(1, int(max_attempts))
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if dry_run:
+                conn.execute("SAVEPOINT dry_run_exhaust_connector_retries")
+                try:
+                    _connector_reclaim_expired_leases_conn(
+                        conn,
+                        host_id=str(host_id),
+                        name=None,
+                        now=current_time,
+                    )
+                    updated = _connector_exhaust_retryable_conn(
+                        conn,
+                        host_id=str(host_id),
+                        max_attempts=attempt_limit,
+                        now=current_time,
+                    )
+                finally:
+                    conn.execute("ROLLBACK TO dry_run_exhaust_connector_retries")
+                    conn.execute("RELEASE dry_run_exhaust_connector_retries")
+            else:
+                _connector_reclaim_expired_leases_conn(
+                    conn,
+                    host_id=str(host_id),
+                    name=None,
+                    now=current_time,
+                )
+                updated = _connector_exhaust_retryable_conn(
+                    conn,
+                    host_id=str(host_id),
+                    max_attempts=attempt_limit,
+                    now=current_time,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "max_attempts": attempt_limit,
+            "updated": int(updated),
+        }
+    )
+
+
 def poll_connector_outbox(
     db_path: Path,
     host_id: str,
@@ -696,6 +826,7 @@ def poll_connector_outbox(
     *,
     limit: int = 1,
     lease_seconds: int = 60,
+    max_attempts: int | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Atomically lease due connector outbox rows for one neutral queue name."""
@@ -722,6 +853,14 @@ def poll_connector_outbox(
                 name=str(name),
                 now=current_time,
             )
+            if max_attempts is not None:
+                _connector_exhaust_retryable_conn(
+                    conn,
+                    host_id=str(host_id),
+                    name=str(name),
+                    max_attempts=max_attempts,
+                    now=current_time,
+                )
             rows = conn.execute(
                 """
                 SELECT
@@ -912,6 +1051,7 @@ def _connector_update_ref(
     reason: str | None = None,
     available_at: str | None = None,
     delay_seconds: int | None = None,
+    max_attempts: int | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     if not db_path.exists():
@@ -992,9 +1132,15 @@ def _connector_update_ref(
                 )
             else:
                 available_at = _connector_iso(available_at)
-            result_status = "retry_scheduled" if action == "fail" else "deferred"
+            attempt_limit = max(1, int(max_attempts)) if max_attempts is not None else None
+            exhausted = action == "fail" and attempt_limit is not None and attempt >= attempt_limit
+            result_status = "attempts_exhausted" if exhausted else ("retry_scheduled" if action == "fail" else "deferred")
             delivery_status = "failed" if action == "fail" else "deferred"
-            outbox_status = "retry" if action == "fail" else "deferred"
+            outbox_status = (
+                _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+                if exhausted
+                else ("retry" if action == "fail" else "deferred")
+            )
             response_json = _canonical_json(
                 sanitize_forbidden_fields(
                     {
@@ -1022,7 +1168,7 @@ def _connector_update_ref(
                 """,
                 (
                     outbox_status,
-                    available_at,
+                    None if exhausted else available_at,
                     current_time,
                     _connector_private_clear_current(row[9]),
                     int(outbox_id),
@@ -1037,7 +1183,7 @@ def _connector_update_ref(
                 ref=ref,
                 key=delivery_key,
                 attempt=attempt,
-                available_at=available_at,
+                available_at=None if exhausted else available_at,
             )
         except Exception:
             conn.rollback()
@@ -1075,6 +1221,7 @@ def fail_connector_delivery(
     response: Mapping[str, Any] | None = None,
     available_at: str | None = None,
     delay_seconds: int | None = None,
+    max_attempts: int | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Record a connector failure and schedule the outbox item for retry."""
@@ -1088,6 +1235,7 @@ def fail_connector_delivery(
         response=response,
         available_at=available_at,
         delay_seconds=delay_seconds,
+        max_attempts=max_attempts,
         now=now,
     )
 
@@ -2496,6 +2644,246 @@ def init_store(db_path: Path) -> None:
     _ensure_dir(db_path)
     with _connect(db_path) as conn:
         _ensure_schema(conn)
+
+
+def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
+    """Return bounded public-safe host-scoped store and outbox counts."""
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "counts": {},
+            "outbox": {"pending": 0, "leased": 0, "terminal": 0, "by_status": {}},
+        }
+    tables = (
+        "snapshots",
+        "events",
+        "spaces",
+        "workers",
+        "turns",
+        "pending_interactions",
+        "attention_items",
+        "commands",
+        "command_receipts",
+        "backend_health",
+    )
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        counts = {
+            table: int(
+                conn.execute(f"SELECT COUNT(*) FROM {table} WHERE host_id = ?", (str(host_id),)).fetchone()[0]
+            )
+            for table in tables
+        }
+        last_event_row = conn.execute(
+            """
+            SELECT observed_at
+            FROM events
+            WHERE host_id = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (str(host_id),),
+        ).fetchone()
+        last_snapshot_row = conn.execute(
+            """
+            SELECT created_at
+            FROM snapshots
+            WHERE host_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (str(host_id),),
+        ).fetchone()
+        outbox_rows = conn.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM connector_outbox
+            WHERE host_id = ?
+            GROUP BY status
+            """,
+            (str(host_id),),
+        ).fetchall()
+    by_status = {str(row[0] or "unknown"): int(row[1] or 0) for row in outbox_rows}
+    pending_statuses = _CONNECTOR_POLLABLE_STATUSES
+    terminal_statuses = {_CONNECTOR_TERMINAL_OUTBOX_STATUS, _CONNECTOR_EXHAUSTED_OUTBOX_STATUS}
+    outbox = {
+        "pending": sum(count for status, count in by_status.items() if status in pending_statuses),
+        "leased": int(by_status.get(_CONNECTOR_LEASE_STATUS, 0)),
+        "terminal": sum(count for status, count in by_status.items() if status in terminal_statuses),
+        "by_status": by_status,
+    }
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "counts": counts,
+            "outbox": outbox,
+            "last_event_at": last_event_row[0] if last_event_row is not None else None,
+            "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
+        }
+    )
+
+
+def tail_event_metadata(
+    db_path: Path,
+    host_id: str,
+    *,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Return bounded event/history metadata without raw payloads."""
+    row_limit = max(1, min(int(limit), 100))
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "limit": row_limit,
+            "events": [],
+        }
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT id, event_type, aggregate_type, observed_at, content_fingerprint
+            FROM events
+            WHERE host_id = ?
+            ORDER BY observed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (str(host_id), row_limit),
+        ).fetchall()
+    events = [
+        {
+            "row_id": int(row[0]),
+            "event_type": str(row[1] or ""),
+            "aggregate_type": str(row[2] or ""),
+            "observed_at": str(row[3] or ""),
+            "content_fingerprint": str(row[4] or ""),
+        }
+        for row in rows
+    ]
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "limit": row_limit,
+            "events": events,
+        }
+    )
+
+
+def cleanup_event_retention(
+    db_path: Path,
+    host_id: str,
+    *,
+    retention_days: int,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Delete only host-scoped old rows from the events/history table."""
+    days = max(1, int(retention_days))
+    cutoff_at = _utc_cutoff(retention_days=days, now=now)
+    if not db_path.exists():
+        return {
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "retention_days": days,
+            "cutoff_at": cutoff_at,
+            "deleted": 0,
+        }
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM events
+            WHERE host_id = ? AND observed_at < ?
+            """,
+            (str(host_id), cutoff_at),
+        ).fetchone()
+        deleted = int(row[0] or 0)
+        if deleted and not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    DELETE FROM events
+                    WHERE host_id = ? AND observed_at < ?
+                    """,
+                    (str(host_id), cutoff_at),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "retention_days": days,
+            "cutoff_at": cutoff_at,
+            "deleted": deleted,
+        }
+    )
+
+
+def run_store_maintenance(
+    db_path: Path,
+    host_id: str,
+    *,
+    retention_days: int,
+    max_outbox_attempts: int,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run bounded host-scoped store maintenance and return public-safe counts."""
+    retention = cleanup_event_retention(
+        db_path,
+        host_id,
+        retention_days=retention_days,
+        now=now,
+        dry_run=dry_run,
+    )
+    outbox = exhaust_connector_retries(
+        db_path,
+        host_id,
+        max_attempts=max_outbox_attempts,
+        now=now,
+        dry_run=dry_run,
+    )
+    ok = bool(retention.get("ok")) and bool(outbox.get("ok"))
+    return sanitize_forbidden_fields(
+        {
+            "schema_version": 1,
+            "ok": ok,
+            "status": "ok" if ok else "store_unavailable",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "retention": {
+                "retention_days": int(retention.get("retention_days") or retention_days),
+                "cutoff_at": retention.get("cutoff_at"),
+                "deleted": int(retention.get("deleted") or 0),
+            },
+            "outbox": {
+                "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
+                "updated": int(outbox.get("updated") or 0),
+            },
+        }
+    )
 
 
 def save_snapshot(db_path: Path, snapshot: Snapshot) -> None:

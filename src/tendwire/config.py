@@ -13,6 +13,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
+DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
+DEFAULT_EVENT_RETENTION_DAYS = 7
+DEFAULT_OUTPUT_EXCERPT_CHARS = 200
+DEFAULT_MAX_WORKERS = 512
+DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
+DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,13 @@ class Config:
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
     herdr_backend: str = "cli"
+    event_debounce_seconds: float = DEFAULT_EVENT_DEBOUNCE_SECONDS
+    reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
+    event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
+    output_excerpt_chars: int = DEFAULT_OUTPUT_EXCERPT_CHARS
+    max_workers: int = DEFAULT_MAX_WORKERS
+    max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
+    connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "herdr_bin", os.path.expanduser(self.herdr_bin))
@@ -47,6 +61,74 @@ class Config:
             allowed = ", ".join(sorted(HERDR_BACKENDS))
             raise ValueError(f"herdr_backend must be one of: {allowed}")
         object.__setattr__(self, "herdr_backend", backend)
+        object.__setattr__(
+            self,
+            "event_debounce_seconds",
+            _non_negative_float(self.event_debounce_seconds, "event_debounce_seconds"),
+        )
+        object.__setattr__(
+            self,
+            "reconcile_interval_seconds",
+            _non_negative_float(self.reconcile_interval_seconds, "reconcile_interval_seconds"),
+        )
+        object.__setattr__(
+            self,
+            "event_retention_days",
+            _positive_int(self.event_retention_days, "event_retention_days", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "output_excerpt_chars",
+            _positive_int(self.output_excerpt_chars, "output_excerpt_chars", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "max_workers",
+            _positive_int(self.max_workers, "max_workers", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "max_outbox_attempts",
+            _positive_int(self.max_outbox_attempts, "max_outbox_attempts", minimum=1),
+        )
+        object.__setattr__(
+            self,
+            "connector_claim_ttl_seconds",
+            _positive_int(
+                self.connector_claim_ttl_seconds,
+                "connector_claim_ttl_seconds",
+                minimum=1,
+            ),
+        )
+
+
+def _non_negative_float(value: float | str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative number") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return parsed
+
+
+def _positive_int(value: int | str, name: str, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer >= {minimum}") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return parsed
+
+
+def _resolve_value(explicit: object, env_name: str, default: object) -> object:
+    if explicit is not None:
+        return explicit
+    env_value = os.environ.get(env_name)
+    if env_value is not None:
+        return env_value
+    return default
 
 
 def load_config(
@@ -58,6 +140,13 @@ def load_config(
     socket_path: str | Path | None = None,
     herdr_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
+    event_debounce_seconds: float | str | None = None,
+    reconcile_interval_seconds: float | str | None = None,
+    event_retention_days: int | str | None = None,
+    output_excerpt_chars: int | str | None = None,
+    max_workers: int | str | None = None,
+    max_outbox_attempts: int | str | None = None,
+    connector_claim_ttl_seconds: int | str | None = None,
 ) -> Config:
     """Build a Config from explicit args, then environment, then defaults."""
     env_host_id = os.environ.get("TENDWIRE_HOST_ID")
@@ -117,4 +206,39 @@ def load_config(
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
         herdr_backend=resolved_herdr_backend,
+        event_debounce_seconds=_resolve_value(
+            event_debounce_seconds,
+            "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
+            DEFAULT_EVENT_DEBOUNCE_SECONDS,
+        ),
+        reconcile_interval_seconds=_resolve_value(
+            reconcile_interval_seconds,
+            "TENDWIRE_RECONCILE_INTERVAL_SECONDS",
+            DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        ),
+        event_retention_days=_resolve_value(
+            event_retention_days,
+            "TENDWIRE_EVENT_RETENTION_DAYS",
+            DEFAULT_EVENT_RETENTION_DAYS,
+        ),
+        output_excerpt_chars=_resolve_value(
+            output_excerpt_chars,
+            "TENDWIRE_OUTPUT_EXCERPT_CHARS",
+            DEFAULT_OUTPUT_EXCERPT_CHARS,
+        ),
+        max_workers=_resolve_value(
+            max_workers,
+            "TENDWIRE_MAX_WORKERS",
+            DEFAULT_MAX_WORKERS,
+        ),
+        max_outbox_attempts=_resolve_value(
+            max_outbox_attempts,
+            "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
+            DEFAULT_MAX_OUTBOX_ATTEMPTS,
+        ),
+        connector_claim_ttl_seconds=_resolve_value(
+            connector_claim_ttl_seconds,
+            "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
+            DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
+        ),
     )

@@ -229,6 +229,81 @@ def test_daemon_api_attention_list_uses_store_lifecycle_payload(tmp_path: Path) 
     _assert_no_public_json_forbidden(response)
 
 
+def test_daemon_health_exposes_public_operational_status_without_private_values(tmp_path: Path) -> None:
+    db_path = tmp_path / "health.db"
+    config = Config(
+        host_id="health-host",
+        db_path=db_path,
+        event_debounce_seconds=0.2,
+        reconcile_interval_seconds=0,
+        event_retention_days=3,
+        output_excerpt_chars=80,
+        max_workers=8,
+        max_outbox_attempts=4,
+        connector_claim_ttl_seconds=33,
+    )
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "backend_target": {"pane_id": "sentinel-private-pane"},
+            }
+        ],
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+                "counts": {"workers": 1},
+            }
+        ],
+    )
+    save_snapshot(db_path, snapshot)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "health-host",
+                "attention",
+                "job-1",
+                "queued",
+                '{"safe":"kept"}',
+                '{"token":"sentinel-private-token"}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    health = TendwireDaemon(config).get_health()
+    encoded = json.dumps(health)
+
+    assert health["status"] == "ok"
+    assert health["daemon"]["started_at"]
+    assert health["store"]["counts"]["snapshots"] == 1
+    assert health["store"]["outbox"]["pending"] == 1
+    assert health["limits"] == {
+        "event_debounce_seconds": 0.2,
+        "reconcile_interval_seconds": 0,
+        "event_retention_days": 3,
+        "output_excerpt_chars": 80,
+        "max_workers": 8,
+        "max_outbox_attempts": 4,
+        "outbox_claim_ttl_seconds": 33,
+    }
+    assert "health.db" not in encoded
+    assert str(tmp_path) not in encoded
+    assert "sentinel-private" not in encoded
+    _assert_no_public_json_forbidden(health)
+
+
 def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Path) -> None:
     db_path = tmp_path / "daemon.db"
     socket_path = tmp_path / "daemon.sock"
