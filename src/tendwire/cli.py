@@ -470,6 +470,8 @@ def _try_daemon_attempt(
     """Return a daemon result when a Tendwire daemon socket is reachable."""
     socket_path = config.socket_path
     if socket_path is None:
+        if config.herdr_backend != "socket":
+            return _DaemonAttempt(error_kind="unavailable")
         socket_path = config.data_dir / "tendwire.sock"
         if not socket_path.exists():
             return _DaemonAttempt(error_kind="unavailable")

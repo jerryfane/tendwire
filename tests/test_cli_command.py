@@ -1613,6 +1613,43 @@ def test_cli_command_read_snapshot_strips_command_public_terminal_fields(
     assert snap_meta["safe"] == "kept"
 
 
+def test_cli_command_does_not_auto_discover_default_daemon_socket(
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A default socket file must not opt ordinary CLI commands into daemon mode."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "tendwire.sock").touch()
+    calls: list[str] = []
+
+    class GuardedDaemonAPIClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            calls.append("daemon")
+            raise AssertionError("implicit default socket should not be contacted")
+
+    monkeypatch.delenv("TENDWIRE_SOCKET_PATH", raising=False)
+    monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", GuardedDaemonAPIClient)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"schema_version": 1, "action": "read_snapshot"})),
+    )
+
+    code = main(["--host-id", "cmd-host", "command", "--json"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 0
+    assert calls == []
+    assert payload["ok"] is True
+    assert payload["status"] == "snapshot"
+    assert payload["result"]["snapshot"]["workers"][0]["id"] == "w-1"
+
+
 def test_cli_command_forbidden_field_rejects_before_backend_and_store(
     capsys, monkeypatch
 ) -> None:
