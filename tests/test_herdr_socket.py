@@ -328,6 +328,27 @@ def test_subscription_ack_events_and_stream_termination(tmp_path: Path) -> None:
         client.close()
 
 
+def test_subscription_accepts_uncorrelated_legacy_event_frames(tmp_path: Path) -> None:
+    events = [
+        {"event": "pane_agent_status_changed", "data": {"status": "blocked"}},
+        {"event": "pane_closed", "data": {"pane_id": "p-1"}},
+    ]
+
+    def handler(conn: _Connection) -> None:
+        request = conn.read_request()
+        conn.send_json({"id": request["id"], "result": {"subscribed": True}})
+        for event in events:
+            conn.send_json(event)
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        stream = client.subscribe("events.subscribe", {"subscriptions": []})
+
+        assert stream.ack == {"subscribed": True}
+        assert list(stream) == events
+        client.close()
+
+
 def test_events_subscribe_wrapper_sends_official_method_and_params(tmp_path: Path) -> None:
     event_names = ("workspace.created", "pane.agent_status_changed")
 

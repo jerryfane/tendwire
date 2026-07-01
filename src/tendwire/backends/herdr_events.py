@@ -48,6 +48,7 @@ from .herdr_protocol import (
     HERDR_OFFICIAL_EVENT_NAME_SET,
     HERDR_OFFICIAL_EVENT_NAMES,
     HerdrEnvelopeError,
+    HerdrErrorResponse,
     HerdrMalformedLineError,
     HerdrProtocolError,
     build_events_subscribe_params,
@@ -70,6 +71,9 @@ DEFAULT_RECONNECT_DELAY_SECONDS = 0.25
 _AGENT_PAYLOAD_KEYS = ("agents", "workers", "data", "items", "results", "result")
 _PANE_PAYLOAD_KEYS = ("panes", "items", "data", "results", "result")
 _SUPPORTED_EVENT_NAMES = HERDR_OFFICIAL_EVENT_NAMES
+_PANE_SCOPED_FALLBACK_EVENT_NAMES = tuple(
+    event_name for event_name in _SUPPORTED_EVENT_NAMES if event_name != "pane.output_matched"
+)
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
 _SPACE_EVENT_NAMES = frozenset(
     {
@@ -255,7 +259,7 @@ def normalize_event(envelope: Mapping[str, Any]) -> NormalizedHerdrEvent | None:
     name = _canonical_event_name(envelope.get("event"))
     if name is None:
         return None
-    payload = envelope.get("payload", {})
+    payload = envelope.get("payload", envelope.get("data", {}))
     if payload is None:
         payload = {}
     if not isinstance(payload, Mapping):
@@ -433,6 +437,7 @@ class HerdrEventBackend:
         self._last_snapshot_at: str | None = None
         self._last_cap_status_at: str | None = None
         self._next_reconcile_monotonic: float | None = None
+        self._subscription_pane_ids: list[str] = []
         self._load_existing_state()
 
     @staticmethod
@@ -633,6 +638,21 @@ class HerdrEventBackend:
             records_by_identity.setdefault(identity, (worker, identity))
         return list(records_by_identity.values())
 
+    def _pane_subscription_ids(self, pane_payload: Any) -> list[str]:
+        pane_ids: list[str] = []
+        seen: set[str] = set()
+        for item in _payload_items(pane_payload, _PANE_PAYLOAD_KEYS):
+            if not _pane_has_agent(item):
+                continue
+            pane_id = _first_text(item, ("pane_id", "paneId", "id"))
+            if not pane_id or pane_id in seen:
+                continue
+            seen.add(pane_id)
+            pane_ids.append(pane_id)
+            if len(pane_ids) >= self.max_workers:
+                break
+        return pane_ids
+
     def reconcile_once(self, *, client: Any | None = None) -> Snapshot:
         """Perform a full Herdr list reconcile and persist Tendwire projections."""
         owns_client = client is None
@@ -661,6 +681,7 @@ class HerdrEventBackend:
                     payloads["agent.list"],
                     payloads["pane.list"],
                 )
+                subscription_pane_ids = self._pane_subscription_ids(payloads["pane.list"])
                 workers, bindings = _workers_and_bindings_from_records(
                     self.config,
                     records,
@@ -697,6 +718,7 @@ class HerdrEventBackend:
                 self._spaces = {space.id: space for space in snapshot.spaces}
                 self._workers = {worker.id: worker for worker in snapshot.workers}
                 self._bindings = {binding.private_fingerprint: binding for binding in bindings}
+                self._subscription_pane_ids = subscription_pane_ids
                 self._health = HerdrEventBackendHealth(
                     status=health.status,
                     outcome=health.outcome,
@@ -728,7 +750,32 @@ class HerdrEventBackend:
                 )
             except TypeError:
                 return client.events_subscribe(_SUPPORTED_EVENT_NAMES)
+            except (HerdrEnvelopeError, HerdrErrorResponse):
+                if not self._subscription_pane_ids:
+                    raise
+                if hasattr(client, "close"):
+                    client.close()
+                if hasattr(client, "connect"):
+                    client.connect()
+                return self._subscribe_pane_scoped_event_stream(client)
         params = build_events_subscribe_params(_SUPPORTED_EVENT_NAMES)
+        try:
+            return client.subscribe(
+                self.subscribe_method,
+                params,
+                timeout=self.config.herdr_timeout_seconds,
+                event_timeout=self.config.herdr_timeout_seconds,
+            )
+        except TypeError:
+            return client.subscribe(self.subscribe_method, params)
+
+    def _subscribe_pane_scoped_event_stream(self, client: Any) -> Any:
+        subscriptions = [
+            {"pane_id": pane_id, "type": event_name}
+            for pane_id in self._subscription_pane_ids
+            for event_name in _PANE_SCOPED_FALLBACK_EVENT_NAMES
+        ]
+        params = {"subscriptions": subscriptions}
         try:
             return client.subscribe(
                 self.subscribe_method,

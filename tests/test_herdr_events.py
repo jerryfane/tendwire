@@ -23,6 +23,7 @@ from tendwire.backends.herdr_socket import (
 from tendwire.backends.herdr_protocol import (
     HERDR_EVENTS_SUBSCRIBE_METHOD,
     HERDR_OFFICIAL_EVENT_NAMES,
+    HerdrEnvelopeError,
     build_events_subscribe_params,
 )
 from tendwire.config import Config
@@ -354,6 +355,19 @@ def test_normalize_event_tolerates_legacy_inbound_aliases_only_after_receive(
     assert event.name == canonical_name
 
 
+def test_normalize_event_accepts_live_idless_data_payload_shape() -> None:
+    event = normalize_event(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {"agent": "Agent One", "status": "blocked"},
+        }
+    )
+
+    assert event is not None
+    assert event.name == "pane.agent_status_changed"
+    assert event.payload == {"agent": "Agent One", "status": "blocked"}
+
+
 def test_backend_default_subscription_uses_official_shape_without_legacy_defaults(tmp_path: Path) -> None:
     config = _config(tmp_path, "default-subscribe")
     init_store(Path(config.db_path))
@@ -397,6 +411,75 @@ def test_backend_default_subscription_uses_official_shape_without_legacy_default
         "agent.status_changed",
         "worktree.updated",
     }.isdisjoint(subscribed_names)
+
+
+def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path: Path) -> None:
+    config = _config(tmp_path, "pane-scoped-subscribe")
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
+
+    class PaneScopedClient(_StaticClient):
+        def __init__(self) -> None:
+            super().__init__(
+                workspaces=[{"id": "space-1", "name": "Build"}],
+                panes=[
+                    {
+                        "pane_id": "pane-private",
+                        "agent": "Agent One",
+                        "workspace_id": "space-1",
+                        "status": "running",
+                    }
+                ],
+            )
+            self.global_attempts = 0
+            self.subscriptions: list[tuple[str, dict[str, Any]]] = []
+            self.closed = 0
+            self.connected = 0
+
+        def connect(self) -> None:
+            self.connected += 1
+
+        def close(self) -> None:
+            self.closed += 1
+
+        def events_subscribe(
+            self,
+            event_names: Any,
+            *,
+            timeout: float | None = None,
+            event_timeout: float | None = None,
+        ) -> Any:
+            self.global_attempts += 1
+            raise HerdrEnvelopeError("Herdr envelope id must be a non-empty string")
+
+        def subscribe(
+            self,
+            method: str,
+            params: Mapping[str, Any],
+            *,
+            timeout: float | None = None,
+            event_timeout: float | None = None,
+        ) -> Any:
+            self.subscriptions.append((method, dict(params)))
+            backend.stop_event.set()
+            return SimpleNamespace(subscription_id="pane-scoped-sub")
+
+    client = PaneScopedClient()
+    backend.client_factory = lambda _config: client
+
+    backend.run_forever()
+
+    assert client.global_attempts == 1
+    assert client.closed >= 1
+    assert client.connected >= 1
+    assert len(client.subscriptions) == 1
+    method, params = client.subscriptions[0]
+    assert method == HERDR_EVENTS_SUBSCRIBE_METHOD
+    subscriptions = params["subscriptions"]
+    fallback_names = set(HERDR_OFFICIAL_EVENT_NAMES) - {"pane.output_matched"}
+    assert len(subscriptions) == len(fallback_names)
+    assert {item["type"] for item in subscriptions} == fallback_names
+    assert {item["pane_id"] for item in subscriptions} == {"pane-private"}
 
 
 def test_backend_rejects_non_official_subscribe_method(tmp_path: Path) -> None:

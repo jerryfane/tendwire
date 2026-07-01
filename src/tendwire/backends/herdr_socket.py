@@ -196,7 +196,8 @@ class HerdrSocketClient:
         envelope = self._read_server_envelope(deadline=deadline)
         if not is_event(envelope):
             raise HerdrEnvelopeError("expected Herdr event envelope")
-        ensure_response_id(envelope, subscription_id)
+        if envelope.get("id") is not None:
+            ensure_response_id(envelope, subscription_id)
         return envelope
 
     def workspace_list(

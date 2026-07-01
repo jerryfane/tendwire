@@ -186,6 +186,9 @@ def test_parse_valid_result_error_and_event_envelopes() -> None:
             b'{"id":"sub-1","event":"pane.output","payload":{"text":"hello"},"future":true}\n'
         )
     )
+    idless_event = validate_event(
+        parse_json_line(b'{"event":"pane.output","data":{"text":"hello"},"future":true}\n')
+    )
 
     assert is_result_response(result) is True
     assert result_payload(result) == {"items": [{"id": "a"}]}
@@ -194,6 +197,8 @@ def test_parse_valid_result_error_and_event_envelopes() -> None:
     assert is_event(event) is True
     assert event["payload"] == {"text": "hello"}
     assert event["future"] is True
+    assert is_event(idless_event) is True
+    assert idless_event["data"] == {"text": "hello"}
 
 
 def test_parse_json_line_rejects_malformed_json() -> None:

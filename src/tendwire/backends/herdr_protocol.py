@@ -279,7 +279,9 @@ def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
 
 def validate_event(envelope: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an event envelope while preserving the raw event payload."""
-    _validated_id(envelope)
+    request_id = envelope.get("id")
+    if request_id is not None and (not isinstance(request_id, str) or not request_id):
+        raise HerdrEnvelopeError("Herdr event id must be a non-empty string when present")
     event_name = envelope.get("event")
     if not isinstance(event_name, str) or not event_name:
         raise HerdrEnvelopeError("Herdr event name must be a non-empty string")
