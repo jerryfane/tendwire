@@ -111,6 +111,55 @@ class _FakeHerdrServer:
             self._done.set()
 
 
+class _FakeOneShotHerdrServer:
+    def __init__(self, tmp_path: Path, handler: Callable[[_Connection], None], *, connections: int) -> None:
+        self.path = tmp_path / f"herdr-oneshot-{time.monotonic_ns()}.sock"
+        self.handler = handler
+        self.connections = connections
+        self.requests: list[dict[str, Any]] = []
+        self.errors: list[BaseException] = []
+        self._ready = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_FakeOneShotHerdrServer":
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.path))
+        listener.listen(self.connections)
+        listener.settimeout(0.5)
+        self._listener = listener
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(1):
+            raise AssertionError("fake one-shot Herdr server did not start")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._listener is not None:
+            self._listener.close()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        if exc_type is None and self.errors:
+            raise AssertionError(f"fake one-shot Herdr server failed: {self.errors!r}")
+
+    def _run(self) -> None:
+        self._ready.set()
+        try:
+            assert self._listener is not None
+            for _index in range(self.connections):
+                conn, _addr = self._listener.accept()
+                with conn:
+                    self.handler(_Connection(conn, self.requests))
+        except OSError:
+            pass
+        except BaseException as exc:
+            self.errors.append(exc)
+
+
 def _responding_handler(result: Any) -> Callable[[_Connection], None]:
     def handler(conn: _Connection) -> None:
         request = conn.read_request()
@@ -130,6 +179,26 @@ def test_client_successful_request_matches_id_and_returns_raw_result(tmp_path: P
     assert server.requests[0]["method"] == "workspace.list"
     assert server.requests[0]["params"] == {"scope": "all"}
     assert isinstance(server.requests[0]["id"], str)
+
+
+def test_client_reconnects_after_one_shot_response_connection_closes(tmp_path: Path) -> None:
+    results = {
+        "workspace.list": {"workspaces": []},
+        "agent.list": {"agents": []},
+    }
+
+    def handler(conn: _Connection) -> None:
+        request = conn.read_request()
+        conn.send_json({"id": request["id"], "result": results[request["method"]]})
+
+    with _FakeOneShotHerdrServer(tmp_path, handler, connections=2) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+
+        assert client.request("workspace.list") == {"workspaces": []}
+        assert client.request("agent.list") == {"agents": []}
+        client.close()
+
+    assert [request["method"] for request in server.requests] == ["workspace.list", "agent.list"]
 
 
 def test_client_timeout_waiting_for_response(tmp_path: Path) -> None:

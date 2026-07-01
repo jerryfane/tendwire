@@ -531,13 +531,13 @@ class HerdrEventBackend:
         while not self.stop_event.is_set():
             try:
                 client = self.client_factory(self.config)
-                if hasattr(client, "connect"):
-                    client.connect()
                 try:
                     self.reconcile_once(client=client)
                     self._ready.set()
                     if self.stop_event.is_set():
                         break
+                    if hasattr(client, "connect"):
+                        client.connect()
                     stream = self._subscribe_event_stream(client)
                     self._read_event_stream(client, stream.subscription_id)
                 finally:
@@ -553,16 +553,25 @@ class HerdrEventBackend:
                 self._mark_unhealthy_safe("unknown")
             if self.stop_event.is_set():
                 break
-            if self.reconnect_delay_seconds:
-                self.stop_event.wait(self.reconnect_delay_seconds)
+            delay = self._reconnect_delay_seconds()
+            if delay:
+                self.stop_event.wait(delay)
+
+    def _reconnect_delay_seconds(self) -> float:
+        delay = self.reconnect_delay_seconds
+        with self._lock:
+            outcome = self._health.outcome
+        if outcome == "protocol_error" and self.ready and self.reconcile_interval_seconds > 0:
+            return max(delay, min(self.reconcile_interval_seconds, 60.0))
+        return delay
 
     def _read_event_stream(self, client: Any, subscription_id: str) -> None:
         while not self.stop_event.is_set():
-            self._run_periodic_reconcile_if_due(client)
+            self._run_periodic_reconcile_if_due()
             try:
                 envelope = client.read_event(subscription_id, timeout=self.config.herdr_timeout_seconds)
             except HerdrSocketTimeoutError:
-                self._run_periodic_reconcile_if_due(client)
+                self._run_periodic_reconcile_if_due()
                 continue
             self.queue_event_envelope(envelope)
             disconnected = False
@@ -584,7 +593,7 @@ class HerdrEventBackend:
                     break
                 self.queue_event_envelope(extra, flush=False)
             self.flush()
-            self._run_periodic_reconcile_if_due(client)
+            self._run_periodic_reconcile_if_due()
             if disconnected:
                 raise HerdrSocketDisconnectedError("Herdr socket disconnected during event drain")
 
@@ -594,7 +603,7 @@ class HerdrEventBackend:
             return
         self._next_reconcile_monotonic = time.monotonic() + self.reconcile_interval_seconds
 
-    def _run_periodic_reconcile_if_due(self, client: Any) -> None:
+    def _run_periodic_reconcile_if_due(self, client: Any | None = None) -> None:
         if self.reconcile_interval_seconds <= 0:
             return
         due_at = self._next_reconcile_monotonic

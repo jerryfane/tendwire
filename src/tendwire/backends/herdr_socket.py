@@ -298,6 +298,18 @@ class HerdrSocketClient:
         try:
             sock.settimeout(self._remaining(deadline))
             sock.sendall(payload)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self.close()
+            try:
+                self.connect()
+                sock = self._active_socket()
+                sock.settimeout(self._remaining(deadline))
+                sock.sendall(payload)
+            except socket.timeout as retry_exc:
+                raise HerdrSocketTimeoutError("Herdr socket write timed out") from retry_exc
+            except OSError as retry_exc:
+                self.close()
+                raise HerdrSocketDisconnectedError("Herdr socket disconnected during write") from retry_exc
         except socket.timeout as exc:
             raise HerdrSocketTimeoutError("Herdr socket write timed out") from exc
         except OSError as exc:
