@@ -471,7 +471,7 @@ def _connector_public_ref() -> str:
 
 def _connector_contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = lowered.replace("-", "").replace("_", "")
+    compact = lowered.replace("-", "").replace("_", "").replace(".", "")
     return any(
         token in lowered or token.replace("_", "") in compact
         for token in _CONNECTOR_FORBIDDEN_PUBLIC_TEXT

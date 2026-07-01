@@ -34,6 +34,10 @@ FORBIDDEN = {
     "argv",
     "connector",
     "delivery",
+    "backend.target",
+    "pane.id",
+    "message.id",
+    "bot.token",
 }
 
 
@@ -70,8 +74,10 @@ def _enqueue(db_path: Path, *, key: str = "job-1", status: str = "queued") -> No
                             "message_id": "must-strip",
                             "safe": "nested",
                             "backend_value": "herdr",
-                            "list": ["ok", "telegram"],
+                            "list": ["ok", "telegram", "bot.token"],
+                            "dot_value": "message.id",
                         },
+                        "dot_private": "backend.target",
                     }
                 ),
                 json.dumps({"route": "private", "token": "secret"}),
@@ -184,7 +190,13 @@ def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) 
                 "ref": "opaque-provider-ref",
                 "provider": "telegram",
                 "message_id": "must-strip",
-                "nested": {"bot_token": "must-strip", "safe": "kept", "transport": "herdres"},
+                "dot_value": "message.id",
+                "nested": {
+                    "bot_token": "must-strip",
+                    "safe": "kept",
+                    "transport": "herdres",
+                    "dot_list": ["safe", "bot.token"],
+                },
             },
         }
     )
@@ -199,6 +211,7 @@ def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) 
     stored = json.loads(rows[0][1])
     assert stored["response"]["ref"] == "opaque-provider-ref"
     assert stored["response"]["nested"]["safe"] == "kept"
+    assert stored["response"]["nested"]["dot_list"] == ["safe"]
     assert "provider" not in stored["response"]
     assert "transport" not in stored["response"]["nested"]
     _assert_no_forbidden(stored)
