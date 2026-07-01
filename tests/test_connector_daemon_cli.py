@@ -154,6 +154,66 @@ def test_cli_connector_poll_and_ack_print_json_only(tmp_path: Path, capsys) -> N
     _assert_json_only_and_safe(ack_payload)
 
 
+def test_cli_daemon_connector_result_is_sanitized_before_printing(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    class FakeDaemonAPIClient:
+        def __init__(self, socket_path: Any, *, timeout_seconds: float, max_response_bytes: int = 1024 * 1024):
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            assert method == "connector.poll"
+            return {
+                "ok": True,
+                "result": {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "ok",
+                    "host_id": "host-a",
+                    "name": "attention",
+                    "backend_target": "sentinel-private-target",
+                    "items": [
+                        {
+                            "ref": "twref1.publicSafeRef",
+                            "payload": {
+                                "safe": "kept",
+                                "chat_id": "sentinel-private-chat",
+                                "raw_payload": "sentinel-private-raw",
+                            },
+                            "pane_id": "sentinel-private-pane",
+                        }
+                    ],
+                },
+            }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+
+    code = main(
+        [
+            "--host-id",
+            "host-a",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "connector",
+            "poll",
+            "--name",
+            "attention",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    encoded = json.dumps(payload, sort_keys=True).lower()
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["items"][0]["payload"] == {"safe": "kept"}
+    assert "sentinel-private" not in encoded
+    assert "raw_payload" not in encoded
+    _assert_json_only_and_safe(payload)
+
+
 def test_connector_api_store_unavailable_returns_safe_error() -> None:
     payload = ConnectorOutboxAPI(None, "host-a").poll({"name": "attention"})
 

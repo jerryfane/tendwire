@@ -38,7 +38,13 @@ from .core.commands import (
     validate_request,
 )
 from .core.projector import project_from_observations
-from .core.models import BackendHealth, WorkerBinding, separate_duplicate_worker_bindings, utc_timestamp
+from .core.models import (
+    BackendHealth,
+    WorkerBinding,
+    sanitize_forbidden_fields,
+    separate_duplicate_worker_bindings,
+    utc_timestamp,
+)
 from .core.turns import (
     payload_to_json,
     pending_payload_from_snapshot,
@@ -488,7 +494,7 @@ def _try_daemon_attempt(
         return _DaemonAttempt(error_kind="protocol")
     result = response.get("result")
     if isinstance(result, dict):
-        return _DaemonAttempt(result=result)
+        return _DaemonAttempt(result=sanitize_forbidden_fields(result))
     return _DaemonAttempt(error_kind="protocol")
 
 
