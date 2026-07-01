@@ -276,6 +276,7 @@ _RAW_COMMAND_HEAD_RE = re.compile(
 )
 _RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
 _SHELL_META_RE = re.compile(r"[;&|`$<>]")
+_PUBLIC_DROP = object()
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -314,7 +315,7 @@ def _public_tendwire_action_value(value: Any) -> str | None:
     if not isinstance(clean, str):
         return None
     text = clean.strip()
-    if not text or _looks_like_raw_command(text):
+    if not text or _looks_like_raw_command(text) or _contains_forbidden_public_text(text):
         return None
     return text
 
@@ -443,6 +444,119 @@ def sanitize_forbidden_fields(value: Any) -> Any:
     return str(value)
 
 
+def _public_text_tokens(value: str) -> list[str]:
+    separated = _CAMEL_CASE_BOUNDARY_RE.sub(" ", value)
+    return [
+        part.lower()
+        for part in re.split(r"[^A-Za-z0-9]+", separated)
+        if part
+    ]
+
+
+def _contains_forbidden_public_text(value: str) -> bool:
+    tokens = _public_text_tokens(value)
+    if not tokens:
+        return False
+    if set(tokens) & (_FORBIDDEN_BACKEND_NAME_TEXT - {"raw"}):
+        return True
+    for index in range(len(tokens)):
+        for size in range(1, min(4, len(tokens) - index) + 1):
+            phrase = "_".join(tokens[index : index + size])
+            if phrase == "command":
+                continue
+            if _is_forbidden_field_name(phrase):
+                return True
+    return bool(set(tokens) & (FORBIDDEN_FIELD_NAMES - {"command"}))
+
+
+def _is_forbidden_public_mapping_key(value: str) -> bool:
+    key_text = str(value)
+    tokens = _public_text_tokens(value)
+    if not tokens:
+        return False
+    normalized = "_".join(tokens)
+    if key_text == normalized and normalized in {"active_tab_id", "raw_status"}:
+        return False
+    if _contains_forbidden_public_text(value):
+        return True
+    sensitive_key_tokens = _FORBIDDEN_BACKEND_NAME_TEXT | {
+        "connector",
+        "delivery",
+        "herdres",
+        "outbox",
+        "private",
+        "raw",
+        "route",
+        "telegram",
+    }
+    return bool(set(tokens) & sensitive_key_tokens)
+
+
+def _public_safe_text(value: Any, *, default: str = "") -> str:
+    text = _string_value(value).strip()
+    if not text or _contains_forbidden_public_text(text):
+        return default
+    return " ".join(text.split())
+
+
+def _public_safe_identity(value: Any, *, prefix: str, default: str = "unknown") -> str:
+    text = _string_value(value, default).strip()
+    if not text:
+        text = default
+    if not _contains_forbidden_public_text(text):
+        return " ".join(text.split())
+    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': text})}"
+
+
+def _public_safe_fingerprint(value: Any) -> str:
+    text = _string_value(value).strip()
+    if not text or _contains_forbidden_public_text(text):
+        return ""
+    return " ".join(text.split())
+
+
+def _optional_public_safe_identity(value: Any, *, prefix: str) -> str | None:
+    if value is None:
+        return None
+    return _public_safe_identity(value, prefix=prefix)
+
+
+def _optional_public_safe_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = _public_safe_text(value)
+    return text or None
+
+
+def _sanitize_public_value(value: Any) -> Any:
+    clean = sanitize_forbidden_fields(value)
+    if isinstance(clean, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in clean.items():
+            key_text = str(key)
+            if _is_forbidden_public_mapping_key(key_text):
+                continue
+            sanitized = _sanitize_public_value(item)
+            if sanitized is not _PUBLIC_DROP:
+                result[key_text] = sanitized
+        return result
+    if isinstance(clean, list):
+        result_list: list[Any] = []
+        for item in clean:
+            sanitized = _sanitize_public_value(item)
+            if sanitized is not _PUBLIC_DROP:
+                result_list.append(sanitized)
+        return result_list
+    if isinstance(clean, str):
+        return _PUBLIC_DROP if _contains_forbidden_public_text(clean) else clean
+    return clean
+
+
+def _sanitize_public_mapping(value: Any) -> dict[str, Any]:
+    clean = _sanitize_public_value(value if isinstance(value, Mapping) else {})
+    return clean if isinstance(clean, dict) else {}
+
+
 def _string_value(value: Any, default: str = "") -> str:
     if value is None:
         return default
@@ -546,9 +660,11 @@ def _backend_health_counts(value: Any) -> dict[str, int]:
 def _status_and_meta(status: Any, meta: Any) -> tuple[str, dict[str, Any]]:
     raw_status = _string_value(status, "unknown").strip()
     normalized = normalize_status(raw_status)
-    clean_meta = sanitize_forbidden_fields(meta if isinstance(meta, Mapping) else {})
+    clean_meta = _sanitize_public_mapping(meta)
     if raw_status and raw_status.lower().replace("_", "-") != normalized:
-        clean_meta["raw_status"] = raw_status
+        public_raw_status = _public_safe_text(raw_status)
+        if public_raw_status:
+            clean_meta["raw_status"] = public_raw_status
     return normalized, clean_meta
 
 
@@ -559,7 +675,7 @@ def _merge_meta(data: Mapping[str, Any], known_keys: set[str]) -> dict[str, Any]
     }
     if isinstance(explicit_meta, Mapping):
         merged.update(explicit_meta)
-    return sanitize_forbidden_fields(merged)
+    return _sanitize_public_mapping(merged)
 
 
 def _strip_snapshot_content_volatile(value: Any) -> Any:
@@ -647,13 +763,13 @@ class SuggestedAction:
         *,
         command: str | None = None,
     ) -> None:
-        label = _string_value(label)
+        label = _public_safe_text(label, default="Action")
         tendwire_action = _string_value(tendwire_action)
         command_alias = _optional_string(command)
         public_tendwire_action = _public_tendwire_action_value(tendwire_action)
         explicit_tendwire_action = public_tendwire_action is not None
-        params = sanitize_forbidden_fields(params if isinstance(params, Mapping) else {})
-        action_id = _string_value(action_id) or stable_fingerprint(
+        params = _sanitize_public_mapping(params)
+        action_id = _public_safe_text(action_id) or stable_fingerprint(
             {"label": label, "tendwire_action": public_tendwire_action or "", "params": params}
         )
         object.__setattr__(self, "action_id", action_id)
@@ -677,7 +793,7 @@ class SuggestedAction:
         payload = {
             "action_id": self.action_id,
             "label": self.label,
-            "params": sanitize_forbidden_fields(self.params),
+            "params": _sanitize_public_mapping(self.params),
         }
         public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
         if self.has_public_tendwire_action and public_tendwire_action is not None:
@@ -689,7 +805,7 @@ class SuggestedAction:
         if isinstance(data, SuggestedAction):
             return data
         command = data.get("command") if isinstance(data, Mapping) else None
-        clean = sanitize_forbidden_fields(data if isinstance(data, Mapping) else {})
+        clean = _sanitize_public_mapping(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
@@ -712,12 +828,12 @@ class Space:
     fingerprint: str = ""
 
     def __post_init__(self) -> None:
-        space_id = _string_value(self.id, "unknown")
-        name = _string_value(self.name, space_id)
+        space_id = _public_safe_identity(self.id, prefix="space")
+        name = _public_safe_text(self.name, default=space_id)
         status, meta = _status_and_meta(self.status, self.meta)
         updated_at = _optional_timestamp(self.updated_at)
-        status_line = _optional_string(self.status_line)
-        fingerprint = _string_value(self.fingerprint) or stable_fingerprint(
+        status_line = _optional_public_safe_text(self.status_line)
+        fingerprint = _public_safe_fingerprint(self.fingerprint) or stable_fingerprint(
             {
                 "type": "space",
                 "id": space_id,
@@ -744,7 +860,7 @@ class Space:
             "updated_at": self.updated_at,
             "status_line": self.status_line,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_forbidden_fields(self.meta),
+            "meta": _sanitize_public_mapping(self.meta),
         }
 
     @classmethod
@@ -778,13 +894,13 @@ class Worker:
     backend_target: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        worker_id = _string_value(self.id, "unknown")
-        name = _string_value(self.name, worker_id)
+        worker_id = _public_safe_identity(self.id, prefix="worker")
+        name = _public_safe_text(self.name, default=worker_id)
         status, meta = _status_and_meta(self.status, self.meta)
-        space_id = _optional_string(self.space_id)
+        space_id = _optional_public_safe_identity(self.space_id, prefix="space")
         last_seen_at = _optional_timestamp(self.last_seen_at)
-        summary = _optional_string(self.summary)
-        fingerprint = _string_value(self.fingerprint) or stable_fingerprint(
+        summary = _optional_public_safe_text(self.summary)
+        fingerprint = _public_safe_fingerprint(self.fingerprint) or stable_fingerprint(
             {
                 "type": "worker",
                 "id": worker_id,
@@ -818,7 +934,7 @@ class Worker:
             "last_seen_at": self.last_seen_at,
             "summary": self.summary,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_forbidden_fields(self.meta),
+            "meta": _sanitize_public_mapping(self.meta),
         }
 
     @classmethod
@@ -881,14 +997,14 @@ class AttentionSignal:
         meta: Mapping[str, Any] | None = None,
         host_id: str | None = None,
     ) -> None:
-        resolved_kind = _string_value(kind, "general")
+        resolved_kind = _public_safe_text(kind, default="general")
         resolved_severity = normalize_severity(severity if severity is not None else level)
         resolved_status, clean_meta = _status_and_meta(status, meta or {})
-        resolved_reason = _string_value(reason)
-        resolved_source = _string_value(source)
+        resolved_reason = _public_safe_text(reason)
+        resolved_source = _public_safe_text(source, default="unknown")
         resolved_updated_at = _optional_timestamp(updated_at)
         actions = self._coerce_actions(suggested_actions)
-        resolved_fingerprint = _string_value(fingerprint) or attention_fingerprint(
+        resolved_fingerprint = _public_safe_fingerprint(fingerprint) or attention_fingerprint(
             host_id=_string_value(host_id),
             source=resolved_source,
             kind=resolved_kind,
@@ -896,7 +1012,7 @@ class AttentionSignal:
             reason=resolved_reason,
             status=resolved_status,
         )
-        resolved_id = _string_value(id) or f"attn-{resolved_fingerprint}"
+        resolved_id = _public_safe_text(id) or f"attn-{resolved_fingerprint}"
 
         object.__setattr__(self, "id", resolved_id)
         object.__setattr__(self, "kind", resolved_kind)
@@ -935,7 +1051,7 @@ class AttentionSignal:
             "updated_at": self.updated_at,
             "suggested_actions": [action.to_dict() for action in self.suggested_actions],
             "fingerprint": self.fingerprint,
-            "meta": sanitize_forbidden_fields(self.meta),
+            "meta": _sanitize_public_mapping(self.meta),
         }
 
     @classmethod

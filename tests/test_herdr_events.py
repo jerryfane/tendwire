@@ -312,9 +312,13 @@ def test_startup_reconcile_uses_socket_client_persists_projection_and_private_bi
         "agent.list",
     ]
     assert snapshot.backend_health[0].status == "healthy"
-    assert "agent-private" in {worker.id for worker in snapshot.workers}
-    assert list_worker_bindings(Path(config.db_path), config.host_id, backend="herdr")
+    assert "agent-private" not in {worker.id for worker in snapshot.workers}
+    assert all("private" not in worker.id.lower() for worker in snapshot.workers)
+    bindings = list_worker_bindings(Path(config.db_path), config.host_id, backend="herdr")
+    assert bindings
+    assert bindings[0].target_value == "agent-private"
     encoded = snapshot.to_json()
+    assert "agent-private" not in encoded
     assert "private-pane" not in encoded
     assert "terminal-private" not in encoded
     _assert_no_public_json_forbidden(json.loads(encoded))

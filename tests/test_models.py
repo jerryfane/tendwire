@@ -291,7 +291,8 @@ def test_suggested_action_from_dict_does_not_promote_forbidden_command_alias() -
         assert action.tendwire_action == ""
         assert action.command == raw_action["command"]
         assert not action.has_public_tendwire_action
-        assert payload["label"] == raw_action["label"]
+        expected_label = "Action" if raw_action["label"] == "Run raw command" else raw_action["label"]
+        assert payload["label"] == expected_label
         assert "tendwire_action" not in payload
         assert "safe" in payload["params"]
         assert "sentinel-" not in encoded
@@ -478,6 +479,208 @@ def test_space_worker_and_attention_serialization_include_contract_fields() -> N
     assert Worker.from_dict(worker_payload).to_dict() == worker_payload
     assert AttentionSignal.from_dict(signal_payload).to_dict() == signal_payload
     _assert_no_forbidden_fields(signal_payload)
+
+
+def test_public_model_text_values_strip_private_labels_before_fingerprints() -> None:
+    dirty_space = Space.from_dict(
+        {
+            "id": "space-1",
+            "name": "telegram delivery workspace",
+            "status": "telegram delivery",
+            "status_line": "backend target chat id",
+            "meta": {
+                "active_tab_id": "tab-1",
+                "safe": "kept",
+                "note": "terminal id",
+                "delivery.route": "leaked route",
+                "connector.outbox": "leaked connector",
+                "private.label": "leaked private",
+                "raw.status": "leaked raw",
+                "telegram.delivery": "leaked route",
+                "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+            },
+        }
+    )
+    clean_space = Space(
+        id="space-1",
+        name="space-1",
+        status="unknown",
+        meta={"active_tab_id": "tab-1", "safe": "kept", "nested": {"safe_nested": "kept"}},
+    )
+    dirty_worker = Worker(
+        id="worker-1",
+        name="message id worker",
+        status="bot token status",
+        summary="backend target pane id",
+        meta={
+            "safe": "kept",
+            "note": "session id",
+            "delivery.route": "leaked route",
+            "connector.outbox": "leaked connector",
+            "private.label": "leaked private",
+            "raw.status": "leaked raw",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+    )
+    clean_worker = Worker(
+        id="worker-1",
+        name="worker-1",
+        status="unknown",
+        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+    )
+    dirty_action = SuggestedAction(
+        action_id="telegram delivery action",
+        label="chat id approve",
+        tendwire_action="herdres route approve",
+        params={
+            "safe": "kept",
+            "note": "backend target",
+            "delivery.route": "leaked route",
+            "connector.outbox": "leaked connector",
+            "private.label": "leaked private",
+            "raw.status": "leaked raw",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+    )
+    clean_action = SuggestedAction(
+        label="Action",
+        params={"safe": "kept", "nested": {"safe_nested": "kept"}},
+    )
+    dirty_signal = AttentionSignal(
+        id="telegram delivery attention",
+        kind="telegram delivery",
+        severity="warning",
+        status="waiting",
+        reason="message id approval",
+        source="herdres route",
+        suggested_actions=[dirty_action],
+        fingerprint="herdres route private fingerprint",
+        meta={
+            "safe": "kept",
+            "note": "bot token",
+            "delivery.route": "leaked route",
+            "connector.outbox": "leaked connector",
+            "private.label": "leaked private",
+            "raw.status": "leaked raw",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+        host_id="model-host",
+    )
+    clean_signal = AttentionSignal(
+        kind="general",
+        severity="warning",
+        status="waiting",
+        source="unknown",
+        suggested_actions=[clean_action],
+        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+        host_id="model-host",
+    )
+    fallback_space = Space.from_dict({"name": "telegram delivery workspace"})
+    fallback_worker = Worker.from_dict(
+        {
+            "name": "telegram chat id worker",
+            "space_id": "telegram delivery workspace",
+        }
+    )
+    explicit_dirty_space = Space(
+        id="telegram delivery workspace",
+        name="Clean",
+        fingerprint="telegram delivery private fingerprint",
+    )
+    explicit_dirty_worker = Worker(
+        id="telegram chat id worker",
+        name="Clean",
+        space_id="telegram delivery workspace",
+        fingerprint="backend target private fingerprint",
+    )
+    private_suffix_space = Space(
+        id="target-private",
+        name="Clean",
+    )
+    private_suffix_worker = Worker(
+        id="pane-private",
+        name="Clean",
+        space_id="target-private",
+    )
+    standalone_backend_space = Space(
+        id="space-2",
+        name="herdres outbox",
+        status_line="outbox",
+    )
+    standalone_backend_worker = Worker(
+        id="worker-2",
+        name="Clean",
+        summary="herdres queue",
+    )
+    standalone_backend_action = SuggestedAction(
+        label="herdres worker",
+        params={"safe": "kept"},
+    )
+
+    payload = {
+        "space": dirty_space.to_dict(),
+        "worker": dirty_worker.to_dict(),
+        "signal": dirty_signal.to_dict(),
+        "fallback_space": fallback_space.to_dict(),
+        "fallback_worker": fallback_worker.to_dict(),
+        "explicit_dirty_space": explicit_dirty_space.to_dict(),
+        "explicit_dirty_worker": explicit_dirty_worker.to_dict(),
+        "redacted_suffix_space": private_suffix_space.to_dict(),
+        "redacted_suffix_worker": private_suffix_worker.to_dict(),
+        "standalone_backend_space": standalone_backend_space.to_dict(),
+        "standalone_backend_worker": standalone_backend_worker.to_dict(),
+        "standalone_backend_action": standalone_backend_action.to_dict(),
+    }
+    encoded = json.dumps(payload, sort_keys=True).lower()
+
+    assert dirty_space.to_dict() == clean_space.to_dict()
+    assert dirty_worker.to_dict() == clean_worker.to_dict()
+    assert dirty_action.to_dict() == clean_action.to_dict()
+    assert dirty_signal.to_dict() == clean_signal.to_dict()
+    assert fallback_space.id.startswith("space-")
+    assert fallback_space.name == fallback_space.id
+    assert fallback_worker.id.startswith("worker-")
+    assert fallback_worker.name == fallback_worker.id
+    assert fallback_worker.space_id is not None
+    assert fallback_worker.space_id.startswith("space-")
+    assert explicit_dirty_space.id.startswith("space-")
+    assert explicit_dirty_space.name == "Clean"
+    assert explicit_dirty_worker.id.startswith("worker-")
+    assert explicit_dirty_worker.name == "Clean"
+    assert explicit_dirty_worker.space_id is not None
+    assert explicit_dirty_worker.space_id.startswith("space-")
+    assert private_suffix_space.id.startswith("space-")
+    assert private_suffix_space.name == "Clean"
+    assert private_suffix_worker.id.startswith("worker-")
+    assert private_suffix_worker.name == "Clean"
+    assert private_suffix_worker.space_id is not None
+    assert private_suffix_worker.space_id.startswith("space-")
+    assert standalone_backend_space.name == "space-2"
+    assert standalone_backend_space.status_line is None
+    assert standalone_backend_worker.summary is None
+    assert standalone_backend_action.label == "Action"
+    for forbidden in (
+        "telegram",
+        "herdres",
+        "delivery",
+        "route",
+        "connector",
+        "outbox",
+        "private",
+        "raw.status",
+        "backend target",
+        "pane id",
+        "session id",
+        "terminal id",
+        "chat id",
+        "message id",
+        "bot token",
+    ):
+        assert forbidden not in encoded
+    _assert_no_forbidden_fields(payload)
 
 
 def test_worker_private_backend_target_and_raw_backend_meta_do_not_serialize() -> None:
