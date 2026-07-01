@@ -277,6 +277,99 @@ def test_pending_interaction_roundtrip_sanitizes_choices_and_ignores_timestamps(
     _assert_no_forbidden_fields(payload)
 
 
+def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints() -> None:
+    dirty_turn = Turn(
+        host_id="text-host",
+        worker_id="worker-1",
+        status="waiting",
+        kind="message",
+        title="message id pane id leaked",
+        summary="backend target chat id bot token",
+        source="telegram delivery",
+        meta={
+            "note": "terminal id session id",
+            "safe": "kept",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+    )
+    clean_turn = Turn(
+        host_id="text-host",
+        worker_id="worker-1",
+        status="waiting",
+        kind="message",
+        source="snapshot",
+        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+    )
+    dirty_choice = InteractionChoice(
+        choice_id="telegram delivery",
+        label="chat id approve",
+        value="bot token approve",
+        description="terminal id choice",
+        params={
+            "safe": "kept",
+            "note": "backend target pane id",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+    )
+    clean_choice = InteractionChoice(label="Action", params={"safe": "kept", "nested": {"safe_nested": "kept"}})
+    dirty_pending = PendingInteraction(
+        host_id="text-host",
+        worker_id="worker-1",
+        question="Approve message id update?",
+        kind="approval",
+        choices=[dirty_choice],
+        meta={
+            "source": "telegram delivery",
+            "safe": "kept",
+            "note": "chat id",
+            "telegram.delivery": "leaked route",
+            "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
+        },
+    )
+    clean_pending = PendingInteraction(
+        host_id="text-host",
+        worker_id="worker-1",
+        question="Action requires attention",
+        kind="approval",
+        choices=[clean_choice],
+        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+    )
+
+    turn_payload = dirty_turn.to_dict()
+    pending_payload = dirty_pending.to_dict()
+    encoded = json.dumps({"turn": turn_payload, "pending": pending_payload}, sort_keys=True).lower()
+
+    assert turn_payload["title"] is None
+    assert turn_payload["summary"] is None
+    assert turn_payload["source"] == "snapshot"
+    assert turn_payload["meta"] == {"safe": "kept", "nested": {"safe_nested": "kept"}}
+    assert dirty_turn.id == clean_turn.id
+    assert dirty_turn.fingerprint == clean_turn.fingerprint
+    assert dirty_choice.to_dict() == clean_choice.to_dict()
+    assert pending_payload["question"] == "Action requires attention"
+    assert pending_payload["meta"] == {"safe": "kept", "nested": {"safe_nested": "kept"}}
+    assert dirty_pending.id == clean_pending.id
+    assert dirty_pending.fingerprint == clean_pending.fingerprint
+    for forbidden in (
+        "telegram",
+        "herdres",
+        "delivery",
+        "route",
+        "backend target",
+        "pane id",
+        "session id",
+        "terminal id",
+        "chat id",
+        "message id",
+        "bot token",
+    ):
+        assert forbidden not in encoded
+    _assert_no_forbidden_fields(turn_payload)
+    _assert_no_forbidden_fields(pending_payload)
+
+
 def test_turn_pending_and_choice_strip_pr5_private_fields_before_fingerprints() -> None:
     dirty_meta = {
         "safe": "kept",

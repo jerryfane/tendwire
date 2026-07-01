@@ -15,8 +15,10 @@ from typing import Any
 from .models import (
     AttentionSignal,
     BackendHealth,
+    FORBIDDEN_FIELD_NAMES,
     Snapshot,
     Worker,
+    _is_forbidden_field_name,
     normalize_status,
     sanitize_forbidden_fields,
     stable_fingerprint,
@@ -134,6 +136,8 @@ _RAW_COMMAND_HEAD_RE = re.compile(
 )
 _RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
 _SHELL_META_RE = re.compile(r"[;&|`$<>]")
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_PUBLIC_DROP = object()
 
 
 def _normalize_turn_kind(kind: Any) -> str:
@@ -166,8 +170,69 @@ def _truthy(value: Any) -> bool:
 
 
 def _clean_meta(value: Any) -> dict[str, Any]:
-    clean = sanitize_forbidden_fields(value if isinstance(value, Mapping) else {})
+    clean = _clean_public_value(value if isinstance(value, Mapping) else {})
     return clean if isinstance(clean, dict) else {}
+
+
+def _public_text_tokens(value: str) -> list[str]:
+    separated = _CAMEL_CASE_BOUNDARY_RE.sub(" ", value)
+    return [
+        part.lower()
+        for part in re.split(r"[^A-Za-z0-9]+", separated)
+        if part
+    ]
+
+
+def _contains_forbidden_public_text(value: str) -> bool:
+    tokens = _public_text_tokens(value)
+    if not tokens:
+        return False
+    for index in range(len(tokens)):
+        for size in range(1, min(4, len(tokens) - index) + 1):
+            phrase = "_".join(tokens[index : index + size])
+            if phrase == "command":
+                continue
+            if _is_forbidden_field_name(phrase):
+                return True
+    return bool(set(tokens) & (FORBIDDEN_FIELD_NAMES - {"command"}))
+
+
+def _public_text(value: Any, *, default: str = "") -> str:
+    text = _string_value(value).strip()
+    if not text or _contains_forbidden_public_text(text):
+        return default
+    return " ".join(text.split())
+
+
+def _optional_public_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = _public_text(value)
+    return text or None
+
+
+def _clean_public_value(value: Any) -> Any:
+    clean = sanitize_forbidden_fields(value)
+    if isinstance(clean, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in clean.items():
+            key_text = str(key)
+            if _contains_forbidden_public_text(key_text):
+                continue
+            sanitized = _clean_public_value(item)
+            if sanitized is not _PUBLIC_DROP:
+                result[key_text] = sanitized
+        return result
+    if isinstance(clean, list):
+        result_list: list[Any] = []
+        for item in clean:
+            sanitized = _clean_public_value(item)
+            if sanitized is not _PUBLIC_DROP:
+                result_list.append(sanitized)
+        return result_list
+    if isinstance(clean, str):
+        return _PUBLIC_DROP if _contains_forbidden_public_text(clean) else clean
+    return clean
 
 
 def _normalized_key(value: Any) -> str:
@@ -208,7 +273,9 @@ def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
 
 
 def _optional_public_description(value: Any) -> str | None:
-    clean = sanitize_forbidden_fields(value)
+    clean = _clean_public_value(value)
+    if clean is _PUBLIC_DROP:
+        return None
     if clean in ({}, []):
         return None
     if isinstance(clean, Mapping) or isinstance(clean, list):
@@ -233,7 +300,9 @@ def _looks_like_raw_command(value: str) -> bool:
 
 
 def _public_choice_value(value: Any) -> Any | None:
-    clean = sanitize_forbidden_fields(value)
+    clean = _clean_public_value(value)
+    if clean is _PUBLIC_DROP:
+        return None
     if clean in ({}, [], ""):
         return None
     if isinstance(clean, str):
@@ -262,11 +331,11 @@ class InteractionChoice:
     params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        label = _string_value(self.label)
+        label = _public_text(self.label, default="Action")
         description = _optional_public_description(self.description)
         params = _clean_meta(self.params)
         value = _public_choice_value(self.value)
-        choice_id = _string_value(self.choice_id) or stable_fingerprint(
+        choice_id = _public_text(self.choice_id) or stable_fingerprint(
             {
                 "label": label,
                 "value": value,
@@ -335,11 +404,11 @@ class Turn:
         worker_id = _string_value(self.worker_id, "unknown")
         status = normalize_status(self.status)
         kind = _normalize_turn_kind(self.kind)
-        source = _string_value(self.source, "snapshot")
+        source = _public_text(self.source, default="snapshot")
         worker_fingerprint = _optional_string(self.worker_fingerprint)
         space_id = _optional_string(self.space_id)
-        title = _optional_string(self.title)
-        summary = _optional_string(self.summary)
+        title = _optional_public_text(self.title)
+        summary = _optional_public_text(self.summary)
         started_at = _optional_timestamp(self.started_at)
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
@@ -462,7 +531,7 @@ class PendingInteraction:
         worker_fingerprint = _optional_string(self.worker_fingerprint)
         space_id = _optional_string(self.space_id)
         kind = _normalize_pending_kind(self.kind)
-        question = _string_value(self.question)
+        question = _public_text(self.question, default="Action requires attention")
         choices = sorted(
             (choice if isinstance(choice, InteractionChoice) else InteractionChoice.from_dict(choice) for choice in self.choices),
             key=lambda choice: (choice.choice_id, choice.label),
