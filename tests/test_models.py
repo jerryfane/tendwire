@@ -144,7 +144,7 @@ _FORBIDDEN_FIELD_COMPACT = {field.replace("_", "") for field in _FORBIDDEN_FIELD
 
 
 def _is_forbidden_test_key(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
+    normalized = str(key).lower().replace("-", "_").replace(".", "_")
     return normalized in _FORBIDDEN_FIELDS or normalized.replace("_", "") in _FORBIDDEN_FIELD_COMPACT
 
 
@@ -185,7 +185,9 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
         "pane_id": "sentinel-pane",
         "terminal_id": "sentinel-terminal",
         "backend_target": "sentinel-backend",
+        "backend.target": "sentinel-dot-backend",
         "session_id": "sentinel-session",
+        "bot.token": "sentinel-dot-token",
         "messageIds": "sentinel-message-ids",
         "terminalIds": "sentinel-terminal-ids",
         "terminal": "sentinel-terminal-object",
@@ -204,9 +206,11 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
                 "processId": "sentinel-camel-process",
                 "tmux-session": "sentinel-kebab-tmux",
                 "terminalid": "sentinel-compact-terminal",
+                "terminal.id": "sentinel-dot-terminal",
                 "backendTarget": "sentinel-camel-backend",
                 "screenSession": "sentinel-camel-screen",
                 "privateBinding": "sentinel-private-binding",
+                "private.binding": "sentinel-dot-private-binding",
                 "telegramChatId": "sentinel-chat",
                 "authToken": "sentinel-auth",
                 "cookies": "sentinel-cookie",
@@ -217,8 +221,10 @@ def test_sanitize_forbidden_fields_strips_pr5_nested_and_variant_keys() -> None:
         "tuple": (
             {
                 "pane-id": "sentinel-kebab-pane",
+                "pane.id": "sentinel-dot-pane",
                 "tabId": "sentinel-camel-tab",
                 "raw-command-line": "sentinel-raw-command-line",
+                "raw.command.line": "sentinel-dot-raw-command-line",
                 "safe_tuple": "kept",
             },
         ),
@@ -822,6 +828,10 @@ def test_backend_health_message_redacts_secret_label_variants() -> None:
         "stdout=abc123 failed",
         "stderr=abc123 failed",
         "stderr token pane_id secret",
+        "backend.target leaked",
+        "pane.id leaked",
+        "message.id leaked",
+        "raw.command.line leaked",
     ]
 
     for message in unsafe_messages:

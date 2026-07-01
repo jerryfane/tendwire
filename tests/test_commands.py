@@ -144,7 +144,7 @@ _FORBIDDEN_COMMAND_COMPACT = {
 
 
 def _is_forbidden_command_key(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
+    normalized = str(key).lower().replace("-", "_").replace(".", "_")
     return (
         normalized in _FORBIDDEN_COMMAND_FIELDS
         or normalized.replace("_", "") in _FORBIDDEN_COMMAND_COMPACT
@@ -303,6 +303,23 @@ def test_validate_request_rejects_forbidden_nested_fields() -> None:
     assert error["code"] == STATUS_INVALID_REQUEST
 
 
+def test_validate_request_rejects_dot_separated_forbidden_fields() -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        target={"worker_id": "w-1", "pane.id": "leaked"},
+        instruction={"text": "ok", "raw.command": "leaked"},
+        params={"nested": [{"backend.target": "leaked", "bot.token": "leaked"}]},
+    )
+    error = validate_request(request)
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    details = str(error.get("details", {}))
+    assert "$.target.pane.id" in details
+    assert "$.instruction.raw.command" in details
+    assert "$.params.nested[0].backend.target" in details
+    assert "$.params.nested[0].bot.token" in details
+
+
 @pytest.mark.parametrize("field", sorted(_FORBIDDEN_COMMAND_FIELDS))
 def test_parse_command_request_rejects_raw_top_level_forbidden_field(field: str) -> None:
     """Raw decoded JSON is rejected before from_dict drops unknown top-level keys."""
@@ -322,6 +339,28 @@ def test_parse_command_request_rejects_raw_top_level_forbidden_field(field: str)
     assert error is not None, field
     assert error["code"] == STATUS_INVALID_REQUEST, field
     assert field in str(error.get("details", {}))
+
+
+def test_parse_command_request_rejects_raw_dot_separated_forbidden_fields() -> None:
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "action": "send_instruction",
+            "request_id": "raw-dot-rej",
+            "dry_run": False,
+            "target": {"worker_id": "w-1"},
+            "instruction": {"text": "hello"},
+            "message.id": "leaked",
+            "params": {"nested": {"backend.target": "leaked"}},
+        }
+    )
+    request, error = parse_command_request(payload)
+    assert request is None
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    details = str(error.get("details", {}))
+    assert "$.message.id" in details
+    assert "$.params.nested.backend.target" in details
 
 
 def test_parse_command_request_rejects_unknown_top_level_fields() -> None:

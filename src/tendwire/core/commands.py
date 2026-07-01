@@ -90,11 +90,11 @@ _DISALLOWED_WORKER_STATUSES = frozenset({"closed", "failed", "unknown"})
 
 
 def _compact_field_name(key: Any) -> str:
-    return str(key).lower().replace("-", "_").replace("_", "")
+    return str(key).lower().replace("-", "_").replace(".", "_").replace("_", "")
 
 
 def _is_forbidden_request_field(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
+    normalized = str(key).lower().replace("-", "_").replace(".", "_")
     compact = _compact_field_name(key)
     return normalized in FORBIDDEN_REQUEST_FIELDS or compact in _FORBIDDEN_REQUEST_COMPACT
 
@@ -383,7 +383,8 @@ def parse_command_request(payload: str) -> tuple[CommandRequest | None, dict[str
     forbidden = _find_forbidden_fields(data)
     if forbidden:
         request = None
-        if not any(path.count(".") == 1 and "[" not in path for path in forbidden):
+        top_level_forbidden = any(_is_forbidden_request_field(key) for key in data)
+        if not top_level_forbidden:
             try:
                 request = CommandRequest.from_dict(data)
             except Exception:

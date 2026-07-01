@@ -250,7 +250,9 @@ FORBIDDEN_FIELD_NAMES = frozenset(
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_BACKEND_MESSAGE_LABEL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)?")
+_BACKEND_MESSAGE_LABEL_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_-]*\s+[A-Za-z][A-Za-z0-9_-]*|[A-Za-z][A-Za-z0-9_.-]*"
+)
 _RAW_COMMAND_HEAD_RE = re.compile(
     r"^(?:sudo\s+)?(?:env\s+)?"
     r"(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python\d*|node|npm|npx|git|gh|docker|"
@@ -264,14 +266,14 @@ WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
 
 def _is_forbidden_field_name(key: Any) -> bool:
-    normalized = str(key).lower().replace("-", "_")
+    normalized = str(key).lower().replace("-", "_").replace(".", "_")
     compact = normalized.replace("_", "")
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
 
 
 def _is_forbidden_backend_message_label(value: str) -> bool:
     separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
-    normalized = "_".join(part for part in re.split(r"[\s_-]+", separated.lower()) if part)
+    normalized = "_".join(part for part in re.split(r"[\s_.-]+", separated.lower()) if part)
     compact = normalized.replace("_", "")
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
 
