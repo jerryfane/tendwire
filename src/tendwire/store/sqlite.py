@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -398,6 +398,14 @@ _CONNECTOR_LEASE_STATUS = "leased"
 _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
 _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
+_CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
+    {
+        _CONNECTOR_LEASE_STATUS,
+        _CONNECTOR_TERMINAL_OUTBOX_STATUS,
+        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+        *_CONNECTOR_POLLABLE_STATUSES,
+    }
+)
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_PUBLIC_DROP = object()
 _CONNECTOR_FORBIDDEN_PUBLIC_TEXT = (
@@ -416,6 +424,11 @@ _CONNECTOR_FORBIDDEN_PUBLIC_TEXT = (
     "argv",
     "connector",
     "delivery",
+)
+_STORE_METADATA_FORBIDDEN_PUBLIC_TEXT = (
+    *_CONNECTOR_FORBIDDEN_PUBLIC_TEXT,
+    "private",
+    "raw",
 )
 
 
@@ -476,6 +489,26 @@ def _connector_contains_forbidden_public_text(value: str) -> bool:
         token in lowered or token.replace("_", "") in compact
         for token in _CONNECTOR_FORBIDDEN_PUBLIC_TEXT
     )
+
+
+def _store_public_label(value: Any, *, allowed: Collection[str] | None = None) -> str:
+    lowered = str(value or "").strip().lower().replace("-", "_")
+    clean = "".join(
+        char if char.isalnum() or char in {"_", "."} else "_"
+        for char in lowered
+    )
+    clean = "_".join(part for part in clean.split("_") if part).strip("._")[:64]
+    if not clean:
+        return "unknown"
+    compact = clean.replace("_", "").replace(".", "")
+    if any(
+        token in clean or token.replace("_", "") in compact
+        for token in _STORE_METADATA_FORBIDDEN_PUBLIC_TEXT
+    ):
+        return "unknown"
+    if allowed is not None and clean not in allowed:
+        return "unknown"
+    return clean
 
 
 def _connector_sanitize_public_value(value: Any) -> Any:
@@ -2706,7 +2739,10 @@ def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
             """,
             (str(host_id),),
         ).fetchall()
-    by_status = {str(row[0] or "unknown"): int(row[1] or 0) for row in outbox_rows}
+    by_status: dict[str, int] = {}
+    for row in outbox_rows:
+        status = _store_public_label(row[0], allowed=_CONNECTOR_PUBLIC_OUTBOX_STATUSES)
+        by_status[status] = by_status.get(status, 0) + int(row[1] or 0)
     pending_statuses = _CONNECTOR_POLLABLE_STATUSES
     terminal_statuses = {_CONNECTOR_TERMINAL_OUTBOX_STATUS, _CONNECTOR_EXHAUSTED_OUTBOX_STATUS}
     outbox = {
@@ -2761,8 +2797,8 @@ def tail_event_metadata(
     events = [
         {
             "row_id": int(row[0]),
-            "event_type": str(row[1] or ""),
-            "aggregate_type": str(row[2] or ""),
+            "event_type": _store_public_label(row[1]),
+            "aggregate_type": _store_public_label(row[2]),
             "observed_at": str(row[3] or ""),
             "content_fingerprint": str(row[4] or ""),
         }

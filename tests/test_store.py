@@ -266,6 +266,70 @@ def test_store_status_tail_and_retention_cleanup_are_host_scoped_and_bounded(tmp
     assert outbox_rows == 1
 
 
+def test_store_operational_metadata_buckets_unsafe_labels(tmp_path: Path) -> None:
+    db_path = tmp_path / "unsafe-metadata.db"
+    init_store(db_path)
+    append_event(
+        db_path,
+        "storehost",
+        "telegram.delivery",
+        {"safe": "kept"},
+        aggregate_type="raw_payload",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attention",
+                "job-unsafe",
+                "telegram_delivery",
+                '{"safe":"kept"}',
+                "{}",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attention",
+                "job-queued",
+                "queued",
+                '{"safe":"kept"}',
+                "{}",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    status = store_status(db_path, "storehost")
+    tail = tail_event_metadata(db_path, "storehost", limit=10)
+    encoded = json.dumps({"status": status, "tail": tail}, sort_keys=True).lower()
+
+    assert status["outbox"]["pending"] == 1
+    assert status["outbox"]["by_status"]["queued"] == 1
+    assert status["outbox"]["by_status"]["unknown"] == 1
+    assert "telegram_delivery" not in status["outbox"]["by_status"]
+    assert tail["events"][0]["event_type"] == "unknown"
+    assert tail["events"][0]["aggregate_type"] == "unknown"
+    assert "telegram" not in encoded
+    assert "raw_payload" not in encoded
+    assert "delivery" not in encoded
+
+
 def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -> None:
     db_path = tmp_path / "outbox-maintenance.db"
     init_store(db_path)
