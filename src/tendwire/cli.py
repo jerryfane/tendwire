@@ -647,6 +647,12 @@ def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnve
     return cached
 
 
+def _command_request_json(request: Any) -> str:
+    if hasattr(request, "to_dict"):
+        return stable_json_dumps(request.to_dict())
+    return "{}"
+
+
 def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
     """Reserve a mutating command key, or return an existing receipt envelope."""
     from .core.commands import CommandRequest
@@ -672,6 +678,7 @@ def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | 
         payload_fingerprint=request.payload_fingerprint(),
         pending_result_json=envelope_to_receipt_json(pending),
         status=STATUS_PENDING,
+        request_json=_command_request_json(request),
     )
     if reservation["reserved"]:
         return None

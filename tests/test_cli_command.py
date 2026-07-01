@@ -1779,6 +1779,22 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     cached = json.loads(receipt["result_json"])
     assert cached["request_id"] == "req-visible"
     assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    with sqlite3.connect(str(db_path)) as conn:
+        audit_row = conn.execute(
+            """
+            SELECT request_json
+            FROM commands
+            WHERE host_id = ?
+              AND request_id = ?
+              AND action = ?
+            """,
+            ("cmd-host", "req-visible", "send_instruction"),
+        ).fetchone()
+    assert audit_row is not None
+    audit_request = json.loads(audit_row[0])
+    assert audit_request["request_id"] == "req-visible"
+    assert audit_request["target"] == {"worker_id": "w-1"}
+    assert audit_request["instruction"] == {"text": "hello"}
     current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
     assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
