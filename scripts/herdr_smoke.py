@@ -1079,18 +1079,149 @@ def _close_live_smoke_pane(
     session_plan: SessionPlan,
     runner: Runner | None,
     pane_id: str | None,
-) -> None:
+) -> dict[str, Any]:
     if not pane_id:
-        return
+        return _check(
+            "close_exited",
+            "skipped",
+            required=False,
+            ok=True,
+            detail="live_skipped_unreliable",
+            limitation="live_skipped_unreliable",
+            closed_count=0,
+            exited_count=0,
+        )
     try:
-        _run_command(
+        completed = _run_command(
             _herdr_args(options, session_plan, ("pane", "close", pane_id)),
             env=session_plan.child_env,
             timeout=options.timeout,
             runner=runner,
         )
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        return _check(
+            "close_exited",
+            "timeout",
+            required=True,
+            ok=False,
+            detail="timeout",
+            closed_count=0,
+            exited_count=0,
+        )
+    except FileNotFoundError:
+        return _check(
+            "close_exited",
+            "missing_binary",
+            required=True,
+            ok=False,
+            detail="binary_unavailable",
+            closed_count=0,
+            exited_count=0,
+        )
+    except OSError:
+        return _check(
+            "close_exited",
+            "launch_error",
+            required=True,
+            ok=False,
+            detail="launch_failed",
+            closed_count=0,
+            exited_count=0,
+        )
+    exit_code = _return_code(completed)
+    ok = exit_code == 0
+    return _check(
+        "close_exited",
+        "ok" if ok else "nonzero",
+        required=True,
+        ok=ok,
+        exit_code=exit_code,
+        detail="live_closed" if ok else "close_failed",
+        closed_count=1 if ok else 0,
+        exited_count=1 if ok else 0,
+    )
+
+
+def _run_live_move_probe(
+    options: SmokeOptions,
+    session_plan: SessionPlan,
+    runner: Runner | None,
+    pane_id: str | None,
+) -> dict[str, Any]:
+    if not pane_id:
+        return _check(
+            "pane_moved_binding_update",
+            "skipped",
+            required=False,
+            ok=True,
+            detail="live_skipped_unreliable",
+            limitation="live_skipped_unreliable",
+            worker_count_before=0,
+            worker_count_after=0,
+            updated_count=0,
+            preserved=False,
+        )
+    try:
+        completed = _run_command(
+            _herdr_args(
+                options,
+                session_plan,
+                ("pane", "move", pane_id, "--new-tab", "--label", "Tendwire smoke move", "--no-focus"),
+            ),
+            env=session_plan.child_env,
+            timeout=options.timeout,
+            runner=runner,
+        )
+    except subprocess.TimeoutExpired:
+        return _check(
+            "pane_moved_binding_update",
+            "timeout",
+            required=True,
+            ok=False,
+            detail="timeout",
+            worker_count_before=1,
+            worker_count_after=0,
+            updated_count=0,
+            preserved=False,
+        )
+    except FileNotFoundError:
+        return _check(
+            "pane_moved_binding_update",
+            "missing_binary",
+            required=True,
+            ok=False,
+            detail="binary_unavailable",
+            worker_count_before=1,
+            worker_count_after=0,
+            updated_count=0,
+            preserved=False,
+        )
+    except OSError:
+        return _check(
+            "pane_moved_binding_update",
+            "launch_error",
+            required=True,
+            ok=False,
+            detail="launch_failed",
+            worker_count_before=1,
+            worker_count_after=0,
+            updated_count=0,
+            preserved=False,
+        )
+    exit_code = _return_code(completed)
+    ok = exit_code == 0
+    return _check(
+        "pane_moved_binding_update",
+        "ok" if ok else "nonzero",
+        required=True,
+        ok=ok,
+        exit_code=exit_code,
+        detail="live_moved" if ok else "move_failed",
+        worker_count_before=1,
+        worker_count_after=1 if ok else 0,
+        updated_count=1 if ok else 0,
+        preserved=ok,
+    )
 
 
 def _run_send_probe(
@@ -1534,6 +1665,8 @@ def _live_payload(options: SmokeOptions, env: Mapping[str, str], runner: Runner 
     if smoke_cwd_context is not None:
         smoke_cwd = smoke_cwd_context.__enter__()
     smoke_pane_id: str | None = None
+    move_check = deterministic["pane_moved_binding_update"]
+    close_check = deterministic["close_exited"]
     try:
         create_check, smoke_pane_id = _run_live_create_attach_probe(
             options,
@@ -1548,8 +1681,9 @@ def _live_payload(options: SmokeOptions, env: Mapping[str, str], runner: Runner 
             runner,
             live_target_ready=smoke_pane_id is not None,
         )
+        move_check = _run_live_move_probe(options, session_plan, runner, smoke_pane_id)
     finally:
-        _close_live_smoke_pane(options, session_plan, runner, smoke_pane_id)
+        close_check = _close_live_smoke_pane(options, session_plan, runner, smoke_pane_id)
         if smoke_cwd_context is not None:
             smoke_cwd_context.__exit__(None, None, None)
 
@@ -1560,8 +1694,8 @@ def _live_payload(options: SmokeOptions, env: Mapping[str, str], runner: Runner 
         deterministic["target_validation"],
         _event_subscription_aggregate_check(),
         _live_status_check(options, session_plan, runner, deterministic["status_agent_status_changed"]),
-        deterministic["pane_moved_binding_update"],
-        deterministic["close_exited"],
+        move_check,
+        close_check,
         deterministic["degraded_backend_preserves_workers"],
     ]
 

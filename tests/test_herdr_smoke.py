@@ -211,6 +211,8 @@ class RecordingRunner:
                     },
                 }
             )
+        if argv[3:5] == ["pane", "move"]:
+            return json.dumps({"id": "cli:pane:move", "result": {"type": "ok"}})
         if argv[3:5] == ["pane", "close"]:
             return json.dumps({"id": "cli:pane:close", "result": {"type": "ok"}})
         if "workspace" in joined and "list" in joined:
@@ -311,8 +313,10 @@ def test_live_session_selection_and_argv_construction(
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
     assert bool(send_calls) is expect_send
     start_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "start"]]
+    move_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "move"]]
     close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
     assert bool(start_calls) is expect_send
+    assert bool(move_calls) is expect_send
     assert bool(close_calls) is expect_send
     assert data.get("default_isolated_session") is expected_default
     assert data.get("explicit_session") is expected_explicit
@@ -323,9 +327,11 @@ def test_live_session_selection_and_argv_construction(
         assert create["status"] == "ok"
         assert create["detail"] == "live_created"
         assert "limitation" not in create
+        assert _check_by_name(data, "pane_moved_binding_update")["detail"] == "live_moved"
+        assert _check_by_name(data, "close_exited")["detail"] == "live_closed"
     else:
         assert create["limitation"] == "caller_override"
-    assert _check_by_name(data, "pane_moved_binding_update")["limitation"] == "live_skipped_unreliable"
+        assert _check_by_name(data, "pane_moved_binding_update")["limitation"] == "live_skipped_unreliable"
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
@@ -349,6 +355,8 @@ def test_environment_variable_opts_into_live_mode(smoke_module, monkeypatch, cap
     assert data.get("mode") == "live"
     assert _check_by_name(data, "create_attach")["detail"] == "live_created"
     assert _check_by_name(data, "send_addressing")["send_attempts"] == 1
+    assert _check_by_name(data, "pane_moved_binding_update")["detail"] == "live_moved"
+    assert _check_by_name(data, "close_exited")["detail"] == "live_closed"
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
 
 
@@ -408,8 +416,10 @@ def test_live_nonzero_send_is_not_ok(smoke_module, monkeypatch, capsys):
     assert send["exit_code"] == 1
     assert send["accepted_count"] == 0
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    move_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "move"]]
     close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
     assert len(send_calls) == 1
+    assert len(move_calls) == 1
     assert len(close_calls) == 1
     assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
@@ -431,8 +441,10 @@ def test_live_zero_accepted_send_is_not_ok(smoke_module, monkeypatch, capsys):
     assert send["json_status"] == "valid"
     assert send["accepted_count"] == 0
     send_calls = [call for call in runner.calls if call["argv"][3:5] == ["agent", "send"]]
+    move_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "move"]]
     close_calls = [call for call in runner.calls if call["argv"][3:5] == ["pane", "close"]]
     assert len(send_calls) == 1
+    assert len(move_calls) == 1
     assert len(close_calls) == 1
     assert send_calls[0]["argv"][1:3] == ["--session", "tendwire-smoke"]
     _assert_public_json_safe(public_text, *PRIVATE_MARKERS)
