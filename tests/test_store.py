@@ -330,6 +330,65 @@ def test_store_operational_metadata_buckets_unsafe_labels(tmp_path: Path) -> Non
     assert "delivery" not in encoded
 
 
+def test_attention_payload_from_store_buckets_unsafe_row_text(tmp_path: Path) -> None:
+    db_path = tmp_path / "unsafe-attention.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO attention_items (
+                host_id, attention_id, source, kind, severity, status,
+                updated_at, fingerprint, snapshot_content_fingerprint, observed_at,
+                first_seen_at, last_seen_at, last_changed_at, lifecycle_status,
+                resolved_reason, signal_count, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "storehost",
+                "attn-unsafe",
+                "telegram:chat",
+                "herdres_delivery",
+                "warning",
+                "blocked",
+                "2026-01-01T00:00:00+00:00",
+                "fp-unsafe",
+                "snapshot-fp",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "open",
+                "telegram delivery resolved",
+                1,
+                json.dumps(
+                    {
+                        "reason": "telegram delivery token",
+                        "meta": {"kept": "visible", "unsafe": "herdres route"},
+                        "suggested_actions": [
+                            {"label": "notify telegram", "tendwire_action": "noop"}
+                        ],
+                    }
+                ),
+            ),
+        )
+
+    payload = attention_payload_from_store(db_path, "storehost")
+    assert payload is not None
+    item = payload["attention"][0]
+    encoded = json.dumps(payload, sort_keys=True).lower()
+
+    assert item["source"] == "unknown"
+    assert item["kind"] == "unknown"
+    assert item["reason"] == ""
+    assert item["meta"] == {"kept": "visible"}
+    assert "resolved_reason" not in item
+    assert "telegram" not in encoded
+    assert "herdres" not in encoded
+    assert "delivery" not in encoded
+    assert "token" not in encoded
+    assert "route" not in encoded
+
+
 def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -> None:
     db_path = tmp_path / "outbox-maintenance.db"
     init_store(db_path)

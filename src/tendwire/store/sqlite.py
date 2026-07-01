@@ -408,6 +408,7 @@ _CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
 )
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_PUBLIC_DROP = object()
+_STORE_PUBLIC_DROP = object()
 _CONNECTOR_FORBIDDEN_PUBLIC_TEXT = (
     "telegram",
     "herdr",
@@ -509,6 +510,50 @@ def _store_public_label(value: Any, *, allowed: Collection[str] | None = None) -
     if allowed is not None and clean not in allowed:
         return "unknown"
     return clean
+
+
+def _store_contains_forbidden_public_text(value: str) -> bool:
+    lowered = value.lower()
+    compact = lowered.replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+    return any(
+        token in lowered or token.replace("_", "") in compact
+        for token in _STORE_METADATA_FORBIDDEN_PUBLIC_TEXT
+    )
+
+
+def _store_public_text(value: Any, *, default: str = "") -> str:
+    text = str(value or "").strip()
+    if not text or _store_contains_forbidden_public_text(text):
+        return default
+    return text
+
+
+def _store_sanitize_public_value(value: Any) -> Any:
+    clean = sanitize_forbidden_fields(value)
+    if isinstance(clean, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in clean.items():
+            sanitized = _store_sanitize_public_value(item)
+            if sanitized is not _STORE_PUBLIC_DROP:
+                result[str(key)] = sanitized
+        return result
+    if isinstance(clean, list):
+        result_list: list[Any] = []
+        for item in clean:
+            sanitized = _store_sanitize_public_value(item)
+            if sanitized is not _STORE_PUBLIC_DROP:
+                result_list.append(sanitized)
+        return result_list
+    if isinstance(clean, str) and _store_contains_forbidden_public_text(clean):
+        return _STORE_PUBLIC_DROP
+    return clean
+
+
+def _store_sanitize_public_mapping(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    clean = _store_sanitize_public_value(dict(value))
+    return dict(clean) if isinstance(clean, Mapping) else {}
 
 
 def _connector_sanitize_public_value(value: Any) -> Any:
@@ -3019,18 +3064,19 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
         parsed = json.loads(row[9] or "{}")
     except (TypeError, json.JSONDecodeError):
         parsed = {}
-    payload = dict(parsed) if isinstance(parsed, Mapping) else {}
+    payload = _store_sanitize_public_mapping(parsed)
     payload.update(
         {
             "id": str(row[0] or ""),
-            "source": str(row[1] or ""),
-            "kind": str(row[2] or "unknown"),
+            "source": _store_public_text(row[1], default="unknown"),
+            "kind": _store_public_label(row[2]),
             "severity": str(row[3] or "info"),
             "status": str(row[4] or "unknown"),
             "updated_at": row[5],
             "fingerprint": str(row[6] or ""),
         }
     )
+    payload["reason"] = _store_public_text(payload.get("reason"), default="")
     return _attention_lifecycle_payload(
         payload,
         attention_id=str(row[0] or ""),
@@ -3040,7 +3086,7 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
         last_changed_at=str(row[12] or row[8] or ""),
         resolved_at=row[13],
         lifecycle_status=str(row[14] or ATTENTION_LIFECYCLE_OPEN),
-        resolved_reason=row[15],
+        resolved_reason=_store_public_text(row[15], default="") or None,
         signal_count=int(row[16] or 1),
     )
 
