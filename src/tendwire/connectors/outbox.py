@@ -58,9 +58,13 @@ _FORBIDDEN_PUBLIC_TEXT = (
 )
 
 
+def _compact_public_text(value: str) -> str:
+    return "".join(char for char in value.lower() if char.isalnum())
+
+
 def _contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = lowered.replace("-", "").replace("_", "").replace(".", "")
+    compact = _compact_public_text(lowered)
     return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 

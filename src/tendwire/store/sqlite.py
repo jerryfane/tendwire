@@ -483,13 +483,24 @@ def _connector_public_ref() -> str:
     return f"{_CONNECTOR_REF_PREFIX}{secrets.token_hex(32)}"
 
 
+def _compact_public_text(value: str) -> str:
+    return "".join(char for char in value.lower() if char.isalnum())
+
+
 def _connector_contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = lowered.replace("-", "").replace("_", "").replace(".", "")
+    compact = _compact_public_text(lowered)
     return any(
         token in lowered or token.replace("_", "") in compact
         for token in _CONNECTOR_FORBIDDEN_PUBLIC_TEXT
     )
+
+
+def _connector_public_reason(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or _connector_contains_forbidden_public_text(text):
+        return ""
+    return text
 
 
 def _store_public_label(value: Any, *, allowed: Collection[str] | None = None) -> str:
@@ -514,7 +525,7 @@ def _store_public_label(value: Any, *, allowed: Collection[str] | None = None) -
 
 def _store_contains_forbidden_public_text(value: str) -> bool:
     lowered = value.lower()
-    compact = lowered.replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+    compact = _compact_public_text(lowered)
     return any(
         token in lowered or token.replace("_", "") in compact
         for token in _STORE_METADATA_FORBIDDEN_PUBLIC_TEXT
@@ -1136,6 +1147,7 @@ def _connector_update_ref(
         return _connector_error_response(status="store_unavailable", host_id=host_id, name=name, ref=ref)
     current_time = _connector_now(now)
     sanitized_response = _connector_sanitize_public_mapping(response or {})
+    sanitized_reason = _connector_public_reason(reason)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -1224,7 +1236,7 @@ def _connector_update_ref(
                     {
                         "schema_version": 1,
                         "status": result_status,
-                        "reason": str(reason or ""),
+                        "reason": sanitized_reason,
                         "available_at": available_at,
                         "response": dict(sanitized_response),
                     }

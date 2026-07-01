@@ -38,6 +38,14 @@ FORBIDDEN = {
     "pane.id",
     "message.id",
     "bot.token",
+    "backend target",
+    "pane id",
+    "session id",
+    "terminal id",
+    "chat id",
+    "topic id",
+    "message id",
+    "bot token",
 }
 
 
@@ -191,11 +199,13 @@ def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) 
                 "provider": "telegram",
                 "message_id": "must-strip",
                 "dot_value": "message.id",
+                "space_value": "message id must strip",
                 "nested": {
                     "bot_token": "must-strip",
                     "safe": "kept",
                     "transport": "herdres",
                     "dot_list": ["safe", "bot.token"],
+                    "space_list": ["safe", "bot token"],
                 },
             },
         }
@@ -212,7 +222,9 @@ def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) 
     assert stored["response"]["ref"] == "opaque-provider-ref"
     assert stored["response"]["nested"]["safe"] == "kept"
     assert stored["response"]["nested"]["dot_list"] == ["safe"]
+    assert stored["response"]["nested"]["space_list"] == ["safe"]
     assert "provider" not in stored["response"]
+    assert "space_value" not in stored["response"]
     assert "transport" not in stored["response"]["nested"]
     _assert_no_forbidden(stored)
 
@@ -227,7 +239,7 @@ def test_fail_and_defer_schedule_future_availability(tmp_path: Path) -> None:
         {
             "name": "attention",
             "ref": first_ref,
-            "reason": "temporary",
+            "reason": "backend target chat id bot token",
             "available_at": "9999-01-01T00:00:00+00:00",
             "response": {"safe": "kept", "chat_id": "must-strip"},
         }
@@ -245,16 +257,23 @@ def test_fail_and_defer_schedule_future_availability(tmp_path: Path) -> None:
             "name": "attention",
             "ref": retry["ref"],
             "available_at": "9999-01-01T00:00:00+00:00",
-            "reason": "later",
+            "reason": "pane id terminal id session id message id",
         }
     )
     blocked_defer = api.poll({"name": "attention"})
+    rows = _delivery_rows(db_path)
+    failed_payload = json.loads(rows[0][1])
+    deferred_payload = json.loads(rows[1][1])
 
     assert failed["status"] == "retry_scheduled"
     assert blocked_retry["items"] == []
     assert retry["attempt"] == 2
     assert deferred["status"] == "deferred"
     assert blocked_defer["items"] == []
+    assert failed_payload["reason"] == ""
+    assert deferred_payload["reason"] == ""
+    _assert_no_forbidden(failed_payload)
+    _assert_no_forbidden(deferred_payload)
     _assert_no_forbidden(failed)
     _assert_no_forbidden(deferred)
 
