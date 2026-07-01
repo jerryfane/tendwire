@@ -18,6 +18,7 @@ from .models import (
     FORBIDDEN_FIELD_NAMES,
     Snapshot,
     Worker,
+    _FORBIDDEN_BACKEND_NAME_TEXT,
     _is_forbidden_field_name,
     normalize_status,
     sanitize_forbidden_fields,
@@ -187,6 +188,8 @@ def _contains_forbidden_public_text(value: str) -> bool:
     tokens = _public_text_tokens(value)
     if not tokens:
         return False
+    if set(tokens) & (_FORBIDDEN_BACKEND_NAME_TEXT - {"raw"}):
+        return True
     for index in range(len(tokens)):
         for size in range(1, min(4, len(tokens) - index) + 1):
             phrase = "_".join(tokens[index : index + size])
@@ -209,6 +212,21 @@ def _optional_public_text(value: Any) -> str | None:
         return None
     text = _public_text(value)
     return text or None
+
+
+def _public_identity(value: Any, *, prefix: str, default: str = "unknown") -> str:
+    text = _string_value(value, default).strip()
+    if not text:
+        text = default
+    if not _contains_forbidden_public_text(text):
+        return " ".join(text.split())
+    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': text})}"
+
+
+def _optional_public_identity(value: Any, *, prefix: str) -> str | None:
+    if value is None:
+        return None
+    return _public_identity(value, prefix=prefix)
 
 
 def _clean_public_value(value: Any) -> Any:
@@ -354,7 +372,7 @@ class InteractionChoice:
         payload: dict[str, Any] = {
             "choice_id": self.choice_id,
             "label": self.label,
-            "params": sanitize_forbidden_fields(self.params),
+            "params": _clean_meta(self.params),
         }
         public_value = _public_choice_value(self.value)
         if public_value is not None:
@@ -401,18 +419,18 @@ class Turn:
 
     def __post_init__(self) -> None:
         host_id = _string_value(self.host_id, "unknown")
-        worker_id = _string_value(self.worker_id, "unknown")
+        worker_id = _public_identity(self.worker_id, prefix="worker")
         status = normalize_status(self.status)
         kind = _normalize_turn_kind(self.kind)
         source = _public_text(self.source, default="snapshot")
-        worker_fingerprint = _optional_string(self.worker_fingerprint)
-        space_id = _optional_string(self.space_id)
+        worker_fingerprint = _optional_public_text(self.worker_fingerprint)
+        space_id = _optional_public_identity(self.space_id, prefix="space")
         title = _optional_public_text(self.title)
         summary = _optional_public_text(self.summary)
         started_at = _optional_timestamp(self.started_at)
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
-        origin_command_id = _optional_string(self.origin_command_id)
+        origin_command_id = _optional_public_text(self.origin_command_id)
         meta = _clean_meta(self.meta)
         identity_payload = {
             "schema_version": TURN_SCHEMA_VERSION,
@@ -470,7 +488,7 @@ class Turn:
             "source": self.source,
             "origin_command_id": self.origin_command_id,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_forbidden_fields(self.meta),
+            "meta": _clean_meta(self.meta),
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -527,9 +545,9 @@ class PendingInteraction:
 
     def __post_init__(self) -> None:
         host_id = _string_value(self.host_id, "unknown")
-        worker_id = _string_value(self.worker_id, "unknown")
-        worker_fingerprint = _optional_string(self.worker_fingerprint)
-        space_id = _optional_string(self.space_id)
+        worker_id = _public_identity(self.worker_id, prefix="worker")
+        worker_fingerprint = _optional_public_text(self.worker_fingerprint)
+        space_id = _optional_public_identity(self.space_id, prefix="space")
         kind = _normalize_pending_kind(self.kind)
         question = _public_text(self.question, default="Action requires attention")
         choices = sorted(
@@ -593,7 +611,7 @@ class PendingInteraction:
             "updated_at": self.updated_at,
             "expires_at": self.expires_at,
             "fingerprint": self.fingerprint,
-            "meta": sanitize_forbidden_fields(self.meta),
+            "meta": _clean_meta(self.meta),
         }
 
     def to_json(self, indent: int | None = None) -> str:

@@ -283,12 +283,13 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
         worker_id="worker-1",
         status="waiting",
         kind="message",
-        title="message id pane id leaked",
-        summary="backend target chat id bot token",
-        source="telegram delivery",
+        title="outbox",
+        summary="herdres queue",
+        source="herdres",
         meta={
-            "note": "terminal id session id",
+            "note": "outbox",
             "safe": "kept",
+            "outbox": "herdres",
             "telegram.delivery": "leaked route",
             "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
         },
@@ -303,12 +304,12 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
     )
     dirty_choice = InteractionChoice(
         choice_id="telegram delivery",
-        label="chat id approve",
-        value="bot token approve",
-        description="terminal id choice",
+        label="herdres action",
+        value="outbox",
+        description="herdres",
         params={
             "safe": "kept",
-            "note": "backend target pane id",
+            "note": "outbox",
             "telegram.delivery": "leaked route",
             "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
         },
@@ -317,13 +318,14 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
     dirty_pending = PendingInteraction(
         host_id="text-host",
         worker_id="worker-1",
-        question="Approve message id update?",
+        question="Review herdres outbox?",
         kind="approval",
         choices=[dirty_choice],
         meta={
-            "source": "telegram delivery",
+            "source": "herdres",
             "safe": "kept",
-            "note": "chat id",
+            "note": "outbox",
+            "outbox": "herdres",
             "telegram.delivery": "leaked route",
             "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
         },
@@ -357,6 +359,7 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
         "herdres",
         "delivery",
         "route",
+        "outbox",
         "backend target",
         "pane id",
         "session id",
@@ -368,6 +371,110 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
         assert forbidden not in encoded
     _assert_no_forbidden_fields(turn_payload)
     _assert_no_forbidden_fields(pending_payload)
+
+
+def test_turn_pending_identity_and_worker_fingerprint_values_are_public_safe() -> None:
+    dirty_turn = Turn(
+        host_id="identity-host",
+        worker_id="pane-private",
+        worker_fingerprint="herdres private fingerprint",
+        space_id="target-private",
+        status="waiting",
+        kind="task",
+        source="worker:pane-private",
+        origin_command_id="raw command private",
+        meta={"safe": "kept"},
+    )
+    clean_turn = Turn(
+        host_id="identity-host",
+        worker_id=dirty_turn.worker_id,
+        space_id=dirty_turn.space_id,
+        status="waiting",
+        kind="task",
+        source="snapshot",
+        meta={"safe": "kept"},
+    )
+    dirty_pending = PendingInteraction(
+        host_id="identity-host",
+        worker_id="pane-private",
+        worker_fingerprint="backend target private fingerprint",
+        space_id="target-private",
+        kind="choice",
+        question="Choose next action",
+        meta={"source": "attention"},
+    )
+    clean_pending = PendingInteraction(
+        host_id="identity-host",
+        worker_id=dirty_pending.worker_id,
+        space_id=dirty_pending.space_id,
+        kind="choice",
+        question="Choose next action",
+        meta={"source": "attention"},
+    )
+
+    payload = {
+        "turn": dirty_turn.to_dict(),
+        "pending": dirty_pending.to_dict(),
+    }
+    encoded = json.dumps(payload, sort_keys=True).lower()
+
+    assert dirty_turn.worker_id.startswith("worker-")
+    assert dirty_turn.space_id is not None
+    assert dirty_turn.space_id.startswith("space-")
+    assert dirty_turn.worker_fingerprint is None
+    assert dirty_turn.origin_command_id is None
+    assert dirty_turn.source == "snapshot"
+    assert dirty_turn.id == clean_turn.id
+    assert dirty_turn.fingerprint == clean_turn.fingerprint
+    assert dirty_pending.worker_id.startswith("worker-")
+    assert dirty_pending.space_id is not None
+    assert dirty_pending.space_id.startswith("space-")
+    assert dirty_pending.worker_fingerprint is None
+    assert dirty_pending.id == clean_pending.id
+    assert dirty_pending.fingerprint == clean_pending.fingerprint
+    for forbidden in ("private", "herdres", "backend target", "pane-private", "target-private"):
+        assert forbidden not in encoded
+    _assert_no_forbidden_fields(payload)
+
+
+def test_turn_pending_to_dict_resanitizes_mutable_public_maps() -> None:
+    choice = InteractionChoice(
+        label="Approve",
+        value={"safe": "kept"},
+        params={"safe_choice": "kept"},
+    )
+    turn = Turn(
+        host_id="mutable-host",
+        worker_id="worker-1",
+        status="waiting",
+        kind="task",
+        meta={"safe_turn": "kept"},
+    )
+    pending = PendingInteraction(
+        host_id="mutable-host",
+        worker_id="worker-1",
+        question="Choose next action",
+        choices=[choice],
+        meta={"safe_pending": "kept"},
+    )
+
+    choice.params["note"] = "herdres outbox"
+    turn.meta["note"] = "herdres outbox"
+    pending.meta["note"] = "herdres outbox"
+
+    payload = {
+        "choice": choice.to_dict(),
+        "turn": turn.to_dict(),
+        "pending": pending.to_dict(),
+    }
+    encoded = json.dumps(payload, sort_keys=True).lower()
+
+    assert payload["choice"]["params"] == {"safe_choice": "kept"}
+    assert payload["turn"]["meta"] == {"safe_turn": "kept"}
+    assert payload["pending"]["meta"] == {"safe_pending": "kept"}
+    for forbidden in ("herdres", "outbox"):
+        assert forbidden not in encoded
+    _assert_no_forbidden_fields(payload)
 
 
 def test_turn_pending_and_choice_strip_pr5_private_fields_before_fingerprints() -> None:
