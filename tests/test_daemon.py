@@ -178,6 +178,82 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     _assert_no_public_json_forbidden(command_response)
 
 
+def test_daemon_api_protocol_errors_do_not_echo_private_request_names() -> None:
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {"schema_version": 1, "status": "ok", "host_id": "daemon-host"},
+        submit_command=lambda params: CommandEnvelope.error(
+            None,
+            {
+                "code": STATUS_INVALID_REQUEST,
+                "message": "bad command",
+                "details": {},
+            },
+        ),
+    )
+
+    unknown_field = api.dispatch(
+        {
+            "method": "ping",
+            "telegram.bot.token": "sentinel-private-field",
+            "backend.target": "sentinel-private-target",
+        }
+    )
+    unknown_method = api.dispatch({"method": "telegram.bot.token"})
+    unsafe_id = api.dispatch({"id": "telegram.bot.token", "method": "telegram.bot.token"})
+    unsafe_object_id = api.dispatch(
+        {
+            "id": {"backend.target": "sentinel-private-id"},
+            "method": "telegram.bot.token",
+        }
+    )
+    unsafe_prefixed_ids = {
+        private_id: api.dispatch({"id": private_id, "method": "telegram.bot.token"})
+        for private_id in ("x-api_key", "my-api-key", "credentials", "my-credentials")
+    }
+    safe_id = api.dispatch({"id": "req-123_ok.1", "method": "ping"})
+
+    unknown_field_encoded = json.dumps(unknown_field, sort_keys=True).lower()
+    unknown_method_encoded = json.dumps(unknown_method, sort_keys=True).lower()
+    unsafe_id_encoded = json.dumps(unsafe_id, sort_keys=True).lower()
+    unsafe_object_id_encoded = json.dumps(unsafe_object_id, sort_keys=True).lower()
+
+    assert unknown_field["ok"] is False
+    assert unknown_field["error"]["message"] == "request contains unknown top-level fields"
+    assert unknown_field["error"]["details"] == {"field_count": 2}
+    assert "sentinel-private" not in unknown_field_encoded
+    assert "telegram" not in unknown_field_encoded
+    assert "bot.token" not in unknown_field_encoded
+    assert "backend.target" not in unknown_field_encoded
+
+    assert unknown_method["ok"] is False
+    assert unknown_method["error"]["message"] == "unknown method"
+    assert "telegram" not in unknown_method_encoded
+    assert "bot.token" not in unknown_method_encoded
+    assert unsafe_id["ok"] is False
+    assert "id" not in unsafe_id
+    assert "telegram" not in unsafe_id_encoded
+    assert "bot.token" not in unsafe_id_encoded
+    assert unsafe_object_id["ok"] is False
+    assert "id" not in unsafe_object_id
+    assert "sentinel-private" not in unsafe_object_id_encoded
+    assert "backend.target" not in unsafe_object_id_encoded
+    for private_id, response in unsafe_prefixed_ids.items():
+        encoded = json.dumps(response, sort_keys=True).lower()
+        assert response["ok"] is False
+        assert "id" not in response
+        assert private_id.lower() not in encoded
+    assert safe_id["ok"] is True
+    assert safe_id["id"] == "req-123_ok.1"
+    _assert_no_public_json_forbidden(unknown_field)
+    _assert_no_public_json_forbidden(unknown_method)
+    _assert_no_public_json_forbidden(unsafe_id)
+    _assert_no_public_json_forbidden(unsafe_object_id)
+    for response in unsafe_prefixed_ids.values():
+        _assert_no_public_json_forbidden(response)
+    _assert_no_public_json_forbidden(safe_id)
+
+
 def test_daemon_api_attention_list_uses_store_lifecycle_payload(tmp_path: Path) -> None:
     db_path = tmp_path / "attention-api.db"
     config = Config(host_id="daemon-host", db_path=db_path)

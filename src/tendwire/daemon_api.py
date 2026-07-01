@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import socket
 import stat
 import threading
@@ -23,6 +25,84 @@ from .core.turns import pending_payload_from_snapshot, turns_payload_from_snapsh
 
 API_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_PUBLIC_REQUEST_ID_CHARS = 128
+_CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
+    {
+        "telegram",
+        "chat",
+        "chats",
+        "topic",
+        "topics",
+        "message",
+        "messages",
+        "thread",
+        "threads",
+        "token",
+        "tokens",
+        "auth",
+        "authorization",
+        "bearer",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "delivery",
+        "deliveries",
+        "route",
+        "routes",
+        "connector",
+        "connectors",
+        "herdres",
+        "backend",
+        "target",
+        "targets",
+        "terminal",
+        "terminals",
+        "pane",
+        "panes",
+        "tab",
+        "tabs",
+        "window",
+        "windows",
+        "tty",
+        "pty",
+        "pid",
+        "pids",
+        "process",
+        "processes",
+        "tmux",
+        "screen",
+        "agent_session",
+        "session",
+        "sessions",
+        "private",
+        "argv",
+        "args",
+        "env",
+        "raw",
+        "payload",
+        "payloads",
+        "control",
+        "controls",
+        "escape",
+        "escapes",
+        "stdin",
+        "stderr",
+        "stdout",
+        "shell",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "api_key",
+        "api_keys",
+        "apikey",
+    }
+)
+_REQUEST_ID_FORBIDDEN_COMPACT = frozenset(
+    segment.replace("_", "") for segment in _REQUEST_ID_FORBIDDEN_SEGMENTS
+)
 
 REQUIRED_METHODS = frozenset(
     {
@@ -54,6 +134,50 @@ class DaemonProtocolError(DaemonAPIError):
     """Raised when a daemon response cannot be parsed or trusted."""
 
 
+def _request_id_has_forbidden_segment_sequence(normalized: str) -> bool:
+    parts = tuple(part for part in normalized.split("_") if part)
+    for forbidden in _REQUEST_ID_FORBIDDEN_SEGMENTS:
+        forbidden_parts = tuple(part for part in forbidden.split("_") if part)
+        if not forbidden_parts:
+            continue
+        part_count = len(forbidden_parts)
+        if any(
+            parts[index : index + part_count] == forbidden_parts
+            for index in range(len(parts) - part_count + 1)
+        ):
+            return True
+    return False
+
+
+def _public_request_id(value: Any) -> str | int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if not isinstance(value, str):
+        return None
+    if not value or len(value) > MAX_PUBLIC_REQUEST_ID_CHARS:
+        return None
+    if not all(char.isascii() and (char.isalnum() or char in "._:-") for char in value):
+        return None
+    separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
+    normalized = re.sub(r"[^a-z0-9]+", "_", separated.lower()).strip("_")
+    compact = normalized.replace("_", "")
+    if normalized in _REQUEST_ID_FORBIDDEN_SEGMENTS or compact in _REQUEST_ID_FORBIDDEN_COMPACT:
+        return None
+    if _request_id_has_forbidden_segment_sequence(normalized):
+        return None
+    if any(
+        compact.endswith(forbidden)
+        for forbidden in _REQUEST_ID_FORBIDDEN_COMPACT
+        if len(forbidden) >= 5
+    ):
+        return None
+    return value
+
+
 def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any = None) -> dict[str, Any]:
     response: dict[str, Any] = {
         "schema_version": API_SCHEMA_VERSION,
@@ -62,8 +186,9 @@ def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any
         "result": sanitize_forbidden_fields(dict(result or {})),
         "error": None,
     }
-    if request_id is not None:
-        response["id"] = sanitize_forbidden_fields(request_id)
+    public_id = _public_request_id(request_id)
+    if public_id is not None:
+        response["id"] = public_id
     return response
 
 
@@ -81,8 +206,9 @@ def error_response(
         "result": None,
         "error": error_value(code, message, details=dict(details or {})),
     }
-    if request_id is not None:
-        response["id"] = sanitize_forbidden_fields(request_id)
+    public_id = _public_request_id(request_id)
+    if public_id is not None:
+        response["id"] = public_id
     return response
 
 
@@ -135,8 +261,8 @@ class TendwireDaemonAPI:
         if unknown:
             return error_response(
                 "invalid_request",
-                f"request contains unknown top-level fields: {unknown}",
-                details={"fields": unknown},
+                "request contains unknown top-level fields",
+                details={"field_count": len(unknown)},
                 request_id=request_id,
             )
 
@@ -151,8 +277,8 @@ class TendwireDaemonAPI:
         if method not in REQUIRED_METHODS:
             return error_response(
                 "unknown_method",
-                f"unknown method {method!r}",
-                details={"method": method, "allowed": sorted(REQUIRED_METHODS)},
+                "unknown method",
+                details={"allowed": sorted(REQUIRED_METHODS)},
                 request_id=request_id,
             )
 
@@ -218,7 +344,7 @@ class TendwireDaemonAPI:
 
         return error_response(
             "unknown_method",
-            f"unknown method {method!r}",
+            "unknown method",
             request_id=request_id,
         )
 
