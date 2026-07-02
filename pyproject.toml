@@ -40,6 +40,10 @@ packages = ["src/tendwire"]
 include = [
     "/src",
     "/tests",
+    "/LICENSE",
+    "/SECURITY.md",
+    "/INSTALL.md",
+    "/.env.example",
     "/README.md",
     "/pyproject.toml",
 ]
