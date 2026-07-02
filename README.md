@@ -629,11 +629,11 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
 `backend_unavailable`, `ambiguous_backend_target`, `backend_unsupported`,
-`backend_failed`, `duplicate_request`, `request_state_uncertain`,
-`invalid_request`, and `pending` for internal receipt reservation. A backend
-that is not enabled, not reachable before send start, or not healthy reports
-`backend_unavailable`; a disconnect, timeout, protocol failure, or OS error
-after send start reports `request_state_uncertain`.
+`backend_failed`, `duplicate_request`, `duplicate_instruction`,
+`request_state_uncertain`, `invalid_request`, and `pending` for internal receipt
+reservation. A backend that is not enabled, not reachable before send start, or
+not healthy reports `backend_unavailable`; a disconnect, timeout, protocol
+failure, or OS error after send start reports `request_state_uncertain`.
 
 Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
 results must never include connector delivery state, Herdr routing objects, bot
@@ -714,6 +714,11 @@ Receipt semantics:
   `duplicate_request`.
 - A pending/uncertain receipt rejects with `request_state_uncertain` and does
   not retry the mutation.
+- A recent same-worker, same long instruction submitted under a different
+  `request_id` may be accepted as `duplicate_instruction` with delivery state
+  `duplicate_suppressed`. This protects Telegram/source-mode replay and manual
+  repair paths from resending old long directives while still allowing short
+  repeated nudges such as "continue".
 
 ### Unsafe non-goals
 
