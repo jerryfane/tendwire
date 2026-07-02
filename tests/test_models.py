@@ -481,7 +481,7 @@ def test_space_worker_and_attention_serialization_include_contract_fields() -> N
     _assert_no_forbidden_fields(signal_payload)
 
 
-def test_public_model_text_values_strip_private_labels_before_fingerprints() -> None:
+def test_public_model_text_values_preserve_public_connector_words_before_fingerprints() -> None:
     dirty_space = Space.from_dict(
         {
             "id": "space-1",
@@ -503,9 +503,14 @@ def test_public_model_text_values_strip_private_labels_before_fingerprints() -> 
     )
     clean_space = Space(
         id="space-1",
-        name="space-1",
+        name="telegram delivery workspace",
         status="unknown",
-        meta={"active_tab_id": "tab-1", "safe": "kept", "nested": {"safe_nested": "kept"}},
+        meta={
+            "active_tab_id": "tab-1",
+            "raw_status": "telegram delivery",
+            "safe": "kept",
+            "nested": {"safe_nested": "kept"},
+        },
     )
     dirty_worker = Worker(
         id="worker-1",
@@ -545,6 +550,7 @@ def test_public_model_text_values_strip_private_labels_before_fingerprints() -> 
         },
     )
     clean_action = SuggestedAction(
+        action_id="telegram delivery action",
         label="Action",
         params={"safe": "kept", "nested": {"safe_nested": "kept"}},
     )
@@ -570,7 +576,8 @@ def test_public_model_text_values_strip_private_labels_before_fingerprints() -> 
         host_id="model-host",
     )
     clean_signal = AttentionSignal(
-        kind="general",
+        id="telegram delivery attention",
+        kind="telegram delivery",
         severity="warning",
         status="waiting",
         source="unknown",
@@ -640,35 +647,33 @@ def test_public_model_text_values_strip_private_labels_before_fingerprints() -> 
     assert dirty_worker.to_dict() == clean_worker.to_dict()
     assert dirty_action.to_dict() == clean_action.to_dict()
     assert dirty_signal.to_dict() == clean_signal.to_dict()
-    assert fallback_space.id.startswith("space-")
-    assert fallback_space.name == fallback_space.id
+    assert fallback_space.id == "telegram delivery workspace"
+    assert fallback_space.name == "telegram delivery workspace"
     assert fallback_worker.id.startswith("worker-")
     assert fallback_worker.name == fallback_worker.id
-    assert fallback_worker.space_id is not None
-    assert fallback_worker.space_id.startswith("space-")
-    assert explicit_dirty_space.id.startswith("space-")
+    assert fallback_worker.space_id == "telegram delivery workspace"
+    assert explicit_dirty_space.id == "telegram delivery workspace"
     assert explicit_dirty_space.name == "Clean"
     assert explicit_dirty_worker.id.startswith("worker-")
     assert explicit_dirty_worker.name == "Clean"
-    assert explicit_dirty_worker.space_id is not None
-    assert explicit_dirty_worker.space_id.startswith("space-")
+    assert explicit_dirty_worker.space_id == "telegram delivery workspace"
     assert private_suffix_space.id.startswith("space-")
     assert private_suffix_space.name == "Clean"
     assert private_suffix_worker.id.startswith("worker-")
     assert private_suffix_worker.name == "Clean"
     assert private_suffix_worker.space_id is not None
     assert private_suffix_worker.space_id.startswith("space-")
-    assert standalone_backend_space.name == "space-2"
-    assert standalone_backend_space.status_line is None
-    assert standalone_backend_worker.summary is None
-    assert standalone_backend_action.label == "Action"
+    assert standalone_backend_space.name == "herdres outbox"
+    assert standalone_backend_space.status_line == "outbox"
+    assert standalone_backend_worker.summary == "herdres queue"
+    assert standalone_backend_action.label == "herdres worker"
+    assert "telegram delivery workspace" in encoded
+    assert "telegram delivery action" in encoded
+    assert "telegram delivery attention" in encoded
+    assert "herdres outbox" in encoded
+    assert "herdres queue" in encoded
     for forbidden in (
-        "telegram",
-        "herdres",
-        "delivery",
         "route",
-        "connector",
-        "outbox",
         "private",
         "raw.status",
         "backend target",
@@ -1045,26 +1050,38 @@ def test_backend_health_message_redacts_secret_label_variants() -> None:
         assert "PROD" not in encoded
 
 
-def test_backend_health_name_buckets_connector_private_names() -> None:
-    unsafe_names = [
+def test_backend_health_name_preserves_public_connector_words() -> None:
+    safe_names = [
         "herdres",
         "telegram",
-        "telegram.delivery",
+        "telegram-connector",
         "connector-outbox",
+    ]
+
+    for name in safe_names:
+        payload = BackendHealth.from_dict({"name": name}).to_dict()
+        assert payload["name"] == name
+
+
+def test_backend_health_name_buckets_private_names() -> None:
+    unsafe_names = [
         "private-backend",
         "raw-status",
         "token-store",
+        "pane-id",
+        "terminal-id",
+        "backend-target",
     ]
 
     for name in unsafe_names:
         payload = BackendHealth.from_dict({"name": name}).to_dict()
         encoded = json.dumps(payload).lower()
         assert payload["name"] == "unknown"
-        assert "herdres" not in encoded
-        assert "telegram" not in encoded
-        assert "connector" not in encoded
         assert "private" not in encoded
         assert "token" not in encoded
+        assert "pane" not in encoded
+        assert "terminal" not in encoded
+        assert "backend-target" not in encoded
 
     assert BackendHealth.from_dict({"name": "herdr-socket"}).to_dict()["name"] == "herdr-socket"
 
@@ -1075,6 +1092,9 @@ def test_backend_health_message_keeps_safe_fixed_messages() -> None:
         "Herdr observation is healthy but empty",
         "Herdr command returned nonzero status",
         "Herdr socket disconnected",
+        "Herdr backend is unavailable",
+        "Herdres Telegram connector degraded",
+        "Telegram connector outbox drained",
     ]
 
     for message in safe_messages:

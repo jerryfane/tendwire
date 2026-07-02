@@ -277,7 +277,7 @@ def test_pending_interaction_roundtrip_sanitizes_choices_and_ignores_timestamps(
     _assert_no_forbidden_fields(payload)
 
 
-def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints() -> None:
+def test_turn_pending_and_choice_preserve_public_connector_text_before_fingerprints() -> None:
     dirty_turn = Turn(
         host_id="text-host",
         worker_id="worker-1",
@@ -299,8 +299,10 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
         worker_id="worker-1",
         status="waiting",
         kind="message",
-        source="snapshot",
-        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+        title="outbox",
+        summary="herdres queue",
+        source="herdres",
+        meta={"note": "outbox", "safe": "kept", "nested": {"safe_nested": "kept"}},
     )
     dirty_choice = InteractionChoice(
         choice_id="telegram delivery",
@@ -314,7 +316,13 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
             "nested": {"safe_nested": "kept", "herdres.route": "leaked route"},
         },
     )
-    clean_choice = InteractionChoice(label="Action", params={"safe": "kept", "nested": {"safe_nested": "kept"}})
+    clean_choice = InteractionChoice(
+        choice_id="telegram delivery",
+        label="herdres action",
+        value="outbox",
+        description="herdres",
+        params={"safe": "kept", "note": "outbox", "nested": {"safe_nested": "kept"}},
+    )
     dirty_pending = PendingInteraction(
         host_id="text-host",
         worker_id="worker-1",
@@ -333,33 +341,39 @@ def test_turn_pending_and_choice_strip_private_text_labels_before_fingerprints()
     clean_pending = PendingInteraction(
         host_id="text-host",
         worker_id="worker-1",
-        question="Action requires attention",
+        question="Review herdres outbox?",
         kind="approval",
         choices=[clean_choice],
-        meta={"safe": "kept", "nested": {"safe_nested": "kept"}},
+        meta={"source": "herdres", "safe": "kept", "note": "outbox", "nested": {"safe_nested": "kept"}},
     )
 
     turn_payload = dirty_turn.to_dict()
     pending_payload = dirty_pending.to_dict()
     encoded = json.dumps({"turn": turn_payload, "pending": pending_payload}, sort_keys=True).lower()
 
-    assert turn_payload["title"] is None
-    assert turn_payload["summary"] is None
-    assert turn_payload["source"] == "snapshot"
-    assert turn_payload["meta"] == {"safe": "kept", "nested": {"safe_nested": "kept"}}
+    assert turn_payload["title"] == "outbox"
+    assert turn_payload["summary"] == "herdres queue"
+    assert turn_payload["source"] == "herdres"
+    assert turn_payload["meta"] == {"note": "outbox", "safe": "kept", "nested": {"safe_nested": "kept"}}
     assert dirty_turn.id == clean_turn.id
     assert dirty_turn.fingerprint == clean_turn.fingerprint
     assert dirty_choice.to_dict() == clean_choice.to_dict()
-    assert pending_payload["question"] == "Action requires attention"
-    assert pending_payload["meta"] == {"safe": "kept", "nested": {"safe_nested": "kept"}}
+    assert pending_payload["question"] == "Review herdres outbox?"
+    assert pending_payload["meta"] == {
+        "source": "herdres",
+        "safe": "kept",
+        "note": "outbox",
+        "nested": {"safe_nested": "kept"},
+    }
     assert dirty_pending.id == clean_pending.id
     assert dirty_pending.fingerprint == clean_pending.fingerprint
+    assert "telegram delivery" in encoded
+    assert "herdres" in encoded
+    assert "outbox" in encoded
+    assert "telegram.delivery" not in encoded
+    assert "herdres.route" not in encoded
+    assert "leaked route" not in encoded
     for forbidden in (
-        "telegram",
-        "herdres",
-        "delivery",
-        "route",
-        "outbox",
         "backend target",
         "pane id",
         "session id",
@@ -469,11 +483,10 @@ def test_turn_pending_to_dict_resanitizes_mutable_public_maps() -> None:
     }
     encoded = json.dumps(payload, sort_keys=True).lower()
 
-    assert payload["choice"]["params"] == {"safe_choice": "kept"}
-    assert payload["turn"]["meta"] == {"safe_turn": "kept"}
-    assert payload["pending"]["meta"] == {"safe_pending": "kept"}
-    for forbidden in ("herdres", "outbox"):
-        assert forbidden not in encoded
+    assert payload["choice"]["params"] == {"safe_choice": "kept", "note": "herdres outbox"}
+    assert payload["turn"]["meta"] == {"safe_turn": "kept", "note": "herdres outbox"}
+    assert payload["pending"]["meta"] == {"safe_pending": "kept", "note": "herdres outbox"}
+    assert "herdres outbox" in encoded
     _assert_no_forbidden_fields(payload)
 
 

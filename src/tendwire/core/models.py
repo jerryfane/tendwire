@@ -251,18 +251,31 @@ FORBIDDEN_FIELD_NAMES = frozenset(
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
 _FORBIDDEN_BACKEND_NAME_TEXT = frozenset(
     {
-        "telegram",
-        "herdres",
-        "connector",
-        "connectors",
-        "delivery",
-        "deliveries",
-        "outbox",
         "private",
         "raw",
         "secret",
         "token",
     }
+)
+_PUBLIC_TEXT_ALLOWED_FIELD_WORDS = frozenset(
+    {
+        "connector",
+        "connectors",
+        "delivery",
+        "deliveries",
+        "herdres",
+        "herdr",
+        "outbox",
+        "telegram",
+        "terminal",
+        "terminals",
+    }
+)
+_PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT = frozenset(
+    word.replace("_", "") for word in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
+)
+_TEXT_FORBIDDEN_FIELD_NAMES = frozenset(
+    name for name in FORBIDDEN_FIELD_NAMES if name not in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
 )
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _BACKEND_MESSAGE_LABEL_RE = re.compile(
@@ -291,6 +304,15 @@ def _is_forbidden_backend_message_label(value: str) -> bool:
     separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
     normalized = "_".join(part for part in re.split(r"[\s_.-]+", separated.lower()) if part)
     compact = normalized.replace("_", "")
+    return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
+
+
+def _is_forbidden_public_text_phrase(value: str) -> bool:
+    separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
+    normalized = "_".join(part for part in re.split(r"[\s_.-]+", separated.lower()) if part)
+    compact = normalized.replace("_", "")
+    if normalized in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS or compact in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT:
+        return False
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
 
 
@@ -464,9 +486,9 @@ def _contains_forbidden_public_text(value: str) -> bool:
             phrase = "_".join(tokens[index : index + size])
             if phrase == "command":
                 continue
-            if _is_forbidden_field_name(phrase):
+            if _is_forbidden_public_text_phrase(phrase):
                 return True
-    return bool(set(tokens) & (FORBIDDEN_FIELD_NAMES - {"command"}))
+    return bool(set(tokens) & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"}))
 
 
 def _is_forbidden_public_mapping_key(value: str) -> bool:
@@ -584,7 +606,7 @@ def _public_safe_backend_name(value: Any) -> str:
     if clean == "herdr" or clean.startswith(("herdr_", "herdr-")):
         return clean[:40]
     compact = clean.replace("_", "").replace("-", "")
-    if _is_forbidden_field_name(clean) or any(
+    if _is_forbidden_public_text_phrase(clean) or any(
         marker in clean or marker.replace("_", "") in compact
         for marker in _FORBIDDEN_BACKEND_NAME_TEXT
     ):
@@ -618,7 +640,7 @@ def _public_safe_backend_message(value: Any) -> str:
     }
     if tokens & sensitive_markers:
         return "Backend health details redacted"
-    if tokens & (FORBIDDEN_FIELD_NAMES - {"command"}):
+    if tokens & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"}):
         return "Backend health details redacted"
     if len(collapsed) > 160:
         return collapsed[:157].rstrip() + "..."

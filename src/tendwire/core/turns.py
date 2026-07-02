@@ -19,7 +19,9 @@ from .models import (
     Snapshot,
     Worker,
     _FORBIDDEN_BACKEND_NAME_TEXT,
-    _is_forbidden_field_name,
+    _is_forbidden_public_mapping_key,
+    _is_forbidden_public_text_phrase,
+    _TEXT_FORBIDDEN_FIELD_NAMES,
     normalize_status,
     sanitize_forbidden_fields,
     stable_fingerprint,
@@ -204,9 +206,9 @@ def _contains_forbidden_public_text(value: str) -> bool:
             phrase = "_".join(tokens[index : index + size])
             if phrase == "command":
                 continue
-            if _is_forbidden_field_name(phrase):
+            if _is_forbidden_public_text_phrase(phrase):
                 return True
-    return bool(set(tokens) & (FORBIDDEN_FIELD_NAMES - {"command"}))
+    return bool(set(tokens) & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"}))
 
 
 def _public_text(value: Any, *, default: str = "") -> str:
@@ -257,7 +259,7 @@ def _clean_public_value(value: Any) -> Any:
         result: dict[str, Any] = {}
         for key, item in clean.items():
             key_text = str(key)
-            if _contains_forbidden_public_text(key_text):
+            if _is_forbidden_public_mapping_key(key_text):
                 continue
             sanitized = _clean_public_value(item)
             if sanitized is not _PUBLIC_DROP:
