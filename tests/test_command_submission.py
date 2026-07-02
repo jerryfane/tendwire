@@ -21,6 +21,7 @@ from tendwire.core.commands import (
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
+    STATUS_DUPLICATE_INSTRUCTION,
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_REQUEST,
     STATUS_NOT_FOUND,
@@ -398,6 +399,65 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     assert "private-secret" not in encoded
     for surface in public_surfaces:
         _assert_no_private_json(surface)
+
+
+def test_submit_command_suppresses_recent_same_worker_long_instruction_with_new_request_id(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    text = "When this exact long Telegram instruction appears again, it should be treated as replay."
+
+    first = submit_command(
+        config,
+        _request(request_id="long-1", text=text),
+        socket_client_factory=_factory(calls),
+    )
+    second = submit_command(
+        config,
+        _request(request_id="long-2", text=text),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.status == STATUS_ACCEPTED
+    assert second.ok is True
+    assert second.status == STATUS_DUPLICATE_INSTRUCTION
+    assert second.result == {
+        "target": {"worker_id": "w-1"},
+        "delivery_state": "duplicate_suppressed",
+        "deduplicated": True,
+        "replay_window_seconds": 21600,
+    }
+    assert calls == [
+        {"method": "agent.get", "params": {"target": "agent-secret"}},
+        *_expected_private_clear_calls(),
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+    ]
+
+    assert config.db_path is not None
+    first_receipt = get_command_receipt(config.db_path, "cmd-host", "long-1", "send_instruction")
+    second_receipt = get_command_receipt(config.db_path, "cmd-host", "long-2", "send_instruction")
+    assert first_receipt is not None
+    assert first_receipt["status"] == STATUS_ACCEPTED
+    assert second_receipt is not None
+    assert second_receipt["status"] == STATUS_DUPLICATE_INSTRUCTION
+    with sqlite3.connect(str(config.db_path)) as conn:
+        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+    assert events == [
+        "snapshot.saved",
+        "command.reserved",
+        "command.send_started",
+        "command.submitted",
+        "command.reserved",
+        "command.duplicate_instruction",
+    ]
+    public_json = json.dumps([second.to_dict(), json.loads(second_receipt["result_json"])])
+    assert text not in public_json
+    assert "agent-secret" not in public_json
+    assert "private-secret" not in public_json
 
 
 def test_submit_command_waits_for_text_to_stage_before_enter(

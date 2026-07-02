@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import Config
@@ -17,6 +18,7 @@ from .core.commands import (
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
+    STATUS_DUPLICATE_INSTRUCTION,
     STATUS_DUPLICATE_REQUEST,
     STATUS_NOT_FOUND,
     STATUS_PENDING,
@@ -38,6 +40,7 @@ from .core.projector import project_from_observations
 from .store.sqlite import (
     append_event,
     envelope_to_receipt_json,
+    find_recent_matching_command_submission,
     latest_snapshot,
     list_worker_bindings,
     reserve_command_receipt,
@@ -49,6 +52,8 @@ HERDR_BACKEND = "herdr"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 _SUBMIT_ENTER_DELAY_SECONDS = 0.2
+_DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS = 6 * 60 * 60
+_DUPLICATE_INSTRUCTION_MIN_CHARS = 40
 _PRIVATE_PANE_CLEAR_KEY_SEQUENCES = (
     ("ctrl+u",),
     ("ctrl+a", "ctrl+k"),
@@ -391,6 +396,51 @@ def _delivery_state_for_worker(worker: Worker) -> str:
     return "submitted"
 
 
+def _instruction_text(request: CommandRequest) -> str:
+    instruction = request.instruction if isinstance(request.instruction, dict) else {}
+    text = instruction.get("text")
+    return text if isinstance(text, str) else ""
+
+
+def _duplicate_instruction_since() -> str:
+    since = datetime.now(timezone.utc) - timedelta(seconds=_DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS)
+    return since.isoformat()
+
+
+def _duplicate_instruction_envelope(
+    config: Config,
+    request: CommandRequest,
+    worker: Worker,
+) -> CommandEnvelope | None:
+    if config.db_path is None:
+        return None
+    text = _instruction_text(request)
+    if len(text.strip()) < _DUPLICATE_INSTRUCTION_MIN_CHARS:
+        return None
+    match = find_recent_matching_command_submission(
+        config.db_path,
+        config.host_id,
+        action=request.action,
+        worker_id=worker.id,
+        instruction_text=text,
+        since=_duplicate_instruction_since(),
+        exclude_request_id=request.request_id or "",
+    )
+    if match is None:
+        return None
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_DUPLICATE_INSTRUCTION,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "duplicate_suppressed",
+            "deduplicated": True,
+            "replay_window_seconds": _DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS,
+        },
+    )
+
+
 def _backend_failure(request: CommandRequest, message: str) -> CommandEnvelope:
     return CommandEnvelope.from_result(
         request,
@@ -617,9 +667,12 @@ def _save_mutating_result(config: Config, request: CommandRequest, envelope: Com
         result_json=envelope_to_receipt_json(envelope),
         uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
     )
+    event_type = "command.submitted"
+    if envelope.status == STATUS_DUPLICATE_INSTRUCTION:
+        event_type = "command.duplicate_instruction"
     _append_command_event(
         config,
-        "command.submitted",
+        event_type,
         request,
         status=envelope.status,
         envelope=envelope,
@@ -675,12 +728,14 @@ def submit_command(
         if isinstance(resolved, CommandEnvelope):
             envelope = resolved
         else:
-            envelope = _socket_send_envelope(
-                config,
-                request,
-                resolved,
-                socket_client_factory=socket_client_factory,
-            )
+            envelope = _duplicate_instruction_envelope(config, request, resolved.worker)
+            if envelope is None:
+                envelope = _socket_send_envelope(
+                    config,
+                    request,
+                    resolved,
+                    socket_client_factory=socket_client_factory,
+                )
 
     _save_mutating_result(config, request, envelope)
     return envelope

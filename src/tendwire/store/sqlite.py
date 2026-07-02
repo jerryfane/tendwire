@@ -2641,6 +2641,61 @@ def _upsert_command_audit_from_receipt_row(
     )
 
 
+def find_recent_matching_command_submission(
+    db_path: Path,
+    host_id: str,
+    *,
+    action: str,
+    worker_id: str,
+    instruction_text: str,
+    since: str,
+    exclude_request_id: str = "",
+) -> dict[str, Any] | None:
+    """Return a recent same-worker/same-text accepted command, if one exists."""
+    if not db_path.exists() or not str(worker_id).strip() or not str(instruction_text):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT request_id, status, request_json, created_at, updated_at
+            FROM commands
+            WHERE host_id = ?
+              AND action = ?
+              AND request_id != ?
+              AND status = 'accepted'
+              AND updated_at >= ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 200
+            """,
+            (str(host_id), str(action), str(exclude_request_id), str(since)),
+        ).fetchall()
+    for row in rows:
+        try:
+            request = json.loads(str(row[2] or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(request, dict):
+            continue
+        target = request.get("target")
+        instruction = request.get("instruction")
+        if not isinstance(target, dict) or not isinstance(instruction, dict):
+            continue
+        if str(target.get("worker_id") or "").strip() != str(worker_id).strip():
+            continue
+        if instruction.get("text") != instruction_text:
+            continue
+        return sanitize_forbidden_fields(
+            {
+                "request_id": str(row[0] or ""),
+                "status": str(row[1] or ""),
+                "created_at": str(row[3] or ""),
+                "updated_at": str(row[4] or ""),
+            }
+        )
+    return None
+
+
 def _backfill_command_audit(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
