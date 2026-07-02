@@ -306,7 +306,7 @@ def test_live_session_selection_and_argv_construction(
     assert return_code in (0, None)
     assert runner.calls, "live opt-in must execute Herdr checks through the injected runner"
     for call in runner.calls:
-        assert call["env"].get("HERDR_SESSION") == expected_session
+        assert "HERDR_SESSION" not in call["env"]
         assert isinstance(call["argv"], list)
         assert call["kwargs"].get("shell") is not True
         assert call["argv"][1:3] == ["--session", expected_session]
@@ -350,7 +350,7 @@ def test_environment_variable_opts_into_live_mode(smoke_module, monkeypatch, cap
     assert return_code in (0, None)
     assert runner.calls
     for call in runner.calls:
-        assert call["env"].get("HERDR_SESSION") == "tendwire-smoke"
+        assert "HERDR_SESSION" not in call["env"]
         assert call["argv"][1:3] == ["--session", "tendwire-smoke"]
     assert data.get("mode") == "live"
     assert _check_by_name(data, "create_attach")["detail"] == "live_created"

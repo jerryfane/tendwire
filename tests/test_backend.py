@@ -580,8 +580,9 @@ def test_herdr_backend_target_precedence_and_pane_fallback(monkeypatch) -> None:
     monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
     monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
 
-    _, workers = fetch_herdr_state(config)
+    _, workers, bindings = fetch_herdr_state(config, include_bindings=True)
     by_id = {worker.id: worker for worker in workers}
+    bindings_by_id = {binding.worker_id: binding for binding in bindings}
 
     assert by_id["public-id"].backend_target is not None
     assert by_id["public-id"].backend_target["kind"] == "agent_id"
@@ -591,6 +592,10 @@ def test_herdr_backend_target_precedence_and_pane_fallback(monkeypatch) -> None:
     assert by_id["pane-public"].backend_target["kind"] == "terminal_id"
     assert by_id["pane-public"].backend_target["value"] == "term-send"
     assert by_id["pane-public"].backend_target["sendable"] is True
+    assert bindings_by_id["public-id"].turn_target_kind == "pane_id"
+    assert bindings_by_id["public-id"].turn_target_value == "pane-fallback"
+    assert bindings_by_id["pane-public"].turn_target_kind == "pane_id"
+    assert bindings_by_id["pane-public"].turn_target_value == "pane-send"
     assert all(
         (worker.backend_target or {}).get("value") != "sess-not-sendable"
         for worker in workers

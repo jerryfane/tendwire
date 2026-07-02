@@ -626,16 +626,16 @@ class HerdrEventBackend:
     def _current_bindings(self) -> list[WorkerBinding]:
         return list(self._bindings.values())
 
-    def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[tuple[Worker, str]]:
-        records_by_identity: OrderedDict[str, tuple[Worker, str]] = OrderedDict()
+    def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[Any]:
+        records_by_identity: OrderedDict[str, Any] = OrderedDict()
         for item in _payload_items(agent_payload, _AGENT_PAYLOAD_KEYS):
-            worker, identity = _worker_record_from_item(item, self.config)
-            records_by_identity.setdefault(identity, (worker, identity))
+            record = _worker_record_from_item(item, self.config)
+            records_by_identity.setdefault(record.private_fingerprint, record)
         for item in _payload_items(pane_payload, _PANE_PAYLOAD_KEYS):
             if not _pane_has_agent(item):
                 continue
-            worker, identity = _worker_record_from_item(item, self.config)
-            records_by_identity.setdefault(identity, (worker, identity))
+            record = _worker_record_from_item(item, self.config)
+            records_by_identity.setdefault(record.private_fingerprint, record)
         return list(records_by_identity.values())
 
     def _pane_subscription_ids(self, pane_payload: Any) -> list[str]:

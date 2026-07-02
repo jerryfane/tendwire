@@ -376,12 +376,13 @@ def parse_options(argv: Sequence[str] | None = None, env: Mapping[str, str] | No
 def _session_plan(options: SmokeOptions, env: Mapping[str, str]) -> SessionPlan:
     child_env = {str(key): str(value) for key, value in env.items()}
     if options.session is not None:
-        child_env["HERDR_SESSION"] = options.session
+        child_env.pop("HERDR_SESSION", None)
         return SessionPlan(child_env=child_env, default_isolated=False, explicit=True, selected=options.session)
     env_session = child_env.get("HERDR_SESSION")
     if env_session:
+        child_env.pop("HERDR_SESSION", None)
         return SessionPlan(child_env=child_env, default_isolated=False, explicit=True, selected=env_session)
-    child_env["HERDR_SESSION"] = DEFAULT_SESSION
+    child_env.pop("HERDR_SESSION", None)
     return SessionPlan(child_env=child_env, default_isolated=True, explicit=False, selected=DEFAULT_SESSION)
 
 
@@ -1006,7 +1007,7 @@ def _live_observe_check(options: SmokeOptions, session_plan: SessionPlan, runner
 
 
 def _live_send_probe_allowed(session_plan: SessionPlan) -> bool:
-    return session_plan.default_isolated or session_plan.child_env.get("HERDR_SESSION") == DEFAULT_SESSION
+    return session_plan.default_isolated or session_plan.selected == DEFAULT_SESSION
 
 
 def _extract_started_pane_id(payload: Any) -> str | None:

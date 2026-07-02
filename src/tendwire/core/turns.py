@@ -32,6 +32,8 @@ from .models import (
 
 
 TURN_SCHEMA_VERSION = 1
+TURN_TEXT_MAX_CHARS = 12000
+TURN_STREAM_TEXT_MAX_CHARS = 4000
 
 TURN_KINDS = frozenset({"task", "message", "review", "unknown"})
 PENDING_KINDS = frozenset(
@@ -100,6 +102,13 @@ _PENDING_STATUS_ALIASES = {
     "timed-out": "expired",
     "timeout": "expired",
 }
+_PRIVATE_TEXT_LABEL_RE = re.compile(
+    r"(?i)\b("
+    r"pane[_ -]?id|terminal[_ -]?id|backend[_ -]?target|raw[_ -]?target|"
+    r"chat[_ -]?id|topic[_ -]?id|message[_ -]?id|thread[_ -]?id|"
+    r"socket[_ -]?path|argv|env|stdout|stderr|token|secret"
+    r")\b\s*[:=]?\s*\S*"
+)
 _VOLATILE_KEYS = frozenset(
     {
         "updated_at",
@@ -211,6 +220,19 @@ def _optional_public_text(value: Any) -> str | None:
     if value is None:
         return None
     text = _public_text(value)
+    return text or None
+
+
+def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str | None:
+    if value is None:
+        return None
+    text = _string_value(value).replace("\x00", "").strip()
+    if not text:
+        return None
+    text = _PRIVATE_TEXT_LABEL_RE.sub("[redacted]", text)
+    text = "\n".join(" ".join(line.split()) for line in text.splitlines()).strip()
+    if len(text) > max_chars:
+        text = text[: max(0, max_chars - 14)].rstrip() + "\n[truncated]"
     return text or None
 
 
@@ -408,6 +430,11 @@ class Turn:
     space_id: str | None = None
     title: str | None = None
     summary: str | None = None
+    user_text: str | None = None
+    assistant_final_text: str | None = None
+    assistant_stream_text: str | None = None
+    complete: bool | None = None
+    has_open_turn: bool | None = None
     started_at: str | None = None
     updated_at: str | None = None
     completed_at: str | None = None
@@ -427,6 +454,12 @@ class Turn:
         space_id = _optional_public_identity(self.space_id, prefix="space")
         title = _optional_public_text(self.title)
         summary = _optional_public_text(self.summary)
+        user_text = _public_turn_text(self.user_text)
+        assistant_final_text = _public_turn_text(self.assistant_final_text)
+        assistant_stream_text = _public_turn_text(
+            self.assistant_stream_text,
+            max_chars=TURN_STREAM_TEXT_MAX_CHARS,
+        )
         started_at = _optional_timestamp(self.started_at)
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
@@ -447,6 +480,11 @@ class Turn:
             "status": status,
             "title": title,
             "summary": summary,
+            "user_text": user_text,
+            "assistant_final_text": assistant_final_text,
+            "assistant_stream_text": assistant_stream_text,
+            "complete": self.complete if isinstance(self.complete, bool) else None,
+            "has_open_turn": self.has_open_turn if isinstance(self.has_open_turn, bool) else None,
             "meta": meta,
         }
         turn_id = _stable_id("turn", identity_payload)
@@ -462,6 +500,11 @@ class Turn:
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "title", title)
         object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "user_text", user_text)
+        object.__setattr__(self, "assistant_final_text", assistant_final_text)
+        object.__setattr__(self, "assistant_stream_text", assistant_stream_text)
+        object.__setattr__(self, "complete", self.complete if isinstance(self.complete, bool) else None)
+        object.__setattr__(self, "has_open_turn", self.has_open_turn if isinstance(self.has_open_turn, bool) else None)
         object.__setattr__(self, "started_at", started_at)
         object.__setattr__(self, "updated_at", updated_at)
         object.__setattr__(self, "completed_at", completed_at)
@@ -482,6 +525,11 @@ class Turn:
             "kind": self.kind,
             "title": self.title,
             "summary": self.summary,
+            "user_text": self.user_text,
+            "assistant_final_text": self.assistant_final_text,
+            "assistant_stream_text": self.assistant_stream_text,
+            "complete": self.complete,
+            "has_open_turn": self.has_open_turn,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -509,6 +557,11 @@ class Turn:
             kind=clean.get("kind", "unknown"),
             title=clean.get("title"),
             summary=clean.get("summary"),
+            user_text=clean.get("user_text"),
+            assistant_final_text=clean.get("assistant_final_text"),
+            assistant_stream_text=clean.get("assistant_stream_text"),
+            complete=clean.get("complete") if isinstance(clean.get("complete"), bool) else None,
+            has_open_turn=clean.get("has_open_turn") if isinstance(clean.get("has_open_turn"), bool) else None,
             started_at=clean.get("started_at"),
             updated_at=clean.get("updated_at"),
             completed_at=clean.get("completed_at"),

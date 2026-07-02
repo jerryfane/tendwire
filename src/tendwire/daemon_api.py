@@ -244,12 +244,14 @@ class TendwireDaemonAPI:
         get_health: Callable[[], Mapping[str, Any]],
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
         get_attention: Callable[[], Mapping[str, Any]] | None = None,
+        get_turns: Callable[[], Mapping[str, Any]] | None = None,
         connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self._get_snapshot = get_snapshot
         self._get_health = get_health
         self._submit_command = submit_command
         self._get_attention = get_attention
+        self._get_turns = get_turns
         self._connector_call = connector_call
 
     def dispatch(self, request: Any) -> dict[str, Any]:
@@ -308,6 +310,8 @@ class TendwireDaemonAPI:
                     return success_response(self._get_attention(), request_id=request_id)
                 return success_response(attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "turn.list":
+                if self._get_turns is not None:
+                    return success_response(self._get_turns(), request_id=request_id)
                 return success_response(turns_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "pending.list":
                 return success_response(pending_payload_from_snapshot(self._get_snapshot()), request_id=request_id)

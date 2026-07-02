@@ -36,6 +36,8 @@ from tendwire.store.sqlite import (
     save_snapshot,
     store_status,
     tail_event_metadata,
+    merge_turn_content,
+    turns_payload_from_store,
     upsert_worker_bindings,
 )
 
@@ -1349,6 +1351,42 @@ def test_store_save_snapshot_updates_pr6_projections_and_prunes_by_host(tmp_path
     assert host_a_health == ("herdr", "degraded", "malformed_json")
     assert event_count == 3
     assert "sentinel-" not in host_a_workers[0][2]
+
+
+def test_store_merges_public_turn_content_without_private_labels(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-content.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "codex", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+
+    updated = merge_turn_content(
+        db_path,
+        "turn-host",
+        "worker-1",
+        {
+            "user_text": "Please explain Telegram delivery.",
+            "assistant_final_text": "Done without leaking pane_id pane-private or terminal_id term-private.",
+            "assistant_stream_text": "Working...",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+
+    assert updated == 1
+    turn = payload["turns"][0]
+    assert turn["worker_id"] == "worker-1"
+    assert turn["user_text"] == "Please explain Telegram delivery."
+    assert "Done without leaking" in turn["assistant_final_text"]
+    assert "pane-private" not in json.dumps(payload)
+    assert "term-private" not in json.dumps(payload)
+    assert turn["complete"] is True
+    assert turn["has_open_turn"] is False
 
 
 def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:

@@ -93,6 +93,7 @@ class TendwireDaemon:
             get_health=self.get_health,
             submit_command=self.submit_command,
             get_attention=self.get_attention,
+            get_turns=self.get_turns,
             connector_call=self.connector_call,
         )
         self._server = UnixSocketJSONServer(
@@ -240,6 +241,18 @@ class TendwireDaemon:
         from .core.attention import attention_payload_from_snapshot
 
         return attention_payload_from_snapshot(self.get_snapshot())
+
+    def get_turns(self) -> Mapping[str, Any]:
+        snapshot = self.get_snapshot()
+        if self.config.db_path is not None:
+            from .backends.herdr_turns import refresh_structured_turn_content
+            from .store.sqlite import turns_payload_from_store
+
+            refresh_structured_turn_content(self.config)
+            return turns_payload_from_store(Path(self.config.db_path), self.config.host_id, snapshot=snapshot)
+        from .core.turns import turns_payload_from_snapshot
+
+        return turns_payload_from_snapshot(snapshot)
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         if self.config.db_path is None:

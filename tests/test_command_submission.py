@@ -123,6 +123,7 @@ def _seed(
 def _binding(
     worker: Worker,
     *,
+    target_kind: str = "agent_id",
     value: str = "agent-secret",
     sendable: bool = True,
     reason: str | None = None,
@@ -134,7 +135,7 @@ def _binding(
         worker_id=worker.id,
         worker_fingerprint=fingerprint or worker.fingerprint,
         backend="herdr",
-        target_kind="agent_id",
+        target_kind=target_kind,
         target_value=value,
         sendable=sendable,
         reason=reason,
@@ -144,28 +145,46 @@ def _binding(
 
 
 class _FakeSocketClient:
-    def __init__(self, calls: list[dict[str, Any]], *, raises: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        calls: list[dict[str, Any]],
+        *,
+        raises: BaseException | None = None,
+        pane_id: str = "pane-secret",
+    ) -> None:
         self.calls = calls
         self.raises = raises
+        self.pane_id = pane_id
 
     def connect(self) -> "_FakeSocketClient":
         return self
 
-    def agent_send(self, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
-        self.calls.append(dict(params))
-        if self.raises is not None:
+    def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        self.calls.append({"method": method, "params": dict(params)})
+        if self.raises is not None and method == "pane.send_input":
             raise self.raises
+        if method == "agent.get":
+            return {"result": {"agent": {"pane_id": self.pane_id}}}
         return {"accepted": True}
 
     def close(self) -> None:
         return None
 
 
-def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None):
+def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None, pane_id: str = "pane-secret"):
     def make_client(config: Config) -> _FakeSocketClient:
-        return _FakeSocketClient(calls, raises=raises)
+        return _FakeSocketClient(calls, raises=raises, pane_id=pane_id)
 
     return make_client
+
+
+def _expected_submit_calls(target: str = "agent-secret", *, pane_id: str = "pane-secret") -> list[dict[str, Any]]:
+    return [
+        {"method": "agent.get", "params": {"target": target}},
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+u"]}},
+        {"method": "pane.send_input", "params": {"pane_id": pane_id, "text": "hello"}},
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
+    ]
 
 @pytest.mark.parametrize(
     ("request_id", "include_request_id"),
@@ -239,9 +258,9 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
             assert connect_exception is not None
             raise connect_exception
 
-        def agent_send(self, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
-            calls.append(dict(params))
-            raise AssertionError("agent_send must not run before setup succeeds")
+        def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+            calls.append({"method": method, "params": dict(params)})
+            raise AssertionError("private send request must not run before setup succeeds")
 
         def close(self) -> None:
             return None
@@ -299,7 +318,11 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
 
     assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert envelope.status != STATUS_BACKEND_UNAVAILABLE
-    assert calls == [{"agent_id": "agent-secret", "text": "hello"}]
+    assert calls == [
+        {"method": "agent.get", "params": {"target": "agent-secret"}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello"}},
+    ]
     assert config.db_path is not None
     receipt = get_command_receipt(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
     assert receipt is not None
@@ -310,7 +333,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert "command.submitted" in events
 
 
-def test_submit_command_uses_socket_agent_send_once_and_caches_result(tmp_path: Path) -> None:
+def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
@@ -327,7 +350,7 @@ def test_submit_command_uses_socket_agent_send_once_and_caches_result(tmp_path: 
     assert first.status == STATUS_ACCEPTED
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
-    assert calls == [{"agent_id": "agent-secret", "text": "hello"}]
+    assert calls == _expected_submit_calls()
 
     assert config.db_path is not None
     receipt = get_command_receipt(config.db_path, "cmd-host", "req-1", "send_instruction")
@@ -363,6 +386,41 @@ def test_submit_command_uses_socket_agent_send_once_and_caches_result(tmp_path: 
     assert "private-secret" not in encoded
     for surface in public_surfaces:
         _assert_no_private_json(surface)
+
+
+def test_submit_command_terminal_binding_resolves_pane_and_submits_input(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker, target_kind="terminal_id", value="term-secret")])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(config, _request(), socket_client_factory=_factory(calls, pane_id="pane-private"))
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert calls == _expected_submit_calls("term-secret", pane_id="pane-private")
+    public_json = json.dumps(envelope.to_dict())
+    assert "term-secret" not in public_json
+    assert "pane-private" not in public_json
+    _assert_no_private_json(envelope.to_dict())
+
+
+def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker, target_kind="pane_id", value="pane-private")])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert calls == [
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello"}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
+    ]
+    public_json = json.dumps(envelope.to_dict())
+    assert "pane-private" not in public_json
+    _assert_no_private_json(envelope.to_dict())
 
 
 def test_submit_command_backend_unavailable_prevents_not_found_and_send(tmp_path: Path) -> None:
@@ -485,7 +543,11 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
 
     assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert second.status == STATUS_REQUEST_STATE_UNCERTAIN
-    assert calls == [{"agent_id": "agent-secret", "text": "hello"}]
+    assert calls == [
+        {"method": "agent.get", "params": {"target": "agent-secret"}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello"}},
+    ]
 
     assert config.db_path is not None
     receipt = get_command_receipt(config.db_path, "cmd-host", "timeout-1", "send_instruction")

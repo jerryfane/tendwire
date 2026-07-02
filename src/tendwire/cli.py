@@ -11,6 +11,7 @@ import json
 import socket
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .backends.herdr_cli import (
@@ -23,6 +24,7 @@ from .backends.herdr_cli import (
     rehydrate_workers_from_bindings,
 )
 from .backends.herdr_command import send_instruction as herdr_send_instruction
+from .backends.herdr_turns import refresh_structured_turn_content
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
 from .core.attention import attention_payload_from_snapshot
@@ -61,6 +63,7 @@ from .store.sqlite import (
     save_command_receipt,
     store_status,
     tail_event_metadata,
+    turns_payload_from_store,
     upsert_worker_bindings,
 )
 
@@ -569,6 +572,10 @@ def cmd_turns(
         print(payload_to_json(daemon_result, indent=2))
         return 0
     snapshot = _current_public_snapshot(config)
+    if config.db_path is not None and Path(config.db_path).exists():
+        refresh_structured_turn_content(config)
+        print(payload_to_json(turns_payload_from_store(config.db_path, config.host_id, snapshot=snapshot), indent=2))
+        return 0
     print(payload_to_json(turns_payload_from_snapshot(snapshot), indent=2))
     return 0
 

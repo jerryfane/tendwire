@@ -47,14 +47,16 @@ from .store.sqlite import (
 HERDR_BACKEND = "herdr"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
-_AGENT_SEND_TARGET_PARAMS = {
-    "agent_id": "agent_id",
-    "agent": "agent",
-    "name": "name",
-    "label": "label",
-    "terminal_id": "terminal_id",
-    "pane_id": "pane_id",
-}
+_PANE_SUBMIT_TARGET_KINDS = frozenset(
+    {
+        "agent_id",
+        "agent",
+        "name",
+        "label",
+        "terminal_id",
+        "pane_id",
+    }
+)
 
 SocketClientFactory = Callable[[Config], Any]
 
@@ -269,7 +271,7 @@ def _binding_for_worker(
     if (
         not binding.sendable
         or not binding.target_value
-        or binding.target_kind not in _AGENT_SEND_TARGET_PARAMS
+        or binding.target_kind not in _PANE_SUBMIT_TARGET_KINDS
     ):
         if (binding.reason or "") in _AMBIGUOUS_BINDING_REASONS:
             return _binding_error(
@@ -309,9 +311,77 @@ def _resolve_authoritative_target(
     return _binding_for_worker(request, worker, bindings)
 
 
-def _agent_send_params(binding: WorkerBinding, instruction_text: str) -> dict[str, Any]:
-    key = _AGENT_SEND_TARGET_PARAMS[binding.target_kind]
-    return {key: binding.target_value, "text": instruction_text}
+def _socket_request(client: Any, method: str, params: Mapping[str, Any], *, timeout: float) -> Any:
+    if not hasattr(client, "request"):
+        raise TypeError("socket client does not expose generic request")
+    return client.request(method, params, timeout=timeout)
+
+
+def _pane_id_from_agent_info(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    result = value.get("result")
+    agent = result.get("agent") if isinstance(result, Mapping) else None
+    if not isinstance(agent, Mapping):
+        agent = value.get("agent")
+    if not isinstance(agent, Mapping):
+        return ""
+    pane_id = agent.get("pane_id") or agent.get("paneId")
+    return str(pane_id or "").strip()
+
+
+def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout: float) -> str:
+    if binding.target_kind == "pane_id":
+        return str(binding.target_value or "").strip()
+    response = _socket_request(
+        client,
+        "agent.get",
+        {"target": binding.target_value},
+        timeout=timeout,
+    )
+    return _pane_id_from_agent_info(response)
+
+
+def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str, *, timeout: float) -> None:
+    # Keep the reliable Telegram contract from the legacy path: clear any stale
+    # staged input, send as an input submission, then press Enter for Herdr/TUI
+    # states that leave text staged after send_input.
+    _socket_request(
+        client,
+        "pane.send_keys",
+        {"pane_id": pane_id, "keys": ["ctrl+u"]},
+        timeout=timeout,
+    )
+    _socket_request(
+        client,
+        "pane.send_input",
+        {"pane_id": pane_id, "text": instruction_text},
+        timeout=timeout,
+    )
+    _socket_request(
+        client,
+        "pane.send_keys",
+        {"pane_id": pane_id, "keys": ["enter"]},
+        timeout=timeout,
+    )
+
+
+def _backend_failure(request: CommandRequest, message: str) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_BACKEND_FAILED,
+        error=error_value(STATUS_BACKEND_FAILED, message),
+    )
+
+
+def _backend_uncertain(request: CommandRequest, message: str) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        error=error_value(STATUS_REQUEST_STATE_UNCERTAIN, message),
+    )
 
 
 def _socket_send_envelope(
@@ -335,8 +405,8 @@ def _socket_send_envelope(
     client: Any | None = None
     try:
         client = factory(config)
-        if not hasattr(client, "agent_send"):
-            raise TypeError("socket client does not expose agent_send")
+        if not hasattr(client, "request"):
+            raise TypeError("socket client does not expose generic request")
         if hasattr(client, "connect"):
             client.connect()
     except Exception:  # noqa: BLE001
@@ -347,6 +417,41 @@ def _socket_send_envelope(
                 pass
         return _backend_unavailable(request, "Herdr socket could not be reached")
 
+    try:
+        pane_id = _private_pane_id_for_binding(
+            client,
+            resolved.binding,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
+        from .backends.herdr_socket import (
+            HerdrSocketConnectionError,
+            HerdrSocketDisconnectedError,
+            HerdrSocketTimeoutError,
+        )
+
+        if hasattr(client, "close"):
+            client.close()
+        if isinstance(exc, HerdrErrorResponse):
+            return _backend_failure(request, "Herdr socket could not resolve the private send target")
+        if isinstance(
+            exc,
+            HerdrSocketConnectionError
+            | HerdrSocketTimeoutError
+            | HerdrSocketDisconnectedError
+            | HerdrProtocolError,
+        ) or isinstance(exc, OSError):
+            return _backend_unavailable(request, "Herdr socket could not resolve the private send target")
+        if isinstance(exc, (TypeError, ValueError)):
+            return _backend_failure(request, "Herdr socket private send target is unsupported")
+        raise
+
+    if not pane_id:
+        if hasattr(client, "close"):
+            client.close()
+        return _backend_failure(request, "Herdr socket private send target has no pane")
+
     _append_command_event(
         config,
         "command.send_started",
@@ -355,8 +460,10 @@ def _socket_send_envelope(
         target_worker_id=resolved.worker.id,
     )
     try:
-        client.agent_send(
-            _agent_send_params(resolved.binding, instruction_text),
+        _submit_private_pane_input(
+            client,
+            pane_id,
+            instruction_text,
             timeout=config.herdr_timeout_seconds,
         )
     except Exception as exc:  # noqa: BLE001
@@ -368,15 +475,7 @@ def _socket_send_envelope(
         )
 
         if isinstance(exc, HerdrErrorResponse):
-            return CommandEnvelope.from_result(
-                request,
-                ok=False,
-                status=STATUS_BACKEND_FAILED,
-                error=error_value(
-                    STATUS_BACKEND_FAILED,
-                    "Herdr socket agent.send returned an error response",
-                ),
-            )
+            return _backend_failure(request, "Herdr socket pane input returned an error response")
         if isinstance(
             exc,
             HerdrSocketConnectionError
@@ -384,25 +483,9 @@ def _socket_send_envelope(
             | HerdrSocketDisconnectedError
             | HerdrProtocolError,
         ):
-            return CommandEnvelope.from_result(
-                request,
-                ok=False,
-                status=STATUS_REQUEST_STATE_UNCERTAIN,
-                error=error_value(
-                    STATUS_REQUEST_STATE_UNCERTAIN,
-                    "Herdr socket agent.send state is uncertain after send start",
-                ),
-            )
+            return _backend_uncertain(request, "Herdr socket pane input state is uncertain after send start")
         if isinstance(exc, OSError):
-            return CommandEnvelope.from_result(
-                request,
-                ok=False,
-                status=STATUS_REQUEST_STATE_UNCERTAIN,
-                error=error_value(
-                    STATUS_REQUEST_STATE_UNCERTAIN,
-                    "Herdr socket agent.send state is uncertain after send start",
-                ),
-            )
+            return _backend_uncertain(request, "Herdr socket pane input state is uncertain after send start")
         raise
     finally:
         if hasattr(client, "close"):

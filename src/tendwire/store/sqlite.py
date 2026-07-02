@@ -27,7 +27,7 @@ from ..core.models import (
     stable_json_dumps,
     utc_timestamp,
 )
-from ..core.turns import pending_from_snapshot, turns_from_snapshot
+from ..core.turns import Turn, pending_from_snapshot, turns_from_snapshot, turns_payload_from_snapshot
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
@@ -2977,6 +2977,153 @@ def run_store_maintenance(
             },
         }
     )
+
+
+_TURN_CONTENT_FIELDS = frozenset(
+    {
+        "user_text",
+        "assistant_final_text",
+        "assistant_stream_text",
+        "complete",
+        "has_open_turn",
+    }
+)
+
+
+def merge_turn_content(
+    db_path: Path,
+    host_id: str,
+    worker_id: str,
+    content: Mapping[str, Any],
+    *,
+    observed_at: str | None = None,
+) -> int:
+    """Merge bounded public structured-turn content into host-scoped turn rows."""
+    if not db_path.exists():
+        return 0
+    clean_content = {key: content.get(key) for key in _TURN_CONTENT_FIELDS if key in content}
+    if not clean_content:
+        return 0
+    current_time = observed_at or utc_timestamp()
+    updated = 0
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT turn_id, payload_json
+            FROM turns
+            WHERE host_id = ? AND worker_id = ?
+            """,
+            (str(host_id), str(worker_id)),
+        ).fetchall()
+        if not rows:
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for turn_id, payload_json in rows:
+                try:
+                    payload = json.loads(str(payload_json or "{}"))
+                except json.JSONDecodeError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload.update(clean_content)
+                turn = Turn.from_dict(payload)
+                item = turn.to_dict()
+                conn.execute(
+                    """
+                    UPDATE turns
+                    SET status = ?,
+                        kind = ?,
+                        updated_at = ?,
+                        fingerprint = ?,
+                        observed_at = ?,
+                        payload_json = ?
+                    WHERE host_id = ? AND turn_id = ?
+                    """,
+                    (
+                        str(item.get("status") or "unknown"),
+                        str(item.get("kind") or "unknown"),
+                        item.get("updated_at") or current_time,
+                        str(item.get("fingerprint") or ""),
+                        current_time,
+                        _canonical_json(item),
+                        str(host_id),
+                        str(turn_id),
+                    ),
+                )
+                updated += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return updated
+
+
+def turns_payload_from_store(
+    db_path: Path,
+    host_id: str,
+    *,
+    snapshot: Snapshot | None = None,
+) -> dict[str, Any]:
+    """Return public turns from the store, preserving structured-turn content."""
+    if not db_path.exists():
+        if snapshot is not None:
+            return turns_payload_from_snapshot(snapshot)
+        return {
+            "schema_version": 1,
+            "host_id": str(host_id),
+            "updated_at": None,
+            "content_fingerprint": stable_fingerprint({"host_id": str(host_id), "turns": []}),
+            "turns": [],
+            "backend_health": [],
+        }
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT payload_json, observed_at
+            FROM turns
+            WHERE host_id = ?
+            ORDER BY worker_id, turn_id
+            """,
+            (str(host_id),),
+        ).fetchall()
+    if not rows:
+        if snapshot is not None:
+            return turns_payload_from_snapshot(snapshot)
+        turns: list[dict[str, Any]] = []
+        updated_at = None
+    else:
+        turns = []
+        observed_values: list[str] = []
+        for payload_json, observed_at in rows:
+            try:
+                payload = json.loads(str(payload_json or "{}"))
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                turns.append(Turn.from_dict(payload).to_dict())
+            if observed_at:
+                observed_values.append(str(observed_at))
+        updated_at = max(observed_values) if observed_values else None
+    backend_health = [health.to_dict() for health in snapshot.backend_health] if snapshot is not None else []
+    payload = {
+        "schema_version": 1,
+        "host_id": str(host_id),
+        "updated_at": updated_at or (snapshot.updated_at if snapshot is not None else None),
+        "turns": turns,
+        "backend_health": backend_health,
+    }
+    payload["content_fingerprint"] = stable_fingerprint(
+        {
+            "schema_version": payload["schema_version"],
+            "host_id": payload["host_id"],
+            "turns": turns,
+            "backend_health": backend_health,
+        }
+    )
+    return sanitize_forbidden_fields(payload)
 
 
 def save_snapshot(db_path: Path, snapshot: Snapshot) -> None:

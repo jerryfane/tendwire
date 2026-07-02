@@ -38,6 +38,13 @@ _HERDR_TIMEOUT_SECONDS = 5.0
 _BACKEND_NAME = "herdr"
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 
+@dataclass(frozen=True)
+class _WorkerRecord:
+    worker: Worker
+    private_fingerprint: str
+    turn_target_kind: str | None = None
+    turn_target_value: str | None = None
+
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
     "chat_id",
@@ -813,6 +820,14 @@ def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _turn_target_from_item(item: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Resolve the private Herdr structured-turn target from backend-observed fields."""
+    pane_id = _first_text(item, ("pane_id",))
+    if pane_id:
+        return "pane_id", pane_id
+    return None
+
+
 def _worker_with_id(worker: Worker, worker_id: str) -> Worker:
     """Return a worker copy with a disambiguated public id."""
     return Worker(
@@ -977,10 +992,16 @@ def _worker_with_summary(worker: Worker, summary: str | None) -> Worker:
     )
 
 
-def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = None) -> tuple[Worker, str]:
+def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = None) -> _WorkerRecord:
     worker = _worker_from_item(item)
     worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
-    return worker, _private_identity_from_item(item, config)
+    turn_target = _turn_target_from_item(item)
+    return _WorkerRecord(
+        worker=worker,
+        private_fingerprint=_private_identity_from_item(item, config),
+        turn_target_kind=turn_target[0] if turn_target is not None else None,
+        turn_target_value=turn_target[1] if turn_target is not None else None,
+    )
 
 
 def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] | None) -> Worker:
@@ -1084,10 +1105,19 @@ def _worker_target_key(worker: Worker) -> tuple[str, str] | None:
     return kind, value
 
 
+def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
+    return _WorkerRecord(
+        worker=worker,
+        private_fingerprint=record.private_fingerprint,
+        turn_target_kind=record.turn_target_kind,
+        turn_target_value=record.turn_target_value,
+    )
+
+
 def _reuse_worker_ids_from_bindings(
-    records: list[tuple[Worker, str]],
+    records: list[_WorkerRecord],
     stored_bindings: Sequence[WorkerBinding] | None,
-) -> list[tuple[Worker, str]]:
+) -> list[_WorkerRecord]:
     """Reuse stable public ids from private binding matches when safe."""
     if not stored_bindings:
         return records
@@ -1103,15 +1133,17 @@ def _reuse_worker_ids_from_bindings(
             if key[0] and key[1]:
                 by_target.setdefault(key, []).append(binding)
 
-    current_private_counts = Counter(private_fingerprint for _worker, private_fingerprint in records)
+    current_private_counts = Counter(record.private_fingerprint for record in records)
     current_target_counts = Counter(
         key
-        for key in (_worker_target_key(worker) for worker, _identity in records)
+        for key in (_worker_target_key(record.worker) for record in records)
         if key is not None
     )
 
-    reused: list[tuple[Worker, str]] = []
-    for worker, private_fingerprint in records:
+    reused: list[_WorkerRecord] = []
+    for record in records:
+        worker = record.worker
+        private_fingerprint = record.private_fingerprint
         matched = None
         private_candidates = [
             binding
@@ -1126,37 +1158,38 @@ def _reuse_worker_ids_from_bindings(
             if key is not None and current_target_counts[key] == 1 and len(candidates) == 1:
                 matched = candidates[0]
         if matched is not None and matched.worker_id:
-            reused.append((_worker_with_id(worker, matched.worker_id), private_fingerprint))
+            reused.append(_record_with_worker(record, _worker_with_id(worker, matched.worker_id)))
         else:
-            reused.append((worker, private_fingerprint))
+            reused.append(record)
     return reused
 
 
 def _deduplicated_worker_records(
-    records: list[tuple[Worker, str]],
+    records: list[_WorkerRecord],
     stored_bindings: Sequence[WorkerBinding] | None = None,
-) -> list[tuple[Worker, str]]:
+) -> list[_WorkerRecord]:
     """Drop exact duplicates, then disambiguate duplicate public ids."""
     records = _reuse_worker_ids_from_bindings(records, stored_bindings)
     seen: set[tuple[str, str, str | None, str, str, str]] = set()
-    unique: list[tuple[Worker, str]] = []
-    for worker, identity in records:
+    unique: list[_WorkerRecord] = []
+    for record in records:
+        worker = record.worker
         backend_kind = ""
         backend_value = ""
         if worker.backend_target:
             backend_kind = str(worker.backend_target.get("kind", ""))
             backend_value = str(worker.backend_target.get("value", ""))
-        key = (worker.id, worker.name, worker.space_id, backend_kind, backend_value, identity)
+        key = (worker.id, worker.name, worker.space_id, backend_kind, backend_value, record.private_fingerprint)
         if key in seen:
             continue
         seen.add(key)
-        unique.append((worker, identity))
+        unique.append(record)
 
-    groups: dict[str, list[tuple[Worker, str]]] = {}
-    for worker, identity in unique:
-        groups.setdefault(worker.id, []).append((worker, identity))
+    groups: dict[str, list[_WorkerRecord]] = {}
+    for record in unique:
+        groups.setdefault(record.worker.id, []).append(record)
 
-    disambiguated: list[tuple[Worker, str]] = []
+    disambiguated: list[_WorkerRecord] = []
     for worker_id, group in groups.items():
         if len(group) == 1:
             disambiguated.append(group[0])
@@ -1164,48 +1197,53 @@ def _deduplicated_worker_records(
         ordered = sorted(
             group,
             key=lambda record: (
-                record[0].name,
-                record[0].space_id or "",
-                str((record[0].backend_target or {}).get("kind", "")),
-                str((record[0].backend_target or {}).get("value", "")),
-                record[1],
+                record.worker.name,
+                record.worker.space_id or "",
+                str((record.worker.backend_target or {}).get("kind", "")),
+                str((record.worker.backend_target or {}).get("value", "")),
+                record.private_fingerprint,
                 stable_fingerprint(
                     {
-                        "id": record[0].id,
-                        "name": record[0].name,
-                        "space_id": record[0].space_id,
-                        "status": record[0].status,
-                        "summary": record[0].summary,
+                        "id": record.worker.id,
+                        "name": record.worker.name,
+                        "space_id": record.worker.space_id,
+                        "status": record.worker.status,
+                        "summary": record.worker.summary,
                     }
                 ),
             ),
         )
-        for index, (worker, _identity) in enumerate(ordered, start=1):
-            disambiguated.append((_worker_with_id(worker, f"{worker_id}-{index}"), _identity))
+        for index, record in enumerate(ordered, start=1):
+            disambiguated.append(_record_with_worker(record, _worker_with_id(record.worker, f"{worker_id}-{index}")))
 
-    disambiguated = sorted(disambiguated, key=lambda record: record[0].id)
-    workers = _mark_backend_sendability([worker for worker, _identity in disambiguated])
+    disambiguated = sorted(disambiguated, key=lambda record: record.worker.id)
+    workers = _mark_backend_sendability([record.worker for record in disambiguated])
     assert_unique_sendable_backend_targets(workers)
-    return list(zip(workers, [identity for _worker, identity in disambiguated], strict=True))
+    return [
+        _record_with_worker(record, worker)
+        for record, worker in zip(disambiguated, workers, strict=True)
+    ]
 
 
 def _deduplicate_worker_records(
-    records: list[tuple[Worker, str]],
+    records: list[_WorkerRecord],
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> list[Worker]:
-    return [worker for worker, _identity in _deduplicated_worker_records(records, stored_bindings)]
+    return [record.worker for record in _deduplicated_worker_records(records, stored_bindings)]
 
 
 def _deduplicate_workers(workers: list[Worker]) -> list[Worker]:
-    return _deduplicate_worker_records([(worker, worker.fingerprint) for worker in workers])
+    return _deduplicate_worker_records(
+        [_WorkerRecord(worker=worker, private_fingerprint=worker.fingerprint) for worker in workers]
+    )
 
 
 def _binding_from_worker_record(
     config: Config,
-    worker: Worker,
-    private_fingerprint: str,
+    record: _WorkerRecord,
     observed_at: str,
 ) -> WorkerBinding | None:
+    worker = record.worker
     target = worker.backend_target
     if not isinstance(target, Mapping):
         return None
@@ -1221,29 +1259,29 @@ def _binding_from_worker_record(
         backend=_BACKEND_NAME,
         target_kind=target_kind,
         target_value=target_value,
-        turn_target_kind=None,
-        turn_target_value=None,
+        turn_target_kind=record.turn_target_kind,
+        turn_target_value=record.turn_target_value,
         sendable=target.get("sendable") is True,
         reason=str(reason) if reason is not None else None,
         observed_at=observed_at,
         expires_at=None,
-        private_fingerprint=private_fingerprint,
+        private_fingerprint=record.private_fingerprint,
     )
 
 
 def _workers_and_bindings_from_records(
     config: Config,
-    records: list[tuple[Worker, str]],
+    records: list[_WorkerRecord],
     *,
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     observed_at = utc_timestamp()
     deduplicated = _deduplicated_worker_records(records, stored_bindings)
-    workers = [worker for worker, _private_fingerprint in deduplicated]
+    workers = [record.worker for record in deduplicated]
     bindings = [
         binding
-        for worker, private_fingerprint in deduplicated
-        if (binding := _binding_from_worker_record(config, worker, private_fingerprint, observed_at)) is not None
+        for record in deduplicated
+        if (binding := _binding_from_worker_record(config, record, observed_at)) is not None
     ]
     return workers, separate_duplicate_worker_bindings(bindings)
 
@@ -1276,7 +1314,8 @@ def bindings_from_workers(
                 "target_value": target_value,
             },
         )
-        binding = _binding_from_worker_record(config, worker, private_fingerprint, timestamp)
+        record = _WorkerRecord(worker=worker, private_fingerprint=private_fingerprint)
+        binding = _binding_from_worker_record(config, record, timestamp)
         if binding is not None:
             bindings.append(binding)
     return separate_duplicate_worker_bindings(bindings)
@@ -1327,7 +1366,7 @@ def _workers_from_payload(
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> list[Worker]:
     """Extract neutral Worker objects from a herdr agent-list payload."""
-    records: list[tuple[Worker, str]] = []
+    records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
         records.append(_worker_record_from_item(item, config))
     return _deduplicate_worker_records(records, stored_bindings)
@@ -1338,7 +1377,7 @@ def _workers_and_bindings_from_payload(
     config: Config,
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
-    records: list[tuple[Worker, str]] = []
+    records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
         records.append(_worker_record_from_item(item, config))
     return _workers_and_bindings_from_records(config, records, stored_bindings=stored_bindings)
@@ -1366,7 +1405,7 @@ def _workers_from_pane_payload(
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> list[Worker]:
     """Extract worker objects from herdr pane list, only for agent-bearing panes."""
-    records: list[tuple[Worker, str]] = []
+    records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
         if not _pane_has_agent(item):
             continue
@@ -1379,7 +1418,7 @@ def _workers_and_bindings_from_pane_payload(
     config: Config,
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
-    records: list[tuple[Worker, str]] = []
+    records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
         if not _pane_has_agent(item):
             continue

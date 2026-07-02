@@ -541,8 +541,10 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         def connect(self) -> "FakeHerdrSocketClient":
             return self
 
-        def agent_send(self, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
-            calls.append(dict(params))
+        def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+            calls.append({"method": method, "params": dict(params)})
+            if method == "agent.get":
+                return {"result": {"agent": {"pane_id": "pane-private"}}}
             return {"accepted": True}
 
         def close(self) -> None:
@@ -577,9 +579,15 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         assert first["result"]["status"] == STATUS_ACCEPTED
         assert second["ok"] is True
         assert second["result"]["status"] == STATUS_ACCEPTED
-        assert calls == [{"agent_id": "agent-private", "text": "hello"}]
+        assert calls == [
+            {"method": "agent.get", "params": {"target": "agent-private"}},
+            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
+            {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello"}},
+            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
+        ]
         assert get_command_receipt(db_path, "cmd-host", "req-1", "send_instruction") is not None
         assert "agent-private" not in json.dumps(first)
+        assert "pane-private" not in json.dumps(first)
         _assert_no_public_json_forbidden(first)
     finally:
         daemon.stop()
