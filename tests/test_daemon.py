@@ -582,6 +582,8 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
+            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
+            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
             {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
         ]

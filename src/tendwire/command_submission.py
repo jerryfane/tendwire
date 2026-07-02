@@ -49,6 +49,14 @@ HERDR_BACKEND = "herdr"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 _SUBMIT_ENTER_DELAY_SECONDS = 0.2
+_PRIVATE_PANE_CLEAR_KEY_SEQUENCES = (
+    ("ctrl+u",),
+    ("ctrl+a", "ctrl+k"),
+    ("ctrl+a", "backspace"),
+)
+_WORKER_QUEUED_STATUSES = frozenset(
+    {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
+)
 _PANE_SUBMIT_TARGET_KINDS = frozenset(
     {
         "agent_id",
@@ -351,12 +359,16 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     # plus Enter matches the older CLI path Herdres used successfully. The
     # small delay mirrors the process/IO gap in that CLI path; without it, some
     # panes acknowledge Enter before the text is visible to the foreground app.
-    _socket_request(
-        client,
-        "pane.send_keys",
-        {"pane_id": pane_id, "keys": ["ctrl+u"]},
-        timeout=timeout,
-    )
+    # A single ctrl+u is not reliable across all foreground TUIs. Use a small
+    # readline-compatible sequence before writing new text so a later Enter
+    # cannot submit stale text left by an earlier uncertain send.
+    for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
+        _socket_request(
+            client,
+            "pane.send_keys",
+            {"pane_id": pane_id, "keys": list(keys)},
+            timeout=timeout,
+        )
     _socket_request(
         client,
         "pane.send_text",
@@ -370,6 +382,13 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
         {"pane_id": pane_id, "keys": ["enter"]},
         timeout=timeout,
     )
+
+
+def _delivery_state_for_worker(worker: Worker) -> str:
+    status = str(worker.status or "").strip().lower().replace("-", "_")
+    if status in _WORKER_QUEUED_STATUSES:
+        return "queued"
+    return "submitted"
 
 
 def _backend_failure(request: CommandRequest, message: str) -> CommandEnvelope:
@@ -501,7 +520,10 @@ def _socket_send_envelope(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
-        result={"target": {"worker_id": resolved.worker.id}},
+        result={
+            "target": {"worker_id": resolved.worker.id},
+            "delivery_state": _delivery_state_for_worker(resolved.worker),
+        },
     )
 
 

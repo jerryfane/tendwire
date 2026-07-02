@@ -181,9 +181,17 @@ def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None
 def _expected_submit_calls(target: str = "agent-secret", *, pane_id: str = "pane-secret") -> list[dict[str, Any]]:
     return [
         {"method": "agent.get", "params": {"target": target}},
-        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+u"]}},
+        *_expected_private_clear_calls(pane_id),
         {"method": "pane.send_text", "params": {"pane_id": pane_id, "text": "hello"}},
         {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
+    ]
+
+
+def _expected_private_clear_calls(pane_id: str = "pane-secret") -> list[dict[str, Any]]:
+    return [
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+u"]}},
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+a", "ctrl+k"]}},
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+a", "backspace"]}},
     ]
 
 @pytest.mark.parametrize(
@@ -320,7 +328,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert envelope.status != STATUS_BACKEND_UNAVAILABLE
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        *_expected_private_clear_calls(),
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
     ]
     assert config.db_path is not None
@@ -348,6 +356,10 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     )
 
     assert first.status == STATUS_ACCEPTED
+    assert first.result == {
+        "target": {"worker_id": "w-1"},
+        "delivery_state": "queued",
+    }
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
     assert calls == _expected_submit_calls()
@@ -407,11 +419,41 @@ def test_submit_command_waits_for_text_to_stage_before_enter(
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        *_expected_private_clear_calls(),
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
         {"sleep": 0.2},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
     ]
+
+
+def test_submit_command_marks_working_worker_delivery_as_queued(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="working")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.result == {
+        "target": {"worker_id": "w-1"},
+        "delivery_state": "queued",
+    }
+
+
+def test_submit_command_marks_idle_worker_delivery_as_submitted(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="idle")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.result == {
+        "target": {"worker_id": "w-1"},
+        "delivery_state": "submitted",
+    }
 
 
 def test_submit_command_terminal_binding_resolves_pane_and_submits_input(tmp_path: Path) -> None:
@@ -440,7 +482,7 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
+        *_expected_private_clear_calls("pane-private"),
         {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
     ]
@@ -571,7 +613,7 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     assert second.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        *_expected_private_clear_calls(),
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
     ]
 
