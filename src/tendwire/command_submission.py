@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -47,6 +48,7 @@ from .store.sqlite import (
 HERDR_BACKEND = "herdr"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
+_SUBMIT_ENTER_DELAY_SECONDS = 0.2
 _PANE_SUBMIT_TARGET_KINDS = frozenset(
     {
         "agent_id",
@@ -346,7 +348,9 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     # Keep the reliable Telegram contract from the legacy path: clear any stale
     # staged input, write literal text, then press Enter to submit it. Herdr's
     # pane.send_input can leave text staged in some TUI states, while send_text
-    # plus Enter matches the older CLI path Herdres used successfully.
+    # plus Enter matches the older CLI path Herdres used successfully. The
+    # small delay mirrors the process/IO gap in that CLI path; without it, some
+    # panes acknowledge Enter before the text is visible to the foreground app.
     _socket_request(
         client,
         "pane.send_keys",
@@ -359,6 +363,7 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
         {"pane_id": pane_id, "text": instruction_text},
         timeout=timeout,
     )
+    time.sleep(_SUBMIT_ENTER_DELAY_SECONDS)
     _socket_request(
         client,
         "pane.send_keys",

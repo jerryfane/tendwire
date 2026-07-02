@@ -388,6 +388,32 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         _assert_no_private_json(surface)
 
 
+def test_submit_command_waits_for_text_to_stage_before_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        "tendwire.command_submission.time.sleep",
+        lambda seconds: calls.append({"sleep": seconds}),
+    )
+
+    envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert calls == [
+        {"method": "agent.get", "params": {"target": "agent-secret"}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
+        {"sleep": 0.2},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+    ]
+
+
 def test_submit_command_terminal_binding_resolves_pane_and_submits_input(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
