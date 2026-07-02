@@ -582,7 +582,7 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
-            {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello"}},
+            {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
         ]
         assert get_command_receipt(db_path, "cmd-host", "req-1", "send_instruction") is not None

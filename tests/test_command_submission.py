@@ -161,7 +161,7 @@ class _FakeSocketClient:
 
     def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         self.calls.append({"method": method, "params": dict(params)})
-        if self.raises is not None and method == "pane.send_input":
+        if self.raises is not None and method == "pane.send_text":
             raise self.raises
         if method == "agent.get":
             return {"result": {"agent": {"pane_id": self.pane_id}}}
@@ -182,7 +182,7 @@ def _expected_submit_calls(target: str = "agent-secret", *, pane_id: str = "pane
     return [
         {"method": "agent.get", "params": {"target": target}},
         {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["ctrl+u"]}},
-        {"method": "pane.send_input", "params": {"pane_id": pane_id, "text": "hello"}},
+        {"method": "pane.send_text", "params": {"pane_id": pane_id, "text": "hello"}},
         {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
     ]
 
@@ -321,7 +321,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello"}},
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
     ]
     assert config.db_path is not None
     receipt = get_command_receipt(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
@@ -415,7 +415,7 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
         {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
-        {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello"}},
+        {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
     ]
     public_json = json.dumps(envelope.to_dict())
@@ -546,7 +546,7 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["ctrl+u"]}},
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello"}},
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
     ]
 
     assert config.db_path is not None

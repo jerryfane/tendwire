@@ -344,8 +344,9 @@ def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout
 
 def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str, *, timeout: float) -> None:
     # Keep the reliable Telegram contract from the legacy path: clear any stale
-    # staged input, send as an input submission, then press Enter for Herdr/TUI
-    # states that leave text staged after send_input.
+    # staged input, write literal text, then press Enter to submit it. Herdr's
+    # pane.send_input can leave text staged in some TUI states, while send_text
+    # plus Enter matches the older CLI path Herdres used successfully.
     _socket_request(
         client,
         "pane.send_keys",
@@ -354,7 +355,7 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     )
     _socket_request(
         client,
-        "pane.send_input",
+        "pane.send_text",
         {"pane_id": pane_id, "text": instruction_text},
         timeout=timeout,
     )
