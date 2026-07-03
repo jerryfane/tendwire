@@ -2689,6 +2689,7 @@ def find_recent_matching_command_submission(
     *,
     action: str,
     worker_id: str,
+    worker_fingerprint: str = "",
     instruction_text: str,
     since: str,
     exclude_request_id: str = "",
@@ -2724,6 +2725,10 @@ def find_recent_matching_command_submission(
         if not isinstance(target, dict) or not isinstance(instruction, dict):
             continue
         if str(target.get("worker_id") or "").strip() != str(worker_id).strip():
+            continue
+        previous_fingerprint = str(target.get("worker_fingerprint") or "").strip()
+        current_fingerprint = str(worker_fingerprint or "").strip()
+        if previous_fingerprint and current_fingerprint and previous_fingerprint != current_fingerprint:
             continue
         if instruction.get("text") != instruction_text:
             continue

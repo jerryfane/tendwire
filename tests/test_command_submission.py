@@ -493,6 +493,61 @@ def test_submit_command_suppresses_recent_same_worker_long_instruction_with_new_
     assert "private-secret" not in public_json
 
 
+def test_submit_command_allows_same_instruction_after_worker_fingerprint_changes(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    old_worker = Worker(id="w-1", name="Alpha", status="active", fingerprint="old-fp")
+    new_worker = Worker(id="w-1", name="Alpha", status="active", fingerprint="new-fp")
+    _seed(
+        config,
+        [old_worker],
+        [_binding(old_worker, value="old-agent-secret", private_fingerprint="old-private-secret")],
+    )
+    calls: list[dict[str, Any]] = []
+    text = "When this exact long Telegram instruction appears for a new binding, it should send."
+
+    first = submit_command(
+        config,
+        _request(request_id="fingerprint-1", text=text, worker_fingerprint="old-fp"),
+        socket_client_factory=_factory(calls),
+    )
+    assert first.status == STATUS_ACCEPTED
+
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:01:00+00:00",
+            workers=[new_worker],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    upsert_worker_bindings(
+        config.db_path,
+        [_binding(new_worker, value="new-agent-secret", private_fingerprint="new-private-secret")],
+    )
+
+    second = submit_command(
+        config,
+        _request(request_id="fingerprint-2", text=text, worker_fingerprint="new-fp"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert second.status == STATUS_ACCEPTED
+    assert calls == [
+        {"method": "agent.get", "params": {"target": "old-agent-secret"}},
+        *_expected_private_clear_calls(),
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+        {"method": "agent.get", "params": {"target": "new-agent-secret"}},
+        *_expected_private_clear_calls(),
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
+        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+    ]
+
+
 def test_submit_command_waits_for_text_to_stage_before_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

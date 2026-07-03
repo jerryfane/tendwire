@@ -418,6 +418,7 @@ def _duplicate_instruction_envelope(
         config.host_id,
         action=request.action,
         worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
         instruction_text=text,
         since=_duplicate_instruction_since(),
         exclude_request_id=request.request_id or "",
