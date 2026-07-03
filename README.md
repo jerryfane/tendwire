@@ -14,11 +14,16 @@ through the Herdr socket/event backend. Both paths normalize Herdr state into
 neutral Tendwire spaces, workers, attention, turns, pending interactions,
 command results, connector jobs, and backend health.
 
-Herdres, Telegram, Hermes, MCP, iOS, AR, UI surfaces, local LLMs, source-mode
-polling, and concrete connector implementations remain outside this README's
-active scope. The connector outbox is only a neutral Tendwire boundary for a
-separate process to poll, acknowledge, fail, or defer jobs; it is not a Herdres,
-Telegram, UI, or delivery bridge.
+Herdres can use Tendwire as its source/control plane while Herdres remains the
+Telegram connector. Tendwire owns Herdr observation, private bindings,
+turns/pending interactions, attention, command routing, receipts, backend
+health, event/projection state, and the neutral connector outbox. Herdres owns
+Telegram formatting, topic/message state, replies, rate limits, retries, and
+delivery bookkeeping. Hermes, MCP, iOS, AR, UI surfaces, local LLMs, and
+concrete connector implementations remain outside this README's active scope.
+The connector outbox is only a neutral Tendwire boundary for a separate process
+to poll, acknowledge, fail, or defer jobs; it is not a Telegram, UI, or delivery
+bridge.
 
 Public Tendwire JSON must not expose raw `pane_id`, `terminal_id`,
 `backend_target`, Telegram/chat/topic/message IDs, socket paths, raw target
@@ -198,8 +203,9 @@ stdout, stderr, env, argv, secrets, or raw Herdr payloads.
 
 Non-goals:
 
-- No Herdres import, mutation, connector bridge, or delivery integration.
-- No Tendwire source-mode, UI, local LLM, MCP, Hermes, iOS, or AR integration.
+- No Herdres import, mutation, connector bridge, Telegram delivery integration,
+  or connector outbox draining.
+- No UI, local LLM, MCP, Hermes, iOS, or AR integration.
 - No raw Herdr pane, socket-path, terminal, PTY, shell, or low-level command
   control exposure.
 - No default contact with live Herdr from ordinary CLI usage or normal pytest.
@@ -737,7 +743,8 @@ Tendwire intentionally does **not** include:
 - Modifications to Herdres or local Herdres files.
 - Connector-specific routing or delivery state inside core models or snapshots;
   the neutral connector outbox boundary remains separate.
-- Tendwire source-mode polling, source adapters, or raw terminal integrations.
+- Telegram delivery, topic mapping, reply rendering, rate limiting, retry
+  policy, or connector-specific presentation logic.
 - Raw Herdr pane, terminal, socket-path, target-value, shell, PTY, argv, env,
   stdout, or stderr exposure in public JSON.
 - Network sync or cross-device transport.

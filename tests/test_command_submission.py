@@ -359,7 +359,10 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     assert first.status == STATUS_ACCEPTED
     assert first.result == {
         "target": {"worker_id": "w-1"},
-        "delivery_state": "queued",
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "active",
+        "observed_turn_state": "pending_observation",
     }
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
@@ -486,7 +489,7 @@ def test_submit_command_waits_for_text_to_stage_before_enter(
     ]
 
 
-def test_submit_command_marks_working_worker_delivery_as_queued(tmp_path: Path) -> None:
+def test_submit_command_reports_submitted_transport_and_worker_state(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="working")
     _seed(config, [worker], [_binding(worker)])
@@ -497,7 +500,10 @@ def test_submit_command_marks_working_worker_delivery_as_queued(tmp_path: Path) 
     assert envelope.status == STATUS_ACCEPTED
     assert envelope.result == {
         "target": {"worker_id": "w-1"},
-        "delivery_state": "queued",
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "active",
+        "observed_turn_state": "pending_observation",
     }
 
 
@@ -513,6 +519,9 @@ def test_submit_command_marks_idle_worker_delivery_as_submitted(tmp_path: Path) 
     assert envelope.result == {
         "target": {"worker_id": "w-1"},
         "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "target_state_at_send": "idle",
+        "observed_turn_state": "pending_observation",
     }
 
 

@@ -59,9 +59,6 @@ _PRIVATE_PANE_CLEAR_KEY_SEQUENCES = (
     ("ctrl+a", "ctrl+k"),
     ("ctrl+a", "backspace"),
 )
-_WORKER_QUEUED_STATUSES = frozenset(
-    {"active", "busy", "in_progress", "pending", "running", "waiting", "working"}
-)
 _PANE_SUBMIT_TARGET_KINDS = frozenset(
     {
         "agent_id",
@@ -389,11 +386,9 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     )
 
 
-def _delivery_state_for_worker(worker: Worker) -> str:
+def _target_state_at_send(worker: Worker) -> str:
     status = str(worker.status or "").strip().lower().replace("-", "_")
-    if status in _WORKER_QUEUED_STATUSES:
-        return "queued"
-    return "submitted"
+    return status or "unknown"
 
 
 def _instruction_text(request: CommandRequest) -> str:
@@ -572,7 +567,10 @@ def _socket_send_envelope(
         status=STATUS_ACCEPTED,
         result={
             "target": {"worker_id": resolved.worker.id},
-            "delivery_state": _delivery_state_for_worker(resolved.worker),
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": _target_state_at_send(resolved.worker),
+            "observed_turn_state": "pending_observation",
         },
     )
 

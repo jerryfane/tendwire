@@ -65,6 +65,37 @@ PY
 Healthy release-candidate output has healthy backend health, an `ok` store
 status, and SQLite integrity `ok`.
 
+## RC Checklist
+
+Before tagging a Tendwire/Herdres source-mode pair:
+
+```bash
+# Tendwire source checkout
+git status -sb
+python3 -m py_compile $(git ls-files '*.py')
+python3 -m pytest -q
+tendwire doctor --json
+tendwire snapshot --json --store --db-path ~/.local/share/tendwire/tendwire.db
+tendwire turns --json
+tendwire pending --json
+tendwire attention --json
+tendwire store status --db-path ~/.local/share/tendwire/tendwire.db
+
+# Local store integrity
+python3 - <<'PY'
+import sqlite3
+from pathlib import Path
+db = Path.home() / ".local/share/tendwire/tendwire.db"
+with sqlite3.connect(db) as conn:
+    print(conn.execute("PRAGMA integrity_check").fetchone()[0])
+PY
+```
+
+Pair this with the Herdres source-mode RC checklist. Herdres source smoke must
+report `direct_herdr_calls=0`, two forced source syncs must not repost completed
+turn text, and `herdr-server.service` should be checked with status-only
+commands unless the operator explicitly asks for an external restart.
+
 ## Rollback
 
 Tendwire does not own Telegram delivery state. To roll back a Herdres source-mode
