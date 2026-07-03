@@ -45,6 +45,7 @@ from .store.sqlite import (
     list_worker_bindings,
     reserve_command_receipt,
     save_command_receipt,
+    upsert_command_pending_turn,
 )
 
 
@@ -650,7 +651,13 @@ def _reserve_mutating_request(config: Config, request: CommandRequest) -> Comman
     return envelope
 
 
-def _save_mutating_result(config: Config, request: CommandRequest, envelope: CommandEnvelope) -> None:
+def _save_mutating_result(
+    config: Config,
+    request: CommandRequest,
+    envelope: CommandEnvelope,
+    *,
+    worker: Worker | None = None,
+) -> None:
     if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
         return
     if config.db_path is None:
@@ -665,6 +672,14 @@ def _save_mutating_result(config: Config, request: CommandRequest, envelope: Com
         result_json=envelope_to_receipt_json(envelope),
         uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
     )
+    if envelope.status == STATUS_ACCEPTED and worker is not None:
+        upsert_command_pending_turn(
+            config.db_path,
+            config.host_id,
+            worker,
+            request_id=request.request_id,
+            instruction_text=_instruction_text(request),
+        )
     event_type = "command.submitted"
     if envelope.status == STATUS_DUPLICATE_INSTRUCTION:
         event_type = "command.duplicate_instruction"
@@ -718,6 +733,7 @@ def submit_command(
 
     snapshot = _current_snapshot(config)
     envelope = _backend_health_error(config, request, snapshot)
+    resolved_worker: Worker | None = None
     if envelope is None:
         bindings = []
         if config.db_path is not None:
@@ -726,6 +742,7 @@ def submit_command(
         if isinstance(resolved, CommandEnvelope):
             envelope = resolved
         else:
+            resolved_worker = resolved.worker
             envelope = _duplicate_instruction_envelope(config, request, resolved.worker)
             if envelope is None:
                 envelope = _socket_send_envelope(
@@ -735,5 +752,5 @@ def submit_command(
                     socket_client_factory=socket_client_factory,
                 )
 
-    _save_mutating_result(config, request, envelope)
+    _save_mutating_result(config, request, envelope, worker=resolved_worker)
     return envelope

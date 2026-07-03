@@ -33,6 +33,7 @@ from tendwire.store.sqlite import (
     get_command_receipt,
     init_store,
     save_snapshot,
+    turns_payload_from_store,
     upsert_worker_bindings,
 )
 
@@ -373,6 +374,32 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     assert receipt is not None
     assert receipt["status"] == STATUS_ACCEPTED
     assert receipt["uncertain"] is False
+    turns_payload = turns_payload_from_store(config.db_path, "cmd-host")
+    command_turns = [
+        turn
+        for turn in turns_payload["turns"]
+        if turn.get("origin_command_id") == "req-1"
+    ]
+    assert len(command_turns) == 1
+    command_turn = command_turns[0]
+    assert command_turn["worker_id"] == "w-1"
+    assert command_turn["worker_fingerprint"] == worker.fingerprint
+    assert command_turn["status"] == "active"
+    assert command_turn["user_text"] == "hello"
+    assert command_turn["assistant_final_text"] is None
+    assert command_turn["complete"] is False
+    assert command_turn["has_open_turn"] is True
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:01:00+00:00",
+            workers=[worker],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    turns_after_snapshot = turns_payload_from_store(config.db_path, "cmd-host")
+    assert any(turn.get("origin_command_id") == "req-1" for turn in turns_after_snapshot["turns"])
 
     with sqlite3.connect(str(config.db_path)) as conn:
         event_rows = conn.execute("SELECT event_type, payload_json FROM events ORDER BY id").fetchall()
@@ -386,6 +413,7 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         "command.submitted",
         "command.cached",
         "command.duplicate",
+        "snapshot.saved",
     ]
     assert command_row is not None
     assert json.loads(command_row[0])["request_id"] == "req-1"
@@ -393,6 +421,8 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     public_surfaces = [
         first.to_dict(),
         duplicate.to_dict(),
+        turns_payload,
+        turns_after_snapshot,
         json.loads(receipt["result_json"]),
         json.loads(command_row[1]),
         *[json.loads(row[1]) for row in event_rows],

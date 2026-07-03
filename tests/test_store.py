@@ -1389,6 +1389,54 @@ def test_store_merges_public_turn_content_without_private_labels(tmp_path: Path)
     assert turn["has_open_turn"] is False
 
 
+def test_store_merges_turn_content_into_matching_command_row_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-command-content.db"
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "codex", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    command_turn = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        "turn-host",
+        worker,
+        request_id="req-1",
+        instruction_text="Please answer from Telegram.",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    assert command_turn is not None
+
+    updated = merge_turn_content(
+        db_path,
+        "turn-host",
+        "worker-1",
+        {
+            "user_text": "Please answer from Telegram.",
+            "assistant_final_text": "Telegram answer delivered.",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    )
+    payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
+    command_rows = [
+        turn for turn in payload["turns"] if turn.get("origin_command_id") == "req-1"
+    ]
+    snapshot_rows = [
+        turn for turn in payload["turns"] if turn.get("id") != command_turn["id"]
+    ]
+
+    assert updated == 1
+    assert len(command_rows) == 1
+    assert command_rows[0]["assistant_final_text"] == "Telegram answer delivered."
+    assert command_rows[0]["complete"] is True
+    assert snapshot_rows
+    assert all(not (turn.get("assistant_final_text") or "") for turn in snapshot_rows)
+
+
 def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
     config_a = Config(host_id="host-a", db_path=db_path)

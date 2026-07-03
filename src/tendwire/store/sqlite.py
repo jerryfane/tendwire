@@ -1864,6 +1864,48 @@ def _prune_host_projection(
         conn.execute(f"DELETE FROM {table} WHERE host_id = ?", (str(host_id),))
 
 
+def _turn_payload_has_origin_command(payload_json: Any) -> bool:
+    try:
+        payload = json.loads(str(payload_json or "{}"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, Mapping) and bool(str(payload.get("origin_command_id") or "").strip())
+
+
+def _prune_turn_projection(
+    conn: sqlite3.Connection,
+    host_id: str,
+    keep_ids: Iterable[str],
+) -> None:
+    ids = sorted({str(value) for value in keep_ids})
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""
+            SELECT turn_id, payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id NOT IN ({placeholders})
+            """,
+            [str(host_id), *ids],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT turn_id, payload_json
+            FROM turns
+            WHERE host_id = ?
+            """,
+            (str(host_id),),
+        ).fetchall()
+    for turn_id, payload_json in rows:
+        if _turn_payload_has_origin_command(payload_json):
+            continue
+        conn.execute(
+            "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
+            (str(host_id), str(turn_id)),
+        )
+
+
 def _attention_id_from_item(item: Mapping[str, Any]) -> str:
     return str(item.get("id") or item.get("fingerprint") or "unknown")
 
@@ -2427,7 +2469,7 @@ def _upsert_snapshot_projections(
                 _canonical_json(item),
             ),
         )
-    _prune_host_projection(conn, "turns", "turn_id", host_id, turn_ids)
+    _prune_turn_projection(conn, host_id, turn_ids)
 
     pending_ids: set[str] = set()
     for pending in pending_from_snapshot(snapshot):
@@ -3045,6 +3087,45 @@ _TURN_CONTENT_FIELDS = frozenset(
 )
 
 
+def _turn_merge_match_text(value: Any) -> str:
+    return "\n".join(" ".join(line.split()) for line in str(value or "").splitlines()).strip()
+
+
+def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) -> tuple[int, str, str]:
+    incoming_user = _turn_merge_match_text(content.get("user_text"))
+    existing_user = _turn_merge_match_text(payload.get("user_text"))
+    source = str(payload.get("source") or "")
+    has_origin = bool(str(payload.get("origin_command_id") or "").strip())
+    open_turn = payload.get("has_open_turn") is True or payload.get("complete") is False
+    has_existing_content = bool(
+        existing_user
+        or str(payload.get("assistant_final_text") or "").strip()
+        or str(payload.get("assistant_stream_text") or "").strip()
+    )
+    score = 0
+    if incoming_user and existing_user == incoming_user:
+        score += 1000
+    elif incoming_user and has_origin and existing_user:
+        score -= 500
+    if has_origin and incoming_user and existing_user == incoming_user:
+        score += 250
+    elif has_origin:
+        score -= 40
+    if open_turn:
+        score += 80
+    if source == "command":
+        score += 40 if incoming_user and existing_user == incoming_user else -20
+    elif source == "snapshot":
+        score += 10
+    if not has_existing_content:
+        score += 5
+    return (
+        score,
+        str(payload.get("updated_at") or payload.get("observed_at") or ""),
+        str(payload.get("id") or payload.get("turn_id") or ""),
+    )
+
+
 def merge_turn_content(
     db_path: Path,
     host_id: str,
@@ -3073,46 +3154,150 @@ def merge_turn_content(
         ).fetchall()
         if not rows:
             return 0
+        decoded_rows: list[tuple[Any, dict[str, Any]]] = []
+        for turn_id, payload_json in rows:
+            try:
+                payload = json.loads(str(payload_json or "{}"))
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            decoded_rows.append((turn_id, payload))
+        turn_id, payload = max(
+            decoded_rows,
+            key=lambda row: _turn_merge_score(row[1], clean_content),
+        )
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for turn_id, payload_json in rows:
-                try:
-                    payload = json.loads(str(payload_json or "{}"))
-                except json.JSONDecodeError:
-                    payload = {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                payload.update(clean_content)
-                turn = Turn.from_dict(payload)
-                item = turn.to_dict()
-                conn.execute(
-                    """
-                    UPDATE turns
-                    SET status = ?,
-                        kind = ?,
-                        updated_at = ?,
-                        fingerprint = ?,
-                        observed_at = ?,
-                        payload_json = ?
-                    WHERE host_id = ? AND turn_id = ?
-                    """,
-                    (
-                        str(item.get("status") or "unknown"),
-                        str(item.get("kind") or "unknown"),
-                        item.get("updated_at") or current_time,
-                        str(item.get("fingerprint") or ""),
-                        current_time,
-                        _canonical_json(item),
-                        str(host_id),
-                        str(turn_id),
-                    ),
-                )
-                updated += 1
+            payload.update(clean_content)
+            turn = Turn.from_dict(payload)
+            item = turn.to_dict()
+            conn.execute(
+                """
+                UPDATE turns
+                SET status = ?,
+                    kind = ?,
+                    updated_at = ?,
+                    fingerprint = ?,
+                    observed_at = ?,
+                    payload_json = ?
+                WHERE host_id = ? AND turn_id = ?
+                """,
+                (
+                    str(item.get("status") or "unknown"),
+                    str(item.get("kind") or "unknown"),
+                    item.get("updated_at") or current_time,
+                    str(item.get("fingerprint") or ""),
+                    current_time,
+                    _canonical_json(item),
+                    str(host_id),
+                    str(turn_id),
+                ),
+            )
+            updated += 1
             conn.commit()
         except Exception:
             conn.rollback()
             raise
     return updated
+
+
+def upsert_command_pending_turn(
+    db_path: Path,
+    host_id: str,
+    worker: Any,
+    *,
+    request_id: str,
+    instruction_text: str,
+    observed_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Upsert a public pending turn for an accepted command submission."""
+    clean_request_id = str(request_id or "").strip()
+    clean_text = str(instruction_text or "").strip()
+    if not clean_request_id or not clean_text:
+        return None
+    current_time = observed_at or utc_timestamp()
+    worker_id = str(getattr(worker, "id", "") or "").strip()
+    if not worker_id and isinstance(worker, Mapping):
+        worker_id = str(worker.get("id") or "").strip()
+    if not worker_id:
+        return None
+    item = Turn(
+        host_id=str(host_id),
+        worker_id=worker_id,
+        worker_fingerprint=str(getattr(worker, "fingerprint", "") or ""),
+        space_id=getattr(worker, "space_id", None),
+        status="active",
+        kind="task",
+        source="command",
+        user_text=clean_text,
+        assistant_final_text="",
+        assistant_stream_text="",
+        complete=False,
+        has_open_turn=True,
+        started_at=current_time,
+        updated_at=current_time,
+        origin_command_id=clean_request_id,
+    ).to_dict()
+    turn_id = str(item.get("id") or "")
+    if not turn_id:
+        return None
+    content_fingerprint = stable_fingerprint(
+        {
+            "source": "command",
+            "host_id": str(host_id),
+            "worker_id": worker_id,
+            "request_id": clean_request_id,
+            "turn_fingerprint": item.get("fingerprint"),
+        }
+    )
+    _ensure_dir(db_path)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id,
+                turn_id,
+                worker_id,
+                worker_fingerprint,
+                space_id,
+                status,
+                kind,
+                updated_at,
+                fingerprint,
+                snapshot_content_fingerprint,
+                observed_at,
+                payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, turn_id) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                worker_fingerprint = excluded.worker_fingerprint,
+                space_id = excluded.space_id,
+                status = excluded.status,
+                kind = excluded.kind,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                str(host_id),
+                turn_id,
+                worker_id,
+                item.get("worker_fingerprint"),
+                item.get("space_id"),
+                str(item.get("status") or "unknown"),
+                str(item.get("kind") or "unknown"),
+                item.get("updated_at"),
+                str(item.get("fingerprint") or ""),
+                content_fingerprint,
+                current_time,
+                _canonical_json(item),
+            ),
+        )
+    return item
 
 
 def turns_payload_from_store(
@@ -3140,7 +3325,7 @@ def turns_payload_from_store(
             SELECT payload_json, observed_at
             FROM turns
             WHERE host_id = ?
-            ORDER BY worker_id, turn_id
+            ORDER BY worker_id, COALESCE(updated_at, observed_at, '') DESC, turn_id
             """,
             (str(host_id),),
         ).fetchall()

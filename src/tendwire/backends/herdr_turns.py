@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from ..config import Config
@@ -19,6 +21,9 @@ _TURN_CONTENT_KEYS = (
     "complete",
     "has_open_turn",
 )
+_CODEX_SESSION_TURN_KIND = "codex_session_id"
+_PANE_TURN_KIND = "pane_id"
+_MAX_CODEX_STREAM_MESSAGES = 4
 
 
 def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
@@ -66,6 +71,179 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
     return content
 
 
+def _codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".codex"
+
+
+def _safe_codex_session_id(session_id: str) -> str:
+    clean = str(session_id or "").strip()
+    if not clean or "/" in clean or "\\" in clean or clean in {".", ".."}:
+        return ""
+    return clean
+
+
+def _find_codex_session_file(session_id: str) -> Path | None:
+    clean = _safe_codex_session_id(session_id)
+    if not clean:
+        return None
+    root = _codex_home() / "sessions"
+    if not root.exists():
+        return None
+    matches = [
+        path
+        for path in root.rglob(f"*{clean}*.jsonl")
+        if path.is_file()
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)
+
+
+def _payload_turn_id(payload: Mapping[str, Any]) -> str:
+    raw = payload.get("turn_id")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, Mapping):
+        raw = metadata.get("turn_id")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return ""
+
+
+def _message_text(payload: Mapping[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, Mapping):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    text = payload.get("message")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
+
+
+def _is_internal_user_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<subagent_notification>") or stripped.startswith("<environment_context>")
+
+
+def _append_unique_recent(items: list[str], text: str) -> None:
+    clean = text.strip()
+    if not clean:
+        return
+    if clean in items:
+        items.remove(clean)
+    items.append(clean)
+    if len(items) > _MAX_CODEX_STREAM_MESSAGES:
+        del items[: len(items) - _MAX_CODEX_STREAM_MESSAGES]
+
+
+def _read_codex_session_turn(session_id: str) -> Mapping[str, Any] | None:
+    session_file = _find_codex_session_file(session_id)
+    if session_file is None:
+        return None
+    active_turn_id = ""
+    last_content_turn_id = ""
+    user_text_by_turn: dict[str, str] = {}
+    stream_by_turn: dict[str, list[str]] = {}
+    final_by_turn: dict[str, str] = {}
+    complete_by_turn: dict[str, bool] = {}
+    try:
+        lines = session_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        payload = item.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        event_type = str(payload.get("type") or "")
+        if item.get("type") == "event_msg" and event_type == "task_started":
+            turn_id = _payload_turn_id(payload)
+            if turn_id:
+                active_turn_id = turn_id
+                complete_by_turn[turn_id] = False
+            continue
+        if item.get("type") == "event_msg" and event_type == "task_complete":
+            turn_id = _payload_turn_id(payload) or active_turn_id
+            final_text = str(payload.get("last_agent_message") or "").strip()
+            if turn_id and final_text:
+                final_by_turn[turn_id] = final_text
+                complete_by_turn[turn_id] = True
+                last_content_turn_id = turn_id
+            continue
+        if item.get("type") != "response_item" or event_type != "message":
+            continue
+        role = str(payload.get("role") or "")
+        turn_id = _payload_turn_id(payload) or active_turn_id
+        if not turn_id:
+            continue
+        text = _message_text(payload)
+        if not text:
+            continue
+        if role == "user":
+            if _is_internal_user_text(text):
+                continue
+            user_text_by_turn[turn_id] = text
+            complete_by_turn.setdefault(turn_id, False)
+            last_content_turn_id = turn_id
+            continue
+        if role != "assistant":
+            continue
+        phase = str(payload.get("phase") or "")
+        if phase == "commentary":
+            _append_unique_recent(stream_by_turn.setdefault(turn_id, []), text)
+            complete_by_turn.setdefault(turn_id, False)
+            last_content_turn_id = turn_id
+        else:
+            final_by_turn[turn_id] = text
+            complete_by_turn[turn_id] = True
+            last_content_turn_id = turn_id
+    turn_id = active_turn_id or last_content_turn_id
+    if not turn_id:
+        return None
+    user_text = user_text_by_turn.get(turn_id)
+    stream_text = "\n\n".join(stream_by_turn.get(turn_id, [])) or None
+    final_text = final_by_turn.get(turn_id)
+    has_final = bool(final_text)
+    content = {
+        "user_text": user_text,
+        "assistant_stream_text": None if has_final else stream_text,
+        "assistant_final_text": final_text,
+        "complete": bool(complete_by_turn.get(turn_id)) if has_final else False,
+        "has_open_turn": not has_final,
+    }
+    if not any(value not in (None, "", False) for value in content.values()):
+        return None
+    return content
+
+
+def _read_turn_for_binding(config: Config, binding: Any) -> Mapping[str, Any] | None:
+    target_kind = str(getattr(binding, "turn_target_kind", "") or "")
+    target_value = str(getattr(binding, "turn_target_value", "") or "")
+    if not target_value:
+        return None
+    if target_kind == _CODEX_SESSION_TURN_KIND:
+        return _read_codex_session_turn(target_value)
+    if target_kind == _PANE_TURN_KIND:
+        return _read_private_turn(config, target_value)
+    return None
+
+
 def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
     """Refresh public turn text from private turn targets, if a turn-capable Herdr bin exists."""
     if config.db_path is None:
@@ -74,12 +252,13 @@ def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
     turn_bindings = [
         binding
         for binding in bindings
-        if binding.turn_target_kind == "pane_id" and binding.turn_target_value
+        if binding.turn_target_kind in {_CODEX_SESSION_TURN_KIND, _PANE_TURN_KIND}
+        and binding.turn_target_value
     ]
     updated = 0
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(turn_bindings)))) as pool:
         futures = {
-            pool.submit(_read_private_turn, config, str(binding.turn_target_value)): binding
+            pool.submit(_read_turn_for_binding, config, binding): binding
             for binding in turn_bindings
         }
         for future in as_completed(futures):

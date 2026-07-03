@@ -822,6 +822,10 @@ def _backend_target_from_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _turn_target_from_item(item: Mapping[str, Any]) -> tuple[str, str] | None:
     """Resolve the private Herdr structured-turn target from backend-observed fields."""
+    agent_name = (_first_text(item, ("agent", "name")) or "").strip().lower()
+    agent_session = _nested_text(item, "agent_session", "value")
+    if agent_name == "codex" and agent_session:
+        return "codex_session_id", agent_session
     pane_id = _first_text(item, ("pane_id",))
     if pane_id:
         return "pane_id", pane_id
