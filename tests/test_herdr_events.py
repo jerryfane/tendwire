@@ -1387,3 +1387,54 @@ def test_status_event_with_pane_id_only_updates_bound_worker_not_a_phantom(tmp_p
         by_target[binding.target_value] = binding.worker_id
     idle_worker_id = by_target["term-2"]
     assert workers[idle_worker_id].status in {"idle", "done"}
+
+
+def test_pane_id_only_status_event_resolves_codex_binding_via_pane_terminal_map(tmp_path: Path) -> None:
+    """Regression: codex bindings' turn target is a session id, so pane-id-only
+    status events must resolve through the pane->terminal map remembered from
+    reconcile instead of inserting a phantom bare 'codex' worker."""
+    backend = _backend(tmp_path, "codex-phantom-host")
+    client = _StaticClient(
+        workspaces=[{"id": "wX8", "name": "projectx", "status": "active"}],
+        panes=[
+            {
+                "pane_id": "wX8:p1",
+                "terminal_id": "term-ctx",
+                "agent": "codex",
+                "agent_session": {"agent": "codex", "kind": "id", "value": "019f-session"},
+                "workspace_id": "wX8",
+                "agent_status": "working",
+            }
+        ],
+        agents=[],
+    )
+    backend.reconcile_once(client=client)
+    assert sorted(backend._workers) == ["codex"]
+    binding = next(iter(backend._bindings.values()))
+    assert binding.turn_target_kind == "codex_session_id"
+    assert backend._pane_terminals == {"wX8:p1": "term-ctx"}
+
+    event = normalize_event(
+        {
+            "event": "pane.agent_status_changed",
+            "payload": {"pane_id": "wX8:p1", "workspace_id": "wX8", "agent_status": "idle"},
+        }
+    )
+    assert event is not None
+    assert backend._apply_event(event) is True
+    assert sorted(backend._workers) == ["codex"], f"phantom inserted: {sorted(backend._workers)}"
+    assert backend._workers["codex"].status in {"idle", "done"}
+
+
+def test_reconcile_drops_unbound_missing_workers_but_keeps_bound_closed(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "phantom-aging-host")
+    worker_bound = Worker(id="codex-1", name="codex", status="active", space_id="wX8")
+    worker_phantom = Worker(id="codex", name="codex", status="working", space_id="wX8")
+    merged = backend._workers_with_closed_missing(
+        [worker_bound, worker_phantom],
+        [],
+        bound_worker_ids={"codex-1"},
+    )
+    ids = {worker.id: worker.status for worker in merged}
+    assert "codex" not in ids, "unbound phantom must be dropped, not carried as closed"
+    assert ids.get("codex-1") == "closed"

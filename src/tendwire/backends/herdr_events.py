@@ -333,6 +333,16 @@ def _binding_target(binding: WorkerBinding) -> tuple[str, str]:
     return (binding.target_kind, binding.target_value)
 
 
+def _pane_terminal_map(payload: Any) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in _payload_items(payload, _PANE_PAYLOAD_KEYS):
+        pane_id = _first_text(item, ("pane_id", "paneId"))
+        terminal_id = _first_text(item, ("terminal_id", "terminalId"))
+        if pane_id and terminal_id:
+            mapping[pane_id] = terminal_id
+    return mapping
+
+
 def _target_pairs_from_item(item: Mapping[str, Any], *, old_first: bool = False) -> list[tuple[str, str]]:
     old_pairs = [
         ("pane_id", _first_text(item, ("old_pane_id", "previous_pane_id", "from_pane_id", "source_pane_id"))),
@@ -431,6 +441,10 @@ class HerdrEventBackend:
         self._spaces: dict[str, Space] = {}
         self._workers: dict[str, Worker] = {}
         self._bindings: dict[str, WorkerBinding] = {}
+        # pane_id -> terminal_id, remembered from reconcile pane lists so that
+        # pane-id-only events (pane.agent_status_changed carries no terminal id)
+        # can still resolve to the terminal-targeted stored binding.
+        self._pane_terminals: dict[str, str] = {}
         self._health = self._health_for("unknown")
         self._last_event_at: str | None = None
         self._last_reconcile_at: str | None = None
@@ -695,6 +709,7 @@ class HerdrEventBackend:
                 snapshot_workers = self._workers_with_closed_missing(
                     previous.workers if previous is not None else [],
                     workers,
+                    bound_worker_ids={binding.worker_id for binding in stored_bindings},
                 )
                 snapshot = project_from_observations(
                     self.config,
@@ -718,6 +733,7 @@ class HerdrEventBackend:
                 self._spaces = {space.id: space for space in snapshot.spaces}
                 self._workers = {worker.id: worker for worker in snapshot.workers}
                 self._bindings = {binding.private_fingerprint: binding for binding in bindings}
+                self._pane_terminals = _pane_terminal_map(payloads["pane.list"])
                 self._subscription_pane_ids = subscription_pane_ids
                 self._health = HerdrEventBackendHealth(
                     status=health.status,
@@ -790,11 +806,18 @@ class HerdrEventBackend:
         self,
         previous_workers: Sequence[Worker],
         current_workers: Sequence[Worker],
+        *,
+        bound_worker_ids: set[str] | None = None,
     ) -> list[Worker]:
         current_by_id = {worker.id: worker for worker in current_workers}
         merged = list(current_workers)
         for worker in previous_workers:
             if worker.id in current_by_id:
+                continue
+            if bound_worker_ids is not None and worker.id not in bound_worker_ids:
+                # A missing worker with no live binding is a phantom (event
+                # projections that never matched a binding); dropping it here
+                # keeps it from riding along as "closed" forever.
                 continue
             merged.append(_closed_worker(worker))
         return merged
@@ -844,11 +867,13 @@ class HerdrEventBackend:
             return self._apply_worktree_event(event.payload, status=status)
         if event.name in _PANE_WORKER_EVENT_NAMES:
             item = _pane_event_payload(event.payload, "pane", "agent", "worker")
+            self._note_pane_terminal(item)
             if not _pane_has_agent(item) and self._match_binding(item) is None:
                 return False
             return self._upsert_worker_from_item(item)
         if event.name == "pane.agent_detected":
             item = _pane_event_payload(event.payload, "agent", "worker", "pane")
+            self._note_pane_terminal(item)
             return self._upsert_worker_from_item(item)
         if event.name == "pane.agent_status_changed":
             item = _pane_event_payload(event.payload, "agent", "worker", "pane")
@@ -994,11 +1019,25 @@ class HerdrEventBackend:
             turn_key = (str(binding.turn_target_kind or ""), str(binding.turn_target_value or ""))
             if turn_key[0] and turn_key[1]:
                 binding_by_target.setdefault(turn_key, binding)
-        for pair in pairs:
+        # Translate pane ids to the terminal ids remembered from the last
+        # reconcile: agent kinds whose turn target is not a pane id (codex
+        # session ids) would otherwise never match a pane-id-only event.
+        mapped_pairs = [
+            ("terminal_id", self._pane_terminals[value])
+            for kind, value in pairs
+            if kind == "pane_id" and value in self._pane_terminals
+        ]
+        for pair in [*pairs, *mapped_pairs]:
             binding = binding_by_target.get(pair)
             if binding is not None:
                 return binding
         return None
+
+    def _note_pane_terminal(self, item: Mapping[str, Any]) -> None:
+        pane_id = _first_text(item, ("pane_id", "paneId"))
+        terminal_id = _first_text(item, ("terminal_id", "terminalId"))
+        if pane_id and terminal_id:
+            self._pane_terminals[pane_id] = terminal_id
 
     def _apply_pane_moved(self, item: Mapping[str, Any]) -> bool:
         old_binding = self._match_binding(item, old_first=True)
