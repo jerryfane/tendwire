@@ -987,6 +987,13 @@ class HerdrEventBackend:
         if not pairs:
             return None
         binding_by_target = {_binding_target(binding): binding for binding in self._bindings.values()}
+        # Event payloads often carry only a pane id while stored bindings target
+        # a terminal id; fall back to the turn target so a known pane never
+        # spawns a duplicate re-lettered worker.
+        for binding in self._bindings.values():
+            turn_key = (str(binding.turn_target_kind or ""), str(binding.turn_target_value or ""))
+            if turn_key[0] and turn_key[1]:
+                binding_by_target.setdefault(turn_key, binding)
         for pair in pairs:
             binding = binding_by_target.get(pair)
             if binding is not None:
