@@ -69,6 +69,12 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
     user_text = content.get("user_text")
     if isinstance(user_text, str) and _is_internal_user_text(user_text):
         return None
+    # Never clobber stored text with an empty value: notification-triggered
+    # turns legitimately carry no prompt, but the previous real prompt and
+    # stream must survive the merge.
+    for key in ("user_text", "assistant_final_text", "assistant_stream_text"):
+        if key in content and not (content.get(key) or "").strip():
+            content.pop(key)
     if not any(value not in (None, "", False) for value in content.values()):
         return None
     return content
