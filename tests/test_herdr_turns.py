@@ -235,3 +235,105 @@ def test_read_private_turn_skips_local_command_turns(monkeypatch) -> None:
 
     monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
     assert herdr_turns._read_private_turn(config, "pane-1") is None
+
+
+def _run_returning(payload):
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps(payload), stderr="")
+    return fake_run
+
+
+def test_read_private_turn_emits_open_turn_from_open_fields(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                # top level is the PREVIOUS completed turn
+                "complete": True,
+                "has_open_turn": True,
+                "user_text": "previous prompt",
+                "assistant_final_text": "previous answer",
+                "source_turn_id": "prompt-prev",
+                # the in-progress turn is carried in open_* fields
+                "open_turn_id": "prompt-open",
+                "open_user_text": "current prompt",
+                "assistant_stream_text": "thinking live...",
+            }
+        }
+    }
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    content = herdr_turns._read_private_turn(config, "pane-1")
+    assert content is not None
+    assert content["user_text"] == "current prompt"
+    assert content["assistant_stream_text"] == "thinking live..."
+    assert content["assistant_final_text"] is None
+    assert content["complete"] is False
+    assert content["has_open_turn"] is True
+    # keyed by the OPEN turn's stable prompt id, not the completed one
+    assert content["source_turn_id"] == "prompt-open"
+
+
+def test_open_turn_and_its_completion_share_source_turn_id(monkeypatch) -> None:
+    """The open turn (prompt-open) and its later completion must share the id so
+    a working card edits into the final instead of duplicating."""
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    open_payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "complete": True,
+                "has_open_turn": True,
+                "user_text": "older",
+                "assistant_final_text": "older answer",
+                "source_turn_id": "prompt-older",
+                "open_turn_id": "prompt-X",
+                "open_user_text": "the question",
+                "assistant_stream_text": "working...",
+            }
+        }
+    }
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(open_payload))
+    open_content = herdr_turns._read_private_turn(config, "pane-1")
+    assert open_content["source_turn_id"] == "prompt-X"
+    assert open_content["complete"] is False
+
+    # Now the same turn completes (no open fields; it is the last completed one).
+    done_payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "complete": True,
+                "has_open_turn": False,
+                "user_text": "the question",
+                "assistant_final_text": "the answer",
+                "source_turn_id": "prompt-X",
+                "turn_id": "assistant-uuid-differs",
+            }
+        }
+    }
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(done_payload))
+    done_content = herdr_turns._read_private_turn(config, "pane-1")
+    assert done_content["source_turn_id"] == "prompt-X"  # same id, not the assistant uuid
+    assert done_content["complete"] is True
+    assert done_content["assistant_final_text"] == "the answer"
+
+
+def test_read_private_turn_prefers_source_turn_id_over_turn_id(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "complete": True,
+                "has_open_turn": False,
+                "user_text": "q",
+                "assistant_final_text": "a",
+                "source_turn_id": "stable-prompt",
+                "turn_id": "assistant-uuid",
+            }
+        }
+    }
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    content = herdr_turns._read_private_turn(config, "pane-1")
+    assert content["source_turn_id"] == "stable-prompt"

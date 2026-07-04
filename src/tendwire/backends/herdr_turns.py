@@ -65,8 +65,19 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
     turn = _extract_turn_payload(payload)
     if not isinstance(turn, Mapping) or turn.get("available") is False:
         return None
+    open_user_text = turn.get("open_user_text")
+    open_turn_id = str(turn.get("open_turn_id") or "").strip()
+    if turn.get("has_open_turn") and (open_user_text or open_turn_id):
+        # An in-progress turn is reported alongside the last completed one via
+        # open_* fields. Emit it as its own open turn keyed by the stable prompt
+        # id so the connector streams a live "working" card that later edits
+        # into the final once this same id completes.
+        return _open_turn_content(open_user_text, turn.get("assistant_stream_text"), open_turn_id)
+
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
-    source_turn_id = str(turn.get("turn_id") or "").strip()
+    # Prefer the stable prompt-scoped id so a turn keeps one identity from
+    # open through complete; fall back to turn_id for backends without it.
+    source_turn_id = str(turn.get("source_turn_id") or turn.get("turn_id") or "").strip()
     if source_turn_id:
         content["source_turn_id"] = source_turn_id[:160]
     user_text = content.get("user_text")
@@ -79,6 +90,29 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
         if key in content and not (content.get(key) or "").strip():
             content.pop(key)
     if not any(value not in (None, "", False) for value in content.values()):
+        return None
+    return content
+
+
+def _open_turn_content(
+    open_user_text: Any,
+    stream_text: Any,
+    open_turn_id: str,
+) -> Mapping[str, Any] | None:
+    if isinstance(open_user_text, str) and _is_internal_user_text(open_user_text):
+        return None
+    content: dict[str, Any] = {
+        "assistant_final_text": None,
+        "complete": False,
+        "has_open_turn": True,
+    }
+    if isinstance(open_user_text, str) and open_user_text.strip():
+        content["user_text"] = open_user_text
+    if isinstance(stream_text, str) and stream_text.strip():
+        content["assistant_stream_text"] = stream_text
+    if open_turn_id:
+        content["source_turn_id"] = open_turn_id[:160]
+    if not (content.get("user_text") or content.get("assistant_stream_text")):
         return None
     return content
 
