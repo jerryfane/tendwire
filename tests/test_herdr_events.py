@@ -1338,3 +1338,52 @@ def test_daemon_socket_fallback_uses_backend_health_when_snapshot_missing(tmp_pa
         assert snapshot.backend_health[0].outcome == "protocol_error"
     finally:
         daemon.stop()
+
+
+def test_status_event_with_pane_id_only_updates_bound_worker_not_a_phantom(tmp_path: Path) -> None:
+    """Regression: status events that only carry a pane id must resolve through
+    the binding turn target instead of inserting a duplicate re-lettered worker
+    that freezes the real worker's status (the 'stuck working icon' bug)."""
+    backend = _backend(tmp_path, "phantom-host")
+    client = _StaticClient(
+        workspaces=[{"id": "space-1", "name": "Build", "status": "active"}],
+        panes=[
+            {
+                "pane_id": "w1:p1",
+                "terminal_id": "term-1",
+                "agent": "claude",
+                "workspace_id": "space-1",
+                "agent_status": "working",
+            },
+            {
+                "pane_id": "w1:p2",
+                "terminal_id": "term-2",
+                "agent": "claude",
+                "workspace_id": "space-1",
+                "agent_status": "working",
+            },
+        ],
+        agents=[],
+    )
+    backend.reconcile_once(client=client)
+    snapshot = latest_snapshot(Path(backend.db_path), backend.config.host_id)
+    assert snapshot is not None
+    ids_before = sorted(worker.id for worker in snapshot.workers)
+    assert ids_before == ["claude-1", "claude-2"]
+
+    event = normalize_event(
+        {
+            "event": "pane.agent_status_changed",
+            "payload": {"pane": {"pane_id": "w1:p2", "agent": "claude", "status": "idle"}},
+        }
+    )
+    assert event is not None
+    assert backend._apply_event(event) is True
+    backend._persist_projection_locked() if hasattr(backend, "_persist_projection_locked") else None
+    workers = backend._workers
+    assert sorted(workers) == ["claude-1", "claude-2"], f"phantom worker inserted: {sorted(workers)}"
+    by_target = {}
+    for binding in backend._bindings.values():
+        by_target[binding.target_value] = binding.worker_id
+    idle_worker_id = by_target["term-2"]
+    assert workers[idle_worker_id].status in {"idle", "done"}
