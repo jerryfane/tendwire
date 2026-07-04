@@ -574,6 +574,26 @@ Human argparse errors may use stderr, but normal command output is machine
 readable. `command.submit` is the daemon method for the same contract; mutating
 Herdr sends require the socket backend and a healthy authoritative snapshot.
 
+### Send transport (current and planned)
+
+`command.submit` (CLI: `tendwire command --json`) is the **only** public send
+path. Callers such as Herdres select a worker by neutral identity
+(`worker_id`/`worker_fingerprint`/`space_id`/`name`) and pass instruction text;
+they never see or supply `pane_id`, `terminal_id`, `send_keys`, or any
+`backend_target`. Those identifiers stay private to Tendwire and never appear in
+public snapshot/turns/pending JSON.
+
+Internally, Tendwire resolves the neutral target to a private worker binding and,
+for delivery reliability on Herdr today, drives a **private Herdr pane transport**
+(pane keystroke submission) behind the public contract. This is an
+implementation detail: it is not exposed, not part of the neutral command shape,
+and can change without affecting callers.
+
+Planned follow-up (not in this RC): switch the internal transport to Herdr's
+semantic `agent.send` API once it is stable, replacing private pane keystroke
+submission. The public `command.submit` contract stays the same, so no caller
+change is required.
+
 ### Command request shape v1
 
 ```json
