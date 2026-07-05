@@ -22,8 +22,10 @@ _TURN_CONTENT_KEYS = (
     "has_open_turn",
 )
 _CODEX_SESSION_TURN_KIND = "codex_session_id"
+_OMP_SESSION_TURN_KIND = "omp_session_path"
 _PANE_TURN_KIND = "pane_id"
 _MAX_CODEX_STREAM_MESSAGES = 4
+_OMP_TAIL_BYTES = 786432
 
 
 def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
@@ -291,6 +293,109 @@ def _read_codex_session_turn(session_id: str) -> Mapping[str, Any] | None:
     return content
 
 
+def _omp_sessions_root() -> Path:
+    raw = os.environ.get("OMP_SESSIONS_DIR")
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".omp" / "agent" / "sessions"
+
+
+def _safe_omp_session_path(value: str) -> Path | None:
+    candidate = Path(str(value or "")).expanduser()
+    root = _omp_sessions_root()
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    if candidate.suffix != ".jsonl" or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _omp_message_text(message: Mapping[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            str(item.get("text") or "").strip()
+            for item in content
+            if isinstance(item, Mapping) and item.get("type") == "text" and str(item.get("text") or "").strip()
+        ).strip()
+    return ""
+
+
+def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
+    """Parse an oh-my-pi native session tail into the current public turn.
+
+    Entries are ``{"type": "message", "id": ..., "message": {"role", "content",
+    "stopReason", "attribution"}}``; ``attribution == "user"`` marks real human
+    prompts, ``stopReason == "stop"`` marks a turn-final assistant message, and
+    ``toolUse`` marks intermediate steps whose text streams as progress.
+    """
+    session_file = _safe_omp_session_path(path_value)
+    if session_file is None:
+        return None
+    try:
+        with open(session_file, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _OMP_TAIL_BYTES))
+            blob = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    lines = blob.splitlines()
+    if size > _OMP_TAIL_BYTES and lines:
+        lines = lines[1:]
+    prompt_id = ""
+    user_text = ""
+    stream_parts: list[str] = []
+    final_text = ""
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(entry, Mapping) or entry.get("type") != "message":
+            continue
+        message = entry.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "")
+        text = _omp_message_text(message)
+        if role == "user":
+            if str(message.get("attribution") or "") != "user":
+                continue
+            if not text or _is_internal_user_text(text):
+                continue
+            prompt_id = str(entry.get("id") or "")
+            user_text = text
+            stream_parts = []
+            final_text = ""
+            continue
+        if role != "assistant" or not prompt_id:
+            continue
+        if str(message.get("stopReason") or "") == "stop" and text:
+            final_text = text
+            stream_parts = []
+        elif text:
+            _append_unique_recent(stream_parts, text)
+    if not prompt_id:
+        return None
+    has_final = bool(final_text)
+    content: dict[str, Any] = {
+        "user_text": user_text or None,
+        "assistant_stream_text": None if has_final else ("\n\n".join(stream_parts) or None),
+        "assistant_final_text": final_text or None,
+        "complete": has_final,
+        "has_open_turn": not has_final,
+        "source_turn_id": prompt_id[:160],
+    }
+    if not (content.get("user_text") or content.get("assistant_stream_text") or content.get("assistant_final_text")):
+        return None
+    return content
+
+
 def _read_turn_for_binding(config: Config, binding: Any) -> Mapping[str, Any] | None:
     target_kind = str(getattr(binding, "turn_target_kind", "") or "")
     target_value = str(getattr(binding, "turn_target_value", "") or "")
@@ -298,6 +403,8 @@ def _read_turn_for_binding(config: Config, binding: Any) -> Mapping[str, Any] | 
         return None
     if target_kind == _CODEX_SESSION_TURN_KIND:
         return _read_codex_session_turn(target_value)
+    if target_kind == _OMP_SESSION_TURN_KIND:
+        return _read_omp_session_turn(target_value)
     if target_kind == _PANE_TURN_KIND:
         return _read_private_turn(config, target_value)
     return None
@@ -311,7 +418,7 @@ def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
     turn_bindings = [
         binding
         for binding in bindings
-        if binding.turn_target_kind in {_CODEX_SESSION_TURN_KIND, _PANE_TURN_KIND}
+        if binding.turn_target_kind in {_CODEX_SESSION_TURN_KIND, _OMP_SESSION_TURN_KIND, _PANE_TURN_KIND}
         and binding.turn_target_value
     ]
     updated = 0

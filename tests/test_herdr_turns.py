@@ -339,7 +339,7 @@ def test_read_private_turn_prefers_source_turn_id_over_turn_id(monkeypatch) -> N
     assert content["source_turn_id"] == "stable-prompt"
 
 
-def test_omp_agent_session_maps_to_codex_session_turn_target() -> None:
+def test_omp_agent_session_id_also_maps_to_omp_turn_target() -> None:
     from tendwire.backends.herdr_cli import _turn_target_from_item
 
     item = {
@@ -347,4 +347,70 @@ def test_omp_agent_session_maps_to_codex_session_turn_target() -> None:
         "pane_id": "wX:p1",
         "agent_session": {"agent": "omp", "kind": "id", "value": "019f-omp-session"},
     }
-    assert _turn_target_from_item(item) == ("codex_session_id", "019f-omp-session")
+    assert _turn_target_from_item(item) == ("omp_session_path", "019f-omp-session")
+
+
+def _write_omp_session(tmp_path, lines):
+    root = tmp_path / "omp-sessions"
+    session_dir = root / "-demoapp"
+    session_dir.mkdir(parents=True)
+    path = session_dir / "2026-07-05T00-00-00-000Z_session.jsonl"
+    path.write_text("\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+    return root, path
+
+
+def _omp_msg(entry_id, role, text, stop=None, attribution=None):
+    message = {"role": role, "content": [{"type": "text", "text": text}]}
+    if stop:
+        message["stopReason"] = stop
+    if attribution:
+        message["attribution"] = attribution
+    return {"type": "message", "id": entry_id, "message": message}
+
+
+def test_read_omp_session_open_then_complete_turn(tmp_path, monkeypatch) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            {"type": "session", "id": "s1"},
+            _omp_msg("u1", "user", "please fix the bug", attribution="user"),
+            _omp_msg("a1", "assistant", "looking at the code", stop="toolUse"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    content = herdr_turns._read_omp_session_turn(str(path))
+    assert content["user_text"] == "please fix the bug"
+    assert content["assistant_stream_text"] == "looking at the code"
+    assert content["complete"] is False
+    assert content["has_open_turn"] is True
+    assert content["source_turn_id"] == "u1"
+
+    # Same turn completes: same source id, final text, stream cleared.
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\n"
+        + json.dumps(_omp_msg("a2", "assistant", "fixed and pushed", stop="stop")),
+        encoding="utf-8",
+    )
+    done = herdr_turns._read_omp_session_turn(str(path))
+    assert done["source_turn_id"] == "u1"
+    assert done["assistant_final_text"] == "fixed and pushed"
+    assert done["complete"] is True
+    assert done["assistant_stream_text"] is None
+
+
+def test_read_omp_session_rejects_paths_outside_root(tmp_path, monkeypatch) -> None:
+    root, path = _write_omp_session(tmp_path, [_omp_msg("u1", "user", "hi", attribution="user")])
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(tmp_path / "elsewhere"))
+    assert herdr_turns._read_omp_session_turn(str(path)) is None
+
+
+def test_omp_agent_session_path_maps_to_omp_turn_target() -> None:
+    from tendwire.backends.herdr_cli import _turn_target_from_item
+
+    item = {
+        "agent": "omp",
+        "pane_id": "wX:p1",
+        "agent_session": {"agent": "omp", "kind": "path", "value": "/home/user/.omp/agent/sessions/-x/a.jsonl"},
+    }
+    assert _turn_target_from_item(item) == ("omp_session_path", "/home/user/.omp/agent/sessions/-x/a.jsonl")
