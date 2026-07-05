@@ -337,3 +337,14 @@ def test_read_private_turn_prefers_source_turn_id_over_turn_id(monkeypatch) -> N
     monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
     content = herdr_turns._read_private_turn(config, "pane-1")
     assert content["source_turn_id"] == "stable-prompt"
+
+
+def test_omp_agent_session_maps_to_codex_session_turn_target() -> None:
+    from tendwire.backends.herdr_cli import _turn_target_from_item
+
+    item = {
+        "agent": "omp",
+        "pane_id": "wX:p1",
+        "agent_session": {"agent": "omp", "kind": "id", "value": "019f-omp-session"},
+    }
+    assert _turn_target_from_item(item) == ("codex_session_id", "019f-omp-session")

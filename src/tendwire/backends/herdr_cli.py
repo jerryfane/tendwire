@@ -824,7 +824,9 @@ def _turn_target_from_item(item: Mapping[str, Any]) -> tuple[str, str] | None:
     """Resolve the private Herdr structured-turn target from backend-observed fields."""
     agent_name = (_first_text(item, ("agent", "name")) or "").strip().lower()
     agent_session = _nested_text(item, "agent_session", "value")
-    if agent_name == "codex" and agent_session:
+    if agent_name in {"codex", "omp"} and agent_session:
+        # oh-my-pi (omp) is a codex fork and writes codex-format rollout
+        # session files, so its turns read through the same session parser.
         return "codex_session_id", agent_session
     pane_id = _first_text(item, ("pane_id",))
     if pane_id:
