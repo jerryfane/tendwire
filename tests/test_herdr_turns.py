@@ -414,3 +414,21 @@ def test_omp_agent_session_path_maps_to_omp_turn_target() -> None:
         "agent_session": {"agent": "omp", "kind": "path", "value": "/home/user/.omp/agent/sessions/-x/a.jsonl"},
     }
     assert _turn_target_from_item(item) == ("omp_session_path", "/home/user/.omp/agent/sessions/-x/a.jsonl")
+
+
+def test_omp_open_turn_streams_thinking_headlines(tmp_path, monkeypatch) -> None:
+    def thinking(entry_id, text):
+        return {"type": "message", "id": entry_id, "message": {"role": "assistant", "stopReason": "toolUse", "content": [{"type": "thinking", "thinking": text}, {"type": "toolCall", "id": "c1", "name": "bash"}]}}
+
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("u1", "user", "add the feature", attribution="user"),
+            thinking("a1", "**Reading the goal doc**\n\nlong reasoning body..."),
+            thinking("a2", "checking the branch state first\nmore detail"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    content = herdr_turns._read_omp_session_turn(str(path))
+    assert content["has_open_turn"] is True
+    assert content["assistant_stream_text"] == "Reading the goal doc\n\nchecking the branch state first"

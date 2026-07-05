@@ -312,6 +312,25 @@ def _safe_omp_session_path(value: str) -> Path | None:
     return candidate
 
 
+def _omp_thinking_snippet(message: Mapping[str, Any]) -> str:
+    """Compact progress line from an omp thinking block: its bold headline,
+    falling back to a trimmed first line."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    for item in content:
+        if not isinstance(item, Mapping) or item.get("type") != "thinking":
+            continue
+        text = str(item.get("thinking") or "").strip()
+        if not text:
+            continue
+        first = text.splitlines()[0].strip()
+        if first.startswith("**") and first.endswith("**") and len(first) > 4:
+            return first.strip("*").strip()
+        return first[:120]
+    return ""
+
+
 def _omp_message_text(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
@@ -380,6 +399,10 @@ def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
             stream_parts = []
         elif text:
             _append_unique_recent(stream_parts, text)
+        else:
+            snippet = _omp_thinking_snippet(message)
+            if snippet:
+                _append_unique_recent(stream_parts, snippet)
     if not prompt_id:
         return None
     has_final = bool(final_text)
