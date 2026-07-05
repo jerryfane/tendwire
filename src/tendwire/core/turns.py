@@ -149,6 +149,28 @@ _RAW_COMMAND_HEAD_RE = re.compile(
 _RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
 _SHELL_META_RE = re.compile(r"[;&|`$<>]")
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_AUTOMATION_JOB_TEMPLATE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_. -]{1,80}\s+job\s*\n\s*\nTemplate:\s*\S+",
+    re.IGNORECASE,
+)
+_AUTOMATION_VALIDATOR_RE = re.compile(
+    r"^Your previous response did not contain a valid [A-Za-z0-9_.-]+ JSON object\.\s*"
+    r"\nValidation errors(?:\s*\([^)]*\))?:",
+    re.IGNORECASE,
+)
+_AUTOMATION_RESULT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,80}_result$")
+_AUTOMATION_RESULT_FIELDS = frozenset(
+    {
+        "changes_made",
+        "decision",
+        "delegations",
+        "findings",
+        "needs",
+        "status",
+        "summary",
+        "tests_run",
+    }
+)
 _PUBLIC_DROP = object()
 
 
@@ -236,6 +258,63 @@ def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> st
     if len(text) > max_chars:
         text = text[: max(0, max_chars - 14)].rstrip() + "\n[truncated]"
     return text or None
+
+
+def _automation_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.lstrip().replace("\r\n", "\n")
+
+
+def _looks_like_automation_user_text(value: Any) -> bool:
+    text = _automation_text(value)
+    return bool(text and (_AUTOMATION_JOB_TEMPLATE_RE.match(text) or _AUTOMATION_VALIDATOR_RE.match(text)))
+
+
+def _strip_json_fence(value: str) -> str:
+    text = value.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) < 3 or lines[-1].strip() != "```":
+        return text
+    opener = lines[0].strip().lower()
+    if opener not in {"```", "```json"}:
+        return text
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _looks_like_automation_result_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = _strip_json_fence(value)
+    if not text.startswith("{"):
+        return False
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, Mapping) or len(payload) != 1:
+        return False
+    key, result = next(iter(payload.items()))
+    if not isinstance(key, str) or not _AUTOMATION_RESULT_KEY_RE.match(key):
+        return False
+    if not isinstance(result, Mapping):
+        return False
+    return bool(set(result) & _AUTOMATION_RESULT_FIELDS)
+
+
+def is_internal_automation_turn_payload(payload: Mapping[str, Any]) -> bool:
+    """Return true for machine protocol turns that should not be public chat."""
+    user_text = payload.get("user_text")
+    if _looks_like_automation_user_text(user_text):
+        return True
+    if isinstance(user_text, str) and user_text.strip():
+        return False
+    return any(
+        _looks_like_automation_result_text(payload.get(key))
+        for key in ("assistant_final_text", "assistant_stream_text")
+    )
 
 
 def _public_identity(value: Any, *, prefix: str, default: str = "unknown") -> str:

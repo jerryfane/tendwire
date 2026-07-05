@@ -27,7 +27,13 @@ from ..core.models import (
     stable_json_dumps,
     utc_timestamp,
 )
-from ..core.turns import Turn, pending_from_snapshot, turns_from_snapshot, turns_payload_from_snapshot
+from ..core.turns import (
+    Turn,
+    is_internal_automation_turn_payload,
+    pending_from_snapshot,
+    turns_from_snapshot,
+    turns_payload_from_snapshot,
+)
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
@@ -3168,6 +3174,8 @@ def merge_turn_content(
     clean_content = {key: content.get(key) for key in _TURN_CONTENT_FIELDS if key in content}
     if not clean_content:
         return 0
+    if is_internal_automation_turn_payload(clean_content):
+        return 0
     current_time = observed_at or utc_timestamp()
     updated = 0
     with _connect(db_path, isolation_level=None) as conn:
@@ -3475,7 +3483,7 @@ def turns_payload_from_store(
                 payload = json.loads(str(payload_json or "{}"))
             except json.JSONDecodeError:
                 payload = {}
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and not is_internal_automation_turn_payload(payload):
                 turns.append(Turn.from_dict(payload).to_dict())
             if observed_at:
                 observed_values.append(str(observed_at))
