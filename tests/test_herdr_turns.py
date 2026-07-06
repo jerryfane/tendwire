@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from tendwire.backends.herdr_turns import refresh_structured_turn_content
 from tendwire.config import Config
 from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_from_raw
+from tendwire.core.turns import is_internal_automation_turn_payload
 from tendwire.store.sqlite import init_store, save_snapshot, turns_payload_from_store, upsert_worker_bindings
 
 
@@ -208,6 +210,164 @@ def test_refresh_structured_turn_content_reads_codex_session_jsonl(
     assert "term-private" not in public_json
 
 
+def test_refresh_structured_turn_content_skips_codex_automation_protocol_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "turns.db"
+    codex_home = tmp_path / "codex-home"
+    session_id = "019f31a8-57cf-7353-b4f0-c25e523267af"
+    session_file = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "07"
+        / "05"
+        / f"rollout-2026-07-05T00-00-00-{session_id}.jsonl"
+    )
+    session_file.parent.mkdir(parents=True)
+    turn_id = "automation-turn"
+    lines = [
+        {
+            "timestamp": "2026-07-05T08:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": turn_id},
+        },
+        {
+            "timestamp": "2026-07-05T08:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Acme job\n\nTemplate: review-lead\nTemplate instructions:",
+                    }
+                ],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            },
+        },
+        {
+            "timestamp": "2026-07-05T08:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn_id,
+                "last_agent_message": '{"acme_result":{"decision":"approved","summary":"internal job result"}}',
+            },
+        },
+    ]
+    session_file.write_text("\n".join(json.dumps(item) for item in lines), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    config = Config(host_id="turn-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "codex", "status": "active", "space_id": "space-1"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    worker = snapshot.workers[0]
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend="herdr",
+                target_kind="terminal_id",
+                target_value="term-private",
+                turn_target_kind="codex_session_id",
+                turn_target_value=session_id,
+                sendable=True,
+                observed_at="2026-07-05T08:00:00+00:00",
+                expires_at="9999-12-31T23:59:59+00:00",
+                private_fingerprint="private-binding",
+            )
+        ],
+    )
+
+    result = refresh_structured_turn_content(config)
+    payload = turns_payload_from_store(db_path, config.host_id, snapshot=snapshot)
+    public_json = json.dumps(payload)
+
+    assert result == {"ok": True, "status": "ok", "updated": 0, "attempted": 1}
+    assert "Acme job" not in public_json
+    assert "acme_result" not in public_json
+
+
+def test_turns_payload_from_store_quarantines_existing_automation_protocol_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turns.db"
+    host_id = "turn-host"
+    init_store(db_path)
+    with sqlite3.connect(db_path) as conn:
+        rows = [
+            (
+                host_id,
+                "bad-turn",
+                "worker-1",
+                "active",
+                "task",
+                "2026-07-05T08:00:00+00:00",
+                "bad-fp",
+                "snap-fp",
+                "2026-07-05T08:00:00+00:00",
+                json.dumps(
+                    {
+                        "host_id": host_id,
+                        "worker_id": "worker-1",
+                        "status": "active",
+                        "kind": "task",
+                        "user_text": "Acme job\n\nTemplate: review-lead\nTemplate instructions:",
+                        "assistant_final_text": '{"acme_result":{"decision":"approved","summary":"internal"}}',
+                    }
+                ),
+            ),
+            (
+                host_id,
+                "good-turn",
+                "worker-1",
+                "active",
+                "task",
+                "2026-07-05T08:01:00+00:00",
+                "good-fp",
+                "snap-fp",
+                "2026-07-05T08:01:00+00:00",
+                json.dumps(
+                    {
+                        "host_id": host_id,
+                        "worker_id": "worker-1",
+                        "status": "active",
+                        "kind": "task",
+                        "user_text": "Please review the issue",
+                        "assistant_final_text": "Normal answer.",
+                    }
+                ),
+            ),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, status, kind, updated_at, fingerprint,
+                snapshot_content_fingerprint, observed_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    payload = turns_payload_from_store(db_path, host_id)
+    public_json = json.dumps(payload)
+
+    assert len(payload["turns"]) == 1
+    assert payload["turns"][0]["assistant_final_text"] == "Normal answer."
+    assert "Acme job" not in public_json
+    assert "acme_result" not in public_json
+
+
 def test_internal_user_text_detects_local_command_artifacts() -> None:
     assert herdr_turns._is_internal_user_text("<local-command-caveat>Caveat: ...")
     assert herdr_turns._is_internal_user_text("  <command-name>/model</command-name>")
@@ -215,6 +375,32 @@ def test_internal_user_text_detects_local_command_artifacts() -> None:
     assert herdr_turns._is_internal_user_text("<system-reminder>context</system-reminder>")
     assert herdr_turns._is_internal_user_text("<subagent_notification>done</subagent_notification>")
     assert not herdr_turns._is_internal_user_text("another test")
+
+
+def test_internal_turn_filter_detects_automation_protocol_without_blocking_discussion() -> None:
+    assert herdr_turns._is_internal_user_text(
+        "Acme job\n\nTemplate: review-lead\nTemplate instructions:"
+    )
+    assert herdr_turns._is_internal_user_text(
+        "Your previous response did not contain a valid acme_result JSON object.\n"
+        "Validation errors (fix every line):"
+    )
+    assert is_internal_automation_turn_payload(
+        {"assistant_final_text": '{"acme_result":{"decision":"approved","summary":"internal job result"}}'}
+    )
+    assert is_internal_automation_turn_payload(
+        {"assistant_final_text": '```json\n{"acme_result":{"decision":"blocked"}}\n```'}
+    )
+    assert not herdr_turns._is_internal_user_text("Can you investigate why automation job responses leaked?")
+    assert not is_internal_automation_turn_payload(
+        {"assistant_final_text": "I found a leaked automation_result row in the Tendwire DB."}
+    )
+    assert not is_internal_automation_turn_payload(
+        {
+            "user_text": "Please return a JSON status object.",
+            "assistant_final_text": '{"acme_result":{"status":"ok"}}',
+        }
+    )
 
 
 def test_read_private_turn_skips_local_command_turns(monkeypatch) -> None:
@@ -234,6 +420,25 @@ def test_read_private_turn_skips_local_command_turns(monkeypatch) -> None:
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
+    assert herdr_turns._read_private_turn(config, "pane-1") is None
+
+
+def test_read_private_turn_skips_automation_protocol_turns(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": "Acme job\n\nTemplate: review-lead\nTemplate instructions:",
+                "assistant_final_text": '{"acme_result":{"decision":"approved"}}',
+                "has_open_turn": False,
+                "complete": True,
+                "source_turn_id": "automation-turn",
+            }
+        }
+    }
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
     assert herdr_turns._read_private_turn(config, "pane-1") is None
 
 
