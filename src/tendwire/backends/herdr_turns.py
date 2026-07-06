@@ -40,6 +40,25 @@ _OMP_SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH|CREDENTIAL|COOKIE)[A-Z0-9_]*)=([^\s;&|]+)"
 )
 _OMP_BEARER_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+_PROMPTLESS_STATUS_FINAL_RE = re.compile(
+    r"\b(?:"
+    r"standing by|"
+    r"waiting(?: quietly)?|"
+    r"wait for|"
+    r"no new state|"
+    r"repeat tick|"
+    r"startup line|"
+    r"initial state|"
+    r"current state|"
+    r"monitor(?: reports|ing)?|"
+    r"review in progress|"
+    r"gate (?:phase|verdict|held|reached)|"
+    r"not yet (?:reached|materialized)|"
+    r"handoff|"
+    r"phase"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -232,7 +251,20 @@ def _is_internal_turn_content(content: Mapping[str, Any]) -> bool:
     user_text = content.get("user_text")
     if isinstance(user_text, str) and _is_internal_user_text(user_text):
         return True
+    if _is_promptless_status_final(content):
+        return True
     return is_internal_automation_turn_payload(content)
+
+
+def _is_promptless_status_final(content: Mapping[str, Any]) -> bool:
+    if str(content.get("user_text") or "").strip():
+        return False
+    if content.get("complete") is False or content.get("has_open_turn") is True:
+        return False
+    final_text = str(content.get("assistant_final_text") or "").strip()
+    if not final_text or len(final_text) > 800:
+        return False
+    return bool(_PROMPTLESS_STATUS_FINAL_RE.search(final_text))
 
 
 def _append_unique_recent(items: list[str], text: str) -> None:

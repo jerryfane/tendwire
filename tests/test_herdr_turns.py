@@ -442,6 +442,47 @@ def test_read_private_turn_skips_automation_protocol_turns(monkeypatch) -> None:
     assert herdr_turns._read_private_turn(config, "pane-1") is None
 
 
+def test_read_private_turn_skips_promptless_status_finals(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "assistant_final_text": "Initial state (review in progress; gate phase not yet reached). Waiting quietly for the gate verdict or merge. Standing by.",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "status-only-turn",
+                "model": "claude-opus-4-8",
+            }
+        }
+    }
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    assert herdr_turns._read_private_turn(config, "pane-1") is None
+
+
+def test_read_private_turn_keeps_prompted_status_like_final(monkeypatch) -> None:
+    config = Config(host_id="turn-host", herdr_bin="herdr", herdr_timeout_seconds=2)
+    payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": "What is the current state?",
+                "assistant_final_text": "Current state: the review is complete.",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "prompted-turn",
+            }
+        }
+    }
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", _run_returning(payload))
+    content = herdr_turns._read_private_turn(config, "pane-1")
+    assert content is not None
+    assert content["user_text"] == "What is the current state?"
+    assert content["assistant_final_text"] == "Current state: the review is complete."
+
+
 def _run_returning(payload):
     def fake_run(args, **kwargs):
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps(payload), stderr="")
