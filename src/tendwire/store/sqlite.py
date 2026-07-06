@@ -3161,6 +3161,13 @@ def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) ->
     )
 
 
+def _turn_content_matches_origin(payload: Mapping[str, Any], content: Mapping[str, Any]) -> bool:
+    incoming_user = _turn_merge_match_text(content.get("user_text"))
+    if not incoming_user:
+        return False
+    return incoming_user == _turn_merge_match_text(payload.get("user_text"))
+
+
 def merge_turn_content(
     db_path: Path,
     host_id: str,
@@ -3229,6 +3236,13 @@ def merge_turn_content(
                     for key in _TURN_IDENTITY_SEED_FIELDS
                     if base_payload.get(key) is not None
                 }
+                if seed.get("origin_command_id") and not _turn_content_matches_origin(
+                    base_payload,
+                    clean_content,
+                ):
+                    seed.pop("origin_command_id", None)
+                    if str(seed.get("source") or "") == "command":
+                        seed["source"] = "snapshot"
                 seed.update(clean_content)
                 item = Turn.from_dict(seed).to_dict()
                 conn.execute(
