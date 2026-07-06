@@ -1909,3 +1909,23 @@ def test_source_turn_history_is_capped(tmp_path: Path) -> None:
     source_rows = [t for t in payload["turns"] if t.get("source_turn_id")]
     assert len(source_rows) == 6
     assert source_rows[0]["assistant_final_text"] == "answer 9"
+
+
+def test_connect_context_manager_closes_connection(tmp_path: Path) -> None:
+    """Regression: ``with _connect(...) as conn:`` must CLOSE the connection on exit.
+
+    sqlite3's context manager commits/rolls back but does not close the
+    connection. Relying on GC to close it leaks the db + WAL file descriptors
+    under the long-running daemon (polled every few seconds) until the process
+    hits its open-file limit and crashes on accept() (EMFILE). ``_connect`` now
+    closes on ``__exit__``.
+    """
+    db_path = tmp_path / "fd-leak.db"
+    init_store(db_path)
+    with store_sqlite._connect(db_path) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    try:
+        conn.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        return
+    raise AssertionError("_connect left the connection open after the with-block (fd leak)")
