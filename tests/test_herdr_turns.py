@@ -556,6 +556,8 @@ def test_omp_agent_session_id_also_maps_to_omp_turn_target() -> None:
 
 
 def _write_omp_session(tmp_path, lines):
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._OMP_SESSION_CACHE.clear()
     root = tmp_path / "omp-sessions"
     session_dir = root / "-demoapp"
     session_dir.mkdir(parents=True)
@@ -636,4 +638,141 @@ def test_omp_open_turn_streams_thinking_headlines(tmp_path, monkeypatch) -> None
     monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
     content = herdr_turns._read_omp_session_turn(str(path))
     assert content["has_open_turn"] is True
-    assert content["assistant_stream_text"] == "Reading the goal doc\n\nchecking the branch state first"
+    assert content["assistant_stream_text"] == (
+        "Reading the goal doc\n\n"
+        "step 1 · bash\n\n"
+        "checking the branch state first\n\n"
+        "step 2 · bash"
+    )
+
+
+def test_omp_cold_start_scans_back_until_current_user_prompt(tmp_path, monkeypatch) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("u1", "user", "large turn please", attribution="user"),
+            _omp_msg("a1", "assistant", "x" * 512, stop="toolUse"),
+            _omp_msg("a2", "assistant", "finished large turn", stop="stop"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    monkeypatch.setattr(herdr_turns, "_OMP_TAIL_BYTES", 80)
+
+    content = herdr_turns._read_omp_session_turn(str(path))
+
+    assert content["source_turn_id"] == "u1"
+    assert content["user_text"] == "large turn please"
+    assert content["assistant_final_text"] == "finished large turn"
+    assert content["complete"] is True
+
+
+def test_omp_cold_start_ignores_internal_user_lines_when_finding_prompt(tmp_path, monkeypatch) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("u1", "user", "real prompt", attribution="user"),
+            _omp_msg("a1", "assistant", "x" * 512, stop="toolUse"),
+            _omp_msg("internal", "user", "<environment_context>\nignore me", attribution="user"),
+            _omp_msg("a2", "assistant", "still answering real prompt", stop="toolUse"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    monkeypatch.setattr(herdr_turns, "_OMP_TAIL_BYTES", 80)
+
+    content = herdr_turns._read_omp_session_turn(str(path))
+
+    assert content["source_turn_id"] == "u1"
+    assert content["user_text"] == "real prompt"
+    assert "still answering real prompt" in content["assistant_stream_text"]
+    assert "<environment_context>" not in content["assistant_stream_text"]
+
+
+def test_omp_incremental_cache_keeps_turn_state_when_prompt_leaves_tail(tmp_path, monkeypatch) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("u1", "user", "keep streaming this", attribution="user"),
+            _omp_msg("a1", "assistant", "started", stop="toolUse"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    monkeypatch.setattr(herdr_turns, "_OMP_TAIL_BYTES", 80)
+
+    first = herdr_turns._read_omp_session_turn(str(path))
+    assert first["source_turn_id"] == "u1"
+    assert first["assistant_stream_text"] == "started"
+
+    def fail_cold_start(*_args):
+        raise AssertionError("incremental read should not cold-scan a cached growing file")
+
+    monkeypatch.setattr(herdr_turns, "_read_omp_state_from_recent", fail_cold_start)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message",
+                "id": "a2",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "toolUse",
+                    "content": [
+                        {"type": "thinking", "thinking": "**Still working**\n\n" + ("x" * 512)},
+                        {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "git status"}},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    second = herdr_turns._read_omp_session_turn(str(path))
+
+    assert second["source_turn_id"] == "u1"
+    assert second["user_text"] == "keep streaming this"
+    assert second["complete"] is False
+    assert "Still working" in second["assistant_stream_text"]
+    assert "step 1 · bash: git status" in second["assistant_stream_text"]
+
+
+def test_omp_tool_snippets_include_arguments_and_redact_sensitive_values(tmp_path, monkeypatch) -> None:
+    tool_message = {
+        "type": "message",
+        "id": "a1",
+        "message": {
+            "role": "assistant",
+            "stopReason": "toolUse",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "id": "c1",
+                    "name": "bash",
+                    "arguments": {"command": "OPENAI_API_KEY=sk-real git checkout -b day2-logic"},
+                },
+                {
+                    "type": "toolCall",
+                    "id": "c2",
+                    "name": "read",
+                    "arguments": {"path": "docs/DAY2_LOGIC_GOAL.md", "token": "must-not-leak"},
+                },
+            ],
+        },
+    }
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("u1", "user", "show tool progress", attribution="user"),
+            tool_message,
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+    content = herdr_turns._read_omp_session_turn(str(path))
+
+    assert (
+        "step 1 · bash: OPENAI_API_KEY=<redacted> git checkout -b day2-logic"
+        in content["assistant_stream_text"]
+    )
+    assert "step 2 · read: docs/DAY2_LOGIC_GOAL.md" in content["assistant_stream_text"]
+    assert "sk-real" not in content["assistant_stream_text"]
+    assert "must-not-leak" not in content["assistant_stream_text"]

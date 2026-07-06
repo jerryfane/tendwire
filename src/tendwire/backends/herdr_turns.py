@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,30 @@ _OMP_SESSION_TURN_KIND = "omp_session_path"
 _PANE_TURN_KIND = "pane_id"
 _MAX_CODEX_STREAM_MESSAGES = 4
 _OMP_TAIL_BYTES = 786432
+_OMP_TOOL_SNIPPET_CHARS = 160
+_OMP_SECRET_KEY_RE = re.compile(
+    r"(token|secret|password|passwd|api[_-]?key|authorization|credential|cookie|stdout|stderr|env)",
+    re.IGNORECASE,
+)
+_OMP_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH|CREDENTIAL|COOKIE)[A-Z0-9_]*)=([^\s;&|]+)"
+)
+_OMP_BEARER_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
+
+
+@dataclass
+class _OmpSessionState:
+    offset: int = 0
+    file_id: tuple[int, int] | None = None
+    prompt_id: str = ""
+    user_text: str = ""
+    stream_parts: list[str] = field(default_factory=list)
+    final_text: str = ""
+    tool_count: int = 0
+
+
+_OMP_SESSION_CACHE: dict[str, _OmpSessionState] = {}
+_OMP_SESSION_CACHE_LOCK = threading.RLock()
 
 
 def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
@@ -326,6 +353,79 @@ def _safe_omp_session_path(value: str) -> Path | None:
     return candidate
 
 
+def _omp_file_id(stat_result: os.stat_result) -> tuple[int, int]:
+    return (int(stat_result.st_dev), int(stat_result.st_ino))
+
+
+def _read_omp_jsonl_lines(
+    session_file: Path,
+    *,
+    start_offset: int,
+    drop_first_partial: bool,
+) -> tuple[list[str], int]:
+    try:
+        with open(session_file, "rb") as handle:
+            handle.seek(start_offset)
+            blob = handle.read()
+    except OSError:
+        return [], start_offset
+    if not blob:
+        return [], start_offset
+
+    offset = start_offset
+    segments = blob.splitlines(keepends=True)
+    if drop_first_partial and segments:
+        offset += len(segments[0])
+        segments = segments[1:]
+
+    lines: list[str] = []
+    for index, segment in enumerate(segments):
+        line_bytes = segment.rstrip(b"\r\n")
+        if not line_bytes:
+            offset += len(segment)
+            continue
+        text = line_bytes.decode("utf-8", "replace")
+        has_line_end = segment.endswith(b"\n") or segment.endswith(b"\r")
+        if not has_line_end and index == len(segments) - 1:
+            try:
+                json.loads(text)
+            except (TypeError, json.JSONDecodeError):
+                break
+        lines.append(text)
+        offset += len(segment)
+    return lines, offset
+
+
+def _omp_message_entry_from_line(line: str) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
+    try:
+        entry = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(entry, Mapping) or entry.get("type") != "message":
+        return None
+    message = entry.get("message")
+    if not isinstance(message, Mapping):
+        return None
+    return entry, message
+
+
+def _is_omp_user_message(message: Mapping[str, Any]) -> bool:
+    return str(message.get("role") or "") == "user" and str(message.get("attribution") or "") == "user"
+
+
+def _last_omp_user_line_index(lines: list[str]) -> int | None:
+    found: int | None = None
+    for index, line in enumerate(lines):
+        parsed = _omp_message_entry_from_line(line)
+        if parsed is None:
+            continue
+        _entry, message = parsed
+        text = _omp_message_text(message)
+        if _is_omp_user_message(message) and text and not _is_internal_user_text(text):
+            found = index
+    return found
+
+
 def _omp_thinking_snippet(message: Mapping[str, Any]) -> str:
     """Compact progress line from an omp thinking block: its bold headline,
     falling back to a trimmed first line."""
@@ -345,6 +445,85 @@ def _omp_thinking_snippet(message: Mapping[str, Any]) -> str:
     return ""
 
 
+def _omp_scrub_tool_text(value: str, *, limit: int = 120) -> str:
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    text = _OMP_SECRET_ASSIGNMENT_RE.sub(r"\1=<redacted>", text)
+    text = _OMP_BEARER_RE.sub(r"\1 <redacted>", text)
+    if len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
+    return text
+
+
+def _omp_public_tool_arg(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)):
+        return _omp_scrub_tool_text(str(value))
+    if isinstance(value, list):
+        parts = [_omp_public_tool_arg(item) for item in value[:3]]
+        return _omp_scrub_tool_text(" ".join(part for part in parts if part))
+    if not isinstance(value, Mapping):
+        return ""
+
+    preferred_keys = ("command", "cmd", "path", "file_path", "filepath", "file", "query", "pattern", "url")
+    for key in preferred_keys:
+        if key not in value or _OMP_SECRET_KEY_RE.search(str(key)):
+            continue
+        text = _omp_public_tool_arg(value.get(key))
+        if text:
+            return text
+
+    parts: list[str] = []
+    for key, item in value.items():
+        key_text = str(key)
+        if _OMP_SECRET_KEY_RE.search(key_text) or not isinstance(item, (str, int, float, bool)):
+            continue
+        text = _omp_public_tool_arg(item)
+        if text:
+            parts.append(f"{key_text}={text}")
+        if len(parts) >= 2:
+            break
+    return _omp_scrub_tool_text(" ".join(parts))
+
+
+def _omp_tool_snippet(item: Mapping[str, Any], step: int) -> str:
+    raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "tool")
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_name).strip("-")[:40] or "tool"
+    arguments = item.get("arguments")
+    if arguments is None:
+        arguments = item.get("input")
+    if arguments is None:
+        arguments = item.get("args")
+    detail = _omp_public_tool_arg(arguments)
+    body = f"{name}: {detail}" if detail else name
+    text = f"step {step} · {body}"
+    if len(text) > _OMP_TOOL_SNIPPET_CHARS:
+        text = text[: _OMP_TOOL_SNIPPET_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _apply_omp_progress_message(state: _OmpSessionState, message: Mapping[str, Any]) -> None:
+    text = _omp_message_text(message)
+    if text:
+        _append_unique_recent(state.stream_parts, text)
+
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for item in content:
+        if not isinstance(item, Mapping):
+            continue
+        kind = str(item.get("type") or "")
+        if kind == "thinking":
+            snippet = _omp_thinking_snippet({"content": [item]})
+            if snippet:
+                _append_unique_recent(state.stream_parts, snippet)
+            continue
+        if kind == "toolCall":
+            state.tool_count += 1
+            snippet = _omp_tool_snippet(item, state.tool_count)
+            if snippet:
+                _append_unique_recent(state.stream_parts, snippet)
+
+
 def _omp_message_text(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
@@ -358,81 +537,120 @@ def _omp_message_text(message: Mapping[str, Any]) -> str:
     return ""
 
 
-def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
-    """Parse an oh-my-pi native session tail into the current public turn.
-
-    Entries are ``{"type": "message", "id": ..., "message": {"role", "content",
-    "stopReason", "attribution"}}``; ``attribution == "user"`` marks real human
-    prompts, ``stopReason == "stop"`` marks a turn-final assistant message, and
-    ``toolUse`` marks intermediate steps whose text streams as progress.
-    """
-    session_file = _safe_omp_session_path(path_value)
-    if session_file is None:
-        return None
-    try:
-        with open(session_file, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - _OMP_TAIL_BYTES))
-            blob = handle.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    lines = blob.splitlines()
-    if size > _OMP_TAIL_BYTES and lines:
-        lines = lines[1:]
-    prompt_id = ""
-    user_text = ""
-    stream_parts: list[str] = []
-    final_text = ""
+def _apply_omp_lines_to_state(state: _OmpSessionState, lines: list[str]) -> None:
     for line in lines:
-        try:
-            entry = json.loads(line)
-        except (TypeError, json.JSONDecodeError):
+        parsed = _omp_message_entry_from_line(line)
+        if parsed is None:
             continue
-        if not isinstance(entry, Mapping) or entry.get("type") != "message":
-            continue
-        message = entry.get("message")
-        if not isinstance(message, Mapping):
-            continue
+        entry, message = parsed
         role = str(message.get("role") or "")
         text = _omp_message_text(message)
         if role == "user":
-            if str(message.get("attribution") or "") != "user":
+            if not _is_omp_user_message(message):
                 continue
             if not text or _is_internal_user_text(text):
                 continue
-            prompt_id = str(entry.get("id") or "")
-            user_text = text
-            stream_parts = []
-            final_text = ""
+            state.prompt_id = str(entry.get("id") or "")
+            state.user_text = text
+            state.stream_parts = []
+            state.final_text = ""
+            state.tool_count = 0
             continue
-        if role != "assistant" or not prompt_id:
+        if role != "assistant" or not state.prompt_id:
             continue
         if str(message.get("stopReason") or "") == "stop" and text:
-            final_text = text
-            stream_parts = []
-        elif text:
-            _append_unique_recent(stream_parts, text)
-        else:
-            snippet = _omp_thinking_snippet(message)
-            if snippet:
-                _append_unique_recent(stream_parts, snippet)
-    if not prompt_id:
+            state.final_text = text
+            state.stream_parts = []
+            continue
+        state.final_text = ""
+        _apply_omp_progress_message(state, message)
+
+
+def _read_omp_state_from_recent(session_file: Path, size: int, file_id: tuple[int, int]) -> _OmpSessionState:
+    state = _OmpSessionState(file_id=file_id)
+    if size <= 0:
+        return state
+
+    window = min(size, max(1, _OMP_TAIL_BYTES))
+    selected_lines: list[str] = []
+    selected_offset = size
+    while True:
+        start = max(0, size - window)
+        lines, next_offset = _read_omp_jsonl_lines(
+            session_file,
+            start_offset=start,
+            drop_first_partial=start > 0,
+        )
+        user_index = _last_omp_user_line_index(lines)
+        if user_index is not None:
+            selected_lines = lines[user_index:]
+            selected_offset = next_offset
+            break
+        if start == 0:
+            selected_lines = lines
+            selected_offset = next_offset
+            break
+        window = min(size, window * 2)
+
+    _apply_omp_lines_to_state(state, selected_lines)
+    state.offset = selected_offset
+    return state
+
+
+def _omp_state_to_content(state: _OmpSessionState) -> Mapping[str, Any] | None:
+    if not state.prompt_id:
         return None
-    has_final = bool(final_text)
+    has_final = bool(state.final_text)
     content: dict[str, Any] = {
-        "user_text": user_text or None,
-        "assistant_stream_text": None if has_final else ("\n\n".join(stream_parts) or None),
-        "assistant_final_text": final_text or None,
+        "user_text": state.user_text or None,
+        "assistant_stream_text": None if has_final else ("\n\n".join(state.stream_parts) or None),
+        "assistant_final_text": state.final_text or None,
         "complete": has_final,
         "has_open_turn": not has_final,
-        "source_turn_id": prompt_id[:160],
+        "source_turn_id": state.prompt_id[:160],
     }
     if _is_internal_turn_content(content):
         return None
     if not (content.get("user_text") or content.get("assistant_stream_text") or content.get("assistant_final_text")):
         return None
     return content
+
+
+def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
+    """Parse an oh-my-pi native session into the current public turn.
+
+    Entries are ``{"type": "message", "id": ..., "message": {"role", "content",
+    "stopReason", "attribution"}}``; ``attribution == "user"`` marks real human
+    prompts, ``stopReason == "stop"`` marks a turn-final assistant message, and
+    ``toolUse`` marks intermediate steps whose text and compact tool calls
+    stream as progress.
+    """
+    session_file = _safe_omp_session_path(path_value)
+    if session_file is None:
+        return None
+    try:
+        stat_result = session_file.stat()
+    except OSError:
+        return None
+    size = int(stat_result.st_size)
+    file_id = _omp_file_id(stat_result)
+    cache_key = str(session_file.resolve())
+
+    with _OMP_SESSION_CACHE_LOCK:
+        state = _OMP_SESSION_CACHE.get(cache_key)
+        if state is None or state.file_id != file_id or size < state.offset:
+            state = _read_omp_state_from_recent(session_file, size, file_id)
+        else:
+            lines, next_offset = _read_omp_jsonl_lines(
+                session_file,
+                start_offset=state.offset,
+                drop_first_partial=False,
+            )
+            _apply_omp_lines_to_state(state, lines)
+            state.offset = next_offset
+            state.file_id = file_id
+        _OMP_SESSION_CACHE[cache_key] = state
+        return _omp_state_to_content(state)
 
 
 def _read_turn_for_binding(config: Config, binding: Any) -> Mapping[str, Any] | None:
