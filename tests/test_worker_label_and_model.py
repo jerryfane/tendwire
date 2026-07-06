@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tendwire.backends.herdr_cli import _worker_from_item
+from tendwire.backends.herdr_cli import _worker_from_item, _workers_and_bindings_from_records
 from tendwire.backends.herdr_events import HerdrEventBackend
 from tendwire.backends.herdr_turns import _TURN_CONTENT_KEYS
 from tendwire.config import Config
@@ -24,8 +24,6 @@ def _config(tmp_path: Path) -> Config:
 
 
 def _pane_item(label: str = "doro") -> dict:
-    # Both shapes carry the same agent_session (as real herdr payloads do), so they share the
-    # private identity fingerprint and collide in the reconcile dedup.
     return {
         "pane_id": "ws-1:p2Q",
         "terminal_id": "term-1",
@@ -40,10 +38,11 @@ def _pane_item(label: str = "doro") -> dict:
 
 def _agent_item() -> dict:
     return {
+        "agent_id": "agent-private",
         "name": "claude",
         "agent": "claude",
         "workspace_id": "ws-1",
-        "status": "idle",
+        "status": "waiting",
         "pane_id": "ws-1:p2Q",
         "terminal_id": "term-1",
         "agent_session": {"kind": "id", "value": "sess-1"},
@@ -58,7 +57,7 @@ def test_pane_label_lands_in_public_worker_meta() -> None:
     assert worker.name == "claude"
 
 
-def test_reconcile_prefers_pane_shaped_record_with_label(tmp_path: Path) -> None:
+def test_reconcile_merges_pane_label_into_agent_record_without_replacing_it(tmp_path: Path) -> None:
     config = _config(tmp_path)
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -66,9 +65,42 @@ def test_reconcile_prefers_pane_shaped_record_with_label(tmp_path: Path) -> None
         {"agents": [_agent_item()]},
         {"panes": [_pane_item()]},
     )
-    # both shapes share the private fingerprint -> exactly one record, the pane one (carries the label)
+    workers, bindings = _workers_and_bindings_from_records(config, records)
+
+    assert len(records) == 1
+    assert len(workers) == 1
+    assert len(bindings) == 1
+    assert records[0].worker.meta.get("label") == "doro"
+    assert records[0].worker.meta.get("cwd") == "/root/temp"
+    assert records[0].worker.status == "waiting"
+    assert bindings[0].target_kind == "agent_id"
+    assert bindings[0].target_value == "agent-private"
+
+
+def test_reconcile_keeps_agent_cwd_when_pane_only_adds_label(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    agent = {**_agent_item(), "cwd": "/root/agent-cwd"}
+    pane = {**_pane_item(), "cwd": "/root/pane-cwd"}
+    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [pane]})
+
     assert len(records) == 1
     assert records[0].worker.meta.get("label") == "doro"
+    assert records[0].worker.meta.get("cwd") == "/root/agent-cwd"
+
+
+def test_reconcile_preserves_pane_only_worker_when_no_agent_record(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    records = backend._records_from_reconcile_payloads({"agents": []}, {"panes": [_pane_item()]})
+    workers, bindings = _workers_and_bindings_from_records(config, records)
+
+    assert len(workers) == 1
+    assert workers[0].meta.get("label") == "doro"
+    assert bindings[0].target_kind == "terminal_id"
+    assert bindings[0].target_value == "term-1"
 
 
 def test_turn_model_round_trip_and_id_stability() -> None:

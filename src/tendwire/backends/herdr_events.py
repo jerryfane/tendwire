@@ -38,6 +38,7 @@ from ..store.sqlite import (
 from .herdr_cli import (
     _pane_has_agent,
     _payload_items,
+    _record_with_worker,
     _spaces_from_payload,
     _worker_record_from_item,
     _workers_and_bindings_from_records,
@@ -640,20 +641,70 @@ class HerdrEventBackend:
     def _current_bindings(self) -> list[WorkerBinding]:
         return list(self._bindings.values())
 
+    def _record_match_keys(
+        self,
+        item: Mapping[str, Any],
+        record: Any,
+        *,
+        pane_shaped: bool = False,
+    ) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = {("private_fingerprint", str(record.private_fingerprint))}
+        pane_id_keys = ("pane_id", "paneId", "id") if pane_shaped else ("pane_id", "paneId")
+        for kind, value in (
+            ("pane_id", _first_text(item, pane_id_keys)),
+            ("terminal_id", _first_text(item, ("terminal_id", "terminalId"))),
+            ("agent_session", _first_text(item, ("agent_session", "session_id", "sessionId"))),
+        ):
+            if value:
+                keys.add((kind, value))
+        return keys
+
+    def _merge_pane_display_meta(self, agent_record: Any, pane_record: Any | None) -> Any:
+        if pane_record is None:
+            return agent_record
+        pane_meta = pane_record.worker.meta
+        merged_meta = dict(agent_record.worker.meta)
+        label = pane_meta.get("label")
+        if isinstance(label, str) and label.strip():
+            merged_meta["label"] = label
+        for key in ("foreground_cwd", "cwd"):
+            value = pane_meta.get(key)
+            if isinstance(value, str) and value.strip() and not merged_meta.get(key):
+                merged_meta[key] = value
+        if merged_meta == agent_record.worker.meta:
+            return agent_record
+        return _record_with_worker(agent_record, _worker_copy(agent_record.worker, meta=merged_meta))
+
     def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[Any]:
-        records_by_identity: OrderedDict[str, Any] = OrderedDict()
-        # Pane-shaped items first: PaneInfo carries display metadata (e.g. the user's pane `label`)
-        # that AgentInfo lacks, and both shapes share the same private fingerprint, so whichever is
-        # ingested first wins the setdefault. Identity/name resolution is unaffected (worker ids key
-        # off binding fingerprints, and both shapes carry the same `agent`).
+        pane_records_by_match: dict[tuple[str, str], Any] = {}
+        pane_fallback_records: OrderedDict[str, Any] = OrderedDict()
         for item in _payload_items(pane_payload, _PANE_PAYLOAD_KEYS):
             if not _pane_has_agent(item):
                 continue
             record = _worker_record_from_item(item, self.config)
-            records_by_identity.setdefault(record.private_fingerprint, record)
+            pane_fallback_records.setdefault(record.private_fingerprint, record)
+            for key in self._record_match_keys(item, record, pane_shaped=True):
+                pane_records_by_match.setdefault(key, record)
+
+        records_by_identity: OrderedDict[str, Any] = OrderedDict()
+        consumed_pane_fingerprints: set[str] = set()
         for item in _payload_items(agent_payload, _AGENT_PAYLOAD_KEYS):
             record = _worker_record_from_item(item, self.config)
-            records_by_identity.setdefault(record.private_fingerprint, record)
+            matched_pane = None
+            for key in self._record_match_keys(item, record):
+                matched_pane = pane_records_by_match.get(key)
+                if matched_pane is not None:
+                    break
+            if matched_pane is not None:
+                consumed_pane_fingerprints.add(str(matched_pane.private_fingerprint))
+            records_by_identity.setdefault(
+                record.private_fingerprint,
+                self._merge_pane_display_meta(record, matched_pane),
+            )
+        for fingerprint, record in pane_fallback_records.items():
+            if str(fingerprint) in consumed_pane_fingerprints:
+                continue
+            records_by_identity.setdefault(fingerprint, record)
         return list(records_by_identity.values())
 
     def _pane_subscription_ids(self, pane_payload: Any) -> list[str]:
