@@ -325,6 +325,14 @@ CREATE_PR6_INDEXES = (
         "ON pending_interactions(host_id, status)"
     ),
     (
+        "CREATE TABLE IF NOT EXISTS backend_pending ("
+        "host_id TEXT NOT NULL, "
+        "worker_id TEXT NOT NULL, "
+        "payload_json TEXT NOT NULL, "
+        "observed_at TEXT NOT NULL, "
+        "PRIMARY KEY (host_id, worker_id))"
+    ),
+    (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_source "
         "ON attention_items(host_id, source)"
     ),
@@ -3182,6 +3190,55 @@ def _turn_content_matches_origin(payload: Mapping[str, Any], content: Mapping[st
     if not incoming_user:
         return False
     return incoming_user == _turn_merge_match_text(payload.get("user_text"))
+def merge_backend_pending(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+    pending: Mapping[str, Any] | None,
+) -> bool:
+    """Presence-sync one worker's backend-provided pending prompt (a REAL pane prompt with choices,
+    read through the turn adapter). `pending=None` prunes the row (the prompt was answered)."""
+    with _connect(db_path) as conn:
+        if pending is None:
+            cur = conn.execute(
+                "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
+                (host_id, worker_id),
+            )
+            return cur.rowcount > 0
+        payload = stable_json_dumps(dict(pending))
+        row = conn.execute(
+            "SELECT payload_json FROM backend_pending WHERE host_id = ? AND worker_id = ?",
+            (host_id, worker_id),
+        ).fetchone()
+        if row and row[0] == payload:
+            return False
+        conn.execute(
+            "INSERT INTO backend_pending (host_id, worker_id, payload_json, observed_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(host_id, worker_id) DO UPDATE SET payload_json = excluded.payload_json, "
+            "observed_at = excluded.observed_at",
+            (host_id, worker_id, payload, utc_timestamp()),
+        )
+        return True
+
+
+def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
+    """worker_id -> normalized pending dict for every live backend-provided prompt."""
+    import json as _json
+
+    out: dict[str, dict[str, Any]] = {}
+    with _connect(db_path) as conn:
+        for worker_id, payload_json in conn.execute(
+            "SELECT worker_id, payload_json FROM backend_pending WHERE host_id = ?",
+            (host_id,),
+        ):
+            try:
+                payload = _json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                out[str(worker_id)] = payload
+    return out
 
 
 def merge_turn_content(

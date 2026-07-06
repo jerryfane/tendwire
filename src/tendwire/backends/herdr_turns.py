@@ -15,7 +15,7 @@ from typing import Any
 
 from ..config import Config
 from ..core.turns import is_internal_automation_turn_payload
-from ..store.sqlite import list_worker_bindings, merge_turn_content
+from ..store.sqlite import list_worker_bindings, merge_backend_pending, merge_turn_content
 
 
 _TURN_CONTENT_KEYS = (
@@ -87,6 +87,62 @@ def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
     return value
 
 
+_PENDING_MAX_CHOICES = 12
+_PENDING_TEXT_MAX = 2000
+
+
+def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Normalize an adapter-emitted pending_decision/pending_interaction (a REAL pane prompt with its
+    choices, captured by the herdres pending hook) into a neutral pending shape. Returns None when the
+    turn carries no pending prompt."""
+    decision = turn.get("pending_decision")
+    if isinstance(decision, Mapping):
+        options = decision.get("options") if isinstance(decision.get("options"), list) else []
+        choices = []
+        for option in options[:_PENDING_MAX_CHOICES]:
+            if not isinstance(option, Mapping):
+                continue
+            label = str(option.get("label") or "").strip()[:_PENDING_TEXT_MAX]
+            if not label:
+                continue
+            choices.append(
+                {
+                    "choice_id": str(option.get("id") or "")[:80] or label[:80],
+                    "label": label,
+                    "value": str(option.get("send_text") or "")[:_PENDING_TEXT_MAX],
+                }
+            )
+        question = str(decision.get("prompt") or "").strip()[:_PENDING_TEXT_MAX]
+        if not question and not choices:
+            return None
+        option_ids = {str(option.get("id") or "") for option in options if isinstance(option, Mapping)}
+        kind = "approval" if "approve" in option_ids else "question"
+        return {
+            "question": question or "Input needed",
+            "kind": kind,
+            "choices": choices,
+            "meta": {
+                "source": "backend",
+                "decision_id": str(decision.get("decision_id") or "")[:160],
+            },
+        }
+    interaction = turn.get("pending_interaction")
+    if isinstance(interaction, Mapping):
+        questions = interaction.get("questions") if isinstance(interaction.get("questions"), list) else []
+        parts = []
+        for q in questions[:4]:
+            if isinstance(q, Mapping) and str(q.get("question") or "").strip():
+                parts.append(str(q.get("question")).strip())
+        question = " / ".join(parts)[:_PENDING_TEXT_MAX] or "Input needed (multi-question form)"
+        return {
+            "question": question,
+            "kind": "review",
+            "choices": [],  # multi-question forms stay read-only (never key-driven)
+            "meta": {"source": "backend", "decision_id": str(interaction.get("decision_id") or "")[:160]},
+        }
+    return None
+
+
 def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None:
     try:
         completed = subprocess.run(
@@ -125,6 +181,9 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
         return _open_turn_content(open_user_text, turn.get("assistant_stream_text"), open_turn_id)
 
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
+    pending = _backend_pending_from_turn(turn)
+    if pending is not None:
+        content["_backend_pending"] = pending
     # Prefer the stable prompt-scoped id so a turn keeps one identity from
     # open through complete; fall back to turn_id for backends without it.
     source_turn_id = str(turn.get("source_turn_id") or turn.get("turn_id") or "").strip()
@@ -141,6 +200,18 @@ def _read_private_turn(config: Config, pane_id: str) -> Mapping[str, Any] | None
     if not any(value not in (None, "", False) for value in content.values()):
         return None
     return content
+
+
+def _pop_backend_pending(content: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split the reserved _backend_pending key off a turn-content read. Returns (content, pending);
+    content becomes None when nothing else remains."""
+    if content is None:
+        return None, None
+    data = dict(content)
+    pending = data.pop("_backend_pending", None)
+    if not any(value not in (None, "", False) for value in data.values()):
+        data = None
+    return data, pending if isinstance(pending, dict) else None
 
 
 def _open_turn_content(
@@ -722,6 +793,13 @@ def refresh_structured_turn_content(config: Config) -> dict[str, Any]:
                 content = future.result()
             except Exception:
                 content = None
+            if content is None:
+                continue
+            content, pending = _pop_backend_pending(content)
+            if binding.turn_target_kind == _PANE_TURN_KIND:
+                # Presence-based: a successful pane read either carries the live pending prompt
+                # (upsert) or it doesn't (the prompt was answered/dismissed -> prune the row).
+                merge_backend_pending(config.db_path, config.host_id, binding.worker_id, pending)
             if content is None:
                 continue
             updated += merge_turn_content(

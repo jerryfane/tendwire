@@ -94,6 +94,7 @@ class TendwireDaemon:
             submit_command=self.submit_command,
             get_attention=self.get_attention,
             get_turns=self.get_turns,
+            get_pending=self.get_pending,
             connector_call=self.connector_call,
         )
         self._server = UnixSocketJSONServer(
@@ -241,6 +242,44 @@ class TendwireDaemon:
         from .core.attention import attention_payload_from_snapshot
 
         return attention_payload_from_snapshot(self.get_snapshot())
+
+    def get_pending(self) -> Mapping[str, Any]:
+        """pending.list: snapshot-derived (attention) pendings, with backend-provided REAL prompts
+        (question + choices captured through the turn adapter) superseding a worker's synthetic row."""
+        snapshot = self.get_snapshot()
+        from .core.turns import PendingInteraction, pending_payload_from_snapshot
+
+        payload = dict(pending_payload_from_snapshot(snapshot))
+        if self.config.db_path is None:
+            return payload
+        from .store.sqlite import list_backend_pending
+
+        backend = list_backend_pending(Path(self.config.db_path), self.config.host_id)
+        if not backend:
+            return payload
+        workers = {worker.id: worker for worker in snapshot.workers}
+        rows = [row for row in payload.get("pending_interactions", []) if row.get("worker_id") not in backend]
+        for worker_id, pending in sorted(backend.items()):
+            worker = workers.get(worker_id)
+            try:
+                interaction = PendingInteraction.from_dict(
+                    {
+                        "host_id": self.config.host_id,
+                        "worker_id": worker_id,
+                        "question": pending.get("question"),
+                        "kind": pending.get("kind"),
+                        "choices": pending.get("choices") or [],
+                        "status": "open",
+                        "worker_fingerprint": worker.fingerprint if worker is not None else None,
+                        "space_id": worker.space_id if worker is not None else None,
+                        "meta": pending.get("meta") or {"source": "backend"},
+                    }
+                )
+            except Exception:
+                continue
+            rows.append(interaction.to_dict())
+        payload["pending_interactions"] = rows
+        return payload
 
     def get_turns(self) -> Mapping[str, Any]:
         snapshot = self.get_snapshot()
