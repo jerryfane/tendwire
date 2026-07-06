@@ -23,7 +23,7 @@ def _config(tmp_path: Path) -> Config:
     )
 
 
-def _pane_item(label: str = "doro") -> dict:
+def _pane_item(label: str = "review-pane") -> dict:
     return {
         "pane_id": "ws-1:p2Q",
         "terminal_id": "term-1",
@@ -52,7 +52,7 @@ def _agent_item() -> dict:
 def test_pane_label_lands_in_public_worker_meta() -> None:
     worker = _worker_from_item(_pane_item())
     assert worker is not None
-    assert worker.meta.get("label") == "doro"
+    assert worker.meta.get("label") == "review-pane"
     # name resolution unchanged: agent-first
     assert worker.name == "claude"
 
@@ -70,7 +70,7 @@ def test_reconcile_merges_pane_label_into_agent_record_without_replacing_it(tmp_
     assert len(records) == 1
     assert len(workers) == 1
     assert len(bindings) == 1
-    assert records[0].worker.meta.get("label") == "doro"
+    assert records[0].worker.meta.get("label") == "review-pane"
     assert records[0].worker.meta.get("cwd") == "/root/temp"
     assert records[0].worker.status == "waiting"
     assert bindings[0].target_kind == "agent_id"
@@ -86,8 +86,59 @@ def test_reconcile_keeps_agent_cwd_when_pane_only_adds_label(tmp_path: Path) -> 
     records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [pane]})
 
     assert len(records) == 1
-    assert records[0].worker.meta.get("label") == "doro"
+    assert records[0].worker.meta.get("label") == "review-pane"
     assert records[0].worker.meta.get("cwd") == "/root/agent-cwd"
+
+
+def test_reconcile_keeps_agent_turn_target_when_present(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    agent = {**_agent_item(), "agent": "codex", "name": "codex"}
+    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [_pane_item()]})
+
+    assert len(records) == 1
+    assert records[0].turn_target_kind == "codex_session_id"
+    assert records[0].turn_target_value == "sess-1"
+    assert records[0].worker.meta.get("label") == "review-pane"
+
+
+def test_reconcile_uses_matched_pane_turn_target_when_agent_lacks_one(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    agent = _agent_item()
+    agent.pop("pane_id")
+    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [_pane_item()]})
+    workers, bindings = _workers_and_bindings_from_records(config, records)
+
+    assert len(records) == 1
+    assert records[0].turn_target_kind == "pane_id"
+    assert records[0].turn_target_value == "ws-1:p2Q"
+    assert len(bindings) == 1
+    assert bindings[0].turn_target_kind == "pane_id"
+    assert bindings[0].turn_target_value == "ws-1:p2Q"
+    assert workers[0].meta.get("label") == "review-pane"
+
+
+def test_reconcile_only_fills_missing_agent_backend_target_from_pane(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    agent = {
+        "workspace_id": "ws-1",
+        "status": "waiting",
+        "agent_session": {"kind": "id", "value": "sess-1"},
+    }
+    records = backend._records_from_reconcile_payloads({"agents": [agent]}, {"panes": [_pane_item()]})
+    workers, bindings = _workers_and_bindings_from_records(config, records)
+
+    assert len(records) == 1
+    assert workers[0].backend_target is not None
+    assert workers[0].backend_target["kind"] == "terminal_id"
+    assert workers[0].backend_target["value"] == "term-1"
+    assert bindings[0].target_kind == "terminal_id"
+    assert bindings[0].target_value == "term-1"
 
 
 def test_reconcile_preserves_pane_only_worker_when_no_agent_record(tmp_path: Path) -> None:
@@ -98,7 +149,7 @@ def test_reconcile_preserves_pane_only_worker_when_no_agent_record(tmp_path: Pat
     workers, bindings = _workers_and_bindings_from_records(config, records)
 
     assert len(workers) == 1
-    assert workers[0].meta.get("label") == "doro"
+    assert workers[0].meta.get("label") == "review-pane"
     assert bindings[0].target_kind == "terminal_id"
     assert bindings[0].target_value == "term-1"
 

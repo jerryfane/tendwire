@@ -36,9 +36,9 @@ from ..store.sqlite import (
     upsert_worker_bindings,
 )
 from .herdr_cli import (
+    _WorkerRecord,
     _pane_has_agent,
     _payload_items,
-    _record_with_worker,
     _spaces_from_payload,
     _worker_record_from_item,
     _workers_and_bindings_from_records,
@@ -659,7 +659,11 @@ class HerdrEventBackend:
                 keys.add((kind, value))
         return keys
 
-    def _merge_pane_display_meta(self, agent_record: Any, pane_record: Any | None) -> Any:
+    def _merge_pane_display_meta(
+        self,
+        agent_record: _WorkerRecord,
+        pane_record: _WorkerRecord | None,
+    ) -> _WorkerRecord:
         if pane_record is None:
             return agent_record
         pane_meta = pane_record.worker.meta
@@ -671,9 +675,48 @@ class HerdrEventBackend:
             value = pane_meta.get(key)
             if isinstance(value, str) and value.strip() and not merged_meta.get(key):
                 merged_meta[key] = value
-        if merged_meta == agent_record.worker.meta:
+        backend_target_changed = False
+        backend_target = agent_record.worker.backend_target
+        if (
+            not self._backend_target_present(backend_target)
+            and self._backend_target_present(pane_record.worker.backend_target)
+        ):
+            backend_target = pane_record.worker.backend_target
+            backend_target_changed = True
+        worker = agent_record.worker
+        if merged_meta != agent_record.worker.meta or backend_target_changed:
+            worker = _worker_copy(worker, meta=merged_meta, backend_target=backend_target)
+
+        turn_target_kind = agent_record.turn_target_kind
+        turn_target_value = agent_record.turn_target_value
+        if (
+            (not turn_target_kind or not turn_target_value)
+            and pane_record.turn_target_kind
+            and pane_record.turn_target_value
+        ):
+            turn_target_kind = pane_record.turn_target_kind
+            turn_target_value = pane_record.turn_target_value
+
+        if (
+            worker == agent_record.worker
+            and turn_target_kind == agent_record.turn_target_kind
+            and turn_target_value == agent_record.turn_target_value
+        ):
             return agent_record
-        return _record_with_worker(agent_record, _worker_copy(agent_record.worker, meta=merged_meta))
+        return _WorkerRecord(
+            worker=worker,
+            private_fingerprint=agent_record.private_fingerprint,
+            turn_target_kind=turn_target_kind,
+            turn_target_value=turn_target_value,
+        )
+
+    @staticmethod
+    def _backend_target_present(target: Any) -> bool:
+        return (
+            isinstance(target, Mapping)
+            and bool(str(target.get("kind") or ""))
+            and bool(str(target.get("value") or ""))
+        )
 
     def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[Any]:
         pane_records_by_match: dict[tuple[str, str], Any] = {}
