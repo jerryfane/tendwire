@@ -82,13 +82,15 @@ def test_merge_and_prune_backend_pending(tmp_path: Path):
 
 # --- Regression tests for the PR#3 review fixes ---------------------------------------------
 
+_GOOGLE_API_KEY_SENTINEL = "AI" + "zaSyD-ExampleKey1234567890abcdefghijk"
+
 _SENTINELS = [
     "sk-live-SENTINELSECRET123ABC",             # sk- secret token
     "/run/user/1000/herdr/sock-abcdef123456",   # socket path
     "w4V:p1",                                    # pseudo pane id
     "/home/smith/.ssh/id_rsa",                  # absolute fs path
     "toolu_SENTINELDECISION01",                 # internal tool_use_id (dropped, not published)
-    "AIzaSyD-ExampleKey1234567890abcdefghijk",  # google api key
+    _GOOGLE_API_KEY_SENTINEL,                   # google api key
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf",  # JWT
     "alice.jones@internal-corp.example",        # email / PII
     "10.4.2.9:5432",                            # internal ip:port
@@ -102,7 +104,7 @@ def _leaky_decision_turn() -> dict:
             "decision_id": "toolu_SENTINELDECISION01",
             "prompt": (
                 "Approve running against pane w4V:p1 at /home/smith/.ssh/id_rsa via "
-                "/run/user/1000/herdr/sock-abcdef123456? Also rotate AIzaSyD-ExampleKey1234567890abcdefghijk "
+                f"/run/user/1000/herdr/sock-abcdef123456? Also rotate {_GOOGLE_API_KEY_SENTINEL} "
                 "and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf; "
                 "notify alice.jones@internal-corp.example on db 10.4.2.9:5432 at home/alice/.ssh/id_rsa"
             ),
