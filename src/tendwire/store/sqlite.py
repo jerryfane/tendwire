@@ -383,6 +383,21 @@ def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path) -> None:
     conn.execute("PRAGMA synchronous=NORMAL")
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3's ``with conn:`` commits/rolls back but does
+    NOT close the connection, so every ``with _connect(...) as conn:`` site leaked
+    its db + WAL file descriptors. Under the long-running daemon (polled every few
+    seconds) these piled up until the process hit its open-file limit and crashed
+    on ``accept()`` (EMFILE), which surfaced as "request_state_uncertain" sends.
+    Closing on __exit__ bounds the FD count."""
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _connect(
     db_path: Path,
     *,
@@ -392,6 +407,7 @@ def _connect(
         str(db_path),
         timeout=30.0,
         isolation_level=isolation_level,
+        factory=_ClosingConnection,
     )
     _apply_connection_pragmas(conn, db_path)
     return conn
