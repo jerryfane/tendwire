@@ -1024,6 +1024,46 @@ def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] |
     )
 
 
+def _stable_pane_identity(record: _WorkerRecord) -> tuple[str, str]:
+    """The worker's durable pane identity as (kind, value), or ("", "") when none is exposed. pane_id is
+    preferred over terminal_id — two split panes in one tab share a terminal_id but not a pane_id — and
+    agent_id / session ids are deliberately excluded (they are session-dependent, the churn this avoids).
+    Resolved after the pane merge, so it reads the record's finalized turn_target / backend_target."""
+    if record.turn_target_kind == "pane_id" and record.turn_target_value:
+        return "pane_id", str(record.turn_target_value)
+    target = record.worker.backend_target
+    if isinstance(target, Mapping) and str(target.get("kind") or "") in ("terminal_id", "pane_id"):
+        return str(target.get("kind") or ""), str(target.get("value") or "")
+    return "", ""
+
+
+def _worker_with_stable_key(config: Config, record: _WorkerRecord) -> Worker:
+    """Return the record's worker with meta.stable_key set to a session-INDEPENDENT hash of its durable
+    pane identity (or the worker unchanged when it exposes none — e.g. codex/omp report only a session
+    id here). A connector reconciles a re-lettered worker id back to the same pane via this key instead
+    of stranding a duplicate topic. Reuses the private-binding hash, so the raw pane id never leaks."""
+    kind, value = _stable_pane_identity(record)
+    worker = record.worker
+    if not value:
+        return worker
+    stable_key = worker_binding_private_fingerprint(
+        host_id=config.host_id,
+        backend=_BACKEND_NAME,
+        identity_material={"stable_pane": {"kind": kind, "value": value, "space_id": worker.space_id}},
+    )
+    return Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta={**worker.meta, "stable_key": stable_key},
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+        fingerprint=worker.fingerprint,
+        backend_target=worker.backend_target,
+    )
+
+
 def _backend_target_send_token(target: Mapping[str, Any] | None) -> str:
     """Return the exact value passed as herdr agent send's target argv token."""
     if not isinstance(target, Mapping):
@@ -1283,7 +1323,7 @@ def _workers_and_bindings_from_records(
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     observed_at = utc_timestamp()
     deduplicated = _deduplicated_worker_records(records, stored_bindings)
-    workers = [record.worker for record in deduplicated]
+    workers = [_worker_with_stable_key(config, record) for record in deduplicated]
     bindings = [
         binding
         for record in deduplicated
