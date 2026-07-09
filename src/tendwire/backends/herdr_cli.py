@@ -44,6 +44,9 @@ class _WorkerRecord:
     private_fingerprint: str
     turn_target_kind: str | None = None
     turn_target_value: str | None = None
+    # herdr's durable terminal id (survives restart), read from the raw item and threaded through the
+    # pane merge / dedup so stable_key can hash it instead of the churning positional pane_id.
+    terminal_id: str | None = None
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -1007,6 +1010,7 @@ def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = No
         private_fingerprint=_private_identity_from_item(item, config),
         turn_target_kind=turn_target[0] if turn_target is not None else None,
         turn_target_value=turn_target[1] if turn_target is not None else None,
+        terminal_id=_first_text(item, ("terminal_id", "terminalId")),
     )
 
 
@@ -1021,6 +1025,55 @@ def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] |
         summary=worker.summary,
         fingerprint=worker.fingerprint,
         backend_target=backend_target,
+    )
+
+
+def _stable_pane_identity(record: _WorkerRecord) -> tuple[str, str]:
+    """The worker's durable identity as (kind, value), or ("", "") when none is exposed. The DURABLE
+    terminal_id is preferred: herdr's public pane_id is the positional {ws}-{n} form, renumbered when a
+    sibling closes and re-enumerated by iteration order on restart — exactly the churn stable_key exists
+    to survive — whereas terminal_id is a registry key that persists across restart. pane_id (turn-target,
+    then backend-target) is used only as a fallback when no terminal id is exposed; agent_id / session ids
+    are excluded (session-dependent). Two split panes in one tab share a terminal_id and so will share a
+    stable_key — the consumer (herdres#147) guards against fusing two live same-key panes, so keeping this
+    simple is acceptable. Resolved after the pane merge, so it reads the record's finalized fields."""
+    if record.terminal_id:
+        return "terminal_id", str(record.terminal_id)
+    target = record.worker.backend_target
+    if isinstance(target, Mapping) and str(target.get("kind") or "") == "terminal_id":
+        return "terminal_id", str(target.get("value") or "")
+    if record.turn_target_kind == "pane_id" and record.turn_target_value:
+        return "pane_id", str(record.turn_target_value)
+    if isinstance(target, Mapping) and str(target.get("kind") or "") == "pane_id":
+        return "pane_id", str(target.get("value") or "")
+    return "", ""
+
+
+def _worker_with_stable_key(config: Config, record: _WorkerRecord) -> Worker:
+    """Return the record's worker with meta.stable_key set to a session-INDEPENDENT hash of its durable
+    identity — the terminal_id that survives restart, falling back to the pane_id only when no terminal
+    id is exposed (or the worker unchanged when it exposes neither — e.g. codex/omp report only a session
+    id here). A connector reconciles a re-lettered worker id back to the same pane via this key instead
+    of stranding a duplicate topic. Reuses the private-binding hash, so the raw id never leaks."""
+    kind, value = _stable_pane_identity(record)
+    worker = record.worker
+    if not value:
+        return worker
+    stable_key = worker_binding_private_fingerprint(
+        host_id=config.host_id,
+        backend=_BACKEND_NAME,
+        identity_material={"stable_pane": {"kind": kind, "value": value, "space_id": worker.space_id}},
+    )
+    return Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta={**worker.meta, "stable_key": stable_key},
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+        fingerprint=worker.fingerprint,
+        backend_target=worker.backend_target,
     )
 
 
@@ -1117,6 +1170,7 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
         private_fingerprint=record.private_fingerprint,
         turn_target_kind=record.turn_target_kind,
         turn_target_value=record.turn_target_value,
+        terminal_id=record.terminal_id,
     )
 
 
@@ -1283,7 +1337,7 @@ def _workers_and_bindings_from_records(
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     observed_at = utc_timestamp()
     deduplicated = _deduplicated_worker_records(records, stored_bindings)
-    workers = [record.worker for record in deduplicated]
+    workers = [_worker_with_stable_key(config, record) for record in deduplicated]
     bindings = [
         binding
         for record in deduplicated
