@@ -1,6 +1,7 @@
-"""meta.stable_key: a session-independent hash of a worker's durable pane identity, emitted so a
-connector can reconcile a re-lettered worker id (herdr reassigns ids positionally across restarts) back
-to the same pane instead of stranding a duplicate. The raw pane/terminal id must never leak."""
+"""meta.stable_key: a session-independent hash of a worker's DURABLE terminal identity, emitted so a
+connector can reconcile a re-lettered worker id (herdr reassigns ids positionally across restarts, and
+renumbers the positional pane_id when a sibling closes) back to the same terminal instead of stranding a
+duplicate. The key must follow the terminal_id, not the churning pane_id, and never leak a raw id."""
 from __future__ import annotations
 
 import json
@@ -46,23 +47,40 @@ def _workers(tmp_path, agents):
     return workers
 
 
-def test_stable_key_is_hex_from_pane_identity(tmp_path: Path) -> None:
+def test_stable_key_is_hex_from_terminal_identity(tmp_path: Path) -> None:
     (worker,) = _workers(tmp_path, [_agent_item()])
     key = worker.meta.get("stable_key")
     assert key and _HEX24.match(key)
 
 
 def test_stable_key_stable_across_worker_id_relettering(tmp_path: Path) -> None:
-    # THE point: the same pane re-registered under a different worker/agent id keeps the SAME stable_key.
-    (w_before,) = _workers(tmp_path, [_agent_item(agent_id="agent-old")])
-    (w_after,) = _workers(tmp_path, [_agent_item(agent_id="agent-new")])
+    # THE point: across a herdr restart the durable terminal_id is unchanged, even though the worker/agent
+    # id is re-lettered AND the positional pane_id is renumbered. The stable_key must stay the same.
+    (w_before,) = _workers(tmp_path, [_agent_item(agent_id="agent-old", pane_id="ws-1:p2")])
+    (w_after,) = _workers(tmp_path, [_agent_item(agent_id="agent-new", pane_id="ws-1:p5")])
     assert w_before.meta["stable_key"] == w_after.meta["stable_key"]
 
 
+def test_stable_key_unchanged_when_only_pane_id_changes(tmp_path: Path) -> None:
+    # A sibling pane closing renumbers this pane's positional pane_id; the terminal_id (and so the key)
+    # holds. Keying off pane_id would (wrongly) treat this as a different worker.
+    (w1,) = _workers(tmp_path, [_agent_item(pane_id="ws-1:p3")])
+    (w2,) = _workers(tmp_path, [_agent_item(pane_id="ws-1:p1")])
+    assert w1.meta["stable_key"] == w2.meta["stable_key"]
+
+
+def test_stable_key_differs_across_terminal_ids(tmp_path: Path) -> None:
+    # Distinct terminals -> distinct keys, even when the positional pane_id happens to be identical.
+    (w1,) = _workers(tmp_path, [_agent_item(agent_id="a", terminal_id="term-a")])
+    (w2,) = _workers(tmp_path, [_agent_item(agent_id="b", terminal_id="term-b")])
+    assert w1.meta["stable_key"] != w2.meta["stable_key"]
+
+
 def test_stable_key_differs_across_distinct_panes(tmp_path: Path) -> None:
+    # Two distinct terminals in one reconcile keep distinct keys through the dedup path.
     workers = _workers(tmp_path, [
-        _agent_item(agent_id="a", pane_id="ws-1:p1"),
-        _agent_item(agent_id="b", pane_id="ws-1:p2"),
+        _agent_item(agent_id="a", pane_id="ws-1:p1", terminal_id="term-a"),
+        _agent_item(agent_id="b", pane_id="ws-1:p2", terminal_id="term-b"),
     ])
     keys = {w.meta.get("stable_key") for w in workers}
     assert len(keys) == 2 and all(k for k in keys)
@@ -80,7 +98,7 @@ def test_stable_key_does_not_leak_raw_pane_or_terminal_id(tmp_path: Path) -> Non
     blob = json.dumps(worker.to_dict())
     assert worker.meta.get("stable_key")               # present
     assert "ws-1:leaky-pane" not in blob               # raw pane id never surfaces
-    assert "term-leaky" not in blob                    # raw terminal id never surfaces
+    assert "term-leaky" not in blob                    # raw terminal id (now hashed) never surfaces
 
 
 def test_stable_key_survives_to_dict_sanitizer(tmp_path: Path) -> None:

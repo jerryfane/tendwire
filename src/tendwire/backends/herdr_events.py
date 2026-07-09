@@ -697,10 +697,15 @@ class HerdrEventBackend:
             turn_target_kind = pane_record.turn_target_kind
             turn_target_value = pane_record.turn_target_value
 
+        # An agent record may omit the durable terminal_id that its matched pane carries; adopt the
+        # pane's so stable_key keys off the terminal rather than the churning positional pane_id.
+        terminal_id = agent_record.terminal_id or pane_record.terminal_id
+
         if (
             worker == agent_record.worker
             and turn_target_kind == agent_record.turn_target_kind
             and turn_target_value == agent_record.turn_target_value
+            and terminal_id == agent_record.terminal_id
         ):
             return agent_record
         return _WorkerRecord(
@@ -708,6 +713,7 @@ class HerdrEventBackend:
             private_fingerprint=agent_record.private_fingerprint,
             turn_target_kind=turn_target_kind,
             turn_target_value=turn_target_value,
+            terminal_id=terminal_id,
         )
 
     @staticmethod
