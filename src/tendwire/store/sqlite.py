@@ -3673,6 +3673,38 @@ def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | Non
     return Snapshot.from_json(row[0])
 
 
+def latest_healthy_backend_snapshot(
+    db_path: Path,
+    host_id: str,
+    *,
+    backend: str,
+) -> Snapshot | None:
+    """Return the newest snapshot reporting a healthy named backend."""
+    if not db_path.exists():
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT snapshot.payload
+            FROM snapshots AS snapshot
+            WHERE snapshot.host_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM json_each(snapshot.payload, '$.backend_health') AS health
+                  WHERE json_extract(health.value, '$.name') = ?
+                    AND json_extract(health.value, '$.status') = 'healthy'
+              )
+            ORDER BY snapshot.id DESC
+            LIMIT 1
+            """,
+            (str(host_id), str(backend)),
+        ).fetchone()
+    if row is None:
+        return None
+    return Snapshot.from_json(row[0])
+
+
 def _attention_rows_conn(
     conn: sqlite3.Connection,
     host_id: str,

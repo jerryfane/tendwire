@@ -1,106 +1,1611 @@
-"""meta.stable_key: a session-independent hash of a worker's DURABLE terminal identity, emitted so a
-connector can reconcile a re-lettered worker id (herdr reassigns ids positionally across restarts, and
-renumbers the positional pane_id when a sibling closes) back to the same terminal instead of stranding a
-duplicate. The key must follow the terminal_id, not the churning pane_id, and never leak a raw id."""
+"""Stable worker continuity from Herdr's persisted workspace/public-pane identity."""
+
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 
+import hashlib
+import hmac
 import json
+import os
 import re
+import stat
+import subprocess
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
-from tendwire.backends.herdr_cli import _workers_and_bindings_from_records
+import pytest
+
+from tendwire import worker_identity
+from tendwire.backends import herdr_cli
+from tendwire.backends.herdr_cli import (
+    _private_identity_material_from_item,
+    _worker_record_from_item,
+    _workers_and_bindings_from_records,
+)
 from tendwire.backends.herdr_events import HerdrEventBackend
 from tendwire.config import Config
+from tendwire.core.models import worker_binding_private_fingerprint
 from tendwire.store.sqlite import init_store
+from tendwire.worker_identity import (
+    InstallationKeyError,
+    load_or_create_installation_key,
+    reset_installation_key,
+)
 
-_HEX24 = re.compile(r"^[0-9a-f]{24}$")
+_STABLE_KEY = re.compile(r"^wsk1_[0-9a-f]{64}$")
+_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "herdr" / "worker_identity_restore.json"
 
 
-def _config(tmp_path: Path) -> Config:
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "unused-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+
+def _fixture() -> dict[str, Any]:
+    return json.loads(_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def _config(data_dir: Path, *, host_id: str = "stable-host") -> Config:
     return Config(
-        host_id="stable-host",
-        data_dir=tmp_path,
-        db_path=tmp_path / "stable-host.db",
+        host_id=host_id,
+        data_dir=data_dir,
+        db_path=data_dir / "stable-host.db",
         herdr_backend="socket",
         herdr_timeout_seconds=0.5,
     )
 
 
-def _agent_item(*, agent_id="agent-1", pane_id="ws-1:p2Q", terminal_id="term-1", name="claude", agent="claude"):
-    item = {"name": name, "agent": agent, "workspace_id": "ws-1", "status": "waiting",
-            "agent_session": {"kind": "id", "value": "sess-1"}}
-    if agent_id is not None:
-        item["agent_id"] = agent_id
-    if pane_id is not None:
-        item["pane_id"] = pane_id
-    if terminal_id is not None:
-        item["terminal_id"] = terminal_id
-    return item
-
-
-def _workers(tmp_path, agents):
-    config = _config(tmp_path)
+def _project(
+    config: Config,
+    agents: list[dict[str, Any]],
+    panes: list[dict[str, Any]] | None = None,
+) -> tuple[HerdrEventBackend, list[Any], list[Any], list[Any]]:
+    config.data_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
-    records = backend._records_from_reconcile_payloads({"agents": agents}, {"panes": []})
-    workers, _bindings = _workers_and_bindings_from_records(config, records)
-    return workers
+    records = backend._records_from_reconcile_payloads(
+        {"agents": deepcopy(agents)},
+        {"panes": deepcopy(panes or [])},
+    )
+    workers, bindings = _workers_and_bindings_from_records(config, records)
+    return backend, workers, bindings, records
 
 
-def test_stable_key_is_hex_from_terminal_identity(tmp_path: Path) -> None:
-    (worker,) = _workers(tmp_path, [_agent_item()])
-    key = worker.meta.get("stable_key")
-    assert key and _HEX24.match(key)
+def _single_worker(config: Config, item: dict[str, Any]) -> Any:
+    _backend, workers, _bindings, _records = _project(config, [], [item])
+    assert len(workers) == 1
+    return workers[0]
 
 
-def test_stable_key_stable_across_worker_id_relettering(tmp_path: Path) -> None:
-    # THE point: across a herdr restart the durable terminal_id is unchanged, even though the worker/agent
-    # id is re-lettered AND the positional pane_id is renumbered. The stable_key must stay the same.
-    (w_before,) = _workers(tmp_path, [_agent_item(agent_id="agent-old", pane_id="ws-1:p2")])
-    (w_after,) = _workers(tmp_path, [_agent_item(agent_id="agent-new", pane_id="ws-1:p5")])
-    assert w_before.meta["stable_key"] == w_after.meta["stable_key"]
+def _stable(worker: Any) -> str:
+    value = worker.meta.get("stable_key")
+    assert isinstance(value, str)
+    return value
 
 
-def test_stable_key_unchanged_when_only_pane_id_changes(tmp_path: Path) -> None:
-    # A sibling pane closing renumbers this pane's positional pane_id; the terminal_id (and so the key)
-    # holds. Keying off pane_id would (wrongly) treat this as a different worker.
-    (w1,) = _workers(tmp_path, [_agent_item(pane_id="ws-1:p3")])
-    (w2,) = _workers(tmp_path, [_agent_item(pane_id="ws-1:p1")])
-    assert w1.meta["stable_key"] == w2.meta["stable_key"]
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
 
 
-def test_stable_key_differs_across_terminal_ids(tmp_path: Path) -> None:
-    # Distinct terminals -> distinct keys, even when the positional pane_id happens to be identical.
-    (w1,) = _workers(tmp_path, [_agent_item(agent_id="a", terminal_id="term-a")])
-    (w2,) = _workers(tmp_path, [_agent_item(agent_id="b", terminal_id="term-b")])
-    assert w1.meta["stable_key"] != w2.meta["stable_key"]
+def _reserved_meta_keys(value: Any, *, include_root: bool = True) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            compact = str(key).lower().replace("_", "").replace("-", "").replace(".", "")
+            if include_root and compact.startswith("stablekey"):
+                found.append(str(key))
+            found.extend(_reserved_meta_keys(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_reserved_meta_keys(child))
+    return found
 
 
-def test_stable_key_differs_across_distinct_panes(tmp_path: Path) -> None:
-    # Two distinct terminals in one reconcile keep distinct keys through the dedup path.
-    workers = _workers(tmp_path, [
-        _agent_item(agent_id="a", pane_id="ws-1:p1", terminal_id="term-a"),
-        _agent_item(agent_id="b", pane_id="ws-1:p2", terminal_id="term-b"),
-    ])
-    keys = {w.meta.get("stable_key") for w in workers}
-    assert len(keys) == 2 and all(k for k in keys)
+def test_restore_fixture_matches_verified_herdr_contract() -> None:
+    """Fixture follows Herdr source commit 4ffd99c2ec62fd3cbc9f9e0673d92c6a2a4f12b1."""
+    fixture = _fixture()
+    session = fixture["session_snapshot"]
+    workspace = session["workspaces"][0]
+    tab = workspace["tabs"][0]
+    before = fixture["pre_restore"]
+    after = fixture["post_restore"]
+
+    assert session["version"] == 3
+    assert workspace["id"] == "wR9"
+    assert workspace["public_pane_numbers"] == {"41": 10, "42": 11}
+    assert tab["layout"]["Split"]["first"] == {"Pane": 41}
+    assert tab["layout"]["Split"]["second"] == {"Pane": 42}
+    assert set(tab["panes"]) == {"41", "42"}
+    assert before["pane_info"]["pane_id"] == after["pane_info"]["pane_id"] == "wR9:pA"
+    assert before["sibling_pane_info"]["pane_id"] == after["sibling_pane_info"]["pane_id"] == "wR9:pB"
+    for field in ("raw_pane_id", "runtime_id", "worker_id", "agent_id"):
+        assert before[field] != after[field]
+    for field in ("terminal_id", "agent"):
+        assert before["pane_info"][field] != after["pane_info"][field]
+    assert before["pane_info"]["agent_session"] != after["pane_info"]["agent_session"]
+    for move in (fixture["same_workspace_move"], fixture["cross_workspace_move"]):
+        assert move["event"] == "pane_moved"
+        assert move["data"]["type"] == "pane_moved"
+        assert "pane" in move["data"]
 
 
-def test_stable_key_absent_without_pane_identity(tmp_path: Path) -> None:
-    # A worker exposing only a session id (no pane_id/terminal_id) gets NO stable_key — never hash a
-    # {no-pane, space} tuple, which would collapse every session-only worker in a space to one key.
-    (worker,) = _workers(tmp_path, [_agent_item(agent="codex", name="codex", pane_id=None, terminal_id=None)])
+def test_exact_format_version_and_domain_separated_hmac(tmp_path: Path) -> None:
+    fixture = _fixture()
+    pane = fixture["pre_restore"]["pane_info"]
+    config = _config(tmp_path / "state")
+    key = bytes(range(32))
+    config.data_dir.mkdir(mode=0o700)
+    config.installation_key_path.write_bytes(key)
+    os.chmod(config.installation_key_path, 0o600)
+
+    worker = _single_worker(config, pane)
+    message = json.dumps(
+        {
+            "backend": "herdr",
+            "domain": "tendwire.worker-stable-key",
+            "host_id": "stable-host",
+            "pane_id": "wR9:pA",
+            "version": 1,
+            "workspace_id": "wR9",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected = "wsk1_" + hmac.new(key, message, hashlib.sha256).hexdigest()
+
+    assert _stable(worker) == expected
+    assert _STABLE_KEY.fullmatch(expected)
+    assert type(worker.meta["stable_key_version"]) is int
+    assert worker.meta["stable_key_version"] == 1
+    public_meta = worker.to_dict()["meta"]
+    assert public_meta["stable_key"] == expected
+    assert type(public_meta["stable_key_version"]) is int
+    assert public_meta["stable_key_version"] == 1
+    assert config.installation_key_marker_path.read_bytes() == hashlib.sha256(key).hexdigest().encode("ascii")
+
+
+def test_restore_continuity_ignores_changed_runtime_terminal_agent_and_session(tmp_path: Path) -> None:
+    fixture = _fixture()
+    config = _config(tmp_path / "state")
+
+    before = _single_worker(config, fixture["pre_restore"]["pane_info"])
+    after = _single_worker(config, fixture["post_restore"]["pane_info"])
+
+    assert before.id != after.id
+    assert _stable(before) == _stable(after)
+
+
+def test_split_panes_have_distinct_keys_and_survive_sibling_close_or_reorder(tmp_path: Path) -> None:
+    fixture = _fixture()
+    primary = fixture["post_restore"]["pane_info"]
+    sibling = fixture["post_restore"]["sibling_pane_info"]
+    config = _config(tmp_path / "state")
+
+    _backend, first, _bindings, _records = _project(config, [], [primary, sibling])
+    by_name = {worker.name: _stable(worker) for worker in first}
+    assert len(set(by_name.values())) == 2
+
+    _backend, reordered, _bindings, _records = _project(config, [], [sibling, primary])
+    assert {worker.name: _stable(worker) for worker in reordered} == by_name
+
+    primary_after_close = _single_worker(config, primary)
+    assert _stable(primary_after_close) == by_name[primary["agent"]]
+
+
+def test_session_targeted_agent_adopts_matched_pane_identity_privately(tmp_path: Path) -> None:
+    fixture = _fixture()
+    pane = deepcopy(fixture["post_restore"]["pane_info"])
+    agent = deepcopy(pane)
+    agent["agent"] = "codex"
+    agent.pop("workspace_id")
+    agent.pop("pane_id")
+    config = _config(tmp_path / "state")
+
+    _backend, workers, _bindings, records = _project(config, [agent], [pane])
+
+    assert len(records) == len(workers) == 1
+    assert records[0].workspace_id == "wR9"
+    assert records[0].pane_id == "wR9:pA"
+    assert records[0].turn_target_kind == "codex_session_id"
+    assert _STABLE_KEY.fullmatch(_stable(workers[0]))
+    public = json.dumps(workers[0].to_dict(), sort_keys=True)
+    assert "wR9:pA" not in public
+    assert pane["terminal_id"] not in public
+    assert pane["agent_session"]["value"] not in public
+
+
+def test_matched_pane_overrides_conflicting_agent_continuity_and_workspace(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["agent"] = "codex"
+    agent = {
+        "worker_id": "public-conflicting-agent",
+        "agent_id": "agent-send-secret",
+        "terminal_id": pane["terminal_id"],
+        "agent": "codex",
+        "agent_status": "working",
+        "agent_session": {
+            "source": "conflicting-agent-source-secret",
+            "agent": "codex",
+            "kind": "id",
+            "value": "conflicting-agent-session-secret",
+        },
+        "workspace_id": "wD2",
+        "pane_id": "wD2:pA",
+    }
+    config = _config(tmp_path / "state")
+
+    _backend, pane_workers, _bindings, pane_records = _project(config, [], [pane])
+    _backend, agent_workers, _bindings, agent_records = _project(config, [agent])
+    _backend, merged_workers, merged_bindings, merged_records = _project(config, [agent], [pane])
+
+    assert len(pane_workers) == len(agent_workers) == len(merged_workers) == 1
+    assert len(pane_records) == len(agent_records) == len(merged_records) == 1
+    assert _stable(merged_workers[0]) == _stable(pane_workers[0])
+    assert "stable_key" not in agent_workers[0].meta
+    assert "stable_key_version" not in agent_workers[0].meta
+    assert merged_records[0].workspace_id == pane_records[0].workspace_id == "wR9"
+    assert merged_records[0].pane_id == pane_records[0].pane_id == "wR9:pA"
+    assert merged_records[0].workspace_id != agent_records[0].workspace_id
+    assert merged_records[0].pane_id != agent_records[0].pane_id
+    assert merged_workers[0].space_id == pane_workers[0].space_id == "wR9"
+    assert merged_workers[0].space_id != agent_workers[0].space_id
+    assert merged_records[0].turn_target_kind == "codex_session_id"
+    assert merged_records[0].turn_target_value == pane["agent_session"]["value"]
+    assert merged_workers[0].backend_target == {
+        "kind": "agent_id",
+        "value": "agent-send-secret",
+        "sendable": True,
+        "reason": None,
+    }
+    assert len(merged_bindings) == 1
+    assert merged_bindings[0].target_kind == "agent_id"
+    assert merged_bindings[0].target_value == "agent-send-secret"
+    assert merged_bindings[0].turn_target_kind == "codex_session_id"
+    assert merged_bindings[0].turn_target_value == pane["agent_session"]["value"]
+
+    public = json.dumps(merged_workers[0].to_dict(), sort_keys=True)
+    for private_value in (
+        pane["pane_id"],
+        pane["terminal_id"],
+        pane["agent_session"]["source"],
+        pane["agent_session"]["value"],
+        agent["agent_id"],
+        agent["pane_id"],
+        agent["workspace_id"],
+        agent["agent_session"]["source"],
+        agent["agent_session"]["value"],
+    ):
+        assert private_value not in public
+
+
+@pytest.mark.parametrize(
+    ("pane_workspace_id", "pane_id"),
+    [
+        (None, "wR9:pA"),
+        ("wR9", None),
+        ("wR9", "wR9:pI"),
+    ],
+)
+def test_matched_incomplete_or_invalid_pane_suppresses_agent_identity_derivation(
+    tmp_path: Path,
+    pane_workspace_id: str | None,
+    pane_id: str | None,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["agent"] = "codex"
+    if pane_workspace_id is None:
+        pane.pop("workspace_id")
+    else:
+        pane["workspace_id"] = pane_workspace_id
+    if pane_id is None:
+        pane.pop("pane_id")
+    else:
+        pane["pane_id"] = pane_id
+    agent = {
+        "worker_id": "public-conflicting-agent",
+        "agent_id": "agent-send-secret",
+        "terminal_id": pane["terminal_id"],
+        "agent": "codex",
+        "agent_session": deepcopy(pane["agent_session"]),
+        "workspace_id": "wD2",
+        "pane_id": "wD2:pA",
+    }
+    config = _config(tmp_path / f"state-{pane_workspace_id}-{pane_id}")
+
+    _backend, pane_workers, _bindings, pane_records = _project(config, [], [pane])
+    _backend, agent_workers, _bindings, _agent_records = _project(config, [agent])
+    _backend, merged_workers, _bindings, merged_records = _project(config, [agent], [pane])
+
+    assert "stable_key" not in agent_workers[0].meta
+    assert "stable_key_version" not in agent_workers[0].meta
+    assert "stable_key" not in pane_workers[0].meta
+    assert "stable_key" not in merged_workers[0].meta
+    assert "stable_key_version" not in merged_workers[0].meta
+    assert merged_records[0].workspace_id == pane_records[0].workspace_id
+    assert merged_records[0].pane_id == pane_records[0].pane_id
+    assert merged_workers[0].space_id == pane_workers[0].space_id
+    assert merged_records[0].turn_target_kind == "codex_session_id"
+    assert merged_records[0].turn_target_value == pane["agent_session"]["value"]
+    assert merged_workers[0].backend_target is not None
+    assert merged_workers[0].backend_target["kind"] == "agent_id"
+    assert merged_workers[0].backend_target["value"] == "agent-send-secret"
+
+
+def test_unmatched_agent_list_identity_never_authorizes_continuity(
+    tmp_path: Path,
+) -> None:
+    agent = deepcopy(_fixture()["post_restore"]["pane_info"])
+    agent["worker_id"] = "public-unmatched-agent"
+    agent["agent_id"] = "unmatched-agent-target-secret"
+    agent["agent"] = "codex"
+    config = _config(tmp_path / "state")
+
+    _backend, workers, bindings, records = _project(config, [agent])
+
+    assert len(records) == len(workers) == len(bindings) == 1
+    assert records[0].pane_info_observed is False
+    assert "stable_key" not in workers[0].meta
+    assert "stable_key_version" not in workers[0].meta
+    assert not config.installation_key_path.exists()
+    assert workers[0].backend_target == {
+        "kind": "agent_id",
+        "value": "unmatched-agent-target-secret",
+        "sendable": True,
+        "reason": None,
+    }
+    assert bindings[0].turn_target_kind == "codex_session_id"
+    assert bindings[0].turn_target_value == agent["agent_session"]["value"]
+
+    public = json.dumps(workers[0].to_dict(), sort_keys=True)
+    for private_value in (
+        agent["pane_id"],
+        agent["terminal_id"],
+        agent["agent_id"],
+        agent["agent_session"]["source"],
+        agent["agent_session"]["value"],
+    ):
+        assert private_value not in public
+
+
+def test_conflicting_match_keys_across_two_panes_fail_closed(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture()["post_restore"]
+    first = deepcopy(fixture["pane_info"])
+    second = deepcopy(fixture["sibling_pane_info"])
+    second["agent"] = "codex"
+    second["agent_session"] = {
+        "source": "second-pane-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "second-pane-session-secret",
+    }
+    agent = {
+        "worker_id": "public-ambiguous-agent",
+        "agent_id": "ambiguous-agent-target-secret",
+        "workspace_id": first["workspace_id"],
+        "pane_id": first["pane_id"],
+        "terminal_id": second["terminal_id"],
+        "agent": "codex",
+        "agent_session": deepcopy(second["agent_session"]),
+    }
+    config = _config(tmp_path / "state")
+
+    _backend, workers, bindings, records = _project(
+        config,
+        [agent],
+        [first, second],
+    )
+
+    assert len(records) == len(workers) == len(bindings) == 1
+    assert records[0].pane_info_observed is False
+    assert records[0].turn_target_kind is None
+    assert records[0].turn_target_value is None
+    assert "stable_key" not in workers[0].meta
+    assert "stable_key_version" not in workers[0].meta
+    assert workers[0].backend_target == {
+        "kind": "agent_id",
+        "value": "ambiguous-agent-target-secret",
+        "sendable": False,
+        "reason": "ambiguous_pane_match",
+    }
+    assert bindings[0].sendable is False
+    assert bindings[0].reason == "ambiguous_pane_match"
+    assert bindings[0].turn_target_kind is None
+    assert bindings[0].turn_target_value is None
+
+    public = json.dumps(workers[0].to_dict(), sort_keys=True)
+    for private_value in (
+        first["pane_id"],
+        first["terminal_id"],
+        first["agent_session"]["value"],
+        second["pane_id"],
+        second["terminal_id"],
+        second["agent_session"]["source"],
+        second["agent_session"]["value"],
+        agent["agent_id"],
+    ):
+        assert private_value not in public
+
+
+def test_two_agents_claiming_one_pane_fail_closed_independent_of_order(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["agent"] = "codex"
+    agents = [
+        {
+            "worker_id": f"public-agent-{suffix}",
+            "agent_id": f"agent-target-{suffix}-secret",
+            "workspace_id": pane["workspace_id"],
+            "pane_id": pane["pane_id"],
+            "terminal_id": pane["terminal_id"],
+            "agent": "codex",
+            "agent_session": deepcopy(pane["agent_session"]),
+        }
+        for suffix in ("a", "b")
+    ]
+    projections: list[tuple[tuple[Any, ...], ...]] = []
+
+    for index, ordered_agents in enumerate((agents, list(reversed(agents)))):
+        config = _config(tmp_path / f"state-{index}")
+        _backend, workers, bindings, records = _project(
+            config,
+            ordered_agents,
+            [pane],
+        )
+
+        assert len(records) == len(workers) == len(bindings) == 2
+        assert all(record.pane_info_observed is False for record in records)
+        assert all(record.turn_target_kind is None for record in records)
+        assert all(record.turn_target_value is None for record in records)
+        assert all("stable_key" not in worker.meta for worker in workers)
+        assert all("stable_key_version" not in worker.meta for worker in workers)
+        assert all(
+            worker.backend_target is not None
+            and worker.backend_target["sendable"] is False
+            and worker.backend_target["reason"] == "ambiguous_pane_match"
+            for worker in workers
+        )
+        assert all(binding.sendable is False for binding in bindings)
+        assert all(binding.reason == "ambiguous_pane_match" for binding in bindings)
+        assert all(binding.turn_target_kind is None for binding in bindings)
+        assert all(binding.turn_target_value is None for binding in bindings)
+        assert not config.installation_key_path.exists()
+        projections.append(
+            tuple(
+                sorted(
+                    (
+                        worker.id,
+                        worker.name,
+                        worker.space_id,
+                        tuple(sorted((worker.backend_target or {}).items())),
+                    )
+                    for worker in workers
+                )
+            )
+        )
+
+    assert projections[0] == projections[1]
+
+
+@pytest.mark.parametrize(
+    "shared_agent_owner",
+    ["backend_target", "turn_target", "send_token"],
+)
+def test_distinct_panes_with_shared_agent_owner_fail_closed_in_any_order(
+    tmp_path: Path,
+    shared_agent_owner: str,
+) -> None:
+    fixture = _fixture()["post_restore"]
+    panes = [
+        deepcopy(fixture["pane_info"]),
+        deepcopy(fixture["sibling_pane_info"]),
+    ]
+    for pane in panes:
+        pane["agent"] = "codex"
+        pane.pop("agent_session", None)
+    if shared_agent_owner == "send_token":
+        panes[1]["terminal_id"] = "shared-agent-target-secret"
+    agents = []
+    for index, pane in enumerate(panes):
+        agents.append(
+            {
+                "worker_id": f"public-owner-{index}",
+                "agent_id": (
+                    "shared-agent-target-secret"
+                    if shared_agent_owner == "backend_target"
+                    or (
+                        shared_agent_owner == "send_token"
+                        and index == 0
+                    )
+                    else (
+                        None
+                        if shared_agent_owner == "send_token"
+                        else f"agent-target-{index}-secret"
+                    )
+                ),
+                "workspace_id": pane["workspace_id"],
+                "pane_id": pane["pane_id"],
+                "terminal_id": pane["terminal_id"],
+                "agent": "codex",
+                "agent_session": {
+                    "source": f"source-{index}-secret",
+                    "agent": "codex",
+                    "kind": "id",
+                    "value": (
+                        "shared-session-secret"
+                        if shared_agent_owner == "turn_target"
+                        else f"session-{index}-secret"
+                    ),
+                },
+            }
+        )
+
+    projections: list[tuple[tuple[Any, ...], ...]] = []
+    for order, (agent_rows, pane_rows) in enumerate(
+        (
+            (agents, panes),
+            (list(reversed(agents)), list(reversed(panes))),
+        )
+    ):
+        config = _config(tmp_path / f"{shared_agent_owner}-{order}")
+        _backend, workers, bindings, records = _project(
+            config,
+            agent_rows,
+            pane_rows,
+        )
+
+        assert len(records) == len(workers) == len(bindings) == 2
+        assert all(record.pane_info_observed is False for record in records)
+        assert all(record.turn_target_kind is None for record in records)
+        assert all(record.turn_target_value is None for record in records)
+        assert all("stable_key" not in worker.meta for worker in workers)
+        assert all(
+            worker.backend_target is not None
+            and worker.backend_target["sendable"] is False
+            and worker.backend_target["reason"] == "ambiguous_pane_match"
+            for worker in workers
+        )
+        assert all(binding.sendable is False for binding in bindings)
+        assert all(binding.reason == "ambiguous_pane_match" for binding in bindings)
+        assert all(binding.turn_target_kind is None for binding in bindings)
+        assert all(binding.turn_target_value is None for binding in bindings)
+        projections.append(
+            tuple(
+                sorted(
+                    (
+                        worker.id,
+                        tuple(sorted((worker.backend_target or {}).items())),
+                    )
+                    for worker in workers
+                )
+            )
+        )
+
+    assert projections[0] == projections[1]
+
+
+@pytest.mark.parametrize(
+    "shared_owner_key",
+    ["terminal_id", "agent_session", "private_fingerprint"],
+)
+def test_conflicting_pane_owner_key_fails_closed_independent_of_row_order(
+    tmp_path: Path,
+    shared_owner_key: str,
+) -> None:
+    fixture = _fixture()["post_restore"]
+    first = deepcopy(fixture["pane_info"])
+    second = deepcopy(fixture["sibling_pane_info"])
+    first["agent"] = "codex"
+    second["agent"] = "omp"
+    first["agent_session"] = {
+        "source": "first-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "first-session-secret",
+    }
+    second["agent_session"] = {
+        "source": "second-source-secret",
+        "agent": "omp",
+        "kind": "id",
+        "value": "second-session-secret",
+    }
+    if shared_owner_key == "terminal_id":
+        first["terminal_id"] = second["terminal_id"] = "shared-terminal-secret"
+    elif shared_owner_key == "agent_session":
+        second["agent_session"]["value"] = first["agent_session"]["value"]
+    else:
+        first.pop("agent_session")
+        second.pop("agent_session")
+        first["agent_id"] = second["agent_id"] = "shared-agent-target-secret"
+
+    projections: list[tuple[tuple[Any, ...], ...]] = []
+    for index, panes in enumerate(([first, second], [second, first])):
+        config = _config(tmp_path / f"{shared_owner_key}-{index}")
+        _backend, workers, bindings, records = _project(config, [], panes)
+
+        assert len(records) == len(workers) == len(bindings) == 2
+        assert all(record.pane_info_observed is False for record in records)
+        assert all(record.turn_target_kind is None for record in records)
+        assert all(record.turn_target_value is None for record in records)
+        assert all("stable_key" not in worker.meta for worker in workers)
+        assert all("stable_key_version" not in worker.meta for worker in workers)
+        assert all(
+            worker.backend_target is not None
+            and worker.backend_target["sendable"] is False
+            and worker.backend_target["reason"] == "ambiguous_pane_match"
+            for worker in workers
+        )
+        assert all(binding.sendable is False for binding in bindings)
+        assert all(binding.reason == "ambiguous_pane_match" for binding in bindings)
+        assert all(binding.turn_target_kind is None for binding in bindings)
+        assert all(binding.turn_target_value is None for binding in bindings)
+        assert not config.installation_key_path.exists()
+        projections.append(
+            tuple(
+                sorted(
+                    (
+                        worker.id,
+                        worker.name,
+                        worker.space_id,
+                        tuple(sorted((worker.backend_target or {}).items())),
+                    )
+                    for worker in workers
+                )
+            )
+        )
+
+    assert projections[0] == projections[1]
+
+
+def test_unmatched_agent_send_token_colliding_with_pane_fails_closed(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["terminal_id"] = "shared-send-token-secret"
+    agent = {
+        "worker_id": "public-unmatched-agent",
+        "agent_id": "shared-send-token-secret",
+        "workspace_id": "wD2",
+        "agent": "other-agent",
+    }
+    config = _config(tmp_path / "state")
+
+    _backend, workers, bindings, records = _project(
+        config,
+        [agent],
+        [pane],
+    )
+
+    assert len(records) == len(workers) == len(bindings) == 2
+    assert all(record.pane_info_observed is False for record in records)
+    assert all(record.turn_target_kind is None for record in records)
+    assert all(record.turn_target_value is None for record in records)
+    assert all(
+        worker.backend_target is not None
+        and worker.backend_target["sendable"] is False
+        and worker.backend_target["reason"] == "ambiguous_pane_match"
+        for worker in workers
+    )
+    assert all(binding.sendable is False for binding in bindings)
+    assert all(binding.reason == "ambiguous_pane_match" for binding in bindings)
+    assert not config.installation_key_path.exists()
+
+
+def test_exact_duplicate_pane_rows_collapse_without_losing_continuity(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    config = _config(tmp_path / "state")
+
+    _backend, workers, bindings, records = _project(config, [], [pane, deepcopy(pane)])
+
+    assert len(records) == len(workers) == len(bindings) == 1
+    assert records[0].pane_info_observed is True
+    assert _STABLE_KEY.fullmatch(_stable(workers[0]))
+    assert bindings[0].sendable is True
+
+
+def test_matched_pane_replaces_conflicting_pane_scoped_targets(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["agent"] = "codex"
+    agent = {
+        "worker_id": "public-pane-target-conflict",
+        "workspace_id": "wD2",
+        "pane_id": "wD2:pA",
+        "agent": "other-agent",
+        "agent_session": deepcopy(pane["agent_session"]),
+    }
+    config = _config(tmp_path / "state")
+
+    _backend, workers, bindings, records = _project(config, [agent], [pane])
+
+    assert len(records) == len(workers) == len(bindings) == 1
+    assert records[0].pane_info_observed is True
+    assert _STABLE_KEY.fullmatch(_stable(workers[0]))
+    assert records[0].workspace_id == pane["workspace_id"]
+    assert records[0].pane_id == pane["pane_id"]
+    assert records[0].terminal_id == pane["terminal_id"]
+    assert workers[0].space_id == pane["workspace_id"]
+    assert workers[0].backend_target == {
+        "kind": "terminal_id",
+        "value": pane["terminal_id"],
+        "sendable": True,
+        "reason": None,
+    }
+    assert bindings[0].target_kind == "terminal_id"
+    assert bindings[0].target_value == pane["terminal_id"]
+    assert bindings[0].turn_target_kind == "codex_session_id"
+    assert bindings[0].turn_target_value == pane["agent_session"]["value"]
+    assert agent["pane_id"] not in {
+        bindings[0].target_value,
+        bindings[0].turn_target_value,
+    }
+
+    public = json.dumps(workers[0].to_dict(), sort_keys=True)
+    for private_value in (
+        pane["pane_id"],
+        pane["terminal_id"],
+        pane["agent_session"]["source"],
+        pane["agent_session"]["value"],
+        agent["pane_id"],
+    ):
+        assert private_value not in public
+
+
+def test_cli_agent_success_always_enriches_identity_from_matching_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pane = deepcopy(_fixture()["post_restore"]["pane_info"])
+    pane["agent"] = "codex"
+    agent = {
+        "terminal_id": pane["terminal_id"],
+        "agent": "codex",
+        "agent_status": "working",
+        "agent_session": deepcopy(pane["agent_session"]),
+    }
+    responses = {
+        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("agent", "list"): {"result": {"agents": [agent]}},
+        ("pane", "list"): {"result": {"panes": [pane]}},
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: Any, config: Config) -> subprocess.CompletedProcess[str]:
+        del config
+        calls.append(tuple(args))
+        response = responses.get(tuple(args))
+        return subprocess.CompletedProcess(
+            args=list(args),
+            returncode=0 if response is not None else 1,
+            stdout=json.dumps(response) if response is not None else "",
+            stderr="",
+        )
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _binary: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_run_herdr", fake_run)
+
+    _spaces, workers = herdr_cli.fetch_herdr_state(_config(tmp_path / "state"))
+
+    assert calls == [
+        ("workspace", "list"),
+        ("agent", "list"),
+        ("pane", "list"),
+    ]
+    assert len(workers) == 1
+    assert _STABLE_KEY.fullmatch(_stable(workers[0]))
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "pane_id"),
+    [
+        (None, "wR9:pA"),
+        ("wR9", None),
+        ("wR9", "wOther:pA"),
+        ("wR9", "wR9:pI"),
+        ("wR9", "wR9:pa"),
+        ("wR9", "wR9:p"),
+        ("wR9", "wR9:A"),
+        ("not-herdr-id", "not-herdr-id:pA"),
+        ("wI", "wI:pA"),
+    ],
+)
+def test_identity_requires_both_canonical_membership_and_herdr_alphabet(
+    tmp_path: Path,
+    workspace_id: str | None,
+    pane_id: str | None,
+) -> None:
+    item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    item["terminal_id"] = "durable-terminal-is-not-a-fallback"
+    if workspace_id is None:
+        item.pop("workspace_id", None)
+    else:
+        item["workspace_id"] = workspace_id
+    if pane_id is None:
+        item.pop("pane_id", None)
+    else:
+        item["pane_id"] = pane_id
+
+    worker = _single_worker(_config(tmp_path / "state"), item)
+
     assert "stable_key" not in worker.meta
+    assert "stable_key_version" not in worker.meta
 
 
-def test_stable_key_does_not_leak_raw_pane_or_terminal_id(tmp_path: Path) -> None:
-    (worker,) = _workers(tmp_path, [_agent_item(pane_id="ws-1:leaky-pane", terminal_id="term-leaky")])
-    blob = json.dumps(worker.to_dict())
-    assert worker.meta.get("stable_key")               # present
-    assert "ws-1:leaky-pane" not in blob               # raw pane id never surfaces
-    assert "term-leaky" not in blob                    # raw terminal id (now hashed) never surfaces
+def test_same_workspace_move_preserves_and_cross_workspace_move_changes_key(tmp_path: Path) -> None:
+    fixture = _fixture()
+    config = _config(tmp_path / "state")
+    initial = fixture["pre_restore"]["pane_info"]
+    backend, workers, bindings, _records = _project(config, [initial], [initial])
+    original = workers[0]
+    backend._workers = {original.id: original}
+    backend._bindings = {binding.private_fingerprint: binding for binding in bindings}
+    backend._pane_terminals = {initial["pane_id"]: initial["terminal_id"]}
+
+    assert backend.queue_event_envelope(fixture["same_workspace_move"], flush=True)
+    same_workspace = backend._workers[original.id]
+    assert _stable(same_workspace) == _stable(original)
+
+    assert backend.queue_event_envelope(fixture["cross_workspace_move"], flush=True)
+    cross_workspace = backend._workers[original.id]
+    assert _stable(cross_workspace) != _stable(original)
+    expected = _single_worker(
+        config,
+        fixture["cross_workspace_move"]["data"]["pane"],
+    )
+    assert _stable(cross_workspace) == _stable(expected)
+    assert cross_workspace.space_id == "wD2"
 
 
-def test_stable_key_survives_to_dict_sanitizer(tmp_path: Path) -> None:
-    (worker,) = _workers(tmp_path, [_agent_item()])
-    assert worker.to_dict()["meta"].get("stable_key") == worker.meta["stable_key"]
+def test_compatibility_only_partial_move_preserves_authenticated_local_key(
+    tmp_path: Path,
+) -> None:
+    initial = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    config = _config(tmp_path / "state")
+    backend, workers, bindings, _records = _project(config, [initial], [initial])
+    original = workers[0]
+    original_key = _stable(original)
+    backend._workers = {original.id: original}
+    backend._bindings = {binding.private_fingerprint: binding for binding in bindings}
+    backend._pane_terminals = {initial["pane_id"]: initial["terminal_id"]}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                "previous_pane_id": initial["pane_id"],
+                "new_pane_id": "wR9:pB",
+            },
+        },
+        flush=True,
+    )
+
+    moved = backend._workers[original.id]
+    moved_binding = next(iter(backend._bindings.values()))
+    assert _stable(moved) == original_key
+    assert moved_binding.target_kind == "pane_id"
+    assert moved_binding.target_value == "wR9:pB"
+
+
+def test_complete_authoritative_move_retains_state_when_rederivation_fails(
+    tmp_path: Path,
+) -> None:
+    initial = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    config = _config(tmp_path / "state")
+    backend, workers, bindings, _records = _project(config, [initial], [initial])
+    original = workers[0]
+    original_binding = bindings[0]
+    backend._workers = {original.id: original}
+    backend._bindings = {binding.private_fingerprint: binding for binding in bindings}
+    backend._pane_terminals = {initial["pane_id"]: initial["terminal_id"]}
+    replacement = bytes(
+        byte ^ 0xFF for byte in config.installation_key_path.read_bytes()
+    )
+    config.installation_key_path.write_bytes(replacement)
+    os.chmod(config.installation_key_path, 0o600)
+    moved_pane = deepcopy(initial)
+    moved_pane["workspace_id"] = "wD2"
+    moved_pane["pane_id"] = "wD2:p7"
+    moved_pane["terminal_id"] = "terminal-moved-secret"
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                "previous_pane_id": initial["pane_id"],
+                "pane": moved_pane,
+            },
+        },
+        flush=True,
+    )
+
+    assert backend._workers[original.id] == original
+    assert next(iter(backend._bindings.values())) == original_binding
+    assert backend.health.status == "degraded"
+    assert backend.health.outcome == "continuity_unavailable"
+
+
+def test_partial_event_preserves_local_key_and_authoritative_failure_retains_state(
+    tmp_path: Path,
+) -> None:
+    initial = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    config = _config(tmp_path / "state")
+    backend, workers, bindings, _records = _project(config, [initial], [initial])
+    original = workers[0]
+    original_key = _stable(original)
+    backend._workers = {original.id: original}
+    backend._bindings = {binding.private_fingerprint: binding for binding in bindings}
+    backend._pane_terminals = {initial["pane_id"]: initial["terminal_id"]}
+
+    replacement = bytes(byte ^ 0xFF for byte in config.installation_key_path.read_bytes())
+    config.installation_key_path.write_bytes(replacement)
+    os.chmod(config.installation_key_path, 0o600)
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {"agent": initial["agent"], "status": "blocked"},
+        },
+        flush=True,
+    )
+    partial = backend._workers[original.id]
+    assert _stable(partial) == original_key
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {"pane_id": initial["pane_id"], "status": "working"},
+        },
+        flush=True,
+    )
+    pane_only = backend._workers[original.id]
+    binding_before_failure = next(iter(backend._bindings.values()))
+    assert _stable(pane_only) == original_key
+
+    full = deepcopy(initial)
+    full["agent_status"] = "idle"
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {"pane": full},
+        },
+        flush=True,
+    )
+
+    assert backend._workers[original.id] == pane_only
+    assert next(iter(backend._bindings.values())) == binding_before_failure
+    assert backend.health.status == "degraded"
+    assert backend.health.outcome == "continuity_unavailable"
+
+
+@pytest.mark.parametrize(
+    (
+        "observed_workspace_id",
+        "observed_pane_id",
+    ),
+    [
+        ("wR9", "wR9:pA"),
+        ("wR9", "wR9:pB"),
+        ("wD2", "wR9:pA"),
+    ],
+)
+def test_key_loss_rejects_every_authoritative_pane_update(
+    tmp_path: Path,
+    observed_workspace_id: str,
+    observed_pane_id: str,
+) -> None:
+    initial = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    config = _config(tmp_path / "state")
+    backend, workers, bindings, records = _project(config, [initial], [initial])
+    original = workers[0]
+    original_binding = bindings[0]
+    backend._workers = {original.id: original}
+    backend._bindings = {
+        binding.private_fingerprint: binding
+        for binding in bindings
+    }
+    backend._pane_terminals = {
+        initial["pane_id"]: initial["terminal_id"],
+    }
+    backend._replace_ownership_maps(records, bindings)
+    config.installation_key_marker_path.unlink()
+
+    observed = deepcopy(initial)
+    observed["pane_id"] = observed_pane_id
+    observed["workspace_id"] = observed_workspace_id
+    observed["agent"] = "codex-runtime-after-key-loss"
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "payload": {"pane": observed},
+        },
+        flush=True,
+    )
+
+    assert set(backend._workers) == {original.id}
+    current = backend._workers[original.id]
+    current_binding = next(iter(backend._bindings.values()))
+    assert current == original
+    assert current_binding == original_binding
+    assert _stable(current) == _stable(original)
+    assert backend.health.status == "degraded"
+    assert backend.health.outcome == "continuity_unavailable"
+    assert backend._pane_terminals == {
+        initial["pane_id"]: initial["terminal_id"],
+    }
+    assert backend._pane_owners == {
+        initial["pane_id"]: {original.id},
+    }
+
+
+def test_installations_are_unlinkable_and_host_is_part_of_message(tmp_path: Path) -> None:
+    pane = _fixture()["pre_restore"]["pane_info"]
+    first = _single_worker(_config(tmp_path / "one"), pane)
+    second = _single_worker(_config(tmp_path / "two"), pane)
+    other_host = _single_worker(_config(tmp_path / "one", host_id="other-host"), pane)
+
+    assert _stable(first) != _stable(second)
+    assert _stable(first) != _stable(other_host)
+
+
+def test_first_bootstrap_publishes_key_marker_and_initialization_sentinel(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "state"
+    candidate = bytes(range(32))
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return candidate
+
+    assert load_or_create_installation_key(data_dir, random_bytes=generated) == candidate
+    assert generated_sizes == [32]
+    assert (data_dir / "installation.key").read_bytes() == candidate
+    assert (data_dir / "installation.key.sha256").read_bytes() == hashlib.sha256(
+        candidate,
+    ).hexdigest().encode("ascii")
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_valid_pre_sentinel_pair_upgrades_only_after_validation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "state"
+    data_dir.mkdir(mode=0o700)
+    key = b"p" * 32
+    (data_dir / "installation.key").write_bytes(key)
+    (data_dir / "installation.key.sha256").write_bytes(
+        hashlib.sha256(key).hexdigest().encode("ascii"),
+    )
+    os.chmod(data_dir / "installation.key", 0o600)
+    os.chmod(data_dir / "installation.key.sha256", 0o600)
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return b"n" * size
+
+    assert load_or_create_installation_key(data_dir, random_bytes=generated) == key
+    assert generated_sizes == []
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_complete_initialized_pair_loss_fails_without_replacement(tmp_path: Path) -> None:
+    data_dir = tmp_path / "state"
+    original = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"a" * size,
+    )
+    (data_dir / "installation.key").unlink()
+    (data_dir / "installation.key.sha256").unlink()
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return b"b" * size
+
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(data_dir, random_bytes=generated)
+
+    assert original == b"a" * 32
+    assert generated_sizes == []
+    assert not (data_dir / "installation.key").exists()
+    assert not (data_dir / "installation.key.sha256").exists()
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_explicit_acknowledged_reset_allows_offline_key_rotation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "state"
+    original = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"a" * size,
+    )
+
+    with pytest.raises(InstallationKeyError, match="reset was not acknowledged"):
+        reset_installation_key(data_dir, acknowledge_continuity_break=False)
+    assert (data_dir / "installation.key").read_bytes() == original
+
+    reset_installation_key(data_dir, acknowledge_continuity_break=True)
+    assert not (data_dir / "installation.key").exists()
+    assert not (data_dir / "installation.key.sha256").exists()
+    assert not (data_dir / "installation.key.initialized").exists()
+
+    rotated = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"b" * size,
+    )
+    assert rotated == b"b" * 32
+    assert rotated != original
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_initialized_digest_loss_fails_without_rewriting_or_randomness(tmp_path: Path) -> None:
+    data_dir = tmp_path / "state"
+    key = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"k" * size,
+    )
+    marker_path = data_dir / "installation.key.sha256"
+    marker_path.unlink()
+    key_path = data_dir / "installation.key"
+    sentinel_path = data_dir / "installation.key.initialized"
+    key_stat = os.lstat(key_path)
+    sentinel_stat = os.lstat(sentinel_path)
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return b"n" * size
+
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(data_dir, random_bytes=generated)
+
+    assert generated_sizes == []
+    assert key_path.read_bytes() == key
+    assert (os.lstat(key_path).st_ino, os.lstat(key_path).st_mtime_ns) == (
+        key_stat.st_ino,
+        key_stat.st_mtime_ns,
+    )
+    assert not marker_path.exists()
+    assert sentinel_path.read_bytes() == b"1"
+    assert (os.lstat(sentinel_path).st_ino, os.lstat(sentinel_path).st_mtime_ns) == (
+        sentinel_stat.st_ino,
+        sentinel_stat.st_mtime_ns,
+    )
+
+
+def test_initialized_replaced_key_and_digest_loss_fails_without_rewriting_or_randomness(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "state"
+    original = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"a" * size,
+    )
+    key_path = data_dir / "installation.key"
+    marker_path = data_dir / "installation.key.sha256"
+    sentinel_path = data_dir / "installation.key.initialized"
+    replacement = bytes(byte ^ 0xFF for byte in original)
+    key_path.write_bytes(replacement)
+    marker_path.unlink()
+    key_stat = os.lstat(key_path)
+    sentinel_stat = os.lstat(sentinel_path)
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return b"n" * size
+
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(data_dir, random_bytes=generated)
+
+    assert generated_sizes == []
+    assert key_path.read_bytes() == replacement
+    assert (os.lstat(key_path).st_ino, os.lstat(key_path).st_mtime_ns) == (
+        key_stat.st_ino,
+        key_stat.st_mtime_ns,
+    )
+    assert not marker_path.exists()
+    assert sentinel_path.read_bytes() == b"1"
+    assert (os.lstat(sentinel_path).st_ino, os.lstat(sentinel_path).st_mtime_ns) == (
+        sentinel_stat.st_ino,
+        sentinel_stat.st_mtime_ns,
+    )
+
+
+def test_missing_key_with_marker_fails_closed_without_source_fallback(tmp_path: Path) -> None:
+    item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    item["meta"] = {"stableKey": "source-fallback", "stable-key-version": 999}
+    config = _config(tmp_path / "state")
+    first = _single_worker(config, item)
+    assert _stable(first)
+    config.installation_key_path.unlink()
+
+    after_loss = _single_worker(config, item)
+
+    assert "stable_key" not in after_loss.meta
+    assert "stable_key_version" not in after_loss.meta
+    assert "source-fallback" not in json.dumps(after_loss.to_dict())
+
+
+def test_replaced_key_or_marker_mismatch_fails_closed(tmp_path: Path) -> None:
+    pane = _fixture()["pre_restore"]["pane_info"]
+    config = _config(tmp_path / "state")
+    assert _stable(_single_worker(config, pane))
+    original_key = config.installation_key_path.read_bytes()
+    replacement = bytes(byte ^ 0xFF for byte in original_key)
+    config.installation_key_path.write_bytes(replacement)
+    os.chmod(config.installation_key_path, 0o600)
+
+    rotated = _single_worker(config, pane)
+    assert "stable_key" not in rotated.meta
+    assert "stable_key_version" not in rotated.meta
+
+    config.installation_key_path.write_bytes(original_key)
+    config.installation_key_marker_path.write_bytes(b"0" * 64)
+    mismatched_marker = _single_worker(config, pane)
+    assert "stable_key" not in mismatched_marker.meta
+
+
+def test_exact_key_and_marker_content_is_required(tmp_path: Path) -> None:
+    pane = _fixture()["pre_restore"]["pane_info"]
+
+    short_config = _config(tmp_path / "short")
+    short_config.data_dir.mkdir(mode=0o700)
+    short_config.installation_key_path.write_bytes(b"x" * 31)
+    os.chmod(short_config.installation_key_path, 0o600)
+    assert "stable_key" not in _single_worker(short_config, pane).meta
+    assert not short_config.installation_key_marker_path.exists()
+
+    marker_config = _config(tmp_path / "marker")
+    marker_config.data_dir.mkdir(mode=0o700)
+    key = b"k" * 32
+    marker_config.installation_key_path.write_bytes(key)
+    marker_config.installation_key_marker_path.write_bytes(hashlib.sha256(key).hexdigest().encode("ascii") + b"\n")
+    os.chmod(marker_config.installation_key_path, 0o600)
+    os.chmod(marker_config.installation_key_marker_path, 0o600)
+    assert "stable_key" not in _single_worker(marker_config, pane).meta
+    assert not marker_config.installation_key_sentinel_path.exists()
+
+
+def test_permissive_umask_still_creates_private_modes(tmp_path: Path) -> None:
+    pane = _fixture()["pre_restore"]["pane_info"]
+    config = _config(tmp_path / "state")
+    previous_umask = os.umask(0)
+    try:
+        assert _stable(_single_worker(config, pane))
+    finally:
+        os.umask(previous_umask)
+
+    assert _mode(config.data_dir) == 0o700
+    assert _mode(config.installation_key_path) == 0o600
+    assert _mode(config.installation_key_marker_path) == 0o600
+    assert _mode(config.installation_key_sentinel_path) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("target_name", "broad_mode"),
+    [
+        pytest.param(None, 0o710, id="data-directory-group"),
+        pytest.param(None, 0o701, id="data-directory-world"),
+        pytest.param("installation.key", 0o640, id="key-group"),
+        pytest.param("installation.key", 0o604, id="key-world"),
+        pytest.param("installation.key.sha256", 0o640, id="digest-group"),
+        pytest.param("installation.key.sha256", 0o604, id="digest-world"),
+        pytest.param("installation.key.initialized", 0o640, id="sentinel-group"),
+        pytest.param("installation.key.initialized", 0o604, id="sentinel-world"),
+    ],
+)
+def test_existing_broad_identity_modes_fail_without_rewriting_or_randomness(
+    tmp_path: Path,
+    target_name: str | None,
+    broad_mode: int,
+) -> None:
+    data_dir = tmp_path / "state"
+    data_dir.mkdir(mode=0o700)
+    key = b"m" * 32
+    paths = {
+        "installation.key": data_dir / "installation.key",
+        "installation.key.sha256": data_dir / "installation.key.sha256",
+        "installation.key.initialized": data_dir / "installation.key.initialized",
+    }
+    paths["installation.key"].write_bytes(key)
+    paths["installation.key.sha256"].write_bytes(hashlib.sha256(key).hexdigest().encode("ascii"))
+    paths["installation.key.initialized"].write_bytes(b"1")
+    for path in paths.values():
+        os.chmod(path, 0o600)
+
+    target = data_dir if target_name is None else paths[target_name]
+    os.chmod(target, broad_mode)
+    data_dir_mode = _mode(data_dir)
+    before = {
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns, _mode(path))
+        for name, path in paths.items()
+    }
+    generated_sizes: list[int] = []
+
+    def generated(size: int) -> bytes:
+        generated_sizes.append(size)
+        return b"n" * size
+
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(data_dir, random_bytes=generated)
+
+    assert generated_sizes == []
+    assert _mode(data_dir) == data_dir_mode
+    assert {
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns, _mode(path))
+        for name, path in paths.items()
+    } == before
+
+
+def test_equal_or_stricter_private_identity_modes_are_accepted_without_widening(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "strict"
+    data_dir.mkdir(mode=0o700)
+    key = b"m" * 32
+    marker = hashlib.sha256(key).hexdigest().encode("ascii")
+    (data_dir / "installation.key").write_bytes(key)
+    (data_dir / "installation.key.sha256").write_bytes(marker)
+    (data_dir / "installation.key.initialized").write_bytes(b"1")
+    os.chmod(data_dir / "installation.key", 0o400)
+    os.chmod(data_dir / "installation.key.sha256", 0o400)
+    os.chmod(data_dir / "installation.key.initialized", 0o400)
+    os.chmod(data_dir, 0o500)
+    generated_sizes: list[int] = []
+
+    assert load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: generated_sizes.append(size) or b"n" * size,
+    ) == key
+    assert generated_sizes == []
+    assert _mode(data_dir) == 0o500
+    assert _mode(data_dir / "installation.key") == 0o400
+    assert _mode(data_dir / "installation.key.sha256") == 0o400
+    assert _mode(data_dir / "installation.key.initialized") == 0o400
+
+
+def test_symlink_identity_files_and_data_dir_fail_closed(tmp_path: Path) -> None:
+    pane = _fixture()["pre_restore"]["pane_info"]
+
+    key_link_config = _config(tmp_path / "key-link")
+    key_link_config.data_dir.mkdir(mode=0o700)
+    outside_key = tmp_path / "outside.key"
+    outside_key.write_bytes(b"z" * 32)
+    key_link_config.installation_key_path.symlink_to(outside_key)
+    assert "stable_key" not in _single_worker(key_link_config, pane).meta
+    assert not key_link_config.installation_key_marker_path.exists()
+
+    sentinel_link_config = _config(tmp_path / "sentinel-link")
+    sentinel_link_config.data_dir.mkdir(mode=0o700)
+    key = b"s" * 32
+    sentinel_link_config.installation_key_path.write_bytes(key)
+    sentinel_link_config.installation_key_marker_path.write_bytes(
+        hashlib.sha256(key).hexdigest().encode("ascii"),
+    )
+    outside_sentinel = tmp_path / "outside.initialized"
+    outside_sentinel.write_bytes(b"1")
+    sentinel_link_config.installation_key_sentinel_path.symlink_to(outside_sentinel)
+    assert "stable_key" not in _single_worker(sentinel_link_config, pane).meta
+
+
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir(mode=0o700)
+    linked_dir = tmp_path / "linked-dir"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    assert "stable_key" not in _single_worker(_config(linked_dir), pane).meta
+
+
+def test_source_stable_key_family_is_recursively_stripped_then_replaced(tmp_path: Path) -> None:
+    item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    item["Stable.Key.Future"] = "outer-injection"
+    item["meta"] = {
+        "stable_key": "snake-injection",
+        "StableKeyVersion": 999,
+        "stable-key-rotation": "kebab-injection",
+        "sTaBlEkEyFuture": "camel-injection",
+        "safe": {"stable.key.next": "nested-injection", "kept": "yes"},
+        "items": [{"STABLE_KEY_NEXT": "list-injection", "kept": 1}],
+    }
+
+    worker = _single_worker(_config(tmp_path / "state"), item)
+
+    assert _STABLE_KEY.fullmatch(_stable(worker))
+    assert worker.meta["stable_key_version"] == 1
+    assert worker.meta["safe"] == {"kept": "yes"}
+    assert worker.meta["items"] == [{"kept": 1}]
+    assert set(_reserved_meta_keys(worker.meta)) == {"stable_key", "stable_key_version"}
+    public = json.dumps(worker.to_dict())
+    for sentinel in (
+        "outer-injection",
+        "snake-injection",
+        "kebab-injection",
+        "camel-injection",
+        "nested-injection",
+        "list-injection",
+    ):
+        assert sentinel not in public
+
+
+def test_source_stable_key_injection_without_identity_is_never_preserved(tmp_path: Path) -> None:
+    item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    item.pop("workspace_id")
+    item["stableKey"] = "top-source"
+    item["meta"] = {
+        "STABLE-KEY-VERSION": 22,
+        "nested": {"stable.key.future": "nested-source", "safe": True},
+    }
+
+    worker = _single_worker(_config(tmp_path / "state"), item)
+
+    assert _reserved_meta_keys(worker.meta) == []
+    assert worker.meta["nested"] == {"safe": True}
+    assert "source" not in json.dumps(worker.to_dict())
+
+
+def test_key_load_occurs_once_for_a_worker_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _fixture()
+    calls = 0
+    original = herdr_cli.load_or_create_installation_key
+
+    def counted(data_dir: Path) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(data_dir)
+
+    monkeypatch.setattr(herdr_cli, "load_or_create_installation_key", counted)
+    config = _config(tmp_path / "state")
+    _backend, workers, _bindings, _records = _project(
+        config,
+        [],
+        [fixture["pre_restore"]["pane_info"], fixture["pre_restore"]["sibling_pane_info"]],
+    )
+
+    assert len(workers) == 2
+    assert calls == 1
+
+
+def test_atomic_publication_never_exposes_partial_final_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "state"
+    original_write_all = worker_identity._write_all
+
+    def interrupted_write(fd: int, content: bytes) -> None:
+        del fd, content
+        raise OSError("simulated interrupted write")
+
+    monkeypatch.setattr(worker_identity, "_write_all", interrupted_write)
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(data_dir)
+
+    assert not (data_dir / "installation.key").exists()
+    assert not (data_dir / "installation.key.sha256").exists()
+    assert list(data_dir.glob(".installation.key.*.tmp")) == []
+    assert not (data_dir / "installation.key.initialized").exists()
+    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+
+    monkeypatch.setattr(worker_identity, "_write_all", original_write_all)
+    assert len(load_or_create_installation_key(data_dir)) == 32
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_interrupted_sentinel_publication_recovers_without_key_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "state"
+    candidate = b"c" * 32
+    original_write_all = worker_identity._write_all
+
+    def interrupt_sentinel(fd: int, content: bytes) -> None:
+        if content == b"1":
+            raise OSError("simulated interrupted sentinel write")
+        original_write_all(fd, content)
+
+    monkeypatch.setattr(worker_identity, "_write_all", interrupt_sentinel)
+    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
+        load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: candidate,
+        )
+
+    assert (data_dir / "installation.key").read_bytes() == candidate
+    assert (data_dir / "installation.key.sha256").read_bytes() == hashlib.sha256(
+        candidate,
+    ).hexdigest().encode("ascii")
+    assert not (data_dir / "installation.key.initialized").exists()
+    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+
+    monkeypatch.setattr(worker_identity, "_write_all", original_write_all)
+    recovered = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"replacement-that-must-not-be-used"[:size],
+    )
+    assert recovered == candidate
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+
+
+def test_concurrent_creators_publish_one_complete_key_marker_and_sentinel(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "nested" / "state"
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        keys = list(executor.map(lambda _index: load_or_create_installation_key(data_dir), range(16)))
+
+    assert len(set(keys)) == 1
+    key = keys[0]
+    assert (data_dir / "installation.key").read_bytes() == key
+    assert (data_dir / "installation.key.sha256").read_bytes() == hashlib.sha256(key).hexdigest().encode("ascii")
+    assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
+    assert list(data_dir.glob(".installation.key.*.tmp")) == []
+    assert list(data_dir.glob(".installation.key.sha256.*.tmp")) == []
+    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+
+
+def test_public_output_excludes_private_identity_and_binding_fingerprint(tmp_path: Path) -> None:
+    fixture = _fixture()
+    before = fixture["pre_restore"]
+    item = before["pane_info"]
+    config = _config(tmp_path / "state")
+    installation_key = b"0123456789abcdef0123456789abcdef"
+    config.data_dir.mkdir(mode=0o700)
+    config.installation_key_path.write_bytes(installation_key)
+    os.chmod(config.installation_key_path, 0o600)
+    backend, workers, _bindings, records = _project(config, [], [item])
+    del backend
+    worker = workers[0]
+    record = records[0]
+    expected_private = worker_binding_private_fingerprint(
+        host_id=config.host_id,
+        backend="herdr",
+        identity_material=_private_identity_material_from_item(item),
+    )
+    public = json.dumps(worker.to_dict(), sort_keys=True)
+
+    assert record.private_fingerprint == expected_private
+    assert record.private_fingerprint != _stable(worker)
+    assert record.private_fingerprint not in public
+    assert installation_key.decode("ascii") not in public
+    assert installation_key.hex() not in public
+    assert item["pane_id"] not in public
+    assert item["terminal_id"] not in public
+    assert item["agent_session"]["source"] not in public
+    assert item["agent_session"]["value"] not in public
+    for field in ("runtime_id", "worker_id", "agent_id"):
+        assert str(before[field]) not in public
+
+
+def test_stable_derivation_does_not_use_binding_or_public_fingerprint_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.core.models import Worker
+
+    record = herdr_cli._WorkerRecord(
+        worker=Worker(id="public", name="Public", status="working", space_id="wR9"),
+        private_fingerprint="existing-private-fingerprint",
+        workspace_id="wR9",
+        pane_id="wR9:pA",
+        pane_info_observed=True,
+    )
+
+    def forbidden(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("unrelated fingerprint helper was called")
+
+    monkeypatch.setattr(herdr_cli, "worker_binding_private_fingerprint", forbidden)
+    monkeypatch.setattr(herdr_cli, "stable_fingerprint", forbidden)
+    workers, bindings = _workers_and_bindings_from_records(_config(tmp_path / "state"), [record])
+
+    assert bindings == []
+    assert _STABLE_KEY.fullmatch(_stable(workers[0]))

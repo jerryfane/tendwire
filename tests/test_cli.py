@@ -723,7 +723,13 @@ def test_cli_snapshot_store_persists_private_bindings_outside_snapshot_payload(
 ) -> None:
     db_path = tmp_path / "bindings.db"
     responses = {
-        ("workspace", "list"): {"result": {"workspaces": []}},
+        ("workspace", "list"): {
+            "result": {
+                "workspaces": [
+                    {"workspace_id": "wA", "label": "Bindings"}
+                ]
+            }
+        },
         ("agent", "list"): {
             "result": {
                 "agents": [
@@ -731,7 +737,20 @@ def test_cli_snapshot_store_persists_private_bindings_outside_snapshot_payload(
                         "worker_id": "public-worker",
                         "agent_id": "agent-secret",
                         "agent": "Worker",
-                        "pane_id": "pane-secret",
+                        "workspace_id": "wA",
+                        "pane_id": "wA:p1",
+                    }
+                ]
+            }
+        },
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {
+                        "workspace_id": "wA",
+                        "pane_id": "wA:p1",
+                        "terminal_id": "terminal-secret",
+                        "agent": "Worker",
                     }
                 ]
             }
@@ -775,7 +794,7 @@ def test_cli_snapshot_store_persists_private_bindings_outside_snapshot_payload(
     assert bindings[0].target_value == "agent-secret"
     encoded = json.dumps(payload)
     assert "agent-secret" not in encoded
-    assert "pane-secret" not in encoded
+    assert "wA:p1" not in encoded
     assert "target_kind" not in encoded
 
 
@@ -820,7 +839,7 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
                     "result": {
                         "workspaces": [
                             {
-                                "workspace_id": "ws-cli",
+                                "workspace_id": "wA",
                                 "label": "CLI Space",
                                 "agent_status": "working",
                                 "focused": True,
@@ -840,9 +859,30 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
                             {
                                 "agent_session": {"value": "sess-cli"},
                                 "agent": "CLI Agent",
-                                "workspace_id": "ws-cli",
+                                "workspace_id": "wA",
+                                "pane_id": "wA:p1",
                                 "agent_status": "executing",
                                 "cwd": "/tmp",
+                            }
+                        ]
+                    }
+                }),
+                stderr="",
+            )
+        if tuple(args) == ("pane", "list"):
+            return subprocess.CompletedProcess(
+                args=list(args),
+                returncode=0,
+                stdout=json.dumps({
+                    "result": {
+                        "panes": [
+                            {
+                                "workspace_id": "wA",
+                                "pane_id": "wA:p1",
+                                "terminal_id": "terminal-cli",
+                                "agent": "CLI Agent",
+                                "agent_session": {"value": "sess-cli"},
+                                "agent_status": "executing",
                             }
                         ]
                     }
@@ -863,7 +903,7 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "cli-live"
     assert len(payload["spaces"]) == 1
-    assert payload["spaces"][0]["id"] == "ws-cli"
+    assert payload["spaces"][0]["id"] == "wA"
     assert payload["spaces"][0]["status"] == "active"
     assert len(payload["workers"]) == 1
     assert payload["workers"][0]["id"] == "CLI Agent"

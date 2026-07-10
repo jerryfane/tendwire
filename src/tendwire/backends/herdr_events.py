@@ -26,6 +26,12 @@ from ..core.models import (
     private_stable_sha256,
     utc_timestamp,
 )
+from ..worker_identity import (
+    InstallationKeyError,
+    STABLE_KEY_VERSION,
+    canonical_herdr_pane_identity,
+    is_stable_worker_key,
+)
 from ..core.projector import project_from_observations
 from ..store.sqlite import (
     expire_stale_worker_bindings,
@@ -36,12 +42,13 @@ from ..store.sqlite import (
     upsert_worker_bindings,
 )
 from .herdr_cli import (
-    _WorkerRecord,
     _pane_has_agent,
     _payload_items,
     _spaces_from_payload,
+    _records_from_agent_and_pane_payloads,
     _worker_record_from_item,
     _workers_and_bindings_from_records,
+    _strip_stable_key_fields,
     herdr_backend_health,
 )
 from .herdr_protocol import (
@@ -196,11 +203,44 @@ def _privatize_pane_event_id(item: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _top_level_pane_identity(
+    payload: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Return only an explicit top-level pane-scoped identity tuple."""
+    workspace_value = _field_value(payload, "workspace_id")
+    pane_value = _field_value(payload, "pane_id")
+    if not isinstance(workspace_value, (str, int, float, bool)):
+        return None
+    if not isinstance(pane_value, (str, int, float, bool)):
+        return None
+    workspace_id = str(workspace_value)
+    pane_id = str(pane_value)
+    if not workspace_id or not pane_id:
+        return None
+    return workspace_id, pane_id
+
+
+def _pane_event_payload_with_provenance(
+    payload: Mapping[str, Any],
+    *entity_names: str,
+) -> tuple[dict[str, Any], bool]:
+    """Return a pane-event item and whether PaneInfo provenance authorizes it."""
+    item, selected_entity = _entity_payload_with_source(payload, *entity_names)
+    top_level_identity = _top_level_pane_identity(payload)
+    if selected_entity in {"agent", "worker"} and top_level_identity is not None:
+        item["workspace_id"], item["pane_id"] = top_level_identity
+        return item, True
+    if selected_entity in {None, "pane"}:
+        return _privatize_pane_event_id(item), True
+    return item, False
+
+
 def _pane_event_payload(payload: Mapping[str, Any], *entity_names: str) -> dict[str, Any]:
     """Return a pane-event item without exposing pane ``id`` as public worker id."""
-    item, selected_entity = _entity_payload_with_source(payload, *entity_names)
-    if selected_entity in {None, "pane"}:
-        return _privatize_pane_event_id(item)
+    item, _pane_info_observed = _pane_event_payload_with_provenance(
+        payload,
+        *entity_names,
+    )
     return item
 
 
@@ -299,12 +339,26 @@ def _worker_copy(
     )
 
 
-def _merge_worker_update(existing: Worker | None, observed: Worker, *, status: str | None = None) -> Worker:
+def _merge_worker_update(
+    existing: Worker | None,
+    observed: Worker,
+    *,
+    status: str | None = None,
+    preserve_existing_continuity: bool = False,
+) -> Worker:
     if existing is None:
         if status is not None:
             return _worker_copy(observed, status=status)
         return observed
-    merged_meta = dict(existing.meta)
+    merged_meta = _strip_stable_key_fields(existing.meta)
+    if (
+        preserve_existing_continuity
+        and is_stable_worker_key(existing.meta.get("stable_key"))
+        and type(existing.meta.get("stable_key_version")) is int
+        and existing.meta.get("stable_key_version") == STABLE_KEY_VERSION
+    ):
+        merged_meta["stable_key"] = existing.meta["stable_key"]
+        merged_meta["stable_key_version"] = STABLE_KEY_VERSION
     merged_meta.update(observed.meta)
     observed_name_is_identity = observed.name in {observed.id, "unknown"}
     resolved_status = status if status is not None else observed.status
@@ -334,14 +388,6 @@ def _binding_target(binding: WorkerBinding) -> tuple[str, str]:
     return (binding.target_kind, binding.target_value)
 
 
-def _pane_terminal_map(payload: Any) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    for item in _payload_items(payload, _PANE_PAYLOAD_KEYS):
-        pane_id = _first_text(item, ("pane_id", "paneId"))
-        terminal_id = _first_text(item, ("terminal_id", "terminalId"))
-        if pane_id and terminal_id:
-            mapping[pane_id] = terminal_id
-    return mapping
 
 
 def _target_pairs_from_item(item: Mapping[str, Any], *, old_first: bool = False) -> list[tuple[str, str]]:
@@ -391,6 +437,32 @@ def _has_public_worker_identity(item: Mapping[str, Any]) -> bool:
         _first_text(item, ("worker_id", "id", "slug", "agent_id", "agent", "name", "label", "title"))
         is not None
     )
+
+def _has_authoritative_identity_tuple(item: Mapping[str, Any]) -> bool:
+    return (
+        _field_value(item, "workspace_id") is not None
+        and _field_value(item, "pane_id") is not None
+    )
+
+
+def _has_authoritative_binding_target(item: Mapping[str, Any]) -> bool:
+    agent_session = _safe_mapping(_field_value(item, "agent_session"))
+    return (
+        _first_text(item, ("agent_id", "terminal_id")) is not None
+        or _first_text(agent_session, ("value", "id")) is not None
+    )
+
+
+def _authenticated_local_stable_key(worker: Worker) -> str | None:
+    value = worker.meta.get("stable_key")
+    version = worker.meta.get("stable_key_version")
+    if (
+        is_stable_worker_key(value)
+        and type(version) is int
+        and version == STABLE_KEY_VERSION
+    ):
+        return str(value)
+    return None
 
 
 class HerdrEventBackend:
@@ -446,6 +518,10 @@ class HerdrEventBackend:
         # pane-id-only events (pane.agent_status_changed carries no terminal id)
         # can still resolve to the terminal-targeted stored binding.
         self._pane_terminals: dict[str, str] = {}
+        self._pane_owners: dict[str, set[str]] = {}
+        self._terminal_owners: dict[str, set[str]] = {}
+        self._session_owners: dict[str, set[str]] = {}
+        self._event_continuity_revalidated = False
         self._health = self._health_for("unknown")
         self._last_event_at: str | None = None
         self._last_reconcile_at: str | None = None
@@ -526,6 +602,7 @@ class HerdrEventBackend:
         except Exception:
             bindings = []
         self._bindings = {binding.private_fingerprint: binding for binding in bindings}
+        self._replace_ownership_maps([], bindings)
 
     def start(self, *, wait_for_reconcile: bool = True, timeout_seconds: float | None = None) -> None:
         if self._thread is not None:
@@ -641,120 +718,12 @@ class HerdrEventBackend:
     def _current_bindings(self) -> list[WorkerBinding]:
         return list(self._bindings.values())
 
-    def _record_match_keys(
-        self,
-        item: Mapping[str, Any],
-        record: Any,
-        *,
-        pane_shaped: bool = False,
-    ) -> set[tuple[str, str]]:
-        keys: set[tuple[str, str]] = {("private_fingerprint", str(record.private_fingerprint))}
-        pane_id_keys = ("pane_id", "paneId", "id") if pane_shaped else ("pane_id", "paneId")
-        for kind, value in (
-            ("pane_id", _first_text(item, pane_id_keys)),
-            ("terminal_id", _first_text(item, ("terminal_id", "terminalId"))),
-            ("agent_session", _first_text(item, ("agent_session", "session_id", "sessionId"))),
-        ):
-            if value:
-                keys.add((kind, value))
-        return keys
-
-    def _merge_pane_display_meta(
-        self,
-        agent_record: _WorkerRecord,
-        pane_record: _WorkerRecord | None,
-    ) -> _WorkerRecord:
-        if pane_record is None:
-            return agent_record
-        pane_meta = pane_record.worker.meta
-        merged_meta = dict(agent_record.worker.meta)
-        label = pane_meta.get("label")
-        if isinstance(label, str) and label.strip():
-            merged_meta["label"] = label
-        for key in ("foreground_cwd", "cwd"):
-            value = pane_meta.get(key)
-            if isinstance(value, str) and value.strip() and not merged_meta.get(key):
-                merged_meta[key] = value
-        backend_target_changed = False
-        backend_target = agent_record.worker.backend_target
-        if (
-            not self._backend_target_present(backend_target)
-            and self._backend_target_present(pane_record.worker.backend_target)
-        ):
-            backend_target = pane_record.worker.backend_target
-            backend_target_changed = True
-        worker = agent_record.worker
-        if merged_meta != agent_record.worker.meta or backend_target_changed:
-            worker = _worker_copy(worker, meta=merged_meta, backend_target=backend_target)
-
-        turn_target_kind = agent_record.turn_target_kind
-        turn_target_value = agent_record.turn_target_value
-        if (
-            (not turn_target_kind or not turn_target_value)
-            and pane_record.turn_target_kind
-            and pane_record.turn_target_value
-        ):
-            turn_target_kind = pane_record.turn_target_kind
-            turn_target_value = pane_record.turn_target_value
-
-        # An agent record may omit the durable terminal_id that its matched pane carries; adopt the
-        # pane's so stable_key keys off the terminal rather than the churning positional pane_id.
-        terminal_id = agent_record.terminal_id or pane_record.terminal_id
-
-        if (
-            worker == agent_record.worker
-            and turn_target_kind == agent_record.turn_target_kind
-            and turn_target_value == agent_record.turn_target_value
-            and terminal_id == agent_record.terminal_id
-        ):
-            return agent_record
-        return _WorkerRecord(
-            worker=worker,
-            private_fingerprint=agent_record.private_fingerprint,
-            turn_target_kind=turn_target_kind,
-            turn_target_value=turn_target_value,
-            terminal_id=terminal_id,
-        )
-
-    @staticmethod
-    def _backend_target_present(target: Any) -> bool:
-        return (
-            isinstance(target, Mapping)
-            and bool(str(target.get("kind") or ""))
-            and bool(str(target.get("value") or ""))
-        )
-
     def _records_from_reconcile_payloads(self, agent_payload: Any, pane_payload: Any) -> list[Any]:
-        pane_records_by_match: dict[tuple[str, str], Any] = {}
-        pane_fallback_records: OrderedDict[str, Any] = OrderedDict()
-        for item in _payload_items(pane_payload, _PANE_PAYLOAD_KEYS):
-            if not _pane_has_agent(item):
-                continue
-            record = _worker_record_from_item(item, self.config)
-            pane_fallback_records.setdefault(record.private_fingerprint, record)
-            for key in self._record_match_keys(item, record, pane_shaped=True):
-                pane_records_by_match.setdefault(key, record)
-
-        records_by_identity: OrderedDict[str, Any] = OrderedDict()
-        consumed_pane_fingerprints: set[str] = set()
-        for item in _payload_items(agent_payload, _AGENT_PAYLOAD_KEYS):
-            record = _worker_record_from_item(item, self.config)
-            matched_pane = None
-            for key in self._record_match_keys(item, record):
-                matched_pane = pane_records_by_match.get(key)
-                if matched_pane is not None:
-                    break
-            if matched_pane is not None:
-                consumed_pane_fingerprints.add(str(matched_pane.private_fingerprint))
-            records_by_identity.setdefault(
-                record.private_fingerprint,
-                self._merge_pane_display_meta(record, matched_pane),
-            )
-        for fingerprint, record in pane_fallback_records.items():
-            if str(fingerprint) in consumed_pane_fingerprints:
-                continue
-            records_by_identity.setdefault(fingerprint, record)
-        return list(records_by_identity.values())
+        return _records_from_agent_and_pane_payloads(
+            self.config,
+            agent_payload,
+            pane_payload,
+        )
 
     def _pane_subscription_ids(self, pane_payload: Any) -> list[str]:
         pane_ids: list[str] = []
@@ -804,9 +773,12 @@ class HerdrEventBackend:
                     self.config,
                     records,
                     stored_bindings=stored_bindings,
+                    require_authenticated_continuity=True,
                 )
                 if _observed_worker_count(workers) > self.max_workers:
-                    return self._mark_worker_cap_exceeded_locked(_observed_worker_count(workers))
+                    return self._mark_worker_cap_exceeded_locked(
+                        _observed_worker_count(workers)
+                    )
                 outcome = "healthy_non_empty" if spaces or workers else "empty_healthy"
                 health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
                 previous = latest_snapshot(self.db_path, self.config.host_id)
@@ -837,7 +809,7 @@ class HerdrEventBackend:
                 self._spaces = {space.id: space for space in snapshot.spaces}
                 self._workers = {worker.id: worker for worker in snapshot.workers}
                 self._bindings = {binding.private_fingerprint: binding for binding in bindings}
-                self._pane_terminals = _pane_terminal_map(payloads["pane.list"])
+                self._replace_ownership_maps(records, bindings)
                 self._subscription_pane_ids = subscription_pane_ids
                 self._health = HerdrEventBackendHealth(
                     status=health.status,
@@ -846,6 +818,12 @@ class HerdrEventBackend:
                     message=health.message,
                 )
                 return snapshot
+        except InstallationKeyError:
+            snapshot = self._mark_unhealthy("continuity_unavailable")
+            with self._lock:
+                self._last_reconcile_at = snapshot.updated_at
+                self._schedule_next_reconcile()
+            return snapshot
         except Exception:
             self._mark_unhealthy("unknown")
             raise
@@ -955,12 +933,19 @@ class HerdrEventBackend:
             self._pending_events.clear()
         if not events:
             return
-        with self._lock:
-            changed = False
-            for event in events:
-                changed = self._apply_event(event) or changed
-            if changed:
-                self._persist_current_state()
+        try:
+            with self._lock:
+                self._event_continuity_revalidated = False
+                changed = False
+                for event in events:
+                    changed = self._apply_event(event) or changed
+                if changed:
+                    self._persist_current_state()
+        except InstallationKeyError:
+            self._mark_unhealthy("continuity_unavailable")
+        finally:
+            with self._lock:
+                self._event_continuity_revalidated = False
 
     def _apply_event(self, event: NormalizedHerdrEvent) -> bool:
         if event.name in _SPACE_EVENT_NAMES:
@@ -970,29 +955,66 @@ class HerdrEventBackend:
             status = "closed" if event.name == "worktree.removed" else None
             return self._apply_worktree_event(event.payload, status=status)
         if event.name in _PANE_WORKER_EVENT_NAMES:
-            item = _pane_event_payload(event.payload, "pane", "agent", "worker")
-            self._note_pane_terminal(item)
+            item, pane_info_observed = _pane_event_payload_with_provenance(
+                event.payload,
+                "pane",
+                "agent",
+                "worker",
+            )
             if not _pane_has_agent(item) and self._match_binding(item) is None:
                 return False
-            return self._upsert_worker_from_item(item)
+            return self._upsert_worker_from_item(
+                item,
+                pane_info_observed=pane_info_observed,
+            )
         if event.name == "pane.agent_detected":
-            item = _pane_event_payload(event.payload, "agent", "worker", "pane")
-            self._note_pane_terminal(item)
-            return self._upsert_worker_from_item(item)
+            item, pane_info_observed = _pane_event_payload_with_provenance(
+                event.payload,
+                "agent",
+                "worker",
+                "pane",
+            )
+            return self._upsert_worker_from_item(
+                item,
+                pane_info_observed=pane_info_observed,
+            )
         if event.name == "pane.agent_status_changed":
-            item = _pane_event_payload(event.payload, "agent", "worker", "pane")
+            item, pane_info_observed = _pane_event_payload_with_provenance(
+                event.payload,
+                "agent",
+                "worker",
+                "pane",
+            )
             raw_status = _first_text(item, ("status", "agent_status", "state", "phase"))
             return self._upsert_worker_from_item(
                 item,
                 status=normalize_status(raw_status),
-                update_binding=False,
+                update_binding=(
+                    pane_info_observed
+                    and _has_authoritative_identity_tuple(item)
+                    and _has_authoritative_binding_target(item)
+                ),
+                pane_info_observed=pane_info_observed,
             )
         if event.name == "pane.moved":
-            item = _pane_event_payload(event.payload, "pane")
-            return self._apply_pane_moved(item)
+            item, pane_info_observed = _pane_event_payload_with_provenance(
+                event.payload,
+                "pane",
+            )
+            return self._apply_pane_moved(
+                item,
+                pane_info_observed=pane_info_observed,
+            )
         if event.name in _CLOSED_EVENT_NAMES:
-            item = _pane_event_payload(event.payload, "pane")
-            return self._apply_pane_closed(item, reason=event.name.replace(".", "_"))
+            item, pane_info_observed = _pane_event_payload_with_provenance(
+                event.payload,
+                "pane",
+            )
+            return self._apply_pane_closed(
+                item,
+                reason=event.name.replace(".", "_"),
+                pane_info_observed=pane_info_observed,
+            )
         if event.name == "pane.output_matched":
             return False
         return False
@@ -1042,14 +1064,22 @@ class HerdrEventBackend:
         item: Mapping[str, Any],
         *,
         status: str | None = None,
+        pane_info_observed: bool = False,
     ) -> tuple[Worker | None, WorkerBinding | None, WorkerBinding | None]:
         try:
-            record = _worker_record_from_item(item, self.config)
+            record = _worker_record_from_item(
+                item,
+                self.config,
+                pane_info_observed=pane_info_observed,
+            )
             workers, bindings = _workers_and_bindings_from_records(
                 self.config,
                 [record],
                 stored_bindings=self._current_bindings(),
+                require_authenticated_continuity=True,
             )
+        except InstallationKeyError:
+            raise
         except Exception:
             return None, None, self._match_binding(item)
         worker = workers[0] if workers else None
@@ -1061,37 +1091,444 @@ class HerdrEventBackend:
             worker = _worker_copy(worker, status=status)
         return worker, binding, matched_binding
 
+    @staticmethod
+    def _add_owner(
+        owners: dict[str, set[str]],
+        value: str | None,
+        worker_id: str,
+    ) -> None:
+        if value:
+            owners.setdefault(value, set()).add(worker_id)
+
+    def _remove_owner(self, worker_id: str) -> None:
+        for owners in (
+            self._pane_owners,
+            self._terminal_owners,
+            self._session_owners,
+        ):
+            for value in list(owners):
+                owner_ids = owners[value]
+                owner_ids.discard(worker_id)
+                if not owner_ids:
+                    owners.pop(value, None)
+
+    def _remember_item_owner(
+        self,
+        item: Mapping[str, Any],
+        worker_id: str,
+        *,
+        replace: bool,
+    ) -> None:
+        if replace:
+            self._remove_owner(worker_id)
+        agent_session = _safe_mapping(_field_value(item, "agent_session"))
+        session_id = (
+            _first_text(agent_session, ("value", "id"))
+            or _first_text(item, ("session_id", "sessionId"))
+        )
+        self._add_owner(
+            self._pane_owners,
+            _first_text(item, ("pane_id", "paneId")),
+            worker_id,
+        )
+        self._add_owner(
+            self._terminal_owners,
+            _first_text(item, ("terminal_id", "terminalId")),
+            worker_id,
+        )
+        self._add_owner(self._session_owners, session_id, worker_id)
+
+    def _replace_ownership_maps(
+        self,
+        records: Sequence[Any],
+        bindings: Sequence[WorkerBinding],
+    ) -> None:
+        self._pane_terminals = {}
+        self._pane_owners = {}
+        self._terminal_owners = {}
+        self._session_owners = {}
+        worker_ids_by_private: dict[str, set[str]] = {}
+        for binding in bindings:
+            worker_ids_by_private.setdefault(
+                binding.private_fingerprint,
+                set(),
+            ).add(binding.worker_id)
+            if binding.target_kind == "pane_id":
+                self._add_owner(
+                    self._pane_owners,
+                    binding.target_value,
+                    binding.worker_id,
+                )
+            if binding.target_kind == "terminal_id":
+                self._add_owner(
+                    self._terminal_owners,
+                    binding.target_value,
+                    binding.worker_id,
+                )
+            if binding.turn_target_value:
+                self._add_owner(
+                    self._session_owners,
+                    binding.turn_target_value,
+                    binding.worker_id,
+                )
+        for record in records:
+            if not record.pane_info_observed:
+                continue
+            owner_ids = worker_ids_by_private.get(
+                record.private_fingerprint,
+                set(),
+            )
+            if len(owner_ids) != 1:
+                continue
+            worker_id = next(iter(owner_ids))
+            if record.pane_id and record.terminal_id:
+                self._pane_terminals[record.pane_id] = record.terminal_id
+            self._add_owner(
+                self._pane_owners,
+                record.pane_id,
+                worker_id,
+            )
+            self._add_owner(
+                self._terminal_owners,
+                record.terminal_id,
+                worker_id,
+            )
+            self._add_owner(
+                self._session_owners,
+                record.agent_session_id,
+                worker_id,
+            )
+
+    def _ownership_worker_ids(
+        self,
+        item: Mapping[str, Any],
+        observed_binding: WorkerBinding | None = None,
+    ) -> set[str]:
+        owner_ids = {
+            binding.worker_id
+            for binding in self._matching_bindings(item)
+            if binding.worker_id
+        }
+        if observed_binding is not None:
+            owner_ids.update(
+                binding.worker_id
+                for binding in self._bindings.values()
+                if binding.worker_id
+                and binding.target_value
+                == observed_binding.target_value
+            )
+        pane_id = _first_text(item, ("pane_id", "paneId"))
+        terminal_id = _first_text(item, ("terminal_id", "terminalId"))
+        agent_session = _safe_mapping(_field_value(item, "agent_session"))
+        session_id = (
+            _first_text(agent_session, ("value", "id"))
+            or _first_text(item, ("session_id", "sessionId"))
+        )
+        owner_ids.update(self._pane_owners.get(pane_id or "", ()))
+        owner_ids.update(self._terminal_owners.get(terminal_id or "", ()))
+        owner_ids.update(self._session_owners.get(session_id or "", ()))
+        return owner_ids
+
+    def _target_worker_ids(
+        self,
+        target_kind: str,
+        target_value: str,
+    ) -> set[str]:
+        owner_ids = {
+            binding.worker_id
+            for binding in self._bindings.values()
+            if binding.worker_id
+            and (
+                binding.target_value == target_value
+                or (
+                    binding.turn_target_kind == target_kind
+                    and binding.turn_target_value == target_value
+                )
+            )
+        }
+        if target_kind == "pane_id":
+            owner_ids.update(self._pane_owners.get(target_value, ()))
+        if target_kind == "terminal_id":
+            owner_ids.update(self._terminal_owners.get(target_value, ()))
+        return owner_ids
+
+
+    def _matching_bindings(
+        self,
+        item: Mapping[str, Any],
+        *,
+        old_first: bool = False,
+    ) -> list[WorkerBinding]:
+        pairs = _target_pairs_from_item(item, old_first=old_first)
+        mapped_pairs = [
+            ("terminal_id", self._pane_terminals[value])
+            for kind, value in pairs
+            if kind == "pane_id" and value in self._pane_terminals
+        ]
+        agent_session = _safe_mapping(_field_value(item, "agent_session"))
+        session_id = (
+            _first_text(agent_session, ("value", "id"))
+            or _first_text(item, ("session_id", "sessionId"))
+        )
+        keys = set([*pairs, *mapped_pairs])
+        if session_id:
+            keys.add(("agent_session", session_id))
+        if not keys:
+            return []
+        return [
+            binding
+            for binding in self._bindings.values()
+            if _binding_target(binding) in keys
+            or (
+                str(binding.turn_target_kind or ""),
+                str(binding.turn_target_value or ""),
+            )
+            in keys
+            or (
+                "agent_session",
+                str(binding.turn_target_value or ""),
+            )
+            in keys
+        ]
+
+    def _fail_closed_ownership(self, worker_ids: set[str]) -> bool:
+        """Remove continuity and routing from every current ambiguous owner."""
+        if not worker_ids:
+            return False
+        if (
+            self._health.outcome == "continuity_unavailable"
+            and not self._event_continuity_revalidated
+        ):
+            return False
+        binding_updates: list[WorkerBinding] = []
+        bindings_by_worker: dict[str, list[WorkerBinding]] = {}
+        for private_fingerprint, binding in list(self._bindings.items()):
+            if binding.worker_id not in worker_ids:
+                continue
+            bindings_by_worker.setdefault(binding.worker_id, []).append(binding)
+            ambiguous = WorkerBinding(
+                host_id=binding.host_id,
+                worker_id=binding.worker_id,
+                worker_fingerprint=binding.worker_fingerprint,
+                backend=binding.backend,
+                target_kind=binding.target_kind,
+                target_value=binding.target_value,
+                turn_target_kind=None,
+                turn_target_value=None,
+                sendable=False,
+                reason="ambiguous_pane_match",
+                observed_at=utc_timestamp(),
+                expires_at=binding.expires_at,
+                private_fingerprint=binding.private_fingerprint,
+            )
+            self._bindings[private_fingerprint] = ambiguous
+            binding_updates.append(ambiguous)
+
+        for worker_id in worker_ids:
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                continue
+            target = worker.backend_target
+            if not isinstance(target, Mapping):
+                candidates = bindings_by_worker.get(worker_id, [])
+                target = candidates[0].backend_target() if candidates else None
+            ambiguous_target = None
+            if isinstance(target, Mapping):
+                kind = str(target.get("kind") or "")
+                value = str(target.get("value") or "")
+                if kind and value:
+                    ambiguous_target = {
+                        "kind": kind,
+                        "value": value,
+                        "sendable": False,
+                        "reason": "ambiguous_pane_match",
+                    }
+            self._workers[worker_id] = _worker_copy(
+                worker,
+                meta=_strip_stable_key_fields(worker.meta),
+                backend_target=ambiguous_target,
+            )
+        if binding_updates:
+            upsert_worker_bindings(self.db_path, binding_updates)
+        return True
+
+
     def _upsert_worker_from_item(
         self,
         item: Mapping[str, Any],
         *,
         status: str | None = None,
         update_binding: bool = True,
+        pane_info_observed: bool = False,
     ) -> bool:
         if not item:
             return False
         if not _has_public_worker_identity(item) and self._match_binding(item) is None:
             return False
-        worker, binding, matched_binding = self._event_worker_and_binding(item, status=status)
+        worker, binding, matched_binding = self._event_worker_and_binding(
+            item,
+            status=status,
+            pane_info_observed=pane_info_observed,
+        )
         if worker is None:
             return False
+
+        authoritative_identity = (
+            pane_info_observed and _has_authoritative_identity_tuple(item)
+        )
+        stable_owner_reused = False
+        if authoritative_identity:
+            observed_stable_key = _authenticated_local_stable_key(worker)
+            stable_owner_ids = (
+                {
+                    current.id
+                    for current in self._workers.values()
+                    if _authenticated_local_stable_key(current)
+                    == observed_stable_key
+                }
+                if observed_stable_key is not None
+                else set()
+            )
+            target_owner_ids = self._ownership_worker_ids(
+                item,
+                binding,
+            )
+            conflicting_owner_ids: set[str] = set()
+            if len(stable_owner_ids) > 1 or len(target_owner_ids) > 1:
+                conflicting_owner_ids.update(stable_owner_ids)
+                conflicting_owner_ids.update(target_owner_ids)
+            elif len(stable_owner_ids) == 1:
+                stable_owner_id = next(iter(stable_owner_ids))
+                other_target_owners = target_owner_ids - {stable_owner_id}
+                if other_target_owners:
+                    conflicting_owner_ids.add(stable_owner_id)
+                    conflicting_owner_ids.update(other_target_owners)
+                else:
+                    worker = _worker_copy(
+                        worker,
+                        worker_id=stable_owner_id,
+                    )
+                    stable_owner_reused = True
+            elif len(target_owner_ids) == 1:
+                target_owner_id = next(iter(target_owner_ids))
+                target_owner = self._workers.get(target_owner_id)
+                target_stable_key = (
+                    _authenticated_local_stable_key(target_owner)
+                    if target_owner is not None
+                    else None
+                )
+                observed_pane_id = _first_text(
+                    item,
+                    ("pane_id", "paneId"),
+                )
+                observed_canonical_identity = canonical_herdr_pane_identity(
+                    _first_text(item, ("workspace_id", "workspaceId")),
+                    observed_pane_id,
+                )
+                same_pane_owner_ids = self._pane_owners.get(
+                    observed_pane_id or "",
+                    set(),
+                )
+                target_is_ambiguous = any(
+                    current_binding.worker_id == target_owner_id
+                    and current_binding.reason == "ambiguous_pane_match"
+                    for current_binding in self._bindings.values()
+                )
+                if target_is_ambiguous or (
+                    observed_stable_key is None
+                    and (
+                        observed_canonical_identity is None
+                        or target_owner_id not in same_pane_owner_ids
+                    )
+                ) or (
+                    observed_stable_key is not None
+                    and target_stable_key is not None
+                    and target_stable_key != observed_stable_key
+                ):
+                    conflicting_owner_ids.add(target_owner_id)
+                else:
+                    worker = _worker_copy(
+                        worker,
+                        worker_id=target_owner_id,
+                    )
+                    stable_owner_reused = True
+            if conflicting_owner_ids:
+                return self._fail_closed_ownership(
+                    conflicting_owner_ids
+                )
+        else:
+            compatibility_owner_ids = self._ownership_worker_ids(
+                item,
+                binding,
+            )
+            matched_owner_ids = (
+                {matched_binding.worker_id}
+                if matched_binding is not None
+                else set()
+            )
+            if compatibility_owner_ids - matched_owner_ids:
+                return self._fail_closed_ownership(
+                    compatibility_owner_ids
+                )
+
         existing = self._workers.get(worker.id)
         if existing is None and matched_binding is not None:
             existing = self._workers.get(matched_binding.worker_id)
-        if matched_binding is not None:
+        if matched_binding is not None and not stable_owner_reused:
             worker = _worker_copy(worker, worker_id=matched_binding.worker_id)
-        worker = _merge_worker_update(existing, worker, status=status)
+        worker = _merge_worker_update(
+            existing,
+            worker,
+            status=status,
+            preserve_existing_continuity=not authoritative_identity,
+        )
+        if not authoritative_identity and matched_binding is not None:
+            worker = _worker_copy(
+                worker,
+                backend_target=matched_binding.backend_target(),
+            )
         if self._would_exceed_worker_cap(worker, existing=existing):
             self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
             return False
         self._workers[worker.id] = worker
         if update_binding and binding is not None:
-            if matched_binding is not None and binding.private_fingerprint != matched_binding.private_fingerprint:
+            if stable_owner_reused:
+                stale_private_fingerprints = [
+                    private_fingerprint
+                    for private_fingerprint, current_binding in self._bindings.items()
+                    if current_binding.worker_id == worker.id
+                    and private_fingerprint != binding.private_fingerprint
+                ]
+                if stale_private_fingerprints:
+                    expire_worker_bindings(
+                        self.db_path,
+                        self.config.host_id,
+                        backend=BACKEND_NAME,
+                        private_fingerprints=stale_private_fingerprints,
+                        reason="identity_replaced",
+                    )
+                    for private_fingerprint in stale_private_fingerprints:
+                        self._bindings.pop(private_fingerprint, None)
+                binding = self._binding_with_worker(binding, worker)
+            elif matched_binding is not None and (
+                not authoritative_identity
+                or binding.private_fingerprint
+                != matched_binding.private_fingerprint
+            ):
                 binding = self._binding_with_worker(matched_binding, worker)
             else:
                 binding = self._binding_with_worker(binding, worker)
             self._bindings[binding.private_fingerprint] = binding
             upsert_worker_bindings(self.db_path, [binding])
+        if authoritative_identity:
+            self._remember_item_owner(
+                item,
+                worker.id,
+                replace=update_binding,
+            )
+            self._note_pane_terminal(item)
+            if _authenticated_local_stable_key(worker) is not None:
+                self._event_continuity_revalidated = True
         return True
 
     def _binding_with_worker(self, binding: WorkerBinding, worker: Worker) -> WorkerBinding:
@@ -1137,58 +1574,329 @@ class HerdrEventBackend:
                 return binding
         return None
 
+    def _previous_ownership_worker_ids(
+        self,
+        item: Mapping[str, Any],
+    ) -> set[str]:
+        previous_pane_id = _first_text(
+            item,
+            (
+                "old_pane_id",
+                "previous_pane_id",
+                "from_pane_id",
+                "source_pane_id",
+            ),
+        )
+        previous_terminal_id = _first_text(
+            item,
+            (
+                "old_terminal_id",
+                "previous_terminal_id",
+                "from_terminal_id",
+                "source_terminal_id",
+            ),
+        )
+        owner_ids = set(self._pane_owners.get(previous_pane_id or "", ()))
+        owner_ids.update(
+            self._terminal_owners.get(previous_terminal_id or "", ())
+        )
+        if previous_pane_id and previous_pane_id in self._pane_terminals:
+            previous_terminal_id = self._pane_terminals[previous_pane_id]
+            owner_ids.update(
+                self._terminal_owners.get(previous_terminal_id, ())
+            )
+        previous_keys = {
+            ("pane_id", previous_pane_id or ""),
+            ("terminal_id", previous_terminal_id or ""),
+        }
+        owner_ids.update(
+            binding.worker_id
+            for binding in self._bindings.values()
+            if binding.worker_id
+            and (
+                _binding_target(binding) in previous_keys
+                or (
+                    str(binding.turn_target_kind or ""),
+                    str(binding.turn_target_value or ""),
+                )
+                in previous_keys
+            )
+        )
+        return owner_ids
+
+
     def _note_pane_terminal(self, item: Mapping[str, Any]) -> None:
         pane_id = _first_text(item, ("pane_id", "paneId"))
         terminal_id = _first_text(item, ("terminal_id", "terminalId"))
         if pane_id and terminal_id:
             self._pane_terminals[pane_id] = terminal_id
 
-    def _apply_pane_moved(self, item: Mapping[str, Any]) -> bool:
-        old_binding = self._match_binding(item, old_first=True)
-        new_target = _new_move_target(item)
-        if old_binding is None or new_target is None:
-            return self._upsert_worker_from_item(item)
-        worker = self._workers.get(old_binding.worker_id)
-        observed_worker, _binding, _matched = self._event_worker_and_binding(item)
-        if worker is None:
-            worker = observed_worker
-        elif observed_worker is not None:
-            worker = _merge_worker_update(worker, _worker_copy(observed_worker, worker_id=worker.id))
-        if worker is None:
-            return False
-        if self._would_exceed_worker_cap(worker, existing=self._workers.get(worker.id)):
-            self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
-            return False
-        target_kind, target_value = new_target
-        moved_binding = WorkerBinding(
-            host_id=old_binding.host_id,
-            worker_id=worker.id,
-            worker_fingerprint=worker.fingerprint,
-            backend=old_binding.backend,
-            target_kind=target_kind,
-            target_value=target_value,
-            turn_target_kind=old_binding.turn_target_kind,
-            turn_target_value=old_binding.turn_target_value,
-            sendable=old_binding.sendable,
-            reason=old_binding.reason,
-            observed_at=utc_timestamp(),
-            expires_at=None,
-            private_fingerprint=old_binding.private_fingerprint,
+    def _apply_pane_moved(
+        self,
+        item: Mapping[str, Any],
+        *,
+        pane_info_observed: bool = False,
+    ) -> bool:
+        authoritative_identity = (
+            pane_info_observed and _has_authoritative_identity_tuple(item)
         )
-        self._workers[worker.id] = _worker_copy(worker, backend_target=moved_binding.backend_target())
+        observed_worker, observed_binding, _matched = self._event_worker_and_binding(
+            item,
+            pane_info_observed=pane_info_observed,
+        )
+        source_owner_ids = self._previous_ownership_worker_ids(item)
+        if len(source_owner_ids) > 1:
+            return self._fail_closed_ownership(source_owner_ids)
+        if not source_owner_ids:
+            return False
+        source_owner_id = next(iter(source_owner_ids))
+        existing = self._workers.get(source_owner_id)
+        if existing is None:
+            return False
+        source_bindings = [
+            binding
+            for binding in self._bindings.values()
+            if binding.worker_id == source_owner_id
+        ]
+        new_target = _new_move_target(item)
+        if new_target is not None:
+            destination_owner_ids = self._target_worker_ids(*new_target)
+            conflicting_destination_ids = destination_owner_ids - {
+                source_owner_id
+            }
+            if conflicting_destination_ids:
+                return self._fail_closed_ownership(
+                    {source_owner_id, *conflicting_destination_ids}
+                )
+
+        if authoritative_identity:
+            if observed_worker is None:
+                return False
+            observed_stable_key = _authenticated_local_stable_key(
+                observed_worker
+            )
+            destination_owner_ids = self._ownership_worker_ids(
+                item,
+                observed_binding,
+            )
+            if observed_stable_key is not None:
+                destination_owner_ids.update(
+                    current.id
+                    for current in self._workers.values()
+                    if _authenticated_local_stable_key(current)
+                    == observed_stable_key
+                )
+            conflicting_owner_ids = destination_owner_ids - {
+                source_owner_id
+            }
+            if conflicting_owner_ids:
+                return self._fail_closed_ownership(
+                    {source_owner_id, *conflicting_owner_ids}
+                )
+            worker = _merge_worker_update(
+                existing,
+                _worker_copy(
+                    observed_worker,
+                    worker_id=source_owner_id,
+                ),
+                preserve_existing_continuity=False,
+            )
+        else:
+            worker = existing
+            if observed_worker is not None:
+                worker = _merge_worker_update(
+                    existing,
+                    _worker_copy(
+                        observed_worker,
+                        worker_id=source_owner_id,
+                    ),
+                    preserve_existing_continuity=True,
+                )
+
+        if self._would_exceed_worker_cap(worker, existing=existing):
+            self._mark_worker_cap_exceeded_locked(
+                _observed_worker_count(list(self._workers.values())) + 1
+            )
+            return False
+
+        if authoritative_identity and observed_binding is not None:
+            if len(source_bindings) != 1:
+                return self._fail_closed_ownership({source_owner_id})
+            old_binding = source_bindings[0]
+            moved_binding = WorkerBinding(
+                host_id=observed_binding.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend=observed_binding.backend,
+                target_kind=observed_binding.target_kind,
+                target_value=observed_binding.target_value,
+                turn_target_kind=observed_binding.turn_target_kind,
+                turn_target_value=observed_binding.turn_target_value,
+                sendable=observed_binding.sendable,
+                reason=observed_binding.reason,
+                observed_at=utc_timestamp(),
+                expires_at=None,
+                private_fingerprint=old_binding.private_fingerprint,
+            )
+        else:
+            if new_target is None or len(source_bindings) != 1:
+                return False
+            old_binding = source_bindings[0]
+            target_kind, target_value = new_target
+            moved_binding = WorkerBinding(
+                host_id=old_binding.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend=old_binding.backend,
+                target_kind=target_kind,
+                target_value=target_value,
+                turn_target_kind=old_binding.turn_target_kind,
+                turn_target_value=(
+                    target_value
+                    if old_binding.turn_target_kind == "pane_id"
+                    and target_kind == "pane_id"
+                    else old_binding.turn_target_value
+                ),
+                sendable=old_binding.sendable,
+                reason=old_binding.reason,
+                observed_at=utc_timestamp(),
+                expires_at=None,
+                private_fingerprint=old_binding.private_fingerprint,
+            )
+
+        stale_private_fingerprints = [
+            binding.private_fingerprint
+            for binding in source_bindings
+            if binding.private_fingerprint
+            != moved_binding.private_fingerprint
+        ]
+        if stale_private_fingerprints:
+            expire_worker_bindings(
+                self.db_path,
+                self.config.host_id,
+                backend=BACKEND_NAME,
+                private_fingerprints=stale_private_fingerprints,
+                reason="identity_replaced",
+            )
+            for private_fingerprint in stale_private_fingerprints:
+                self._bindings.pop(private_fingerprint, None)
+
+        worker = _worker_copy(
+            worker,
+            backend_target=moved_binding.backend_target(),
+        )
+        moved_binding = self._binding_with_worker(moved_binding, worker)
+        self._workers[worker.id] = worker
         self._bindings[moved_binding.private_fingerprint] = moved_binding
         upsert_worker_bindings(self.db_path, [moved_binding])
+
+        previous_pane_ids: set[str] = set()
+        previous_pane_id = _first_text(
+            item,
+            (
+                "old_pane_id",
+                "previous_pane_id",
+                "from_pane_id",
+                "source_pane_id",
+            ),
+        )
+        if previous_pane_id:
+            previous_pane_ids.add(previous_pane_id)
+        previous_terminal_id = _first_text(
+            item,
+            (
+                "old_terminal_id",
+                "previous_terminal_id",
+                "from_terminal_id",
+                "source_terminal_id",
+            ),
+        )
+        if previous_terminal_id:
+            previous_pane_ids.update(
+                pane_id
+                for pane_id, terminal_id in self._pane_terminals.items()
+                if terminal_id == previous_terminal_id
+                and source_owner_id in self._pane_owners.get(pane_id, ())
+            )
+        current_pane_id = _first_text(item, ("pane_id", "paneId"))
+        for source_pane_id in previous_pane_ids:
+            if source_pane_id != current_pane_id:
+                self._pane_terminals.pop(source_pane_id, None)
+
+        self._remove_owner(worker.id)
+        if authoritative_identity:
+            self._remember_item_owner(
+                item,
+                worker.id,
+                replace=False,
+            )
+            self._note_pane_terminal(item)
+            if _authenticated_local_stable_key(worker) is not None:
+                self._event_continuity_revalidated = True
+        else:
+            if moved_binding.target_kind == "pane_id":
+                self._add_owner(
+                    self._pane_owners,
+                    moved_binding.target_value,
+                    worker.id,
+                )
+            if moved_binding.target_kind == "terminal_id":
+                self._add_owner(
+                    self._terminal_owners,
+                    moved_binding.target_value,
+                    worker.id,
+                )
+            if moved_binding.turn_target_value:
+                self._add_owner(
+                    self._session_owners,
+                    moved_binding.turn_target_value,
+                    worker.id,
+                )
         return True
 
-    def _apply_pane_closed(self, item: Mapping[str, Any], *, reason: str) -> bool:
-        binding = self._match_binding(item)
+    def _apply_pane_closed(
+        self,
+        item: Mapping[str, Any],
+        *,
+        reason: str,
+        pane_info_observed: bool = False,
+    ) -> bool:
+        observed_worker: Worker | None = None
+        matched_binding: WorkerBinding | None = None
+        observed_binding: WorkerBinding | None = None
+        if pane_info_observed:
+            observed_worker, observed_binding, matched_binding = self._event_worker_and_binding(
+                item,
+                status="closed",
+                pane_info_observed=True,
+            )
+        observed_stable_key = (
+            _authenticated_local_stable_key(observed_worker)
+            if observed_worker is not None
+            else None
+        )
+        if observed_stable_key is not None:
+            stable_owner_ids = {
+                current.id
+                for current in self._workers.values()
+                if _authenticated_local_stable_key(current) == observed_stable_key
+            }
+            target_owner_ids = self._ownership_worker_ids(item, observed_binding)
+            if len(stable_owner_ids | target_owner_ids) > 1:
+                return False
+        binding = matched_binding or self._match_binding(item)
         worker: Worker | None = None
         if binding is not None:
             worker = self._workers.get(binding.worker_id)
         if worker is None:
             if binding is None and not _has_public_worker_identity(item):
                 return False
-            observed_worker, _event_binding, matched_binding = self._event_worker_and_binding(item, status="closed")
+            if observed_worker is None:
+                observed_worker, _event_binding, matched_binding = self._event_worker_and_binding(
+                    item,
+                    status="closed",
+                    pane_info_observed=False,
+                )
             if matched_binding is not None:
                 binding = matched_binding
             worker = observed_worker
@@ -1218,13 +1926,29 @@ class HerdrEventBackend:
                 now=utc_timestamp(),
                 reason=reason,
             )
+        if (
+            pane_info_observed
+            and observed_worker is not None
+            and _authenticated_local_stable_key(observed_worker) is not None
+        ):
+            self._event_continuity_revalidated = True
         return True
 
     def _persist_current_state(self) -> Snapshot:
         spaces = list(self._spaces.values())
         workers = list(self._workers.values())
-        outcome = "healthy_non_empty" if spaces or _observed_worker_count(workers) else "empty_healthy"
-        health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
+        if (
+            self._health.outcome == "continuity_unavailable"
+            and not self._event_continuity_revalidated
+        ):
+            health = self._health.to_backend_health(spaces=spaces, workers=workers)
+        else:
+            outcome = (
+                "healthy_non_empty"
+                if spaces or _observed_worker_count(workers)
+                else "empty_healthy"
+            )
+            health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
         snapshot = project_from_observations(
             self.config,
             spaces=spaces,
@@ -1254,13 +1978,19 @@ class HerdrEventBackend:
         previous = latest_snapshot(self.db_path, self.config.host_id)
         spaces = list(previous.spaces) if previous is not None else list(self._spaces.values())
         workers = list(previous.workers) if previous is not None else list(self._workers.values())
-        health = herdr_backend_health(
-            "worker_cap_exceeded",
-            observed_at=now,
-            message="Herdr observation exceeded the configured worker cap",
-            spaces=spaces,
-            workers=workers,
-        )
+        if (
+            self._health.outcome == "continuity_unavailable"
+            and not self._event_continuity_revalidated
+        ):
+            health = self._health.to_backend_health(spaces=spaces, workers=workers)
+        else:
+            health = herdr_backend_health(
+                "worker_cap_exceeded",
+                observed_at=now,
+                message="Herdr observation exceeded the configured worker cap",
+                spaces=spaces,
+                workers=workers,
+            )
         snapshot = project_from_observations(
             self.config,
             spaces=spaces,
@@ -1284,8 +2014,15 @@ class HerdrEventBackend:
 
     def _mark_unhealthy(self, outcome: str) -> Snapshot:
         with self._lock:
-            health_state = self._health_for(outcome)
+            if (
+                self._health.outcome == "continuity_unavailable"
+                and not self._event_continuity_revalidated
+            ):
+                health_state = self._health
+            else:
+                health_state = self._health_for(outcome)
             self._health = health_state
+            self._event_continuity_revalidated = False
             spaces = list(self._spaces.values())
             workers = list(self._workers.values())
             if not spaces and not workers:

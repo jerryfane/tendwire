@@ -54,6 +54,7 @@ class Config:
             object.__setattr__(self, "db_path", Path(self.db_path).expanduser())
         if self.socket_path is not None:
             object.__setattr__(self, "socket_path", Path(self.socket_path).expanduser())
+
         if self.herdr_timeout_seconds <= 0:
             raise ValueError("herdr_timeout_seconds must be positive")
         backend = str(self.herdr_backend or "").strip().lower()
@@ -100,6 +101,21 @@ class Config:
                 minimum=1,
             ),
         )
+
+    @property
+    def installation_key_path(self) -> Path:
+        """Private stable-worker installation key path."""
+        return self.data_dir / "installation.key"
+
+    @property
+    def installation_key_marker_path(self) -> Path:
+        """Nonsecret digest marker used to detect installation key loss."""
+        return self.data_dir / "installation.key.sha256"
+
+    @property
+    def installation_key_sentinel_path(self) -> Path:
+        """Nonsecret durable marker that the installation identity was initialized."""
+        return self.data_dir / "installation.key.initialized"
 
 
 def _non_negative_float(value: float | str, name: str) -> float:

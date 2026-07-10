@@ -358,6 +358,7 @@ BACKEND_HEALTH_OUTCOMES = frozenset(
         "protocol_error",
         "socket_disconnected",
         "worker_cap_exceeded",
+        "continuity_unavailable",
         "unknown",
     }
 )

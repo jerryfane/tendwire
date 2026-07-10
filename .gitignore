@@ -41,6 +41,9 @@ Thumbs.db
 
 # Tendwire local data
 *.db
+installation.key
+installation.key.sha256
+installation.key.initialized
 
 # Local coordination notes
 HANDOFF.md

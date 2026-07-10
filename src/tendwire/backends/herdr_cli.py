@@ -32,11 +32,20 @@ from ..core.models import (
     utc_timestamp,
     worker_binding_private_fingerprint,
 )
+from ..worker_identity import (
+    InstallationKeyError,
+    STABLE_KEY_VERSION,
+    canonical_herdr_pane_identity,
+    load_or_create_installation_key,
+    stable_worker_key,
+)
 
 
 _HERDR_TIMEOUT_SECONDS = 5.0
 _BACKEND_NAME = "herdr"
-_AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
+_AMBIGUOUS_BINDING_REASONS = frozenset(
+    {"ambiguous_pane_match", "duplicate_backend_target", "not_unique"}
+)
 
 @dataclass(frozen=True)
 class _WorkerRecord:
@@ -44,9 +53,15 @@ class _WorkerRecord:
     private_fingerprint: str
     turn_target_kind: str | None = None
     turn_target_value: str | None = None
-    # herdr's durable terminal id (survives restart), read from the raw item and threaded through the
-    # pane merge / dedup so stable_key can hash it instead of the churning positional pane_id.
+    # Raw top-level Herdr fields retained only in memory. The public pane id is
+    # authoritative only when it canonically belongs to the workspace id.
+    workspace_id: str | None = None
+    pane_id: str | None = None
     terminal_id: str | None = None
+    agent_session_id: str | None = None
+    # Continuity is authorized only by a PaneInfo observation, never by
+    # workspace/pane-shaped fields reported by agent.list.
+    pane_info_observed: bool = False
 
 _FORBIDDEN_CONNECTOR_FIELDS = {
     "telegram",
@@ -75,6 +90,10 @@ _STATUS_KEYS = (
 _BACKEND_TARGET_KINDS = frozenset(
     {"agent_id", "terminal_id", "pane_id", "agent", "name", "label"}
 )
+_AGENT_SCOPED_BACKEND_TARGET_KINDS = frozenset({"agent_id", "agent"})
+_SESSION_SCOPED_TURN_TARGET_KINDS = frozenset(
+    {"codex_session_id", "omp_session_path"}
+)
 _DEADLINE_EXHAUSTED_OUTCOMES = frozenset({"timeout", "deadline_exhausted"})
 _UNAVAILABLE_HEALTH_OUTCOMES = frozenset({"missing_binary", "launch_error", "socket_disconnected"})
 _DEGRADED_HEALTH_OUTCOMES = frozenset(
@@ -85,6 +104,7 @@ _DEGRADED_HEALTH_OUTCOMES = frozenset(
         "malformed_json",
         "protocol_error",
         "worker_cap_exceeded",
+        "continuity_unavailable",
     }
 )
 
@@ -100,6 +120,7 @@ _HEALTH_MESSAGES = {
     "protocol_error": "Herdr protocol returned an invalid envelope",
     "socket_disconnected": "Herdr socket disconnected",
     "worker_cap_exceeded": "Herdr observation exceeded the configured worker cap",
+    "continuity_unavailable": "Herdr continuity identity is unavailable",
     "unknown": "Herdr observation state is unknown",
 }
 
@@ -174,6 +195,7 @@ def herdr_backend_health(
         "protocol_error",
         "socket_disconnected",
         "worker_cap_exceeded",
+        "continuity_unavailable",
         "unknown",
     }:
         normalized_outcome = "unknown"
@@ -279,6 +301,26 @@ def _compact_field_name(key: object) -> str:
 def _field_matches(key: object, expected: str) -> bool:
     """Return True when a payload key matches snake_case or camelCase spelling."""
     return _compact_field_name(key) == _compact_field_name(expected)
+
+def _is_reserved_stable_key_field(key: object) -> bool:
+    """Match the entire current and future normalized stable-key family."""
+    compact = str(key).lower().replace("_", "").replace("-", "").replace(".", "")
+    return compact.startswith("stablekey")
+
+
+def _strip_stable_key_fields(value: Any) -> Any:
+    """Recursively remove every source-controlled stable-key family field."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_stable_key_fields(child)
+            for key, child in value.items()
+            if not _is_reserved_stable_key_field(key)
+        }
+    if isinstance(value, list):
+        return [_strip_stable_key_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_stable_key_fields(item) for item in value]
+    return value
 
 
 def _private_fingerprint(value: Any) -> str:
@@ -719,6 +761,7 @@ def _status_from_item(item: Mapping[str, Any]) -> tuple[str, str | None]:
 
 def _meta_from_item(item: Mapping[str, Any], excluded_keys: set[str], raw_status: str | None) -> dict[str, Any]:
     """Build sanitized neutral metadata for a projected model."""
+    item = _strip_stable_key_fields(item)
     explicit_meta = _value_for_key(item, "meta")
     meta = {
         str(key): _strip_status_fields(value)
@@ -1001,7 +1044,12 @@ def _worker_with_summary(worker: Worker, summary: str | None) -> Worker:
     )
 
 
-def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = None) -> _WorkerRecord:
+def _worker_record_from_item(
+    item: Mapping[str, Any],
+    config: Config | None = None,
+    *,
+    pane_info_observed: bool = False,
+) -> _WorkerRecord:
     worker = _worker_from_item(item)
     worker = _worker_with_summary(worker, _bounded_excerpt(worker.summary, _output_excerpt_limit(config)))
     turn_target = _turn_target_from_item(item)
@@ -1010,7 +1058,14 @@ def _worker_record_from_item(item: Mapping[str, Any], config: Config | None = No
         private_fingerprint=_private_identity_from_item(item, config),
         turn_target_kind=turn_target[0] if turn_target is not None else None,
         turn_target_value=turn_target[1] if turn_target is not None else None,
+        workspace_id=_first_text(item, ("workspace_id", "workspaceId")),
+        pane_id=_first_text(item, ("pane_id", "paneId")),
         terminal_id=_first_text(item, ("terminal_id", "terminalId")),
+        agent_session_id=(
+            _nested_text(item, "agent_session", "value")
+            or _first_text(item, ("session_id", "sessionId"))
+        ),
+        pane_info_observed=pane_info_observed,
     )
 
 
@@ -1028,48 +1083,50 @@ def _worker_with_backend_target(worker: Worker, backend_target: dict[str, Any] |
     )
 
 
-def _stable_pane_identity(record: _WorkerRecord) -> tuple[str, str]:
-    """The worker's durable identity as (kind, value), or ("", "") when none is exposed. The DURABLE
-    terminal_id is preferred: herdr's public pane_id is the positional {ws}-{n} form, renumbered when a
-    sibling closes and re-enumerated by iteration order on restart — exactly the churn stable_key exists
-    to survive — whereas terminal_id is a registry key that persists across restart. pane_id (turn-target,
-    then backend-target) is used only as a fallback when no terminal id is exposed; agent_id / session ids
-    are excluded (session-dependent). Two split panes in one tab share a terminal_id and so will share a
-    stable_key — the consumer (herdres#147) guards against fusing two live same-key panes, so keeping this
-    simple is acceptable. Resolved after the pane merge, so it reads the record's finalized fields."""
-    if record.terminal_id:
-        return "terminal_id", str(record.terminal_id)
-    target = record.worker.backend_target
-    if isinstance(target, Mapping) and str(target.get("kind") or "") == "terminal_id":
-        return "terminal_id", str(target.get("value") or "")
-    if record.turn_target_kind == "pane_id" and record.turn_target_value:
-        return "pane_id", str(record.turn_target_value)
-    if isinstance(target, Mapping) and str(target.get("kind") or "") == "pane_id":
-        return "pane_id", str(target.get("value") or "")
-    return "", ""
-
-
-def _worker_with_stable_key(config: Config, record: _WorkerRecord) -> Worker:
-    """Return the record's worker with meta.stable_key set to a session-INDEPENDENT hash of its durable
-    identity — the terminal_id that survives restart, falling back to the pane_id only when no terminal
-    id is exposed (or the worker unchanged when it exposes neither — e.g. codex/omp report only a session
-    id here). A connector reconciles a re-lettered worker id back to the same pane via this key instead
-    of stranding a duplicate topic. Reuses the private-binding hash, so the raw id never leaks."""
-    kind, value = _stable_pane_identity(record)
-    worker = record.worker
-    if not value:
-        return worker
-    stable_key = worker_binding_private_fingerprint(
-        host_id=config.host_id,
-        backend=_BACKEND_NAME,
-        identity_material={"stable_pane": {"kind": kind, "value": value, "space_id": worker.space_id}},
+def _agent_observation_record(
+    item: Mapping[str, Any],
+    config: Config | None = None,
+) -> _WorkerRecord:
+    """Record agent.list provenance without authorizing pane continuity."""
+    return _worker_record_from_item(
+        item,
+        config,
+        pane_info_observed=False,
     )
+
+
+def _stable_pane_identity(record: _WorkerRecord) -> tuple[str, str] | None:
+    """Return a PaneInfo-verified workspace/public-pane pair, never a runtime id."""
+    if not record.pane_info_observed:
+        return None
+    return canonical_herdr_pane_identity(record.workspace_id, record.pane_id)
+
+
+def _worker_with_stable_key(
+    config: Config,
+    record: _WorkerRecord,
+    installation_key: bytes | None,
+) -> Worker:
+    """Replace source continuity metadata with a locally authenticated key."""
+    worker = record.worker
+    meta = _strip_stable_key_fields(worker.meta)
+    identity = _stable_pane_identity(record)
+    if installation_key is not None and identity is not None:
+        workspace_id, pane_id = identity
+        meta["stable_key"] = stable_worker_key(
+            installation_key,
+            backend=_BACKEND_NAME,
+            host_id=config.host_id,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+        )
+        meta["stable_key_version"] = STABLE_KEY_VERSION
     return Worker(
         id=worker.id,
         name=worker.name,
         status=worker.status,
         space_id=worker.space_id,
-        meta={**worker.meta, "stable_key": stable_key},
+        meta=meta,
         last_seen_at=worker.last_seen_at,
         summary=worker.summary,
         fingerprint=worker.fingerprint,
@@ -1094,6 +1151,9 @@ def _mark_backend_sendability(workers: list[Worker]) -> list[Worker]:
             continue
         kind = str(target.get("kind") or "")
         value = _backend_target_send_token(target)
+        if target.get("sendable") is False:
+            marked.append(worker)
+            continue
         if kind not in _BACKEND_TARGET_KINDS or not value:
             marked.append(
                 _worker_with_backend_target(
@@ -1170,7 +1230,11 @@ def _record_with_worker(record: _WorkerRecord, worker: Worker) -> _WorkerRecord:
         private_fingerprint=record.private_fingerprint,
         turn_target_kind=record.turn_target_kind,
         turn_target_value=record.turn_target_value,
+        workspace_id=record.workspace_id,
+        pane_id=record.pane_id,
         terminal_id=record.terminal_id,
+        agent_session_id=record.agent_session_id,
+        pane_info_observed=record.pane_info_observed,
     )
 
 
@@ -1334,10 +1398,26 @@ def _workers_and_bindings_from_records(
     records: list[_WorkerRecord],
     *,
     stored_bindings: Sequence[WorkerBinding] | None = None,
+    require_authenticated_continuity: bool = False,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     observed_at = utc_timestamp()
     deduplicated = _deduplicated_worker_records(records, stored_bindings)
-    workers = [_worker_with_stable_key(config, record) for record in deduplicated]
+    installation_key = None
+    if any(
+        _stable_pane_identity(record) is not None
+        or (require_authenticated_continuity and record.pane_info_observed)
+        for record in deduplicated
+    ):
+        try:
+            installation_key = load_or_create_installation_key(config.data_dir)
+        except InstallationKeyError:
+            if require_authenticated_continuity:
+                raise
+            installation_key = None
+    workers = [
+        _worker_with_stable_key(config, record, installation_key)
+        for record in deduplicated
+    ]
     bindings = [
         binding
         for record in deduplicated
@@ -1428,7 +1508,7 @@ def _workers_from_payload(
     """Extract neutral Worker objects from a herdr agent-list payload."""
     records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
-        records.append(_worker_record_from_item(item, config))
+        records.append(_agent_observation_record(item, config))
     return _deduplicate_worker_records(records, stored_bindings)
 
 
@@ -1439,7 +1519,7 @@ def _workers_and_bindings_from_payload(
 ) -> tuple[list[Worker], list[WorkerBinding]]:
     records: list[_WorkerRecord] = []
     for item in _payload_items(payload, ("agents", "workers", "data", "items", "results", "result")):
-        records.append(_worker_record_from_item(item, config))
+        records.append(_agent_observation_record(item, config))
     return _workers_and_bindings_from_records(config, records, stored_bindings=stored_bindings)
 
 
@@ -1459,17 +1539,441 @@ def _pane_has_agent(item: Mapping[str, Any]) -> bool:
     return False
 
 
+def _record_match_keys(
+    item: Mapping[str, Any],
+    record: _WorkerRecord,
+    *,
+    pane_shaped: bool = False,
+) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    pane_id_keys = ("pane_id", "paneId", "id") if pane_shaped else ("pane_id", "paneId")
+    agent_session = (
+        _nested_text(item, "agent_session", "value")
+        or _first_text(item, ("session_id", "sessionId"))
+    )
+    for kind, value in (
+        ("pane_id", _first_text(item, pane_id_keys)),
+        ("terminal_id", _first_text(item, ("terminal_id", "terminalId"))),
+        ("agent_session", agent_session),
+        ("private_fingerprint", str(record.private_fingerprint)),
+    ):
+        if value and (kind, value) not in keys:
+            keys.append((kind, value))
+    return keys
+
+
+def _backend_target_present(target: Any) -> bool:
+    return (
+        isinstance(target, Mapping)
+        and bool(str(target.get("kind") or ""))
+        and bool(str(target.get("value") or ""))
+    )
+
+
+def _compatible_backend_target(
+    agent_record: _WorkerRecord,
+    pane_record: _WorkerRecord,
+) -> dict[str, Any] | None:
+    """Retain only verified agent-scoped targets; PaneInfo owns pane targets."""
+    agent_target = agent_record.worker.backend_target
+    pane_target = pane_record.worker.backend_target
+    if not _backend_target_present(agent_target):
+        return pane_target if _backend_target_present(pane_target) else None
+
+    kind = str(agent_target.get("kind") or "")
+    value = str(agent_target.get("value") or "")
+    if (
+        kind == "agent_id"
+        and _backend_target_present(pane_target)
+        and str(pane_target.get("kind") or "") == "agent_id"
+        and str(pane_target.get("value") or "") != value
+    ):
+        return pane_target
+    if kind in _AGENT_SCOPED_BACKEND_TARGET_KINDS and (
+        kind != "agent" or value == pane_record.worker.name
+    ):
+        return agent_target
+    return pane_target if _backend_target_present(pane_target) else None
+
+
+def _compatible_turn_target(
+    agent_record: _WorkerRecord,
+    pane_record: _WorkerRecord,
+) -> tuple[str | None, str | None]:
+    """Prefer PaneInfo targets unless a compatible session target is more precise."""
+    agent_kind = agent_record.turn_target_kind
+    agent_value = agent_record.turn_target_value
+    pane_kind = pane_record.turn_target_kind
+    pane_value = pane_record.turn_target_value
+    if agent_kind in _SESSION_SCOPED_TURN_TARGET_KINDS and agent_value:
+        pane_session_id = pane_record.agent_session_id
+        if pane_session_id and pane_session_id != agent_value:
+            if pane_kind and pane_value:
+                return pane_kind, pane_value
+            return None, None
+        if pane_kind in _SESSION_SCOPED_TURN_TARGET_KINDS and pane_value:
+            return pane_kind, pane_value
+        return agent_kind, agent_value
+    if pane_kind and pane_value:
+        return pane_kind, pane_value
+    return None, None
+
+
+def _ambiguous_agent_record(
+    record: _WorkerRecord,
+    *,
+    config: Config | None = None,
+    observation: Mapping[str, Any] | None = None,
+) -> _WorkerRecord:
+    """Fail closed and retain a unique auditable row for ambiguous ownership."""
+    worker = record.worker
+    target = worker.backend_target
+    if _backend_target_present(target):
+        worker = _worker_with_backend_target(
+            worker,
+            _private_backend_target(
+                str(target.get("kind") or ""),
+                str(target.get("value") or ""),
+                sendable=False,
+                reason="ambiguous_pane_match",
+            ),
+        )
+    private_fingerprint = record.private_fingerprint
+    if config is not None and observation is not None:
+        private_fingerprint = worker_binding_private_fingerprint(
+            host_id=config.host_id,
+            backend=_BACKEND_NAME,
+            identity_material={
+                "ambiguous_pane_ownership": dict(observation),
+                "source_private_fingerprint": record.private_fingerprint,
+            },
+        )
+    return _WorkerRecord(
+        worker=worker,
+        private_fingerprint=private_fingerprint,
+        workspace_id=record.workspace_id,
+        pane_id=record.pane_id,
+        terminal_id=record.terminal_id,
+        agent_session_id=record.agent_session_id,
+        pane_info_observed=False,
+    )
+
+
+def _merge_agent_pane_record(
+    agent_record: _WorkerRecord,
+    pane_record: _WorkerRecord | None,
+) -> _WorkerRecord:
+    if pane_record is None:
+        return agent_record
+    pane_meta = pane_record.worker.meta
+    merged_meta = dict(agent_record.worker.meta)
+    label = pane_meta.get("label")
+    if isinstance(label, str) and label.strip():
+        merged_meta["label"] = label
+    for key in ("foreground_cwd", "cwd"):
+        value = pane_meta.get(key)
+        if isinstance(value, str) and value.strip() and not merged_meta.get(key):
+            merged_meta[key] = value
+
+    backend_target = _compatible_backend_target(agent_record, pane_record)
+    worker = agent_record.worker
+    pane_space_id = pane_record.worker.space_id
+    if (
+        merged_meta != worker.meta
+        or backend_target != worker.backend_target
+        or pane_space_id != worker.space_id
+    ):
+        worker = Worker(
+            id=worker.id,
+            name=worker.name,
+            status=worker.status,
+            space_id=pane_space_id,
+            meta=merged_meta,
+            last_seen_at=worker.last_seen_at,
+            summary=worker.summary,
+            backend_target=backend_target,
+        )
+
+    turn_target_kind, turn_target_value = _compatible_turn_target(
+        agent_record,
+        pane_record,
+    )
+
+    workspace_id = pane_record.workspace_id
+    pane_id = pane_record.pane_id
+    terminal_id = pane_record.terminal_id
+    if (
+        worker == agent_record.worker
+        and turn_target_kind == agent_record.turn_target_kind
+        and turn_target_value == agent_record.turn_target_value
+        and workspace_id == agent_record.workspace_id
+        and pane_id == agent_record.pane_id
+        and terminal_id == agent_record.terminal_id
+        and agent_record.pane_info_observed
+    ):
+        return agent_record
+    return _WorkerRecord(
+        worker=worker,
+        private_fingerprint=agent_record.private_fingerprint,
+        turn_target_kind=turn_target_kind,
+        turn_target_value=turn_target_value,
+        workspace_id=workspace_id,
+        pane_id=pane_id,
+        terminal_id=terminal_id,
+        agent_session_id=pane_record.agent_session_id,
+        pane_info_observed=True,
+    )
+
+
+def _collapse_exact_observation_items(
+    items: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse byte-equivalent JSON observations before ownership cardinality."""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in items:
+        signature = json.dumps(
+            item,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(dict(item))
+    return unique
+
+
+def _record_ownership_keys(
+    item: Mapping[str, Any],
+    record: _WorkerRecord,
+    *,
+    pane_shaped: bool = False,
+) -> set[tuple[str, str]]:
+    keys = set(
+        _record_match_keys(
+            item,
+            record,
+            pane_shaped=pane_shaped,
+        )
+    )
+    backend_target = record.worker.backend_target
+    if _backend_target_present(backend_target):
+        keys.add(
+            (
+                f"backend:{backend_target.get('kind')}",
+                str(backend_target.get("value") or ""),
+            )
+        )
+        keys.add(
+            (
+                "backend_send_token",
+                str(backend_target.get("value") or ""),
+            )
+        )
+    if record.turn_target_kind and record.turn_target_value:
+        keys.add(
+            (
+                f"turn:{record.turn_target_kind}",
+                record.turn_target_value,
+            )
+        )
+    return keys
+
+
+def _pane_ownership_graph(
+    agent_items: Sequence[Mapping[str, Any]],
+    agent_records: Sequence[_WorkerRecord],
+    pane_items: Sequence[Mapping[str, Any]],
+    pane_records: Sequence[_WorkerRecord],
+) -> tuple[list[set[int]], set[int], set[int]]:
+    """Return agent-to-pane edges and every ambiguous ownership component."""
+    agent_nodes = [("agent", index) for index in range(len(agent_records))]
+    pane_nodes = [("pane", index) for index in range(len(pane_records))]
+    adjacency: dict[tuple[str, int], set[tuple[str, int]]] = {
+        node: set() for node in [*agent_nodes, *pane_nodes]
+    }
+    ambiguous_seeds: set[tuple[str, int]] = set()
+
+    pane_indices_by_match: dict[tuple[str, str], set[int]] = {}
+    pane_indices_by_owner: dict[tuple[str, str], set[int]] = {}
+    for pane_index, (item, record) in enumerate(
+        zip(pane_items, pane_records, strict=True)
+    ):
+        match_keys = _record_match_keys(item, record, pane_shaped=True)
+        for key in match_keys:
+            pane_indices_by_match.setdefault(key, set()).add(pane_index)
+        for key in _record_ownership_keys(item, record, pane_shaped=True):
+            pane_indices_by_owner.setdefault(key, set()).add(pane_index)
+
+    # Each private pane, terminal, session, or agent identity may own only one
+    # PaneInfo row. Exact duplicate rows were already collapsed above.
+    for pane_indices in pane_indices_by_owner.values():
+        if len(pane_indices) < 2:
+            continue
+        ordered = sorted(pane_indices)
+        first_node = ("pane", ordered[0])
+        ambiguous_seeds.update(("pane", index) for index in ordered)
+        for pane_index in ordered[1:]:
+            pane_node = ("pane", pane_index)
+            adjacency[first_node].add(pane_node)
+            adjacency[pane_node].add(first_node)
+
+    agent_matches: list[set[int]] = []
+    pane_claimants: dict[int, set[int]] = {}
+    agent_indices_by_owner: dict[tuple[str, str], set[int]] = {}
+    for agent_index, (item, record) in enumerate(
+        zip(agent_items, agent_records, strict=True)
+    ):
+        matches: set[int] = set()
+        for key in _record_match_keys(item, record):
+            matches.update(pane_indices_by_match.get(key, ()))
+        agent_matches.append(matches)
+        agent_node = ("agent", agent_index)
+        owner_keys = _record_ownership_keys(item, record)
+        for key in owner_keys:
+            agent_indices_by_owner.setdefault(key, set()).add(agent_index)
+            if key[0] != "backend_send_token":
+                continue
+            for pane_index in pane_indices_by_owner.get(key, ()):
+                if pane_index in matches:
+                    continue
+                pane_node = ("pane", pane_index)
+                adjacency[agent_node].add(pane_node)
+                adjacency[pane_node].add(agent_node)
+                ambiguous_seeds.add(agent_node)
+                ambiguous_seeds.add(pane_node)
+        for pane_index in matches:
+            pane_node = ("pane", pane_index)
+            adjacency[agent_node].add(pane_node)
+            adjacency[pane_node].add(agent_node)
+            pane_claimants.setdefault(pane_index, set()).add(agent_index)
+        if len(matches) > 1:
+            ambiguous_seeds.add(agent_node)
+            ambiguous_seeds.update(("pane", index) for index in matches)
+
+    for agent_indices in agent_indices_by_owner.values():
+        if len(agent_indices) < 2:
+            continue
+        if not any(agent_matches[index] for index in agent_indices):
+            continue
+        ordered = sorted(agent_indices)
+        first_node = ("agent", ordered[0])
+        ambiguous_seeds.update(("agent", index) for index in ordered)
+        for agent_index in ordered[1:]:
+            agent_node = ("agent", agent_index)
+            adjacency[first_node].add(agent_node)
+            adjacency[agent_node].add(first_node)
+
+    for pane_index, claimants in pane_claimants.items():
+        if len(claimants) < 2:
+            continue
+        ambiguous_seeds.add(("pane", pane_index))
+        ambiguous_seeds.update(("agent", index) for index in claimants)
+
+    ambiguous_nodes = set(ambiguous_seeds)
+    pending = list(ambiguous_seeds)
+    while pending:
+        node = pending.pop()
+        for adjacent in adjacency[node]:
+            if adjacent in ambiguous_nodes:
+                continue
+            ambiguous_nodes.add(adjacent)
+            pending.append(adjacent)
+
+    return (
+        agent_matches,
+        {index for kind, index in ambiguous_nodes if kind == "agent"},
+        {index for kind, index in ambiguous_nodes if kind == "pane"},
+    )
+
+
+def _records_from_agent_and_pane_payloads(
+    config: Config | None,
+    agent_payload: Any,
+    pane_payload: Any,
+    *,
+    include_unmatched_panes: bool = True,
+) -> list[_WorkerRecord]:
+    """Merge PaneInfo identity only across a one-to-one ownership graph."""
+    pane_items = _collapse_exact_observation_items(
+        [
+            item
+            for item in _payload_items(
+                pane_payload,
+                ("panes", "items", "data", "results", "result"),
+            )
+            if _pane_has_agent(item)
+        ]
+    )
+    pane_records = [
+        _worker_record_from_item(item, config, pane_info_observed=True)
+        for item in pane_items
+    ]
+    agent_items = _collapse_exact_observation_items(
+        _payload_items(
+            agent_payload,
+            ("agents", "workers", "data", "items", "results", "result"),
+        )
+    )
+    agent_records = [
+        _agent_observation_record(item, config)
+        for item in agent_items
+    ]
+    agent_matches, ambiguous_agents, ambiguous_panes = _pane_ownership_graph(
+        agent_items,
+        agent_records,
+        pane_items,
+        pane_records,
+    )
+
+    records: list[_WorkerRecord] = []
+    consumed_pane_indices: set[int] = set()
+    for agent_index, record in enumerate(agent_records):
+        matched_pane_indices = agent_matches[agent_index]
+        consumed_pane_indices.update(matched_pane_indices)
+        if agent_index in ambiguous_agents:
+            records.append(
+                _ambiguous_agent_record(
+                    record,
+                    config=config,
+                    observation=agent_items[agent_index],
+                )
+            )
+        elif len(matched_pane_indices) == 1:
+            matched_pane_index = next(iter(matched_pane_indices))
+            records.append(
+                _merge_agent_pane_record(record, pane_records[matched_pane_index])
+            )
+        else:
+            records.append(record)
+    if include_unmatched_panes:
+        records.extend(
+            _ambiguous_agent_record(
+                record,
+                config=config,
+                observation=pane_items[index],
+            )
+            if index in ambiguous_panes
+            else record
+            for index, record in enumerate(pane_records)
+            if index not in consumed_pane_indices
+        )
+    return records
+
+
 def _workers_from_pane_payload(
     payload: Any,
     config: Config | None = None,
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> list[Worker]:
-    """Extract worker objects from herdr pane list, only for agent-bearing panes."""
-    records: list[_WorkerRecord] = []
-    for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
-        if not _pane_has_agent(item):
-            continue
-        records.append(_worker_record_from_item(item, config))
+    """Extract pane workers through the ownership graph."""
+    records = _records_from_agent_and_pane_payloads(
+        config,
+        None,
+        payload,
+    )
     return _deduplicate_worker_records(records, stored_bindings)
 
 
@@ -1478,12 +1982,16 @@ def _workers_and_bindings_from_pane_payload(
     config: Config,
     stored_bindings: Sequence[WorkerBinding] | None = None,
 ) -> tuple[list[Worker], list[WorkerBinding]]:
-    records: list[_WorkerRecord] = []
-    for item in _payload_items(payload, ("panes", "items", "data", "results", "result")):
-        if not _pane_has_agent(item):
-            continue
-        records.append(_worker_record_from_item(item, config))
-    return _workers_and_bindings_from_records(config, records, stored_bindings=stored_bindings)
+    records = _records_from_agent_and_pane_payloads(
+        config,
+        None,
+        payload,
+    )
+    return _workers_and_bindings_from_records(
+        config,
+        records,
+        stored_bindings=stored_bindings,
+    )
 
 
 def _probe_payload_variants(
@@ -1514,14 +2022,27 @@ def _probe_payload_variants(
     return outcomes[-1] if outcomes else "nonzero", None
 
 
-def _degraded_observation(outcome: str, message: str) -> HerdrCommandObservation:
-    health = herdr_backend_health(outcome, message=message)
-    return HerdrCommandObservation(
-        spaces=[],
-        workers=[],
-        status=health.status,
-        outcome=outcome,
+def _degraded_observation(
+    outcome: str,
+    message: str,
+    *,
+    spaces: Sequence[Space] | None = None,
+    workers: Sequence[Worker] | None = None,
+) -> HerdrCommandObservation:
+    observed_spaces = list(spaces or [])
+    observed_workers = list(workers or [])
+    health = herdr_backend_health(
+        outcome,
         message=message,
+        spaces=observed_spaces,
+        workers=observed_workers,
+    )
+    return HerdrCommandObservation(
+        spaces=observed_spaces,
+        workers=observed_workers,
+        status=health.status,
+        outcome=health.outcome,
+        message=health.message,
         backend_health=[health],
     )
 
@@ -1589,25 +2110,40 @@ def fetch_herdr_command_observation(
         )
 
     spaces = _spaces_from_payload(workspace_payload)
-    workers, bindings = _workers_and_bindings_from_payload(
-        agent_payload,
+    try:
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
+    except TypeError:
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+    records = _records_from_agent_and_pane_payloads(
         config,
-        stored_bindings=stored_bindings,
-    )
-    if not workers:
-        try:
-            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
-        except TypeError:
-            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
-        if pane_outcome != "ok":
-            return _degraded_observation(
-                pane_outcome,
-                "Herdr pane fallback observation is not healthy",
+        agent_payload,
+        pane_payload if pane_outcome == "ok" else None,
+        include_unmatched_panes=not bool(
+            _payload_items(
+                agent_payload,
+                ("agents", "workers", "data", "items", "results", "result"),
             )
-        workers, bindings = _workers_and_bindings_from_pane_payload(
-            pane_payload,
+        ),
+    )
+    try:
+        workers, bindings = _workers_and_bindings_from_records(
             config,
+            records,
             stored_bindings=stored_bindings,
+            require_authenticated_continuity=True,
+        )
+    except InstallationKeyError:
+        return _degraded_observation(
+            "continuity_unavailable",
+            _HEALTH_MESSAGES["continuity_unavailable"],
+            spaces=spaces,
+        )
+    if pane_outcome != "ok":
+        return _degraded_observation(
+            pane_outcome,
+            "Herdr pane continuity observation is not healthy",
+            spaces=spaces,
+            workers=workers,
         )
 
     return HerdrCommandObservation(
@@ -1697,30 +2233,35 @@ def fetch_herdr_snapshot_observation(
             message=_HEALTH_MESSAGES[agent_outcome],
         )
 
-    workers, bindings = _workers_and_bindings_from_payload(
-        agent_payload,
+    try:
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
+    except TypeError:
+        pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
+    records = _records_from_agent_and_pane_payloads(
         config,
-        stored_bindings=stored_bindings,
-    )
-    pane_outcome = "ok"
-    if not workers:
-        try:
-            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config, budget)
-        except TypeError:
-            pane_outcome, pane_payload = _probe_herdr(["pane", "list"], config)
-        if pane_outcome != "ok":
-            outcome = pane_outcome if pane_outcome in _DEADLINE_EXHAUSTED_OUTCOMES else pane_outcome
-            return _snapshot_observation(
-                spaces,
-                [],
-                [],
-                outcome,
-                message=_HEALTH_MESSAGES.get(outcome, _HEALTH_MESSAGES["unknown"]),
+        agent_payload,
+        pane_payload if pane_outcome == "ok" else None,
+        include_unmatched_panes=not bool(
+            _payload_items(
+                agent_payload,
+                ("agents", "workers", "data", "items", "results", "result"),
             )
-        workers, bindings = _workers_and_bindings_from_pane_payload(
-            pane_payload,
+        ),
+    )
+    try:
+        workers, bindings = _workers_and_bindings_from_records(
             config,
+            records,
             stored_bindings=stored_bindings,
+            require_authenticated_continuity=True,
+        )
+    except InstallationKeyError:
+        return _snapshot_observation(
+            spaces,
+            [],
+            [],
+            "continuity_unavailable",
+            message=_HEALTH_MESSAGES["continuity_unavailable"],
         )
 
     failed_outcomes = [

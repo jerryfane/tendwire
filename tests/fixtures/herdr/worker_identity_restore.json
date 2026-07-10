@@ -1,0 +1,224 @@
+{
+  "session_snapshot": {
+    "version": 3,
+    "workspaces": [
+      {
+        "id": "wR9",
+        "custom_name": "continuity",
+        "identity_cwd": "/continuity",
+        "public_pane_numbers": {
+          "41": 10,
+          "42": 11
+        },
+        "next_public_pane_number": 12,
+        "public_tab_numbers": [1],
+        "next_public_tab_number": 2,
+        "tabs": [
+          {
+            "custom_name": "main",
+            "layout": {
+              "Split": {
+                "direction": "Horizontal",
+                "ratio": 0.5,
+                "first": {
+                  "Pane": 41
+                },
+                "second": {
+                  "Pane": 42
+                }
+              }
+            },
+            "panes": {
+              "41": {
+                "cwd": "/continuity/primary",
+                "label": "primary",
+                "agent_name": "codex-before-sentinel",
+                "agent_session": {
+                  "source": "restore-before-source-sentinel",
+                  "agent": "codex-before-sentinel",
+                  "kind": "id",
+                  "value": "session-before-sentinel"
+                }
+              },
+              "42": {
+                "cwd": "/continuity/sibling",
+                "label": "sibling",
+                "agent_name": "claude-sibling-sentinel"
+              }
+            },
+            "zoomed": false,
+            "focused": 41,
+            "root_pane": 41
+          }
+        ],
+        "active_tab": 0
+      }
+    ],
+    "active": 0,
+    "selected": 0,
+    "agent_panel_scope": "AllWorkspaces",
+    "sidebar_width": 30,
+    "sidebar_section_split": 0.5,
+    "collapsed_space_keys": []
+  },
+  "pre_restore": {
+    "raw_pane_id": 41,
+    "runtime_id": "runtime-before-sentinel",
+    "worker_id": "worker-before-sentinel",
+    "agent_id": "agent-before-sentinel",
+    "pane_info": {
+      "pane_id": "wR9:pA",
+      "terminal_id": "terminal-before-sentinel",
+      "workspace_id": "wR9",
+      "tab_id": "wR9:t1",
+      "focused": true,
+      "cwd": "/continuity/primary",
+      "foreground_cwd": "/continuity/primary",
+      "label": "primary",
+      "agent": "codex-before-sentinel",
+      "title": "Before",
+      "display_agent": "Codex Before",
+      "agent_status": "working",
+      "agent_session": {
+        "source": "restore-before-source-sentinel",
+        "agent": "codex-before-sentinel",
+        "kind": "id",
+        "value": "session-before-sentinel"
+      },
+      "revision": 17
+    },
+    "sibling_pane_info": {
+      "pane_id": "wR9:pB",
+      "terminal_id": "terminal-sibling-before-sentinel",
+      "workspace_id": "wR9",
+      "tab_id": "wR9:t1",
+      "focused": false,
+      "cwd": "/continuity/sibling",
+      "label": "sibling",
+      "agent": "claude-sibling-sentinel",
+      "agent_status": "idle",
+      "revision": 9
+    }
+  },
+  "post_restore": {
+    "raw_pane_id": 907,
+    "runtime_id": "runtime-after-sentinel",
+    "worker_id": "worker-after-sentinel",
+    "agent_id": "agent-after-sentinel",
+    "pane_info": {
+      "pane_id": "wR9:pA",
+      "terminal_id": "terminal-after-sentinel",
+      "workspace_id": "wR9",
+      "tab_id": "wR9:t1",
+      "focused": true,
+      "cwd": "/continuity/primary",
+      "foreground_cwd": "/continuity/primary",
+      "label": "primary",
+      "agent": "codex-after-sentinel",
+      "title": "After",
+      "display_agent": "Codex After",
+      "agent_status": "working",
+      "agent_session": {
+        "source": "restore-after-source-sentinel",
+        "agent": "codex-after-sentinel",
+        "kind": "id",
+        "value": "session-after-sentinel"
+      },
+      "revision": 1
+    },
+    "sibling_pane_info": {
+      "pane_id": "wR9:pB",
+      "terminal_id": "terminal-sibling-after-sentinel",
+      "workspace_id": "wR9",
+      "tab_id": "wR9:t1",
+      "focused": false,
+      "cwd": "/continuity/sibling",
+      "label": "sibling",
+      "agent": "claude-sibling-after-sentinel",
+      "agent_status": "idle",
+      "revision": 1
+    }
+  },
+  "same_workspace_move": {
+    "event": "pane_moved",
+    "data": {
+      "type": "pane_moved",
+      "previous_pane_id": "wR9:pA",
+      "previous_workspace_id": "wR9",
+      "previous_tab_id": "wR9:t1",
+      "pane": {
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-move-same-sentinel",
+        "workspace_id": "wR9",
+        "tab_id": "wR9:t2",
+        "focused": true,
+        "cwd": "/continuity/primary",
+        "label": "primary",
+        "agent": "codex-move-same-sentinel",
+        "agent_status": "working",
+        "agent_session": {
+          "source": "move-same-source-sentinel",
+          "agent": "codex-move-same-sentinel",
+          "kind": "id",
+          "value": "session-move-same-sentinel"
+        },
+        "revision": 18
+      },
+      "created_tab": {
+        "tab_id": "wR9:t2",
+        "workspace_id": "wR9",
+        "number": 2,
+        "label": "moved",
+        "focused": true,
+        "pane_count": 1,
+        "agent_status": "working"
+      }
+    }
+  },
+  "cross_workspace_move": {
+    "event": "pane_moved",
+    "data": {
+      "type": "pane_moved",
+      "previous_pane_id": "wR9:pA",
+      "previous_workspace_id": "wR9",
+      "previous_tab_id": "wR9:t2",
+      "pane": {
+        "pane_id": "wD2:p7",
+        "terminal_id": "terminal-move-cross-sentinel",
+        "workspace_id": "wD2",
+        "tab_id": "wD2:t1",
+        "focused": true,
+        "cwd": "/continuity/primary",
+        "label": "primary",
+        "agent": "codex-move-cross-sentinel",
+        "agent_status": "working",
+        "agent_session": {
+          "source": "move-cross-source-sentinel",
+          "agent": "codex-move-cross-sentinel",
+          "kind": "id",
+          "value": "session-move-cross-sentinel"
+        },
+        "revision": 19
+      },
+      "created_workspace": {
+        "workspace_id": "wD2",
+        "number": 2,
+        "label": "destination",
+        "focused": true,
+        "pane_count": 1,
+        "tab_count": 1,
+        "active_tab_id": "wD2:t1",
+        "agent_status": "working"
+      },
+      "created_tab": {
+        "tab_id": "wD2:t1",
+        "workspace_id": "wD2",
+        "number": 1,
+        "label": "main",
+        "focused": true,
+        "pane_count": 1,
+        "agent_status": "working"
+      }
+    }
+  }
+}

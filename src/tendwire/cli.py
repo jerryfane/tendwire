@@ -57,6 +57,8 @@ from .store.sqlite import (
     attention_payload_from_store,
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
+    latest_healthy_backend_snapshot,
+    latest_snapshot,
     list_worker_bindings,
     reserve_command_receipt,
     run_store_maintenance,
@@ -350,22 +352,64 @@ def _fetch_snapshot_observation_with_bindings(
 ) -> tuple[list[Any], list[Any], list[WorkerBinding], list[BackendHealth]]:
     if fetch_herdr_state is not _DEFAULT_FETCH_HERDR_STATE:
         spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
-        return spaces, workers, bindings, _legacy_backend_health(spaces, workers)
-    try:
-        observation = fetch_herdr_snapshot_observation(
-            config,
-            stored_bindings=stored_bindings,
-        )
-    except TypeError:
-        spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
-        return spaces, workers, bindings, _legacy_backend_health(spaces, workers)
-
-    spaces = list(getattr(observation, "spaces", []) or [])
-    workers = list(getattr(observation, "workers", []) or [])
-    bindings = list(getattr(observation, "bindings", []) or [])
-    backend_health = list(getattr(observation, "backend_health", []) or [])
-    if not backend_health:
         backend_health = _legacy_backend_health(spaces, workers)
+    else:
+        try:
+            observation = fetch_herdr_snapshot_observation(
+                config,
+                stored_bindings=stored_bindings,
+            )
+        except TypeError:
+            spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
+            backend_health = _legacy_backend_health(spaces, workers)
+        else:
+            spaces = list(getattr(observation, "spaces", []) or [])
+            workers = list(getattr(observation, "workers", []) or [])
+            bindings = list(getattr(observation, "bindings", []) or [])
+            backend_health = list(getattr(observation, "backend_health", []) or [])
+            if not backend_health:
+                backend_health = _legacy_backend_health(spaces, workers)
+
+    health = _herdr_health_from_items(backend_health)
+    if health.status == "healthy":
+        return spaces, workers, bindings, backend_health
+
+    # Failed observations are not an authority for routing or continuity.
+    # Never persist their bindings, and retain the last authenticated public
+    # state when one has already been stored.
+    bindings = []
+    if config.db_path is None:
+        return spaces, workers, bindings, backend_health
+
+    db_path = Path(config.db_path)
+    latest = latest_snapshot(db_path, config.host_id)
+    if latest is not None:
+        latest_health = _herdr_health_from_items(list(latest.backend_health))
+        if latest_health.outcome == "continuity_unavailable":
+            health = latest_health
+
+    previous = latest_healthy_backend_snapshot(
+        db_path,
+        config.host_id,
+        backend=_HERDR_BACKEND,
+    )
+    if previous is not None:
+        spaces = list(previous.spaces)
+        workers = list(previous.workers)
+
+    retained_health = herdr_backend_health(
+        health.outcome,
+        observed_at=health.observed_at,
+        message=health.message,
+        spaces=spaces,
+        workers=workers,
+    )
+    backend_health = [
+        retained_health if item.name == _HERDR_BACKEND else item
+        for item in backend_health
+    ]
+    if not any(item.name == _HERDR_BACKEND for item in backend_health):
+        backend_health.append(retained_health)
     return spaces, workers, bindings, backend_health
 
 

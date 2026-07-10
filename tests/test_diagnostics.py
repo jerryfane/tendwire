@@ -203,7 +203,7 @@ def test_fixture_outputs_parse_through_snapshot_fail_soft_path(monkeypatch) -> N
 
     spaces, workers = fetch_herdr_state(config)
 
-    assert calls == [("workspace", "list"), ("agent", "list")]
+    assert calls == [("workspace", "list"), ("agent", "list"), ("pane", "list")]
     assert len(spaces) == 1
     assert spaces[0].id == "ws-fixture"
     assert len(workers) == 1

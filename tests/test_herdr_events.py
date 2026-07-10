@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import socket
 import threading
@@ -516,6 +517,971 @@ def test_pane_agent_detected_official_event_updates_worker_and_private_binding(t
     assert bindings[0].target_kind == "agent_id"
     assert bindings[0].target_value == "agent-2"
     _assert_no_public_json_forbidden(json.loads(snapshot.to_json()))
+
+
+@pytest.mark.parametrize(
+    "event_name",
+    [
+        "pane.created",
+        "pane.focused",
+        "pane.agent_detected",
+        "pane.agent_status_changed",
+    ],
+)
+@pytest.mark.parametrize("entity_name", ["agent", "worker"])
+def test_supported_nested_agent_or_worker_canonical_fields_cannot_mint_continuity(
+    tmp_path: Path,
+    event_name: str,
+    entity_name: str,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"nested-no-mint-{event_name}-{entity_name}",
+    )
+    backend.reconcile_once(
+        client=_StaticClient(workspaces=[{"id": "wR9", "name": "Build"}])
+    )
+    entity = {
+        "worker_id": f"public-{entity_name}",
+        "agent_id": f"{entity_name}-target-secret",
+        "name": "codex",
+        "agent": "codex",
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "status": "running",
+        "agent_session": {
+            "source": "compatibility-secret",
+            "agent": "codex",
+            "kind": "id",
+            "value": "compatibility-session-secret",
+        },
+    }
+
+    assert backend.queue_event_envelope(
+        {
+            "event": event_name,
+            "payload": {entity_name: entity},
+        }
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert len(snapshot.workers) == 1
+    worker = snapshot.workers[0]
+    assert "stable_key" not in worker.meta
+    assert "stable_key_version" not in worker.meta
+    assert not backend.config.installation_key_path.exists()
+    _assert_no_public_json_forbidden(json.loads(snapshot.to_json()))
+
+
+def test_nested_compatibility_event_cannot_duplicate_authenticated_turn_owner(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "nested-turn-owner-conflict")
+    session = {
+        "source": "old-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "shared-session-secret",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[
+                {
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "old-terminal-secret",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "status": "running",
+                }
+            ],
+            agents=[
+                {
+                    "worker_id": "public-old-owner",
+                    "agent_id": "old-agent-target-secret",
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "old-terminal-secret",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "status": "running",
+                }
+            ],
+        )
+    )
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "worker_id": "public-compatibility-claimant",
+                    "agent_id": "new-agent-target-secret",
+                    "agent": "codex",
+                    "agent_session": {
+                        "source": "new-source-secret",
+                        "agent": "codex",
+                        "kind": "id",
+                        "value": "shared-session-secret",
+                    },
+                    "status": "running",
+                }
+            },
+        }
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert snapshot is not None
+    assert len(snapshot.workers) == len(bindings) == 1
+    assert "stable_key" not in snapshot.workers[0].meta
+    assert bindings[0].sendable is False
+    assert bindings[0].reason == "ambiguous_pane_match"
+    assert bindings[0].turn_target_kind is None
+    assert bindings[0].turn_target_value is None
+
+
+@pytest.mark.parametrize("entity_source", ["top_level", "pane"])
+def test_official_pane_tuple_provenance_mints_continuity(
+    tmp_path: Path,
+    entity_source: str,
+) -> None:
+    backend = _backend(tmp_path, f"official-pane-{entity_source}")
+    backend.reconcile_once(
+        client=_StaticClient(workspaces=[{"id": "wR9", "name": "Build"}])
+    )
+    pane = {
+        "agent": "codex",
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "official-terminal-secret",
+        "status": "running",
+        "agent_session": {
+            "source": "official-source-secret",
+            "agent": "codex",
+            "kind": "id",
+            "value": "official-session-secret",
+        },
+    }
+    payload = pane if entity_source == "top_level" else {"pane": pane}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "payload": payload,
+        }
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert len(snapshot.workers) == 1
+    assert snapshot.workers[0].meta["stable_key"].startswith("wsk1_")
+    assert snapshot.workers[0].meta["stable_key_version"] == 1
+    assert backend.config.installation_key_path.exists()
+
+
+@pytest.mark.parametrize(
+    "event_name",
+    ["pane.agent_detected", "pane.agent_status_changed"],
+)
+@pytest.mark.parametrize("key_failure", [False, True])
+def test_official_event_id_churn_reuses_single_authenticated_pane_owner(
+    tmp_path: Path,
+    key_failure: bool,
+    event_name: str,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"event-pane-owner-id-churn-{key_failure}-{event_name}",
+    )
+    old_session = {
+        "source": "old-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "old-session-secret",
+    }
+    pane = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "old-terminal-secret",
+        "agent": "codex",
+        "agent_session": old_session,
+        "status": "running",
+    }
+    agent = {
+        "worker_id": "public-old-owner",
+        "agent_id": "old-agent-target-secret",
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "old-terminal-secret",
+        "agent": "codex",
+        "agent_session": old_session,
+        "status": "running",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[pane],
+            agents=[agent],
+        )
+    )
+    before = latest_snapshot(backend.db_path, backend.config.host_id)
+    before_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert before is not None
+    assert len(before.workers) == len(before_bindings) == 1
+    worker_id = before.workers[0].id
+    stable_key = before.workers[0].meta["stable_key"]
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    if key_failure:
+        backend.config.installation_key_marker_path.unlink()
+
+    event_payload = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "agent": {
+            "worker_id": "public-new-owner",
+            "agent_id": "new-agent-target-secret",
+            "terminal_id": "new-terminal-secret",
+            "agent": "codex",
+            "agent_session": {
+                "source": "new-source-secret",
+                "agent": "codex",
+                "kind": "id",
+                "value": "new-session-secret",
+            },
+            "status": "working",
+        },
+    }
+    assert backend.queue_event_envelope(
+        {
+            "event": event_name,
+            "payload": event_payload,
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert after is not None
+    assert len(after.workers) == len(bindings) == 1
+    assert after.workers[0].id == worker_id
+    if key_failure:
+        assert after.workers == before.workers
+        assert bindings == before_bindings
+        assert after.backend_health[0].status == "degraded"
+        assert after.backend_health[0].outcome == "continuity_unavailable"
+        assert after.backend_health[0].counts == {"spaces": 1, "workers": 1}
+
+        assert backend.queue_event_envelope(
+            {
+                "event": "workspace.updated",
+                "event_id": f"unrelated-{event_name}",
+                "payload": {
+                    "workspace": {
+                        "workspace_id": "wR9",
+                        "name": "Build Renamed",
+                    }
+                },
+            }
+        )
+        after_unrelated = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert after_unrelated is not None
+        assert after_unrelated.backend_health[0].status == "degraded"
+        assert after_unrelated.backend_health[0].outcome == "continuity_unavailable"
+
+        after_cap = backend._mark_worker_cap_exceeded_locked(999)
+        assert after_cap.backend_health[0].outcome == "continuity_unavailable"
+        after_disconnect = backend._mark_unhealthy("socket_disconnected")
+        assert after_disconnect.backend_health[0].outcome == "continuity_unavailable"
+
+        backend.config.installation_key_marker_path.write_bytes(marker)
+        os.chmod(backend.config.installation_key_marker_path, 0o600)
+        assert backend.queue_event_envelope(
+            {
+                "event": event_name,
+                "event_id": f"recovery-{event_name}",
+                "payload": event_payload,
+            }
+        )
+        after = latest_snapshot(backend.db_path, backend.config.host_id)
+        bindings = list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        assert after is not None
+        assert after.backend_health[0].status == "healthy"
+        assert after.workers[0].meta["stable_key"] == stable_key
+    else:
+        assert after.workers[0].meta["stable_key"] == stable_key
+    assert bindings[0].worker_id == worker_id
+    assert bindings[0].target_kind == "agent_id"
+    assert bindings[0].target_value == "new-agent-target-secret"
+    assert bindings[0].turn_target_kind == "codex_session_id"
+    assert bindings[0].turn_target_value == "new-session-secret"
+    _assert_no_public_json_forbidden(json.loads(after.to_json()))
+
+
+@pytest.mark.parametrize("shared_owner", ["terminal_id", "agent_session"])
+@pytest.mark.parametrize("key_failure", [False, True])
+def test_incremental_shared_private_owner_fails_closed_across_canonical_panes(
+    tmp_path: Path,
+    shared_owner: str,
+    key_failure: bool,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"event-shared-{shared_owner}-owner-{key_failure}",
+    )
+    backend.reconcile_once(
+        client=_StaticClient(workspaces=[{"id": "wR9", "name": "Build"}])
+    )
+
+    for suffix, pane_id in (("a", "wR9:pA"), ("b", "wR9:pB")):
+        assert backend.queue_event_envelope(
+            {
+                "event": "pane.created",
+                "payload": {
+                    "workspace_id": "wR9",
+                    "pane_id": pane_id,
+                    "terminal_id": (
+                        "shared-terminal-secret"
+                        if shared_owner == "terminal_id"
+                        else f"terminal-{suffix}-secret"
+                    ),
+                    "agent_id": f"agent-{suffix}-secret",
+                    "agent": "codex",
+                    "agent_session": {
+                        "source": f"source-{suffix}-secret",
+                        "agent": "codex",
+                        "kind": "id",
+                        "value": (
+                            "shared-session-secret"
+                            if shared_owner == "agent_session"
+                            else f"session-{suffix}-secret"
+                        ),
+                    },
+                    "status": "running",
+                },
+            }
+        )
+        if suffix == "a" and key_failure:
+            backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "event_id": f"repeat-{shared_owner}-{key_failure}",
+            "payload": {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pB",
+                "terminal_id": (
+                    "shared-terminal-secret"
+                    if shared_owner == "terminal_id"
+                    else "terminal-b-secret"
+                ),
+                "agent_id": "agent-b-secret",
+                "agent": "codex",
+                "agent_session": {
+                    "source": "source-b-secret",
+                    "agent": "codex",
+                    "kind": "id",
+                    "value": (
+                        "shared-session-secret"
+                        if shared_owner == "agent_session"
+                        else "session-b-secret"
+                    ),
+                },
+                "status": "running",
+            },
+        }
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert snapshot is not None
+    assert len(snapshot.workers) == len(bindings) == 1
+    if key_failure:
+        assert snapshot.workers[0].meta["stable_key"].startswith("wsk1_")
+        assert snapshot.workers[0].meta["stable_key_version"] == 1
+        assert snapshot.backend_health[0].status == "degraded"
+        assert snapshot.backend_health[0].outcome == "continuity_unavailable"
+        assert bindings[0].sendable is True
+        assert bindings[0].reason is None
+        assert bindings[0].turn_target_kind is not None
+        assert bindings[0].turn_target_value is not None
+    else:
+        assert "stable_key" not in snapshot.workers[0].meta
+        assert "stable_key_version" not in snapshot.workers[0].meta
+        assert bindings[0].sendable is False
+        assert bindings[0].reason == "ambiguous_pane_match"
+        assert bindings[0].turn_target_kind is None
+        assert bindings[0].turn_target_value is None
+
+
+@pytest.mark.parametrize("complete_move", [False, True])
+def test_move_into_owned_pane_fails_closed_for_both_owners(
+    tmp_path: Path,
+    complete_move: bool,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"event-move-owned-destination-{complete_move}",
+    )
+    panes = [
+        {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pA",
+            "agent": "Agent A",
+            "status": "running",
+        },
+        {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pB",
+            "agent": "Agent B",
+            "status": "running",
+        },
+    ]
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=panes,
+        )
+    )
+
+    payload: dict[str, Any] = {
+        "previous_pane_id": "wR9:pB",
+        "new_pane_id": "wR9:pA",
+    }
+    if complete_move:
+        payload["pane"] = {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pA",
+            "agent": "Agent B",
+            "status": "running",
+        }
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": payload,
+        }
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert snapshot is not None
+    assert len(snapshot.workers) == len(bindings) == 2
+    assert all("stable_key" not in worker.meta for worker in snapshot.workers)
+    assert all("stable_key_version" not in worker.meta for worker in snapshot.workers)
+    assert all(binding.sendable is False for binding in bindings)
+    assert all(binding.reason == "ambiguous_pane_match" for binding in bindings)
+    assert all(binding.turn_target_kind is None for binding in bindings)
+    assert all(binding.turn_target_value is None for binding in bindings)
+
+
+def test_key_failure_precedes_move_conflict_mutation(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "event-move-conflict-key-failure")
+    panes = [
+        {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pA",
+            "agent": "Agent A",
+            "status": "running",
+        },
+        {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pB",
+            "agent": "Agent B",
+            "status": "running",
+        },
+    ]
+    before = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=panes,
+        )
+    )
+    before_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    backend.config.installation_key_marker_path.unlink()
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                "previous_pane_id": "wR9:pB",
+                "pane": {
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "agent": "Agent B",
+                    "status": "running",
+                },
+            },
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert after.workers == before.workers
+    assert after.spaces == before.spaces
+    assert after.backend_health[0].status == "degraded"
+    assert after.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == before_bindings
+    )
+
+
+@pytest.mark.parametrize("key_failure", [False, True])
+def test_authoritative_move_resolves_agent_targeted_source_by_previous_pane(
+    tmp_path: Path,
+    key_failure: bool,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"event-move-agent-targeted-source-{key_failure}",
+    )
+    old_session = {
+        "source": "old-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "old-session-secret",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[
+                {"id": "wR9", "name": "Source"},
+                {"id": "wD2", "name": "Destination"},
+            ],
+            panes=[
+                {
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "old-terminal-secret",
+                    "agent": "codex",
+                    "agent_session": old_session,
+                    "status": "running",
+                }
+            ],
+            agents=[
+                {
+                    "worker_id": "public-source-owner",
+                    "agent_id": "old-agent-target-secret",
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "old-terminal-secret",
+                    "agent": "codex",
+                    "agent_session": old_session,
+                    "status": "running",
+                }
+            ],
+        )
+    )
+    before = latest_snapshot(backend.db_path, backend.config.host_id)
+    before_binding = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )[0]
+    assert before is not None
+    worker_id = before.workers[0].id
+    original_key = before.workers[0].meta["stable_key"]
+    if key_failure:
+        key_bytes = backend.config.installation_key_path.read_bytes()
+        backend.config.installation_key_path.write_bytes(
+            bytes(byte ^ 0xFF for byte in key_bytes)
+        )
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                "previous_pane_id": "wR9:pA",
+                "pane": {
+                    "workspace_id": "wD2",
+                    "pane_id": "wD2:p7",
+                    "terminal_id": "new-terminal-secret",
+                    "agent": "codex",
+                    "agent_session": {
+                        "source": "new-source-secret",
+                        "agent": "codex",
+                        "kind": "id",
+                        "value": "new-session-secret",
+                    },
+                    "status": "running",
+                },
+            },
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert after is not None
+    assert len(after.workers) == len(bindings) == 1
+    assert after.workers[0].id == worker_id
+    if key_failure:
+        assert after.workers == before.workers
+        assert after.workers[0].meta["stable_key"] == original_key
+        assert bindings == [before_binding]
+        assert after.backend_health[0].status == "degraded"
+        assert after.backend_health[0].outcome == "continuity_unavailable"
+    else:
+        assert after.workers[0].meta["stable_key"] != original_key
+        assert after.workers[0].space_id == "wD2"
+        assert bindings[0].private_fingerprint == before_binding.private_fingerprint
+        assert bindings[0].target_kind == "terminal_id"
+        assert bindings[0].target_value == "new-terminal-secret"
+        assert bindings[0].turn_target_kind == "codex_session_id"
+        assert bindings[0].turn_target_value == "new-session-secret"
+
+
+def test_reconcile_retains_authenticated_snapshot_until_installation_key_recovers(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "reconcile-key-recovery")
+    client = _StaticClient(
+        workspaces=[{"id": "wR9", "name": "Build"}],
+        panes=[
+            {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pA",
+                "terminal_id": "terminal-secret",
+                "agent": "codex",
+                "status": "running",
+            }
+        ],
+        agents=[
+            {
+                "worker_id": "public-worker",
+                "agent_id": "agent-secret",
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pA",
+                "terminal_id": "terminal-secret",
+                "agent": "codex",
+                "status": "running",
+            }
+        ],
+    )
+    first = backend.reconcile_once(client=client)
+    first_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    stable_key = first.workers[0].meta["stable_key"]
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    backend.config.installation_key_marker_path.unlink()
+
+    degraded = backend.reconcile_once(client=client)
+
+    assert degraded.workers == first.workers
+    assert degraded.spaces == first.spaces
+    assert degraded.backend_health[0].status == "degraded"
+    assert degraded.backend_health[0].outcome == "continuity_unavailable"
+    assert degraded.backend_health[0].counts == {"spaces": 1, "workers": 1}
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == first_bindings
+    )
+
+    previous_max_workers = backend.max_workers
+    backend.max_workers = 1
+    capped = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            agents=[
+                {"worker_id": "agent-a", "agent": "Agent A"},
+                {"worker_id": "agent-b", "agent": "Agent B"},
+            ],
+        )
+    )
+    assert capped.backend_health[0].outcome == "continuity_unavailable"
+    backend.max_workers = previous_max_workers
+
+    backend.config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(backend.config.installation_key_marker_path, 0o600)
+    recovered = backend.reconcile_once(client=client)
+
+    assert recovered.backend_health[0].status == "healthy"
+    assert recovered.workers[0].meta["stable_key"] == stable_key
+
+
+def test_incomplete_pane_event_does_not_clear_continuity_failure(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "incomplete-pane-key-recovery")
+    pane = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-secret",
+        "agent": "codex",
+        "status": "running",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[pane],
+        )
+    )
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.focused",
+            "payload": {"pane": pane},
+        }
+    )
+    failed = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert failed is not None
+    assert failed.backend_health[0].outcome == "continuity_unavailable"
+
+    backend.config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(backend.config.installation_key_marker_path, 0o600)
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "event_id": "incomplete-close-after-key-recovery",
+            "payload": {"pane": {"pane_id": "wR9:pA"}},
+        }
+    )
+
+    incomplete = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert incomplete is not None
+    assert incomplete.backend_health[0].status == "degraded"
+    assert incomplete.backend_health[0].outcome == "continuity_unavailable"
+
+
+def test_over_cap_authenticated_retry_does_not_clear_continuity_failure(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "over-cap-key-recovery")
+    pane_a = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "agent": "Agent A",
+        "status": "running",
+    }
+    pane_b = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pB",
+        "agent": "Agent B",
+        "status": "running",
+    }
+    first = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[pane_a],
+        )
+    )
+    first_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    backend.max_workers = 1
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "event_id": "over-cap-key-loss",
+            "payload": {"pane": pane_b},
+        }
+    )
+
+    backend.config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(backend.config.installation_key_marker_path, 0o600)
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "event_id": "over-cap-key-retry",
+            "payload": {"pane": pane_b},
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert after.workers == first.workers
+    assert after.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == first_bindings
+    )
+
+
+def test_conflicting_close_does_not_revalidate_continuity(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "conflicting-close-key-recovery")
+    pane_a = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-a-secret",
+        "agent": "Agent A",
+        "status": "running",
+    }
+    pane_b = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pB",
+        "terminal_id": "terminal-b-secret",
+        "agent": "Agent B",
+        "status": "running",
+    }
+    first = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[pane_a, pane_b],
+        )
+    )
+    first_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.focused",
+            "event_id": "conflicting-close-key-loss",
+            "payload": {"pane": pane_a},
+        }
+    )
+
+    backend.config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(backend.config.installation_key_marker_path, 0o600)
+    conflicting_close = {
+        **pane_a,
+        "terminal_id": pane_b["terminal_id"],
+    }
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "event_id": "conflicting-close-retry",
+            "payload": {"pane": conflicting_close},
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert after.workers == first.workers
+    assert after.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == first_bindings
+    )
+
+
+def test_conflicting_upsert_preserves_latched_authenticated_state(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "conflicting-upsert-key-recovery")
+    pane_a = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-a-secret",
+        "agent": "Agent A",
+        "status": "running",
+    }
+    pane_b = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pB",
+        "terminal_id": "terminal-b-secret",
+        "agent": "Agent B",
+        "status": "running",
+    }
+    first = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build"}],
+            panes=[pane_a, pane_b],
+        )
+    )
+    first_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    marker = backend.config.installation_key_marker_path.read_bytes()
+    backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.focused",
+            "event_id": "conflicting-upsert-key-loss",
+            "payload": {"pane": pane_a},
+        }
+    )
+
+    backend.config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(backend.config.installation_key_marker_path, 0o600)
+    conflicting_pane = {
+        **pane_a,
+        "terminal_id": pane_b["terminal_id"],
+        "status": "blocked",
+    }
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.focused",
+            "event_id": "conflicting-upsert-retry",
+            "payload": {"pane": conflicting_pane},
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert after.workers == first.workers
+    assert after.backend_health[0].status == "degraded"
+    assert after.backend_health[0].outcome == "continuity_unavailable"
+    assert (
+        list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        == first_bindings
+    )
 
 
 def test_official_pane_event_generic_id_remains_private_binding_only(tmp_path: Path) -> None:
@@ -1424,6 +2390,12 @@ def test_pane_id_only_status_event_resolves_codex_binding_via_pane_terminal_map(
     assert backend._apply_event(event) is True
     assert sorted(backend._workers) == ["codex"], f"phantom inserted: {sorted(backend._workers)}"
     assert backend._workers["codex"].status in {"idle", "done"}
+    updated_binding = next(iter(backend._bindings.values()))
+    assert updated_binding.private_fingerprint == binding.private_fingerprint
+    assert updated_binding.target_kind == binding.target_kind == "terminal_id"
+    assert updated_binding.target_value == binding.target_value == "term-ctx"
+    assert updated_binding.turn_target_kind == binding.turn_target_kind == "codex_session_id"
+    assert updated_binding.turn_target_value == binding.turn_target_value == "019f-session"
 
 
 def test_reconcile_drops_unbound_missing_workers_but_keeps_bound_closed(tmp_path: Path) -> None:
@@ -1438,3 +2410,349 @@ def test_reconcile_drops_unbound_missing_workers_but_keeps_bound_closed(tmp_path
     ids = {worker.id: worker.status for worker in merged}
     assert "codex" not in ids, "unbound phantom must be dropped, not carried as closed"
     assert ids.get("codex-1") == "closed"
+
+
+def test_nested_agent_pane_claim_cannot_poison_terminal_close_matching(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "pane-terminal-provenance")
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "W1", "name": "Build", "status": "active"}],
+            panes=[
+                {
+                    "pane_id": "P1",
+                    "terminal_id": "T1",
+                    "workspace_id": "W1",
+                    "agent": "codex",
+                    "agent_status": "working",
+                }
+            ],
+        )
+    )
+    worker = initial.workers[0]
+    binding = next(iter(backend._bindings.values()))
+    assert backend._pane_terminals == {"P1": "T1"}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {
+                "agent": {
+                    "worker_id": "nested-agent-claimant",
+                    "pane_id": "Pfake",
+                    "terminal_id": "T1",
+                    "agent": "codex",
+                    "status": "working",
+                }
+            },
+        }
+    )
+    assert backend._pane_terminals == {"P1": "T1"}
+    assert backend._pane_owners == {"P1": {worker.id}}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "payload": {"pane_id": "Pfake"},
+        }
+    )
+
+    current = backend._workers[worker.id]
+    assert current.status == worker.status
+    assert current.status != "closed"
+    assert "Pfake" not in backend._pane_terminals
+    assert backend._pane_owners == {"P1": {worker.id}}
+    stored = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert len(stored) == 1
+    assert stored[0].private_fingerprint == binding.private_fingerprint
+    assert stored[0].sendable is True
+
+
+def test_reconcile_maps_only_accepted_pane_info_rows(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "reconcile-pane-map-provenance")
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "W1", "name": "Build", "status": "active"}],
+            panes=[
+                {
+                    "pane_id": "P1",
+                    "terminal_id": "T1",
+                    "workspace_id": "W1",
+                    "agent": "codex",
+                    "agent_status": "working",
+                },
+                {
+                    "pane_id": "Pfake",
+                    "terminal_id": "T1",
+                    "workspace_id": "W1",
+                    "agent_status": "working",
+                },
+            ],
+        )
+    )
+    worker = initial.workers[0]
+    binding = next(iter(backend._bindings.values()))
+    assert backend._pane_terminals == {"P1": "T1"}
+    assert backend._pane_owners == {"P1": {worker.id}}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "payload": {"pane_id": "Pfake"},
+        }
+    )
+
+    assert backend._workers[worker.id].status == worker.status
+    assert backend._workers[worker.id].status != "closed"
+    stored = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert len(stored) == 1
+    assert stored[0].private_fingerprint == binding.private_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("source_field", "source_value"),
+    [
+        ("previous_pane_id", "P1"),
+        ("previous_terminal_id", "T1"),
+    ],
+)
+def test_accepted_move_removes_source_pane_terminal_alias_before_stale_close(
+    tmp_path: Path,
+    source_field: str,
+    source_value: str,
+) -> None:
+    backend = _backend(tmp_path, "moved-pane-map-provenance")
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "W1", "name": "Build", "status": "active"}],
+            panes=[
+                {
+                    "pane_id": "P1",
+                    "terminal_id": "T1",
+                    "workspace_id": "W1",
+                    "agent": "codex",
+                    "agent_status": "working",
+                }
+            ],
+        )
+    )
+    worker = initial.workers[0]
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.moved",
+            "payload": {
+                source_field: source_value,
+                "pane": {
+                    "pane_id": "P2",
+                    "terminal_id": "T1",
+                    "workspace_id": "W1",
+                    "agent": "codex",
+                    "agent_status": "working",
+                },
+            },
+        }
+    )
+    assert backend._pane_terminals == {"P2": "T1"}
+    assert backend._pane_owners == {"P2": {worker.id}}
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.closed",
+            "payload": {"pane_id": "P1"},
+        }
+    )
+
+    assert backend._workers[worker.id].status == worker.status
+    assert backend._workers[worker.id].status != "closed"
+    assert backend._pane_terminals == {"P2": "T1"}
+
+
+def test_pane_only_status_preserves_unobserved_owner_aliases_for_later_conflict(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "status-owner-alias-provenance")
+    session = {
+        "source": "old-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "old-session-secret",
+    }
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build", "status": "active"}],
+            panes=[
+                {
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "shared-terminal-secret",
+                    "workspace_id": "wR9",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "agent_status": "working",
+                }
+            ],
+            agents=[
+                {
+                    "worker_id": "public-owner",
+                    "agent_id": "old-agent-target-secret",
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "shared-terminal-secret",
+                    "workspace_id": "wR9",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "agent_status": "working",
+                }
+            ],
+        )
+    )
+    worker = initial.workers[0]
+    binding = next(iter(backend._bindings.values()))
+    assert binding.target_kind == "agent_id"
+    assert binding.turn_target_kind == "codex_session_id"
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "payload": {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pA",
+                "status": "idle",
+            },
+        }
+    )
+    status_binding = next(iter(backend._bindings.values()))
+    assert status_binding.private_fingerprint == binding.private_fingerprint
+    assert status_binding.target_kind == binding.target_kind
+    assert status_binding.target_value == binding.target_value
+    assert status_binding.turn_target_kind == binding.turn_target_kind
+    assert status_binding.turn_target_value == binding.turn_target_value
+    assert backend._terminal_owners == {
+        "shared-terminal-secret": {worker.id},
+    }
+    assert backend._session_owners == {
+        "old-session-secret": {worker.id},
+    }
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "payload": {
+                "pane": {
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pB",
+                    "terminal_id": "shared-terminal-secret",
+                    "agent_id": "new-agent-target-secret",
+                    "agent": "codex",
+                    "agent_session": {
+                        "source": "new-source-secret",
+                        "agent": "codex",
+                        "kind": "id",
+                        "value": "new-session-secret",
+                    },
+                    "status": "working",
+                }
+            },
+        }
+    )
+
+    assert set(backend._workers) == {worker.id}
+    conflicted = next(iter(backend._bindings.values()))
+    assert conflicted.worker_id == worker.id
+    assert conflicted.sendable is False
+    assert conflicted.reason == "ambiguous_pane_match"
+    assert "wR9:pB" not in backend._pane_terminals
+
+
+def test_nested_compatibility_replay_cannot_rehabilitate_ambiguous_binding(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "compatibility-ambiguity-provenance")
+    session = {
+        "source": "shared-source-secret",
+        "agent": "codex",
+        "kind": "id",
+        "value": "shared-session-secret",
+    }
+    original_agent = {
+        "worker_id": "public-owner-a",
+        "agent_id": "agent-target-a-secret",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-a-secret",
+        "workspace_id": "wR9",
+        "agent": "codex",
+        "agent_session": session,
+        "status": "working",
+    }
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "wR9", "name": "Build", "status": "active"}],
+            panes=[
+                {
+                    "pane_id": "wR9:pA",
+                    "terminal_id": "terminal-a-secret",
+                    "workspace_id": "wR9",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "status": "working",
+                }
+            ],
+            agents=[original_agent],
+        )
+    )
+    worker = initial.workers[0]
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "payload": {
+                "pane": {
+                    "workspace_id": "wR9",
+                    "pane_id": "wR9:pB",
+                    "terminal_id": "terminal-b-secret",
+                    "agent_id": "agent-target-b-secret",
+                    "agent": "codex",
+                    "agent_session": session,
+                    "status": "working",
+                }
+            },
+        }
+    )
+    ambiguous = next(iter(backend._bindings.values()))
+    assert ambiguous.worker_id == worker.id
+    assert ambiguous.target_value == "agent-target-a-secret"
+    assert ambiguous.sendable is False
+    assert ambiguous.reason == "ambiguous_pane_match"
+    assert ambiguous.turn_target_kind is None
+    assert ambiguous.turn_target_value is None
+    assert backend._workers[worker.id].backend_target == ambiguous.backend_target()
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_detected",
+            "payload": {"agent": original_agent},
+        }
+    )
+
+    replayed = next(iter(backend._bindings.values()))
+    assert replayed.private_fingerprint == ambiguous.private_fingerprint
+    assert replayed.target_kind == ambiguous.target_kind
+    assert replayed.target_value == ambiguous.target_value
+    assert replayed.sendable is False
+    assert replayed.reason == "ambiguous_pane_match"
+    assert replayed.turn_target_kind is None
+    assert replayed.turn_target_value is None
+    assert backend._workers[worker.id].backend_target == replayed.backend_target()
+    assert backend._pane_terminals == {
+        "wR9:pA": "terminal-a-secret",
+    }

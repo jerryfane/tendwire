@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections.abc import Sequence
 from typing import Any
 
 import pytest
 
+from tendwire import cli as tendwire_cli
 from tendwire.backends import herdr_cli, herdr_command
 from tendwire.backends.herdr_cli import fetch_herdr_state
 from tendwire.config import Config
@@ -22,6 +24,7 @@ from tendwire.core.commands import (
 )
 from tendwire.core.models import Worker, WorkerBinding, worker_binding_private_fingerprint
 from tendwire.core.projector import project_from_observations
+from tendwire.store.sqlite import init_store, list_worker_bindings
 
 
 _FORBIDDEN_FIELDS = {
@@ -885,6 +888,7 @@ def test_fetch_herdr_snapshot_observation_reports_healthy_non_empty(monkeypatch)
     responses = {
         ("workspace", "list"): {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "Build"}]}},
         ("agent", "list"): {"result": {"agents": [{"worker_id": "w-1", "agent_id": "agent-1", "agent": "Coder"}]}},
+        ("pane", "list"): {"result": {"panes": []}},
     }
     monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
     monkeypatch.setattr(herdr_cli, "_run_herdr", lambda args, cfg: _respond(args, responses))
@@ -976,6 +980,177 @@ def test_herdr_health_mapping_includes_socket_disconnect() -> None:
 
     assert health.status == "unavailable"
     assert health.outcome == "socket_disconnected"
+
+
+def test_cli_snapshot_retains_authenticated_worker_while_pane_probe_recovers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = Config(
+        host_id="pane-recovery",
+        herdr_bin="herdr",
+        data_dir=tmp_path / "state",
+        db_path=tmp_path / "pane-recovery.db",
+    )
+    init_store(config.db_path)
+    responses = {
+        ("workspace", "list"): {
+            "result": {"workspaces": [{"workspace_id": "wR9", "label": "Build"}]}
+        },
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-worker",
+                        "agent_id": "private-agent",
+                        "workspace_id": "wR9",
+                        "pane_id": "wR9:pA",
+                        "terminal_id": "private-terminal",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {
+                        "workspace_id": "wR9",
+                        "pane_id": "wR9:pA",
+                        "terminal_id": "private-terminal",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+    }
+    pane_available = True
+
+    def fake_probe(args: Sequence[str], cfg: Config, *unused: Any) -> tuple[str, Any]:
+        if tuple(args) == ("pane", "list") and not pane_available:
+            return "timeout", None
+        payload = responses.get(tuple(args))
+        return ("ok", payload) if payload is not None else ("nonzero", None)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    first = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+    first_worker = first.workers[0]
+    first_binding = list_worker_bindings(config.db_path, config.host_id, backend="herdr")
+    assert first.backend_health[0].status == "healthy"
+    assert first_worker.meta["stable_key"].startswith("wsk1_")
+
+    pane_available = False
+    degraded = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert degraded.workers == first.workers
+    assert degraded.spaces == first.spaces
+    assert degraded.backend_health[0].status == "degraded"
+    assert degraded.backend_health[0].outcome == "timeout"
+    assert degraded.backend_health[0].counts == {"spaces": 1, "workers": 1}
+    assert list_worker_bindings(config.db_path, config.host_id, backend="herdr") == first_binding
+
+    pane_available = True
+    recovered = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert recovered.backend_health[0].status == "healthy"
+    assert recovered.workers[0].meta["stable_key"] == first_worker.meta["stable_key"]
+
+
+def test_cli_snapshot_retains_authenticated_worker_while_installation_key_recovers(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = Config(
+        host_id="key-recovery",
+        herdr_bin="herdr",
+        data_dir=tmp_path / "state",
+        db_path=tmp_path / "key-recovery.db",
+    )
+    init_store(config.db_path)
+    responses = {
+        ("workspace", "list"): {
+            "result": {"workspaces": [{"workspace_id": "wR9", "label": "Build"}]}
+        },
+        ("agent", "list"): {
+            "result": {
+                "agents": [
+                    {
+                        "worker_id": "public-worker",
+                        "agent_id": "private-agent",
+                        "workspace_id": "wR9",
+                        "pane_id": "wR9:pA",
+                        "terminal_id": "private-terminal",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+        ("pane", "list"): {
+            "result": {
+                "panes": [
+                    {
+                        "workspace_id": "wR9",
+                        "pane_id": "wR9:pA",
+                        "terminal_id": "private-terminal",
+                        "agent": "Coder",
+                    }
+                ]
+            }
+        },
+    }
+
+    def fake_probe(args: Sequence[str], cfg: Config, *unused: Any) -> tuple[str, Any]:
+        payload = responses.get(tuple(args))
+        return ("ok", payload) if payload is not None else ("nonzero", None)
+
+    monkeypatch.setattr(herdr_cli.shutil, "which", lambda _: "/usr/bin/herdr")
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    first = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+    first_worker = first.workers[0]
+    first_binding = list_worker_bindings(config.db_path, config.host_id, backend="herdr")
+    marker = config.installation_key_marker_path.read_bytes()
+    config.installation_key_marker_path.unlink()
+
+    degraded = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert degraded.workers == first.workers
+    assert degraded.backend_health[0].status == "degraded"
+    assert degraded.backend_health[0].outcome == "continuity_unavailable"
+    assert degraded.backend_health[0].message == "Herdr continuity identity is unavailable"
+    assert degraded.backend_health[0].counts == {"spaces": 1, "workers": 1}
+    assert json.loads(degraded.to_json())["backend_health"][0]["outcome"] == "continuity_unavailable"
+    assert list_worker_bindings(config.db_path, config.host_id, backend="herdr") == first_binding
+
+    degraded_again = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+    assert degraded_again.workers == first.workers
+    assert degraded_again.spaces == first.spaces
+    assert degraded_again.backend_health[0].outcome == "continuity_unavailable"
+    assert degraded_again.backend_health[0].counts == {"spaces": 1, "workers": 1}
+
+    def timeout_pane_probe(
+        args: Sequence[str],
+        cfg: Config,
+        *unused: Any,
+    ) -> tuple[str, Any]:
+        if tuple(args) == ("pane", "list"):
+            return "timeout", None
+        return fake_probe(args, cfg, *unused)
+
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", timeout_pane_probe)
+    alternate_failure = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+    assert alternate_failure.workers == first.workers
+    assert alternate_failure.backend_health[0].outcome == "continuity_unavailable"
+    monkeypatch.setattr(herdr_cli, "_probe_herdr", fake_probe)
+
+    config.installation_key_marker_path.write_bytes(marker)
+    os.chmod(config.installation_key_marker_path, 0o600)
+    recovered = tendwire_cli.observe_public_snapshot(config, store_snapshot=True)
+
+    assert recovered.backend_health[0].status == "healthy"
+    assert recovered.workers[0].meta["stable_key"] == first_worker.meta["stable_key"]
 
 
 def test_probe_payload_variants_stops_after_timeout(monkeypatch) -> None:
@@ -1166,6 +1341,7 @@ def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypa
                 ]
             }
         },
+        ("pane", "list"): {"result": {"panes": []}},
     }
     calls: list[tuple[str, ...]] = []
 
@@ -1180,7 +1356,7 @@ def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypa
 
     spaces, workers = fetch_herdr_state(config)
 
-    assert calls == [("workspace", "list"), ("agent", "list")]
+    assert calls == [("workspace", "list"), ("agent", "list"), ("pane", "list")]
     assert len(spaces) == 1
     assert spaces[0].id == "ws-1"
     assert spaces[0].name == "Build"
@@ -1248,6 +1424,7 @@ def test_json_agent_list_fallback_when_no_flag_is_malformed(monkeypatch) -> None
                 ]
             }
         },
+        ("pane", "list"): {"result": {"panes": []}},
     }
     calls: list[tuple[str, ...]] = []
 
@@ -1260,7 +1437,12 @@ def test_json_agent_list_fallback_when_no_flag_is_malformed(monkeypatch) -> None
 
     spaces, workers = fetch_herdr_state(config)
 
-    assert calls == [("workspace", "list"), ("agent", "list"), ("agent", "list", "--json")]
+    assert calls == [
+        ("workspace", "list"),
+        ("agent", "list"),
+        ("agent", "list", "--json"),
+        ("pane", "list"),
+    ]
     assert spaces == []
     assert len(workers) == 1
     assert workers[0].id == "CompatAgent"
@@ -1323,8 +1505,8 @@ def test_pane_fallback_only_when_agent_list_yields_none(monkeypatch) -> None:
     assert workers[0].backend_target["sendable"] is True
 
 
-def test_pane_fallback_skipped_when_agents_present(monkeypatch) -> None:
-    """Pane list is not used as a fallback when agent list already produced workers."""
+def test_pane_list_enriches_without_adding_unmatched_panes_when_agents_present(monkeypatch) -> None:
+    """Pane list enriches matching agents without projecting unmatched fallback panes."""
     config = Config(host_id="testhost", herdr_bin="herdr")
     responses = {
         ("workspace", "list", "--json"): _completed("", returncode=1),

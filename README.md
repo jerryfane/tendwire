@@ -31,6 +31,62 @@ values, private fingerprints, argv/env/stdout/stderr, tokens, or secrets. Herdr
 pane and terminal identifiers may exist only inside private
 `WorkerBinding`/store internals used by Tendwire itself.
 
+## Opaque worker continuity metadata
+
+When Tendwire can validate an authoritative Herdr workspace/public-pane
+identity, a public worker may carry optional continuity metadata in `meta`.
+`meta.stable_key` has the exact format `wsk1_` followed by 64 lowercase
+hexadecimal characters (`^wsk1_[0-9a-f]{64}$`), and
+`meta.stable_key_version` is the exact integer `1` (not a string or boolean).
+Consumers must treat an absent or invalid pair as no continuity claim.
+
+The handle is a Tendwire-owned, opaque public value. Before projection,
+Tendwire recursively removes source-supplied fields in the normalized
+stable-key family, so Herdr metadata cannot select or spoof this identity.
+Tendwire then derives the handle locally from a validated workspace/public-pane
+identity and a private 32-byte installation key. Neither the handle nor any
+other public field exposes that key or the raw identity used to derive it.
+Herdres validates only the exact public format and version; it does not possess
+the installation key or raw identity and does not call Herdr to reconstruct
+either one.
+
+The installation identity has three artifacts in `data_dir`: the private
+32-byte `installation.key`, its nonsecret `installation.key.sha256` digest
+marker, and `installation.key.initialized`. The sentinel is the exact
+nonsecret one-byte value `1`; Tendwire creates it only after validating and
+publishing the key and digest. Ordinary loads validate and reuse an initialized
+identity and never rotate it. The default `data_dir` is
+`~/.local/share/tendwire` and can be changed with `TENDWIRE_DATA_DIR`. All three
+artifacts belong to Tendwire, not Herdr or Herdres, and must be backed up and
+restored together from one stopped-service checkpoint.
+
+Continuity is deliberately narrow. Moves that keep the worker in the same
+workspace and retain its authoritative public-pane identity, including tab
+moves, preserve the handle. A cross-workspace move changes the handle.
+Terminal and agent-session identifiers are not continuity inputs: they may be
+recreated during restore without changing the handle when Herdr restores the
+same logical pane. Destroying and recreating a logical pane does not inherit the
+old handle. The same raw worker identity under a different Tendwire installation
+key produces an unrelated handle, preventing cross-installation correlation.
+
+With `installation.key.initialized` present, a missing key, digest, or both
+fails closed and never bootstraps a replacement. Replaced, mismatched, malformed,
+or unsafe identity state also fails closed. An absent sentinel is only initial
+bootstrap or legacy-migration state, never a rotation request: Tendwire
+validates and publishes the key and digest before publishing the sentinel.
+Tendwire does not trust source continuity metadata or publish a locally
+unauthenticated handle.
+
+Intentional rotation is an explicit coordinated offline operation. Stop
+Tendwire and every identity consumer, then invoke
+`tendwire.worker_identity.reset_installation_key(Path(data_dir),
+acknowledge_continuity_break=True)` from a controlled operator Python
+environment; do not delete identity artifacts by hand. The next eligible load
+bootstraps a new three-artifact identity. Every `wsk1_` handle changes, so
+Herdres state, bindings, and topics require explicit migration and review;
+stale bindings are quarantined and old topics are not silently rebound or
+automatically reused.
+
 ## Running Tendwire
 
 Tendwire installs a console script named `tendwire`. The primary public entry
