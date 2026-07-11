@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import json
 import os
 import sqlite3
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from tendwire.backends import herdr_turns
 from tendwire.backends.herdr_events import (
     DEFAULT_SUBSCRIBE_METHOD,
     HerdrEventBackend,
@@ -45,7 +50,9 @@ from tendwire.store.sqlite import (
     latest_snapshot,
     list_attention_items,
     list_worker_bindings,
+    merge_turn_content,
     save_snapshot,
+    turns_payload_from_store,
 )
 
 
@@ -3304,3 +3311,535 @@ def test_nested_compatibility_replay_cannot_rehabilitate_ambiguous_binding(
     assert backend._pane_terminals == {
         "wR9:pA": "terminal-a-secret",
     }
+
+
+def _run_authoritative_recovery_trace(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> dict[str, Any]:
+    backend = _backend(tmp_path, "authoritative-turn-recovery")
+    session = {
+        "source": "codex",
+        "agent": "codex",
+        "kind": "id",
+        "value": "session-private-recovery",
+    }
+    agent = {
+        "worker_id": "public-recovery-worker",
+        "agent_id": "agent-private-recovery",
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-private-a",
+        "agent": "codex",
+        "agent_session": session,
+        "status": "working",
+    }
+    pane_a = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pA",
+        "terminal_id": "terminal-private-a",
+        "agent": "codex",
+        "agent_session": session,
+        "status": "working",
+    }
+    workspace = [{"id": "wR9", "name": "Build", "status": "active"}]
+
+    initial = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=workspace,
+            panes=[pane_a],
+            agents=[agent],
+        )
+    )
+    worker = initial.workers[0]
+    initial_binding = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )[0]
+    assert initial_binding.worker_id == worker.id
+    assert initial_binding.turn_target_kind == "codex_session_id"
+    assert initial_binding.turn_target_value == "session-private-recovery"
+    assert merge_turn_content(
+        backend.db_path,
+        backend.config.host_id,
+        worker.id,
+        {
+            "user_text": "Recover the deterministic producer final.",
+            "assistant_stream_text": "Still working.",
+            "assistant_final_text": None,
+            "complete": False,
+            "has_open_turn": True,
+            "source_turn_id": "producer-turn-42",
+        },
+    ) == 1
+    seeded_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=initial,
+    )
+    seeded_turns = [
+        turn
+        for turn in seeded_payload["turns"]
+        if turn.get("user_text") == "Recover the deterministic producer final."
+    ]
+    assert len(seeded_turns) == 1
+    public_turn_id = seeded_turns[0]["id"]
+    public_source_turn_id = seeded_turns[0]["source_turn_id"]
+    assert public_source_turn_id != "producer-turn-42"
+    assert seeded_turns[0]["worker_id"] == worker.id
+    assert seeded_turns[0]["complete"] is False
+
+    adapter_calls: list[tuple[str, str | None]] = []
+
+    def read_existing_final(_config: Config, binding: Any) -> dict[str, Any]:
+        adapter_calls.append((binding.worker_id, binding.turn_target_value))
+        return {
+            "user_text": "Recover the deterministic producer final.",
+            "assistant_stream_text": None,
+            "assistant_final_text": "The durable producer final.",
+            "complete": True,
+            "has_open_turn": False,
+            "source_turn_id": "producer-turn-42",
+        }
+
+    monkeypatch.setattr(herdr_turns, "_read_turn_for_binding", read_existing_final)
+    pane_b = {
+        "workspace_id": "wR9",
+        "pane_id": "wR9:pB",
+        "terminal_id": "terminal-private-b",
+        "agent": "codex",
+        "agent_session": session,
+        "status": "working",
+    }
+    quarantined = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=workspace,
+            panes=[pane_a, pane_b],
+            agents=[agent],
+        )
+    )
+    quarantined_bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert len(quarantined_bindings) == 1
+    quarantined_binding = quarantined_bindings[0]
+    assert quarantined_binding.worker_id == worker.id
+    assert quarantined_binding.sendable is False
+    assert quarantined_binding.reason == "ambiguous_pane_match"
+    assert quarantined_binding.turn_target_kind is None
+    assert quarantined_binding.turn_target_value is None
+    assert herdr_turns.refresh_structured_turn_content(backend.config) == {
+        "ok": True,
+        "status": "ok",
+        "updated": 0,
+        "attempted": 0,
+    }
+    assert adapter_calls == []
+    quarantined_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=quarantined,
+    )
+    quarantined_turn = next(
+        turn for turn in quarantined_payload["turns"] if turn["id"] == public_turn_id
+    )
+    assert quarantined_turn["source_turn_id"] == public_source_turn_id
+    assert quarantined_turn["assistant_final_text"] is None
+    assert quarantined_turn["assistant_stream_text"] == "Still working."
+    assert quarantined_turn["complete"] is False
+
+    restarted = HerdrEventBackend(
+        backend.config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    assert len(restarted._bindings) == 1
+    restarted_binding = next(iter(restarted._bindings.values()))
+    assert restarted_binding.worker_id == worker.id
+    assert restarted_binding.reason == "ambiguous_pane_match"
+    assert restarted_binding.turn_target_value is None
+
+    recovered = restarted.reconcile_once(
+        client=_StaticClient(
+            workspaces=workspace,
+            panes=[pane_a],
+            agents=[agent],
+        )
+    )
+    recovered_bindings = list_worker_bindings(
+        restarted.db_path,
+        restarted.config.host_id,
+        backend="herdr",
+    )
+    assert len(recovered_bindings) == 1
+    recovered_binding = recovered_bindings[0]
+    assert recovered.workers[0].id == worker.id
+    assert recovered_binding.worker_id == initial_binding.worker_id
+    assert recovered_binding.private_fingerprint == initial_binding.private_fingerprint
+    assert recovered_binding.sendable is True
+    assert recovered_binding.reason is None
+    assert recovered_binding.turn_target_kind == "codex_session_id"
+    assert recovered_binding.turn_target_value == "session-private-recovery"
+
+    assert herdr_turns.refresh_structured_turn_content(restarted.config) == {
+        "ok": True,
+        "status": "ok",
+        "updated": 1,
+        "attempted": 1,
+    }
+    assert adapter_calls == [(worker.id, "session-private-recovery")]
+
+    final_payload = turns_payload_from_store(
+        restarted.db_path,
+        restarted.config.host_id,
+        snapshot=recovered,
+    )
+    final_turns = [
+        turn
+        for turn in final_payload["turns"]
+        if turn.get("assistant_final_text") == "The durable producer final."
+    ]
+    assert len(final_turns) == 1
+    assert final_turns[0]["id"] == public_turn_id
+    assert final_turns[0]["source_turn_id"] == public_source_turn_id
+    assert final_turns[0]["worker_id"] == worker.id
+    assert final_turns[0]["assistant_stream_text"] is None
+    assert final_turns[0]["complete"] is True
+    assert final_turns[0]["has_open_turn"] is False
+    public_json = json.dumps(final_payload, sort_keys=True)
+    for private_value in (
+        "producer-turn-42",
+        "agent-private-recovery",
+        "session-private-recovery",
+        "terminal-private-a",
+        "terminal-private-b",
+        "wR9:pA",
+        "wR9:pB",
+    ):
+        assert private_value not in public_json
+    _assert_no_public_json_forbidden(json.loads(public_json))
+    snapshot_payload = json.loads(recovered.to_json())
+    snapshot_payload["ok"] = True
+    return {
+        "turns_payload": final_payload,
+        "snapshot_payload": snapshot_payload,
+        "public_turn": final_turns[0],
+    }
+
+
+def test_authoritative_reconcile_quarantines_then_recovers_existing_final_once(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _run_authoritative_recovery_trace(tmp_path, monkeypatch)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HERDRES_SOURCE_DIR"),
+    reason="HERDRES_SOURCE_DIR is required for the cross-repository recovery contract",
+)
+def test_authoritative_recovery_payload_promotes_herdres_working_once(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    trace = _run_authoritative_recovery_trace(tmp_path, monkeypatch)
+    turns_payload = trace["turns_payload"]
+    snapshot_payload = trace["snapshot_payload"]
+    public_turn = trace["public_turn"]
+    assert turns_payload["schema_version"] == 1
+    assert public_turn["id"]
+
+    source_dir = Path(os.environ["HERDRES_SOURCE_DIR"]).expanduser().resolve()
+    package_roots = [
+        candidate
+        for candidate in (source_dir, source_dir / "src")
+        if (candidate / "herdres_connector" / "source_sync.py").is_file()
+    ]
+    assert len(package_roots) == 1, (
+        "HERDRES_SOURCE_DIR must contain herdres_connector/source_sync.py "
+        "either directly or under src/"
+    )
+    package_root = package_roots[0]
+    monkeypatch.syspath_prepend(str(package_root))
+    preloaded_herdres_modules = sorted(
+        name
+        for name in sys.modules
+        if name == "herdres_connector" or name.startswith("herdres_connector.")
+    )
+    assert preloaded_herdres_modules == []
+    direct_boundary_attempts: list[str] = []
+
+    def reject_direct_boundary(*_args: Any, **_kwargs: Any) -> Any:
+        direct_boundary_attempts.append("process_or_socket")
+        raise AssertionError("Herdres source sync must not access Herdr outside Tendwire")
+
+    class RejectDirectSocket(socket.socket):
+        def __new__(cls, *_args: Any, **_kwargs: Any) -> Any:
+            direct_boundary_attempts.append("socket")
+            raise AssertionError("Herdres source sync must not open a direct socket")
+
+
+    real_import = builtins.__import__
+
+    def guarded_import(
+        name: str,
+        globals: Any = None,
+        locals: Any = None,
+        fromlist: Any = (),
+        level: int = 0,
+    ) -> Any:
+        private_roots = {
+            "herdr",
+            "herdr_turn_adapter",
+            "herdr_socket",
+            "herdr_cli",
+            "herdr_events",
+        }
+        if name.split(".", 1)[0] in private_roots or name.startswith(
+            "tendwire.backends"
+        ):
+            direct_boundary_attempts.append(f"import:{name[:80]}")
+            raise AssertionError("Herdres source sync must not import a direct Herdr client")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(subprocess, "run", reject_direct_boundary)
+    monkeypatch.setattr(subprocess, "Popen", reject_direct_boundary)
+    monkeypatch.setattr(socket, "socket", RejectDirectSocket)
+    monkeypatch.setattr(socket, "create_connection", reject_direct_boundary)
+    monkeypatch.setenv("HERDRES_TENDWIRE_MODE", "source")
+    monkeypatch.setenv("HERDRES_PINNED_STATUS", "0")
+    source_sync = importlib.import_module("herdres_connector.source_sync")
+    herdres_state = importlib.import_module("herdres_connector.state")
+    source_sync_path = Path(source_sync.__file__).resolve()
+    loaded_herdres_files = {
+        name: Path(module.__file__).resolve()
+        for name, module in sys.modules.items()
+        if (name == "herdres_connector" or name.startswith("herdres_connector."))
+        and getattr(module, "__file__", None)
+    }
+    assert source_sync_path == package_root / "herdres_connector" / "source_sync.py"
+    assert loaded_herdres_files
+    assert all(path.is_relative_to(package_root) for path in loaded_herdres_files.values())
+
+    worker_observation = next(
+        worker
+        for worker in snapshot_payload["workers"]
+        if worker["id"] == public_turn["worker_id"]
+    )
+    space_observation = next(
+        space
+        for space in snapshot_payload["spaces"]
+        if space["id"] == public_turn["space_id"]
+    )
+    store = {
+        "enabled": True,
+        "telegram": {"chat_id": "-100", "general_thread_id": "1"},
+        "panes": {},
+        "spaces": {},
+        "tendwired_bootstrap_complete": True,
+    }
+    _worker_key, worker_entry, _created = herdres_state.upsert_worker_entry(
+        store,
+        worker_observation,
+        topic_id="77",
+    )
+    herdres_state.upsert_space_entry(
+        store,
+        space_observation,
+        topic_id="77",
+    )
+    worker_entry.update(
+        {
+            "last_stream_turn_id": public_turn["id"],
+            "last_stream_hash": "persisted-working-hash",
+            "last_stream_message_id": "555",
+            "last_stream_bot_kind": "manager",
+        }
+    )
+    herdres_state.bind_message_to_worker(
+        store,
+        "555",
+        worker_entry,
+        topic_id="77",
+        kind="working",
+        turn_id=public_turn["id"],
+        bot_kind="manager",
+    )
+
+    class RecoveryTendwire:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.turn_payload_objects: list[dict[str, Any]] = []
+
+        def snapshot(self) -> dict[str, Any]:
+            self.calls.append("snapshot")
+            return snapshot_payload
+
+        def turns(self) -> dict[str, Any]:
+            self.calls.append("turns")
+            self.turn_payload_objects.append(turns_payload)
+            return turns_payload
+
+        def pending(self) -> dict[str, Any]:
+            self.calls.append("pending")
+            return {"ok": True, "pending_interactions": []}
+
+    class RecoveryTelegram:
+        dry_run = False
+
+        def __init__(
+            self,
+            token: str = "fake",
+            shared: dict[str, list[Any]] | None = None,
+        ) -> None:
+            self.token = token
+            self.shared = shared or {
+                "sent": [],
+                "edited": [],
+                "topics": [],
+                "deleted_topics": [],
+                "renamed_topics": [],
+                "pins": [],
+                "api_calls": [],
+                "icon_edits": [],
+            }
+            self.sent = self.shared["sent"]
+            self.edited = self.shared["edited"]
+            self.topics = self.shared["topics"]
+            self.deleted_topics = self.shared["deleted_topics"]
+            self.renamed_topics = self.shared["renamed_topics"]
+            self.pins = self.shared["pins"]
+            self.api_calls = self.shared["api_calls"]
+            self.icon_edits = self.shared["icon_edits"]
+
+        def with_token(self, token: str) -> Any:
+            return RecoveryTelegram(token=token, shared=self.shared)
+
+        def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.api_calls.append((method, dict(payload), self.token))
+            if method == "editMessageText":
+                rich_payload = payload.get("rich_message")
+                rich = json.loads(rich_payload) if rich_payload else {}
+                html = str(rich.get("html") or payload.get("text") or "")
+                message_id = str(payload.get("message_id") or "")
+                self.edited.append((str(payload.get("chat_id") or ""), message_id, html))
+                return {"ok": True, "result": {"message_id": message_id}}
+            if method == "sendRichMessage":
+                message_id = str(100 + len(self.sent))
+                rich = json.loads(payload.get("rich_message") or "{}")
+                self.sent.append(
+                    (
+                        str(payload.get("chat_id") or ""),
+                        str(rich.get("html") or ""),
+                        {"thread_id": str(payload.get("message_thread_id") or "")},
+                        message_id,
+                    )
+                )
+                return {"ok": True, "result": {"message_id": message_id}}
+            return {"ok": True, "result": {"message_id": "0"}}
+
+        def create_topic(
+            self,
+            _chat_id: str,
+            name: str,
+            icon_color: int | None = None,
+        ) -> dict[str, Any]:
+            self.topics.append((name, icon_color))
+            return {"ok": True, "topic_id": str(76 + len(self.topics))}
+
+        def rename_topic(
+            self,
+            chat_id: str,
+            thread_id: str,
+            name: str,
+        ) -> dict[str, Any]:
+            self.renamed_topics.append((chat_id, thread_id, name))
+            return {"ok": True}
+
+        def edit_topic_icon(
+            self,
+            chat_id: str,
+            thread_id: str,
+            emoji_id: str,
+        ) -> dict[str, Any]:
+            self.icon_edits.append((chat_id, thread_id, emoji_id))
+            return {"ok": True}
+
+        def delete_topic(self, _chat_id: str, thread_id: str) -> dict[str, Any]:
+            self.deleted_topics.append(thread_id)
+            return {"ok": True}
+
+        def send_message(
+            self,
+            chat_id: str,
+            html: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            message_id = str(100 + len(self.sent))
+            self.sent.append((chat_id, html, dict(kwargs), message_id))
+            return {"ok": True, "message_id": message_id}
+
+        def edit_message(
+            self,
+            chat_id: str,
+            message_id: str,
+            html: str,
+        ) -> dict[str, Any]:
+            self.edited.append((chat_id, str(message_id), html))
+            return {"ok": True, "message_id": str(message_id)}
+
+        def pin_message(self, chat_id: str, message_id: str) -> dict[str, Any]:
+            self.pins.append((chat_id, str(message_id)))
+            return {"ok": True}
+
+    tendwire = RecoveryTendwire()
+    telegram = RecoveryTelegram()
+    runtime = source_sync.SyncRuntime(tendwire, telegram, with_outbox=False)
+
+    first = source_sync.sync_once(store, runtime)
+    ledger_after_first = json.loads(
+        json.dumps(herdres_state.delivered_turns(store), sort_keys=True)
+    )
+    edits_after_first = list(telegram.edited)
+    sends_after_first = list(telegram.sent)
+    second = source_sync.sync_once(store, runtime)
+    ledger_after_second = json.loads(
+        json.dumps(herdres_state.delivered_turns(store), sort_keys=True)
+    )
+    third = source_sync.sync_once(store, runtime)
+
+    binding = herdres_state.find_message_binding(store, "555", topic_id="77")
+    ledger = herdres_state.delivered_turns(store)
+    assert tendwire.calls == ["snapshot", "turns", "pending"] * 3
+    assert tendwire.turn_payload_objects == [turns_payload] * 3
+    assert all(payload is turns_payload for payload in tendwire.turn_payload_objects)
+    assert first["feed_sent"] == first["sent"] == 1
+    assert len(telegram.edited) == 1
+    assert telegram.edited[0][1] == "555"
+    assert public_turn["assistant_final_text"] in telegram.edited[0][2]
+    assert telegram.sent == []
+    assert second["feed_sent"] == second["sent"] == second["turn_updates"] == 0
+    assert third["feed_sent"] == third["sent"] == third["turn_updates"] == 0
+    assert telegram.edited == edits_after_first
+    assert telegram.sent == sends_after_first
+    assert ledger_after_second == ledger_after_first
+    assert ledger == ledger_after_first
+    assert len(ledger) == 1
+    assert list(ledger.values())[0]["turn_id"] == public_turn["id"]
+    assert binding is not None
+    assert binding["kind"] == "final"
+    assert binding["turn_id"] == public_turn["id"]
+    assert binding["topic_id"] == "77"
+    assert worker_entry["topic_id"] == "77"
+    assert worker_entry["last_turn_id"] == public_turn["id"]
+    assert worker_entry["last_clean_message_id"] == "555"
+    assert worker_entry["last_clean_message_ids"] == ["555"]
+    assert "last_stream_turn_id" not in worker_entry
+    assert "last_stream_hash" not in worker_entry
+    assert "last_stream_message_id" not in worker_entry
+    assert "last_stream_bot_kind" not in worker_entry
+    assert direct_boundary_attempts == []

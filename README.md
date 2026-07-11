@@ -40,15 +40,27 @@ hexadecimal characters (`^wsk1_[0-9a-f]{64}$`), and
 `meta.stable_key_version` is the exact integer `1` (not a string or boolean).
 Consumers must treat an absent or invalid pair as no continuity claim.
 
+Within one Tendwire installation, the authoritative version-1 pair—not
+`worker.id`—is the continuity authority. Restoring the same Herdr public
+workspace/pane identity therefore reproduces the exact `meta.stable_key`, even
+when Tendwire worker IDs or runtime terminal, agent, and session identifiers
+change.
+
 The handle is a Tendwire-owned, opaque public value. Before projection,
 Tendwire recursively removes source-supplied fields in the normalized
 stable-key family, so Herdr metadata cannot select or spoof this identity.
 Tendwire then derives the handle locally from a validated workspace/public-pane
 identity and a private 32-byte installation key. Neither the handle nor any
 other public field exposes that key or the raw identity used to derive it.
-Herdres validates only the exact public format and version; it does not possess
-the installation key or raw identity and does not call Herdr to reconstruct
-either one.
+Herdres accepts only the exact public format and version. An absent pair, a
+partial pair, a malformed value, or any version other than the integer `1`
+fails closed: Herdres quarantines the local binding instead of falling back to
+worker ID. It neither possesses the installation key or raw identity nor calls
+Herdr to reconstruct them. Herdres also requires the turns source wrapper's
+`schema_version` to be the exact integer `1`; a missing, malformed, or
+unsupported value stops source state and delivery mutation. After that gate,
+legacy private state can adopt an already exact key only through a
+deterministic, unique match; conflicting claims remain quarantined.
 
 The installation identity has three artifacts in `data_dir`: the private
 32-byte `installation.key`, its nonsecret `installation.key.sha256` digest

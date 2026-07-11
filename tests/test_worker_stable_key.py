@@ -118,7 +118,7 @@ def _reserved_meta_keys(value: Any, *, include_root: bool = True) -> list[str]:
 
 
 def test_restore_fixture_matches_verified_herdr_contract() -> None:
-    """Fixture follows Herdr source commit 4ffd99c2ec62fd3cbc9f9e0673d92c6a2a4f12b1."""
+    """Fixture follows authoritative Herdr commit 46174563489273199a17c982356c6e4674ef00d4."""
     fixture = _fixture()
     session = fixture["session_snapshot"]
     workspace = session["workspaces"][0]
@@ -139,13 +139,20 @@ def test_restore_fixture_matches_verified_herdr_contract() -> None:
     for field in ("terminal_id", "agent"):
         assert before["pane_info"][field] != after["pane_info"][field]
     assert before["pane_info"]["agent_session"] != after["pane_info"]["agent_session"]
+    split = fixture["split_creation"]
+    assert split["event"] == split["data"]["type"] == "pane_created"
+    assert split["data"]["pane"]["pane_id"] == before["sibling_pane_info"]["pane_id"]
+    assert split["data"]["pane"]["workspace_id"] == workspace["id"]
     for move in (fixture["same_workspace_move"], fixture["cross_workspace_move"]):
         assert move["event"] == "pane_moved"
         assert move["data"]["type"] == "pane_moved"
         assert "pane" in move["data"]
 
 
-def test_exact_format_version_and_domain_separated_hmac(tmp_path: Path) -> None:
+def test_exact_format_version_and_domain_separated_hmac(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fixture = _fixture()
     pane = fixture["pre_restore"]["pane_info"]
     config = _config(tmp_path / "state")
@@ -153,23 +160,28 @@ def test_exact_format_version_and_domain_separated_hmac(tmp_path: Path) -> None:
     config.data_dir.mkdir(mode=0o700)
     config.installation_key_path.write_bytes(key)
     os.chmod(config.installation_key_path, 0o600)
+    captured_messages: list[bytes] = []
+    original_hmac_new = hmac.new
 
+    def capture_hmac(
+        hmac_key: bytes,
+        message: bytes,
+        digestmod: Any,
+    ) -> hmac.HMAC:
+        captured_messages.append(message)
+        return original_hmac_new(hmac_key, message, digestmod)
+
+    monkeypatch.setattr(worker_identity.hmac, "new", capture_hmac)
     worker = _single_worker(config, pane)
-    message = json.dumps(
-        {
-            "backend": "herdr",
-            "domain": "tendwire.worker-stable-key",
-            "host_id": "stable-host",
-            "pane_id": "wR9:pA",
-            "version": 1,
-            "workspace_id": "wR9",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    expected = "wsk1_" + hmac.new(key, message, hashlib.sha256).hexdigest()
+    message = (
+        b'{"backend":"herdr","domain":"tendwire.worker-stable-key",'
+        b'"host_id":"stable-host","pane_id":"wR9:pA","version":1,'
+        b'"workspace_id":"wR9"}'
+    )
+    expected = "wsk1_" + original_hmac_new(key, message, hashlib.sha256).hexdigest()
 
     assert _stable(worker) == expected
+    assert captured_messages == [message]
     assert _STABLE_KEY.fullmatch(expected)
     assert type(worker.meta["stable_key_version"]) is int
     assert worker.meta["stable_key_version"] == 1
@@ -178,6 +190,144 @@ def test_exact_format_version_and_domain_separated_hmac(tmp_path: Path) -> None:
     assert type(public_meta["stable_key_version"]) is int
     assert public_meta["stable_key_version"] == 1
     assert config.installation_key_marker_path.read_bytes() == hashlib.sha256(key).hexdigest().encode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "pane_id", "expected"),
+    [
+        ("w0", "w0:p0", ("w0", "w0:p0")),
+        ("w1", "w1:p1", ("w1", "w1:p1")),
+        ("wZ", "wZ:pZ", ("wZ", "wZ:pZ")),
+        (
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+            (
+                "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
+                "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+            ),
+        ),
+        (None, "wA:pA", None),
+        ("wA", None, None),
+        ("", ":pA", None),
+        ("w", "w:pA", None),
+        ("W1", "W1:p1", None),
+        ("wwA", "wwA:pA", None),
+        ("wa", "wa:pA", None),
+        ("wAa", "wAa:pA", None),
+        ("wA-B", "wA-B:pA", None),
+        ("wA_B", "wA_B:pA", None),
+        ("wI", "wI:pA", None),
+        ("wL", "wL:pA", None),
+        ("wO", "wO:pA", None),
+        ("wU", "wU:pA", None),
+        ("wΑ", "wΑ:pA", None),
+        ("wＡ", "wＡ:pA", None),
+        ("wA", "wA:p", None),
+        ("wA", "wA:PA", None),
+        ("wA", "wA:pa", None),
+        ("wA", "wA:pAa", None),
+        ("wA", "wA:pA-B", None),
+        ("wA", "wA:pA_B", None),
+        ("wA", "wA:pI", None),
+        ("wA", "wA:pL", None),
+        ("wA", "wA:pO", None),
+        ("wA", "wA:pU", None),
+        ("wA", "wA:pΑ", None),
+        ("wA", "wA:pＡ", None),
+        ("wA", "wA:pA:pB", None),
+        ("wA", " wA:pA", None),
+        ("wA", "wA:pA ", None),
+        ("wA", "wB:pA", None),
+        ("wA", "wAA:pA", None),
+    ],
+    ids=[
+        "zero-boundary",
+        "one-boundary",
+        "uppercase-boundary",
+        "full-authoritative-alphabet",
+        "missing-workspace",
+        "missing-pane",
+        "empty-workspace",
+        "empty-workspace-suffix",
+        "uppercase-structural-prefix",
+        "extra-workspace-prefix",
+        "lowercase-workspace-suffix",
+        "mixed-case-workspace-suffix",
+        "hyphenated-workspace-suffix",
+        "underscored-workspace-suffix",
+        "workspace-ascii-I-confusable",
+        "workspace-ascii-L-confusable",
+        "workspace-ascii-O-confusable",
+        "workspace-ascii-U",
+        "workspace-greek-alpha-confusable",
+        "workspace-fullwidth-alpha-confusable",
+        "empty-pane-suffix",
+        "uppercase-pane-structural-prefix",
+        "lowercase-pane-suffix",
+        "mixed-case-pane-suffix",
+        "hyphenated-pane-suffix",
+        "underscored-pane-suffix",
+        "pane-ascii-I-confusable",
+        "pane-ascii-L-confusable",
+        "pane-ascii-O-confusable",
+        "pane-ascii-U",
+        "pane-greek-alpha-confusable",
+        "pane-fullwidth-alpha-confusable",
+        "injected-pane-structure",
+        "leading-pane-whitespace",
+        "trailing-pane-whitespace",
+        "cross-workspace",
+        "cross-workspace-prefix",
+    ],
+)
+def test_canonical_herdr_pane_identity_uses_exact_authoritative_grammar(
+    workspace_id: str | None,
+    pane_id: str | None,
+    expected: tuple[str, str] | None,
+) -> None:
+    assert worker_identity.canonical_herdr_pane_identity(workspace_id, pane_id) == expected
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "pane_id"),
+    [
+        ("w0", "w0:p0"),
+        ("w1", "w1:p1"),
+        ("wZ", "wZ:pZ"),
+        (
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+        ),
+    ],
+)
+def test_every_supported_identity_form_is_restart_stable_and_private(
+    tmp_path: Path,
+    workspace_id: str,
+    pane_id: str,
+) -> None:
+    item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    item["workspace_id"] = workspace_id
+    item["pane_id"] = pane_id
+    data_dir = tmp_path / "state"
+    before = _single_worker(_config(data_dir), item)
+
+    restarted_item = deepcopy(item)
+    restarted_item["terminal_id"] = "runtime-terminal-after-restart"
+    restarted_item["agent"] = "runtime-agent-after-restart"
+    restarted_item["agent_session"] = {
+        "source": "runtime-source-after-restart",
+        "agent": "runtime-agent-after-restart",
+        "kind": "id",
+        "value": "runtime-session-after-restart",
+    }
+    after = _single_worker(_config(data_dir), restarted_item)
+
+    assert _stable(after) == _stable(before)
+    public = json.dumps(after.to_dict(), sort_keys=True)
+    assert pane_id not in public
+    assert restarted_item["terminal_id"] not in public
+    assert restarted_item["agent_session"]["source"] not in public
+    assert restarted_item["agent_session"]["value"] not in public
 
 
 def test_restore_continuity_ignores_changed_runtime_terminal_agent_and_session(tmp_path: Path) -> None:
@@ -206,6 +356,52 @@ def test_split_panes_have_distinct_keys_and_survive_sibling_close_or_reorder(tmp
 
     primary_after_close = _single_worker(config, primary)
     assert _stable(primary_after_close) == by_name[primary["agent"]]
+
+
+def test_split_creation_adds_a_distinct_restart_stable_identity(tmp_path: Path) -> None:
+    fixture = _fixture()
+    primary = deepcopy(fixture["post_restore"]["pane_info"])
+    created = deepcopy(fixture["split_creation"]["data"]["pane"])
+    config = _config(tmp_path / "state")
+    backend, workers, bindings, records = _project(config, [], [primary])
+    original = workers[0]
+    original_key = _stable(original)
+    backend._workers = {original.id: original}
+    backend._bindings = {binding.private_fingerprint: binding for binding in bindings}
+    backend._pane_terminals = {primary["pane_id"]: primary["terminal_id"]}
+    backend._replace_ownership_maps(records, bindings)
+
+    assert backend.queue_event_envelope(fixture["split_creation"], flush=True)
+
+    assert len(backend._workers) == 2
+    keys = {_stable(worker) for worker in backend._workers.values()}
+    assert original_key in keys
+    assert len(keys) == 2
+    restarted_created = _single_worker(_config(config.data_dir), created)
+    assert _stable(restarted_created) in keys
+    public = json.dumps(
+        [worker.to_dict() for worker in backend._workers.values()],
+        sort_keys=True,
+    )
+    assert created["pane_id"] not in public
+    assert created["terminal_id"] not in public
+
+
+def test_same_pane_suffix_in_distinct_workspaces_has_distinct_keys(tmp_path: Path) -> None:
+    first_item = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    first_item["workspace_id"] = "wA"
+    first_item["pane_id"] = "wA:p7"
+    second_item = deepcopy(first_item)
+    second_item["workspace_id"] = "wB"
+    second_item["pane_id"] = "wB:p7"
+    config = _config(tmp_path / "state")
+
+    first = _single_worker(config, first_item)
+    second = _single_worker(config, second_item)
+
+    assert _stable(first) != _stable(second)
+    assert "wA:p7" not in json.dumps(first.to_dict(), sort_keys=True)
+    assert "wB:p7" not in json.dumps(second.to_dict(), sort_keys=True)
 
 
 def test_session_targeted_agent_adopts_matched_pane_identity_privately(tmp_path: Path) -> None:
@@ -1038,6 +1234,16 @@ def test_complete_authoritative_move_retains_state_when_rederivation_fails(
     assert next(iter(backend._bindings.values())) == original_binding
     assert backend.health.status == "degraded"
     assert backend.health.outcome == "continuity_unavailable"
+    diagnostic = json.dumps(backend.health.to_backend_health().to_dict(), sort_keys=True)
+    for private_value in (
+        initial["pane_id"],
+        initial["terminal_id"],
+        moved_pane["pane_id"],
+        moved_pane["terminal_id"],
+        moved_pane["agent_session"]["source"],
+        moved_pane["agent_session"]["value"],
+    ):
+        assert private_value not in diagnostic
 
 
 def test_partial_event_preserves_local_key_and_authoritative_failure_retains_state(

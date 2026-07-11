@@ -91,6 +91,16 @@ files are restricted to mode `0600`. The service `UMask=0077` above protects
 newly created local state as well. Once initialized, ordinary loads only
 validate and reuse this state; they never rotate it.
 
+The public continuity contract is the exact
+`meta.stable_key`/`meta.stable_key_version` pair derived from an authoritative
+Herdr public workspace/pane identity; the supported version is the integer `1`.
+For the same installation and authoritative identity, the key must remain
+byte-for-byte identical across Tendwire worker-ID churn. Treat an absent,
+partial, malformed, or unknown-version pair as a continuity failure: do not
+rebind it by worker ID. Herdres keeps such local state quarantined; routing can
+recover only from a later valid Tendwire refresh that supplies the
+authoritative pair.
+
 Treat Tendwire and Herdres continuity data as one recovery unit:
 
 1. Identify the active Tendwire database path, Tendwire `data_dir`, and the
@@ -100,10 +110,21 @@ Treat Tendwire and Herdres continuity data as one recovery unit:
 2. Into one access-restricted backup, copy the Tendwire database,
    `data_dir/installation.key`, `data_dir/installation.key.sha256`,
    `data_dir/installation.key.initialized`, and the complete Herdres persistent
-   state. Preserve ownership and modes. The three identity artifacts must come
-   from the same stopped-service checkpoint and must be backed up and restored
-   together. Do not publish the backup as an issue attachment or build
-   artifact.
+   state. Preserve ownership and modes. Use the SQLite backup API for every
+   SQLite database, or copy database files only after all writers are confirmed
+   stopped; never copy a live database file by itself. The three identity
+   artifacts must come from the same stopped-service checkpoint and must be
+   backed up and restored together. Do not publish the backup as an issue
+   attachment or build artifact.
+
+Keep that checkpoint unchanged. Before allowing candidate code to initialize
+or migrate local SQLite state, make a second access-restricted scratch copy,
+point the candidate only at that copy, and run the status and read-only SQLite
+integrity checks below. Confirm that a known authoritative worker retains the
+exact version-1 stable key even if its Tendwire worker ID changed. If any check
+fails or the identity is quarantined, discard the scratch copy and investigate;
+the untouched checkpoint remains the rollback source. Never test a migration
+against the only recovery copy or attempt to repair its rows by hand.
 3. For an ordinary upgrade, update only the installed software or checkout.
    Retain the database, all three identity artifacts, and Herdres state
    unchanged. Restart Tendwire first, verify that a known same-workspace worker
@@ -206,3 +227,10 @@ Tendwire does not own Telegram delivery state. To roll back a Herdres source-mod
 deployment, switch Herdres to `HERDRES_TENDWIRE_MODE=enrich` or
 `HERDRES_TENDWIRE_MODE=off`, restart Herdres services, and leave Tendwire running
 or stop `tendwired.service` after clients have stopped using it.
+
+For a state rollback, stop Herdres consumers and Tendwire, then restore the
+complete untouched pre-upgrade checkpoint: the Tendwire database, all three
+Tendwire identity artifacts, and the matching Herdres state. Do not reverse a
+SQLite migration in place or mix files from different checkpoints. Validate
+Tendwire's store integrity and exact version-1 continuity before restarting
+Herdres; if validation fails, leave consumers stopped and retain the checkpoint.

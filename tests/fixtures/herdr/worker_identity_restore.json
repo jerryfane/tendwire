@@ -139,6 +139,24 @@
       "revision": 1
     }
   },
+  "split_creation": {
+    "event": "pane_created",
+    "data": {
+      "type": "pane_created",
+      "pane": {
+        "pane_id": "wR9:pB",
+        "terminal_id": "terminal-sibling-created-sentinel",
+        "workspace_id": "wR9",
+        "tab_id": "wR9:t1",
+        "focused": false,
+        "cwd": "/continuity/sibling",
+        "label": "sibling",
+        "agent": "claude-sibling-created-sentinel",
+        "agent_status": "idle",
+        "revision": 1
+      }
+    }
+  },
   "same_workspace_move": {
     "event": "pane_moved",
     "data": {
