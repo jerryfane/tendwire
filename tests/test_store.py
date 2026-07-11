@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import sqlite3
 import stat
@@ -107,6 +108,34 @@ def _unique_index_columns(conn: sqlite3.Connection, table: str) -> dict[str, tup
         )
         indexes[index_name] = columns
     return indexes
+
+
+def _cross_process_store_writer(
+    db_path: str,
+    barrier: Any,
+    results: Any,
+    actor: str,
+    padding_fd_count: int,
+) -> None:
+    padding_fds: list[int] = []
+    try:
+        padding_fds = [
+            os.open(os.devnull, os.O_RDONLY) for _ in range(padding_fd_count)
+        ]
+        with store_sqlite._connect(Path(db_path), prepare=True) as conn:
+            barrier.wait(timeout=15)
+            for sequence in range(80):
+                conn.execute(
+                    "INSERT INTO cross_process_writes (actor, sequence) VALUES (?, ?)",
+                    (actor, sequence),
+                )
+                conn.commit()
+        results.put(None)
+    except BaseException as exc:
+        results.put(f"{type(exc).__name__}: {exc}")
+    finally:
+        for fd in padding_fds:
+            os.close(fd)
 
 
 def _mode(path: Path) -> int:
@@ -555,6 +584,50 @@ def test_store_uri_quotes_pinned_database_leaf(tmp_path: Path) -> None:
     ]
 
 
+def test_store_wal_is_shared_safely_across_independent_processes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "cross-process" / "tendwire.db"
+    init_store(db_path)
+    with store_sqlite._connect(db_path, prepare=True) as conn:
+        conn.execute(
+            "CREATE TABLE cross_process_writes ("
+            "actor TEXT NOT NULL, sequence INTEGER NOT NULL, "
+            "PRIMARY KEY (actor, sequence))"
+        )
+
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_cross_process_store_writer,
+            args=(str(db_path), barrier, results, "first", 0),
+        ),
+        context.Process(
+            target=_cross_process_store_writer,
+            args=(str(db_path), barrier, results, "second", 11),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("cross-process SQLite writer did not terminate")
+        assert process.exitcode == 0
+
+    assert [results.get(timeout=5) for _ in processes] == [None, None]
+    with store_sqlite._connect(db_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM cross_process_writes").fetchone()[0]
+            == 160
+        )
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
 @pytest.mark.parametrize("prepare", [False, True])
 def test_store_connection_stays_on_pinned_parent_after_ancestor_substitution(
     tmp_path: Path,
@@ -576,7 +649,7 @@ def test_store_connection_stays_on_pinned_parent_after_ancestor_substitution(
                 member.unlink()
 
     displaced_root = tmp_path / "displaced"
-    original_proc_fd_path = store_sqlite.proc_fd_path
+    original_canonical_path = store_sqlite.canonical_path_from_fd
     substituted = False
 
     def substitute_ancestor(parent_fd: int, leaf: str) -> str:
@@ -585,9 +658,9 @@ def test_store_connection_stays_on_pinned_parent_after_ancestor_substitution(
             current_root.rename(displaced_root)
             replacement_root.rename(current_root)
             substituted = True
-        return original_proc_fd_path(parent_fd, leaf)
+        return original_canonical_path(parent_fd, leaf)
 
-    monkeypatch.setattr(store_sqlite, "proc_fd_path", substitute_ancestor)
+    monkeypatch.setattr(store_sqlite, "canonical_path_from_fd", substitute_ancestor)
 
     with store_sqlite._connect(current_db, prepare=prepare) as conn:
         assert conn.execute("SELECT value FROM anchor_marker").fetchone()[0] == "pinned"
@@ -625,7 +698,9 @@ def test_memory_store_does_not_create_filesystem_state(
     monkeypatch.setattr(
         store_sqlite, "prepare_resolved_private_parent", reject_filesystem_resolution
     )
-    monkeypatch.setattr(store_sqlite, "proc_fd_path", reject_filesystem_resolution)
+    monkeypatch.setattr(
+        store_sqlite, "canonical_path_from_fd", reject_filesystem_resolution
+    )
 
     init_store(Path(":memory:"))
 
@@ -644,7 +719,9 @@ def test_shared_named_memory_uri_uses_sqlite_uri_without_creating_a_file(
     monkeypatch.setattr(
         store_sqlite, "prepare_resolved_private_parent", reject_filesystem_resolution
     )
-    monkeypatch.setattr(store_sqlite, "proc_fd_path", reject_filesystem_resolution)
+    monkeypatch.setattr(
+        store_sqlite, "canonical_path_from_fd", reject_filesystem_resolution
+    )
     db_uri = "file:tendwire-shared?mode=memory&cache=shared"
 
     with store_sqlite._connect(db_uri) as writer:

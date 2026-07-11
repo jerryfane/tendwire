@@ -19,6 +19,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlsplit
 
 from ..local_state import (
+    canonical_path_from_fd,
     LocalStateError,
     LocalStateErrorCode,
     PermissionState,
@@ -28,7 +29,6 @@ from ..local_state import (
     open_resolved_parent,
     prepare_resolved_private_parent,
     prepare_sqlite_family_at,
-    proc_fd_path,
     repair_sqlite_family_at,
     validate_owned_directory_stat,
 )
@@ -567,14 +567,16 @@ def _connect(
     memory_db = _is_memory_db(raw_db_path)
     parent_fd: int | None = None
     leaf: str | None = None
+    expected_db: os.stat_result | None = None
     if memory_db:
         connect_target = raw_db_path
         connect_uri = raw_db_path.startswith("file:")
     else:
         parent_fd, leaf = _open_filesystem_db(db_path, prepare=prepare)
         try:
-            anchored_path = proc_fd_path(parent_fd, leaf)
-            connect_target = f"file:{quote(anchored_path, safe='/')}?mode=rw"
+            expected_db = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            canonical_path = canonical_path_from_fd(parent_fd, leaf)
+            connect_target = f"file:{quote(canonical_path, safe='/')}?mode=rw"
         except Exception:
             os.close(parent_fd)
             raise
@@ -598,6 +600,21 @@ def _connect(
             if parent_fd is not None:
                 os.close(parent_fd)
         raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+    if parent_fd is not None and leaf is not None and expected_db is not None:
+        try:
+            # Catch path substitution across sqlite3.connect before any pragma
+            # can mutate a database other than the securely resolved one.
+            canonical_path_from_fd(parent_fd, leaf)
+            current_db = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                current_db.st_dev != expected_db.st_dev
+                or current_db.st_ino != expected_db.st_ino
+            ):
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
+        except Exception:
+            conn.close()
+            os.close(parent_fd)
+            raise
     if parent_fd is not None:
         conn._own_parent_fd(parent_fd)
         parent_fd = None

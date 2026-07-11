@@ -1248,6 +1248,22 @@ def test_proc_fd_path_has_no_non_linux_fallback(
         os.close(parent_fd)
 
 
+def test_canonical_path_from_fd_tracks_validated_directory_after_rename(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    original.mkdir()
+    parent_fd, leaf = local_state.open_resolved_parent(original / "state.db")
+    moved = tmp_path / "moved"
+
+    try:
+        original.rename(moved)
+        resolved = Path(local_state.canonical_path_from_fd(parent_fd, leaf))
+        assert resolved == moved / "state.db"
+    finally:
+        os.close(parent_fd)
+
+
 def test_path_wrappers_close_every_resolved_component_fd(tmp_path: Path) -> None:
     db_path = tmp_path / "deep" / "state" / "tendwire.db"
     prepare_sqlite_family(db_path)

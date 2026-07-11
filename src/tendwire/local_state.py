@@ -393,7 +393,11 @@ def proc_fd_path(dir_fd: int, name: str) -> str:
 
     require_posix_support()
     leaf = _leaf_name(name)
-    if not sys.platform.startswith("linux") or not isinstance(dir_fd, int) or dir_fd < 0:
+    if (
+        not sys.platform.startswith("linux")
+        or not isinstance(dir_fd, int)
+        or dir_fd < 0
+    ):
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     try:
         expected = os.fstat(dir_fd)
@@ -409,6 +413,48 @@ def proc_fd_path(dir_fd: int, name: str) -> str:
     if not same_inode(expected, current):
         _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
     return f"{anchor}/{leaf}"
+
+
+def canonical_path_from_fd(dir_fd: int, name: str) -> str:
+    """Return a normal pathname that still names the retained directory.
+
+    Unlike :func:`proc_fd_path`, the result is stable across processes and is
+    therefore suitable for SQLite's filename-based WAL and locking identity.
+    The configured path must already have been resolved component by component;
+    this helper only recovers and verifies the pathname of that retained result.
+    """
+
+    require_posix_support()
+    leaf = _leaf_name(name)
+    if (
+        not sys.platform.startswith("linux")
+        or not isinstance(dir_fd, int)
+        or dir_fd < 0
+    ):
+        _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+    try:
+        expected = os.fstat(dir_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    if not stat.S_ISDIR(expected.st_mode):
+        _raise(LocalStateErrorCode.WRONG_TYPE)
+    try:
+        parent = os.readlink(f"/proc/self/fd/{dir_fd}")
+    except OSError:
+        _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+    if (
+        not parent.startswith(os.sep)
+        or "\x00" in parent
+        or parent.endswith(" (deleted)")
+    ):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    try:
+        current = os.stat(parent, follow_symlinks=False)
+    except OSError:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    if not same_inode(expected, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    return os.path.join(parent, leaf)
 
 
 def lstat_at(dir_fd: int, name: str) -> os.stat_result | None:
