@@ -607,6 +607,15 @@ def _write_omp_session(tmp_path, lines):
     return root, path
 
 
+def _write_valid_git_head(git_dir: Path) -> None:
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="ascii")
+
+
+def _mark_git_repository(path: Path) -> None:
+    _write_valid_git_head(path / ".git")
+
+
 def _omp_msg(entry_id, role, text, stop=None, attribution=None):
     message = {"role": role, "content": [{"type": "text", "text": text}]}
     if stop:
@@ -614,6 +623,25 @@ def _omp_msg(entry_id, role, text, stop=None, attribution=None):
     if attribution:
         message["attribution"] = attribution
     return {"type": "message", "id": entry_id, "message": message}
+
+
+def _omp_read_msg(entry_id, path_value):
+    return {
+        "type": "message",
+        "id": entry_id,
+        "message": {
+            "role": "assistant",
+            "stopReason": "toolUse",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "id": f"{entry_id}-tool",
+                    "name": "read",
+                    "arguments": {"path": path_value},
+                }
+            ],
+        },
+    }
 
 
 def test_read_omp_session_open_then_complete_turn(tmp_path, monkeypatch) -> None:
@@ -681,9 +709,9 @@ def test_omp_open_turn_streams_thinking_headlines(tmp_path, monkeypatch) -> None
     assert content["has_open_turn"] is True
     assert content["assistant_stream_text"] == (
         "Reading the goal doc\n\n"
-        "step 1 · bash\n\n"
+        "step 1 · run command\n\n"
         "checking the branch state first\n\n"
-        "step 2 · bash"
+        "step 2 · run command"
     )
 
 
@@ -773,10 +801,19 @@ def test_omp_incremental_cache_keeps_turn_state_when_prompt_leaves_tail(tmp_path
     assert second["user_text"] == "keep streaming this"
     assert second["complete"] is False
     assert "Still working" in second["assistant_stream_text"]
-    assert "step 1 · bash: git status" in second["assistant_stream_text"]
+    assert "step 1 · git status" in second["assistant_stream_text"]
 
 
-def test_omp_tool_snippets_include_arguments_and_redact_sensitive_values(tmp_path, monkeypatch) -> None:
+def test_omp_tool_progress_uses_only_allowlisted_structured_summaries(tmp_path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    _mark_git_repository(project)
+    (project / "README.md").write_text("public", encoding="utf-8")
+    private_key_path = "/home/alice/.ssh/id_ed25519"
+    herdr_socket_path = "/run/user/1000/herdr/private.sock"
+    credential_url = "https://alice:password@internal.example/private"
+    provider_key = "sk-" + "proj-" + "PUBLICSAFETY1234567890"
+    raw_tool_id = "toolu_PUBLICSAFETYTOOL01"
     tool_message = {
         "type": "message",
         "id": "a1",
@@ -786,15 +823,33 @@ def test_omp_tool_snippets_include_arguments_and_redact_sensitive_values(tmp_pat
             "content": [
                 {
                     "type": "toolCall",
-                    "id": "c1",
+                    "id": raw_tool_id,
                     "name": "bash",
-                    "arguments": {"command": "OPENAI_API_KEY=sk-real git checkout -b day2-logic"},
+                    "arguments": {
+                        "command": f"cat {private_key_path}; connect {herdr_socket_path} {credential_url}",
+                        "env": {"TOKEN": provider_key},
+                    },
                 },
                 {
                     "type": "toolCall",
                     "id": "c2",
-                    "name": "read",
-                    "arguments": {"path": "docs/DAY2_LOGIC_GOAL.md", "token": "must-not-leak"},
+                    "toolName": "bash",
+                    "input": {"command": "python -m pytest -q tests/test_turns.py"},
+                },
+                {
+                    "type": "toolCall",
+                    "id": "c3",
+                    "tool": "read",
+                    "args": {"path": "README.md", "stdout": private_key_path},
+                },
+                {
+                    "type": "toolCall",
+                    "id": "c4",
+                    "name": raw_tool_id,
+                    "arguments": {
+                        "nested": [private_key_path, herdr_socket_path, provider_key],
+                        "url": credential_url,
+                    },
                 },
             ],
         },
@@ -802,18 +857,185 @@ def test_omp_tool_snippets_include_arguments_and_redact_sensitive_values(tmp_pat
     root, path = _write_omp_session(
         tmp_path,
         [
-            _omp_msg("u1", "user", "show tool progress", attribution="user"),
+            {"type": "session", "id": "private-session", "cwd": str(project)},
+            _omp_msg("u1", "user", "show safe tool progress", attribution="user"),
             tool_message,
         ],
     )
     monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
 
     content = herdr_turns._read_omp_session_turn(str(path))
+    stream = content["assistant_stream_text"]
 
-    assert (
-        "step 1 · bash: OPENAI_API_KEY=<redacted> git checkout -b day2-logic"
-        in content["assistant_stream_text"]
+    assert stream.split("\n\n") == [
+        "step 1 · run command",
+        "step 2 · test: pytest",
+        "step 3 · read: README.md",
+        "step 4 · tool",
+    ]
+    for private_value in (
+        private_key_path,
+        herdr_socket_path,
+        credential_url,
+        provider_key,
+        raw_tool_id,
+    ):
+        assert private_value not in stream
+
+
+def test_omp_shell_progress_uses_a_small_constant_allowlist() -> None:
+    cases = [
+        ("git status --short", "step 1 · git status"),
+        ("pytest -q tests/test_turns.py", "step 1 · test: pytest"),
+        ("uv run pytest tests/test_turns.py", "step 1 · test: pytest"),
+        ("cargo test --workspace", "step 1 · test: cargo"),
+        ("npm run build", "step 1 · build: npm"),
+        ("make all", "step 1 · build: make"),
+        ("git checkout -b private-branch", "step 1 · run command"),
+        ("echo arbitrary private text", "step 1 · run command"),
+    ]
+
+    for command, expected in cases:
+        item = {"name": "bash", "arguments": {"command": command}}
+        assert herdr_turns._omp_tool_snippet(item, 1) == expected
+
+
+def test_omp_file_progress_requires_repository_root_proof(tmp_path: Path) -> None:
+    project = tmp_path / "repo"
+    docs = project / "docs"
+    docs.mkdir(parents=True)
+    _mark_git_repository(project)
+    readme = project / "README.md"
+    guide = docs / "guide.md"
+    outside = tmp_path / "outside.txt"
+    readme.write_text("readme", encoding="utf-8")
+    guide.write_text("guide", encoding="utf-8")
+    outside.write_text("private", encoding="utf-8")
+    escape = project / "escape"
+    escape.symlink_to(outside)
+
+    def snippet(path_value: str, root: Path | None = project) -> str:
+        return herdr_turns._omp_tool_snippet(
+            {"name": "read", "arguments": {"path": path_value}},
+            1,
+            root,
+        )
+
+    assert snippet("README.md") == "step 1 · read: README.md"
+    assert snippet(str(guide)) == "step 1 · read: docs/guide.md"
+    assert snippet("README.md", None) == "step 1 · read file"
+    assert snippet(str(outside)) == "step 1 · read file"
+    assert snippet("../outside.txt") == "step 1 · read file"
+    assert snippet(str(escape)) == "step 1 · read file"
+    assert snippet("~/.ssh/id_ed25519") == "step 1 · read file"
+    assert snippet("docs/../README.md") == "step 1 · read file"
+    assert snippet(".env") == "step 1 · read file"
+    assert snippet(".git/config") == "step 1 · read file"
+    assert snippet("secrets/key.txt") == "step 1 · read file"
+    assert snippet("credentials.json") == "step 1 · read file"
+
+
+def test_omp_file_progress_rejects_unproven_session_cwds(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home" / "alice"
+    home.mkdir(parents=True)
+    (home / ".bashrc").write_text("operator shell settings", encoding="utf-8")
+    notes = tmp_path / "operator-work"
+    notes.mkdir()
+    (notes / "operator-notes.txt").write_text("private operator notes", encoding="utf-8")
+
+    cases = (
+        ("filesystem-root", Path("/"), "/etc/passwd"),
+        ("home", home, ".bashrc"),
+        ("notes", notes, "operator-notes.txt"),
     )
-    assert "step 2 · read: docs/DAY2_LOGIC_GOAL.md" in content["assistant_stream_text"]
-    assert "sk-real" not in content["assistant_stream_text"]
-    assert "must-not-leak" not in content["assistant_stream_text"]
+    for label, cwd, path_value in cases:
+        root, session_path = _write_omp_session(
+            tmp_path / label,
+            [
+                {"type": "session", "id": label, "cwd": str(cwd)},
+                _omp_msg(f"{label}-user", "user", "inspect a file", attribution="user"),
+                _omp_read_msg(f"{label}-assistant", path_value),
+            ],
+        )
+        monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+        content = herdr_turns._read_omp_session_turn(str(session_path))
+
+        assert content is not None
+        assert content["assistant_stream_text"] == "step 1 · read file"
+
+
+def test_omp_file_progress_finds_repository_above_session_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "repo-with-subdir"
+    docs = project / "docs"
+    docs.mkdir(parents=True)
+    _mark_git_repository(project)
+    guide = docs / "guide.md"
+    guide.write_text("public", encoding="utf-8")
+    root, session_path = _write_omp_session(
+        tmp_path / "subdir-session",
+        [
+            {"type": "session", "id": "subdir", "cwd": str(docs)},
+            _omp_msg("subdir-user", "user", "inspect the guide", attribution="user"),
+            _omp_read_msg("subdir-assistant", str(guide)),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+    content = herdr_turns._read_omp_session_turn(str(session_path))
+
+    assert content is not None
+    assert content["assistant_stream_text"] == "step 1 · read: docs/guide.md"
+
+
+def test_omp_file_progress_accepts_worktree_gitdir_file(tmp_path: Path, monkeypatch) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "README.md").write_text("public", encoding="utf-8")
+    worktree_git_dir = tmp_path / "main" / ".git" / "worktrees" / "checkout"
+    _write_valid_git_head(worktree_git_dir)
+    (checkout / ".git").write_text(
+        f"gitdir: {worktree_git_dir}\n",
+        encoding="utf-8",
+    )
+    root, session_path = _write_omp_session(
+        tmp_path / "worktree-session",
+        [
+            {"type": "session", "id": "worktree", "cwd": str(checkout)},
+            _omp_msg("worktree-user", "user", "inspect the readme", attribution="user"),
+            _omp_read_msg("worktree-assistant", "README.md"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+    content = herdr_turns._read_omp_session_turn(str(session_path))
+
+    assert content is not None
+    assert content["assistant_stream_text"] == "step 1 · read: README.md"
+
+
+def test_omp_file_progress_rejects_invalid_worktree_gitdir_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkout = tmp_path / "invalid-checkout"
+    checkout.mkdir()
+    (checkout / "README.md").write_text("public", encoding="utf-8")
+    (checkout / ".git").write_text("gitdir: ../missing-git-dir\n", encoding="utf-8")
+    root, session_path = _write_omp_session(
+        tmp_path / "invalid-worktree-session",
+        [
+            {"type": "session", "id": "invalid-worktree", "cwd": str(checkout)},
+            _omp_msg("invalid-user", "user", "inspect the readme", attribution="user"),
+            _omp_read_msg("invalid-assistant", "README.md"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+    content = herdr_turns._read_omp_session_turn(str(session_path))
+
+    assert content is not None
+    assert content["assistant_stream_text"] == "step 1 · read file"

@@ -10,14 +10,33 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from tendwire.backends import herdr_cli
-from tendwire.cli import main
+from tendwire.cli import _build_parser, main, observe_public_snapshot
 from tendwire.config import Config
 from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
 from tendwire.core.projector import project_from_raw
-from tendwire.store.sqlite import append_event, init_store, latest_snapshot, list_worker_bindings, save_snapshot
+from tendwire.store.sqlite import (
+    SnapshotObservationContext,
+    append_event,
+    init_store,
+    latest_snapshot,
+    list_worker_bindings,
+    save_snapshot,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    private_home = tmp_path / "home"
+    private_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(private_home))
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path / "tendwire-data"))
+    monkeypatch.delenv("TENDWIRE_DB_PATH", raising=False)
 
 
 _PUBLIC_JSON_FORBIDDEN_KEYS = {
@@ -130,6 +149,22 @@ def test_cli_snapshot_no_herdr_works() -> None:
     """Empty snapshot works even when herdr is not installed."""
     code = main(["--herdr-bin", "definitely-not-a-real-herdr-binary", "snapshot", "--json"])
     assert code == 0
+
+
+def test_cli_socket_group_option_is_daemon_only_and_normalized(monkeypatch) -> None:
+    captured: list[Config] = []
+
+    def capture_daemon_config(config: Config) -> int:
+        captured.append(config)
+        return 0
+
+    monkeypatch.delenv("TENDWIRE_SOCKET_GROUP", raising=False)
+    monkeypatch.setattr("tendwire.cli.cmd_daemon", capture_daemon_config)
+
+    snapshot_args = _build_parser().parse_args(["snapshot"])
+    assert not hasattr(snapshot_args, "socket_group")
+    assert main(["daemon", "--socket-group", "  daemon-clients  "]) == 0
+    assert captured[0].socket_group == "daemon-clients"
 
 
 def test_cli_turns_json_no_herdr_prints_public_empty_collection(capsys) -> None:
@@ -404,7 +439,6 @@ def test_cli_turns_and_pending_json_strip_raw_command_action_material(capsys, mo
         {
             "choice_id": pending_payload["pending_interactions"][0]["choices"][0]["choice_id"],
             "label": "Action",
-            "params": {"safe_choice": "kept"},
         }
     ]
     assert "sentinel-cli-" not in encoded_turns
@@ -471,6 +505,96 @@ def test_cli_snapshot_store_persists_printed_snapshot(tmp_path: Path, capsys) ->
     assert restored.content_fingerprint == payload["content_fingerprint"]
 
 
+@pytest.mark.parametrize(
+    ("outcome", "has_workers", "expected_authority"),
+    [
+        ("healthy_non_empty", True, "complete"),
+        ("empty_healthy", False, "complete"),
+        ("missing_binary", False, "none"),
+        ("timeout", False, "none"),
+        ("malformed_json", False, "none"),
+        ("continuity_unavailable", True, "none"),
+        ("unknown", False, "none"),
+    ],
+)
+def test_cli_snapshot_persistence_passes_explicit_observation_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    has_workers: bool,
+    expected_authority: str,
+) -> None:
+    db_path = tmp_path / f"{outcome}.db"
+    init_store(db_path)
+    config = Config(host_id=f"cli-{outcome}", db_path=db_path)
+    observed_at = "2026-01-01T00:00:00+00:00"
+    workers = [Worker(id="worker-1", name="Worker One", status="active")] if has_workers else []
+    health = herdr_cli.herdr_backend_health(
+        outcome,
+        observed_at=observed_at,
+        workers=workers,
+    )
+    observation = SimpleNamespace(
+        spaces=[],
+        workers=workers,
+        bindings=[],
+        backend_health=[health],
+    )
+    captured: list[SnapshotObservationContext] = []
+
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_snapshot_observation",
+        lambda _config, *, stored_bindings: observation,
+    )
+
+    def _capture_save(
+        _db_path: Path,
+        _snapshot: Snapshot,
+        *,
+        observation: SnapshotObservationContext,
+    ) -> None:
+        captured.append(observation)
+
+    monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
+
+    observe_public_snapshot(config, store_snapshot=True)
+
+    assert len(captured) == 1
+    assert captured[0].authority == expected_authority
+    assert captured[0].observed_at == observed_at
+
+
+def test_cli_legacy_observation_cannot_claim_complete_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "legacy-observation.db"
+    init_store(db_path)
+    config = Config(host_id="cli-legacy", db_path=db_path)
+    worker = Worker(id="worker-1", name="Worker One", status="blocked")
+    captured: list[SnapshotObservationContext] = []
+
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_state",
+        lambda _config, **_kwargs: ([], [worker]),
+    )
+
+    def _capture_save(
+        _db_path: Path,
+        _snapshot: Snapshot,
+        *,
+        observation: SnapshotObservationContext,
+    ) -> None:
+        captured.append(observation)
+
+    monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
+
+    observe_public_snapshot(config, store_snapshot=True)
+
+    assert len(captured) == 1
+    assert captured[0].authority == "none"
+
+
 def test_cli_attention_json_reads_store_backed_lifecycle(
     tmp_path: Path,
     capsys,
@@ -505,7 +629,14 @@ def test_cli_attention_json_reads_store_backed_lifecycle(
         ],
         timestamp=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
     )
-    save_snapshot(db_path, snapshot)
+    save_snapshot(
+        db_path,
+        snapshot,
+        observation=SnapshotObservationContext(
+            authority="complete",
+            observed_at="2026-01-01T00:00:00+00:00",
+        ),
+    )
 
     code = main(
         [
@@ -528,6 +659,16 @@ def test_cli_attention_json_reads_store_backed_lifecycle(
     assert payload["attention"][0]["lifecycle_status"] == "open"
     assert payload["attention"][0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
     assert payload["attention"][0]["signal_count"] == 1
+    assert len(payload["attention"]) == 1
+    assert not {
+        "family_key",
+        "generation",
+        "first_missing_at",
+        "missing_observation_count",
+        "last_accepted_at",
+        "last_observation_key",
+        "max_notified_severity_rank",
+    }.intersection(payload["attention"][0])
     assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
     _assert_no_public_json_forbidden(payload)
 

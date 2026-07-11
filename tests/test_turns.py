@@ -269,8 +269,8 @@ def test_pending_interaction_roundtrip_sanitizes_choices_and_ignores_timestamps(
     assert payload["schema_version"] == 1
     assert payload["kind"] == "confirm_destructive_action"
     assert payload["status"] == "open"
-    assert payload["choices"][0]["value"] == {"decision": "yes"}
-    assert payload["choices"][0]["params"] == {"safe": "kept"}
+    assert payload["choices"] == [{"choice_id": choice.choice_id, "label": "Approve"}]
+    assert "decision" not in json.dumps(payload)
     assert pending.id == same_logical_pending.id
     assert pending.fingerprint == same_logical_pending.fingerprint
     assert PendingInteraction.from_json(pending.to_json()).to_dict() == payload
@@ -367,7 +367,7 @@ def test_turn_pending_and_choice_preserve_public_connector_text_before_fingerpri
     }
     assert dirty_pending.id == clean_pending.id
     assert dirty_pending.fingerprint == clean_pending.fingerprint
-    assert "telegram delivery" in encoded
+    assert "telegram delivery" not in encoded
     assert "herdres" in encoded
     assert "outbox" in encoded
     assert "telegram.delivery" not in encoded
@@ -483,7 +483,7 @@ def test_turn_pending_to_dict_resanitizes_mutable_public_maps() -> None:
     }
     encoded = json.dumps(payload, sort_keys=True).lower()
 
-    assert payload["choice"]["params"] == {"safe_choice": "kept", "note": "herdres outbox"}
+    assert payload["choice"] == {"choice_id": choice.choice_id, "label": "Approve"}
     assert payload["turn"]["meta"] == {"safe_turn": "kept", "note": "herdres outbox"}
     assert payload["pending"]["meta"] == {"safe_pending": "kept", "note": "herdres outbox"}
     assert "herdres outbox" in encoded
@@ -605,9 +605,6 @@ def test_turn_pending_and_choice_strip_pr5_private_fields_before_fingerprints() 
     assert dirty_choice.to_dict() == {
         "choice_id": clean_choice.choice_id,
         "label": "Approve",
-        "params": {"safe": "kept", "nested": {"safe": "kept"}},
-        "value": {"decision": "yes", "nested": {"safe": "kept"}},
-        "description": '{"text":"safe description"}',
     }
     assert dirty_pending.id == clean_pending.id
     assert dirty_pending.fingerprint == clean_pending.fingerprint
@@ -835,12 +832,12 @@ def test_pending_projection_reuses_public_suggested_actions_as_choices() -> None
     assert payload["kind"] == "approval"
     assert payload["choices"] == [
         {
-            "choice_id": "approve-action",
+            "choice_id": pending[0].choices[0].choice_id,
             "label": "Approve",
-            "params": {"safe": "kept", "worker_id": "worker-1"},
-            "value": "approve",
         }
     ]
+    assert payload["choices"][0]["choice_id"].startswith("choice-")
+    assert "approve-action" not in json.dumps(payload)
     assert payload["meta"]["needs_human"] is True
     assert "term-private" not in json.dumps(payload)
     _assert_no_forbidden_fields(payload)
@@ -900,7 +897,6 @@ def test_pending_projection_omits_raw_command_suggested_action_material_before_f
         {
             "choice_id": pending_b.choices[0].choice_id,
             "label": "Run diagnostic",
-            "params": {"safe_choice": "kept"},
         }
     ]
     _assert_no_forbidden_fields(payload)
@@ -968,7 +964,6 @@ def test_pending_projection_omits_command_alias_values_before_public_fingerprint
         {
             "choice_id": pending_b.choices[0].choice_id,
             "label": "Run diagnostic",
-            "params": {"safe_choice": "kept"},
         }
     ]
     assert "value" not in wrapper_a["pending_interactions"][0]["choices"][0]
@@ -1027,13 +1022,13 @@ def test_pending_projection_keeps_safe_explicit_action_value_with_forbidden_comm
     assert payload["kind"] == "approval"
     assert payload["choices"] == [
         {
-            "choice_id": "approve-action",
+            "choice_id": pending.choices[0].choice_id,
             "label": "Approve",
-            "params": {"safe_choice": "kept"},
-            "value": "approve",
         }
     ]
-    assert wrapper["pending_interactions"][0]["choices"][0]["value"] == "approve"
+    assert payload["choices"][0]["choice_id"].startswith("choice-")
+    assert "approve-action" not in json.dumps(wrapper)
+    assert "value" not in wrapper["pending_interactions"][0]["choices"][0]
     _assert_no_forbidden_fields(payload)
     _assert_no_forbidden_fields(wrapper)
     _assert_no_private_sentinels(payload)
@@ -1169,7 +1164,9 @@ def test_turn_pending_projectors_strip_pr5_metadata_and_keep_public_fingerprints
     assert dirty_pending.to_dict()["meta"]["safe_attention"] == "kept"
     assert "workerId" not in dirty_pending.to_dict()["meta"]
     assert "space-id" not in dirty_pending.to_dict()["meta"]
-    assert dirty_pending.to_dict()["choices"][0]["params"] == {"safe_choice": "kept"}
+    assert dirty_pending.to_dict()["choices"] == [
+        {"choice_id": dirty_pending.choices[0].choice_id, "label": "Approve"}
+    ]
     assert turns_payload["host_id"] == "projector-pr5-host"
     assert turns_payload["turns"][0]["worker_id"] == "worker-1"
     assert turns_payload["turns"][0]["space_id"] == "space-1"

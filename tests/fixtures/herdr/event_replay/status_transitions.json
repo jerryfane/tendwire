@@ -1,0 +1,30 @@
+[
+  {
+    "event": "pane.agent_status_changed",
+    "data": {
+      "pane_id": "pane-1",
+      "status": "working"
+    }
+  },
+  {
+    "event": "pane.agent_status_changed",
+    "data": {
+      "pane_id": "pane-1",
+      "status": "idle"
+    }
+  },
+  {
+    "event": "pane.agent_status_changed",
+    "data": {
+      "pane_id": "pane-1",
+      "status": "working"
+    }
+  },
+  {
+    "event": "pane.agent_status_changed",
+    "data": {
+      "pane_id": "pane-1",
+      "status": "working"
+    }
+  }
+]

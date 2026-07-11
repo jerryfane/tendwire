@@ -71,13 +71,13 @@ def test_reconcile_merges_pane_label_into_agent_record_without_replacing_it(tmp_
     assert len(workers) == 1
     assert len(bindings) == 1
     assert records[0].worker.meta.get("label") == "review-pane"
-    assert records[0].worker.meta.get("cwd") == "/root/temp"
+    assert "cwd" not in records[0].worker.meta
     assert records[0].worker.status == "waiting"
     assert bindings[0].target_kind == "agent_id"
     assert bindings[0].target_value == "agent-private"
 
 
-def test_reconcile_keeps_agent_cwd_when_pane_only_adds_label(tmp_path: Path) -> None:
+def test_reconcile_drops_agent_and_pane_cwd_from_public_worker(tmp_path: Path) -> None:
     config = _config(tmp_path)
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -87,7 +87,9 @@ def test_reconcile_keeps_agent_cwd_when_pane_only_adds_label(tmp_path: Path) -> 
 
     assert len(records) == 1
     assert records[0].worker.meta.get("label") == "review-pane"
-    assert records[0].worker.meta.get("cwd") == "/root/agent-cwd"
+    assert "cwd" not in records[0].worker.meta
+    assert "/root/agent-cwd" not in str(records[0].worker.to_dict())
+    assert "/root/pane-cwd" not in str(records[0].worker.to_dict())
 
 
 def test_reconcile_keeps_agent_turn_target_when_present(tmp_path: Path) -> None:

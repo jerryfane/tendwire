@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import re
 import socket
-import stat
+import struct
 import threading
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,15 +20,36 @@ from .core.attention import attention_payload_from_snapshot
 from .core.commands import CommandEnvelope, STATUS_INVALID_REQUEST, error_value
 from .core.models import (
     Snapshot,
-    sanitize_forbidden_fields,
-    stable_json_dumps,
+    public_json_dumps,
+    sanitize_public_mapping,
 )
 from .core.turns import pending_payload_from_snapshot, turns_payload_from_snapshot
+from .local_state import (
+    EntryIdentity,
+    LocalStateError,
+    LocalStateErrorCode,
+    PermissionState,
+    enforce_bound_socket_permissions_at,
+    inspect_owned_socket_at,
+    open_resolved_parent,
+    owned_socket_identity_at,
+    pin_group_socket_for_client_at,
+    pin_owned_socket_at,
+    prepare_resolved_private_parent,
+    proc_fd_path,
+    resolve_socket_group,
+    socket_bind_umask,
+    unlink_verified_socket_at,
+    validate_private_socket_parent_at,
+    validate_socket_group_parent_at,
+)
 
 
 API_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_PUBLIC_REQUEST_ID_CHARS = 128
+_SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
+_SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
     {
@@ -127,7 +151,18 @@ class DaemonAPIError(Exception):
 
 
 class DaemonUnavailable(DaemonAPIError):
-    """Raised when the local daemon socket cannot be reached."""
+    """Raised when the local daemon socket cannot be reached safely."""
+
+    def __init__(
+        self,
+        message: str = "daemon socket is unavailable",
+        *,
+        code: LocalStateErrorCode | None = None,
+        timed_out: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.timed_out = timed_out
 
 
 class DaemonProtocolError(DaemonAPIError):
@@ -183,13 +218,13 @@ def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any
         "schema_version": API_SCHEMA_VERSION,
         "ok": True,
         "status": "ok",
-        "result": sanitize_forbidden_fields(dict(result or {})),
+        "result": sanitize_public_mapping(dict(result or {})),
         "error": None,
     }
     public_id = _public_request_id(request_id)
     if public_id is not None:
         response["id"] = public_id
-    return response
+    return sanitize_public_mapping(response)
 
 
 def error_response(
@@ -209,11 +244,11 @@ def error_response(
     public_id = _public_request_id(request_id)
     if public_id is not None:
         response["id"] = public_id
-    return response
+    return sanitize_public_mapping(response)
 
 
 def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:
-    return sanitize_forbidden_fields(snapshot.to_dict())
+    return sanitize_public_mapping(snapshot.to_dict())
 
 
 def _command_result(value: Any) -> dict[str, Any]:
@@ -222,9 +257,9 @@ def _command_result(value: Any) -> dict[str, Any]:
     if hasattr(value, "to_dict"):
         data = value.to_dict()
         if isinstance(data, Mapping):
-            return sanitize_forbidden_fields(dict(data))
+            return sanitize_public_mapping(dict(data))
     if isinstance(value, Mapping):
-        return sanitize_forbidden_fields(dict(value))
+        return sanitize_public_mapping(dict(value))
     return CommandEnvelope.error(
         None,
         error_value(
@@ -383,33 +418,77 @@ def _read_json_frame(conn: socket.socket, *, max_bytes: int = MAX_REQUEST_BYTES)
     return b"".join(chunks)
 
 
-def _socket_identity(path: Path) -> tuple[int, int] | None:
+def _local_state_unavailable(exc: LocalStateError) -> DaemonUnavailable:
+    return DaemonUnavailable(
+        "daemon socket local state is invalid",
+        code=exc.code,
+    )
+
+
+@contextmanager
+def _socket_startup_lock(parent_fd: int) -> Iterator[None]:
+    """Serialize stale cleanup and socket publication within one parent."""
+
     try:
-        current = path.stat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISSOCK(current.st_mode):
-        return None
-    return (int(current.st_dev), int(current.st_ino))
+        import fcntl
+    except ImportError:
+        raise DaemonUnavailable(
+            "secure daemon socket startup is unsupported",
+            code=LocalStateErrorCode.UNSUPPORTED_PLATFORM,
+        ) from None
+    deadline = time.monotonic() + _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise DaemonUnavailable(
+                    "daemon socket startup lock failed",
+                    code=LocalStateErrorCode.OPERATION_FAILED,
+                ) from None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DaemonUnavailable(
+                    "daemon socket startup lock timed out",
+                    code=LocalStateErrorCode.OPERATION_FAILED,
+                ) from None
+            time.sleep(min(_SOCKET_STARTUP_LOCK_RETRY_SECONDS, remaining))
+    try:
+        yield
+    finally:
+        while True:
+            try:
+                fcntl.flock(parent_fd, fcntl.LOCK_UN)
+                break
+            except OSError as exc:
+                if exc.errno != errno.EINTR:
+                    break
 
 
-def _cleanup_stale_socket(path: Path) -> None:
-    if not path.exists():
+def _cleanup_stale_socket(parent_fd: int, leaf: str, address: str) -> None:
+    pinned = pin_owned_socket_at(parent_fd, leaf)
+    if pinned is None:
         return
-    mode = path.stat().st_mode
-    if not stat.S_ISSOCK(mode):
-        raise DaemonUnavailable(f"socket path exists and is not a socket: {path}")
-
+    pin_fd, identity = pinned
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.settimeout(0.1)
-        probe.connect(str(path))
-    except OSError:
-        path.unlink()
+        probe.connect(address)
+    except OSError as exc:
+        if exc.errno != errno.ECONNREFUSED:
+            raise DaemonUnavailable("daemon socket state is ambiguous") from None
+        unlink_verified_socket_at(parent_fd, leaf, identity)
     else:
-        raise DaemonUnavailable(f"daemon already appears to be listening on {path}")
+        raise DaemonUnavailable("daemon socket is already active")
     finally:
         probe.close()
+        try:
+            os.close(pin_fd)
+        except OSError:
+            pass
 
 
 class UnixSocketJSONServer:
@@ -424,6 +503,8 @@ class UnixSocketJSONServer:
         accept_timeout_seconds: float = 0.2,
         client_timeout_seconds: float = 1.0,
         max_request_bytes: int = MAX_REQUEST_BYTES,
+        socket_group: str | None = None,
+        prepare_parent: bool = False,
     ) -> None:
         self.socket_path = Path(socket_path)
         self.dispatcher = dispatcher
@@ -431,8 +512,13 @@ class UnixSocketJSONServer:
         self.accept_timeout_seconds = accept_timeout_seconds
         self.client_timeout_seconds = client_timeout_seconds
         self.max_request_bytes = max_request_bytes
+        self.socket_group = socket_group
+        self.prepare_parent = prepare_parent
         self._listener: socket.socket | None = None
-        self._identity: tuple[int, int] | None = None
+        self._identity: EntryIdentity | None = None
+        self._pin_fd: int | None = None
+        self._parent_fd: int | None = None
+        self._leaf: str | None = None
 
     @property
     def listening(self) -> bool:
@@ -441,20 +527,145 @@ class UnixSocketJSONServer:
     def start(self) -> None:
         if self._listener is not None:
             return
+        if (
+            self._identity is not None
+            or self._pin_fd is not None
+            or self._parent_fd is not None
+            or self._leaf is not None
+        ):
+            raise DaemonUnavailable(
+                "daemon socket cleanup is pending",
+                code=LocalStateErrorCode.OPERATION_FAILED,
+            )
+        if self.stop_event.is_set():
+            raise DaemonUnavailable("daemon socket server has already stopped")
         _ensure_unix_socket_supported()
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        _cleanup_stale_socket(self.socket_path)
 
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        parent_fd: int | None = None
+        listener: socket.socket | None = None
         try:
-            listener.bind(str(self.socket_path))
-            listener.listen()
-            listener.settimeout(self.accept_timeout_seconds)
+            resolved_group = resolve_socket_group(self.socket_group)
+            if self.prepare_parent:
+                if resolved_group is not None:
+                    raise DaemonUnavailable(
+                        "group sharing requires an explicit protected socket parent",
+                        code=LocalStateErrorCode.INSECURE_SOCKET_PARENT,
+                    )
+                parent_fd, leaf, _result = prepare_resolved_private_parent(
+                    self.socket_path
+                )
+            elif resolved_group is not None:
+                parent_fd, leaf = open_resolved_parent(self.socket_path)
+                validate_socket_group_parent_at(
+                    parent_fd,
+                    self.socket_group,
+                )
+            else:
+                try:
+                    parent_fd, leaf = open_resolved_parent(self.socket_path)
+                except LocalStateError as exc:
+                    if exc.code is not LocalStateErrorCode.MISSING_ENTRY:
+                        raise
+                    parent_fd, leaf = open_resolved_parent(
+                        self.socket_path,
+                        create_missing=True,
+                    )
+                validate_private_socket_parent_at(parent_fd)
+
+            address = proc_fd_path(parent_fd, leaf)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            identity: EntryIdentity | None = None
+            pin_fd: int | None = None
+            with _socket_startup_lock(parent_fd):
+                try:
+                    _cleanup_stale_socket(parent_fd, leaf, address)
+                    with socket_bind_umask(self.socket_group):
+                        listener.bind(address)
+                    identity = owned_socket_identity_at(parent_fd, leaf)
+                    if identity is None:
+                        raise DaemonUnavailable("daemon socket could not be started")
+                    pinned = pin_owned_socket_at(parent_fd, leaf)
+                    if pinned is None:
+                        raise DaemonUnavailable("daemon socket could not be started")
+                    pin_fd, pinned_identity = pinned
+                    if pinned_identity != identity:
+                        raise DaemonUnavailable(
+                            "daemon socket changed during startup",
+                            code=LocalStateErrorCode.ENTRY_CHANGED,
+                        )
+                    enforce_bound_socket_permissions_at(
+                        parent_fd,
+                        leaf,
+                        socket_group=self.socket_group,
+                        expected=identity,
+                    )
+                    listener.listen()
+                    listener.settimeout(self.accept_timeout_seconds)
+                except Exception:
+                    self._rollback_bound_socket(
+                        listener,
+                        parent_fd,
+                        leaf,
+                        identity,
+                        pin_fd,
+                    )
+                    raise
             self._listener = listener
-            self._identity = _socket_identity(self.socket_path)
-        except Exception:
-            listener.close()
-            raise
+            self._identity = identity
+            self._pin_fd = pin_fd
+            self._parent_fd = parent_fd
+            self._leaf = leaf
+            listener = None
+            parent_fd = None
+        except LocalStateError as exc:
+            raise _local_state_unavailable(exc) from None
+        except OSError:
+            raise DaemonUnavailable("daemon socket could not be started") from None
+        finally:
+            if listener is not None:
+                listener.close()
+            if parent_fd is not None and self._parent_fd != parent_fd:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+
+    def _rollback_bound_socket(
+        self,
+        listener: socket.socket,
+        parent_fd: int,
+        leaf: str,
+        identity: EntryIdentity | None,
+        pin_fd: int | None,
+    ) -> None:
+        listener.close()
+        if identity is None:
+            if pin_fd is not None:
+                try:
+                    os.close(pin_fd)
+                except OSError:
+                    pass
+            return
+        try:
+            unlink_verified_socket_at(parent_fd, leaf, identity)
+        except LocalStateError as exc:
+            if exc.code not in {
+                LocalStateErrorCode.MISSING_ENTRY,
+                LocalStateErrorCode.WRONG_TYPE,
+                LocalStateErrorCode.WRONG_OWNER,
+                LocalStateErrorCode.ENTRY_CHANGED,
+            }:
+                self._identity = identity
+                self._pin_fd = pin_fd
+                self._parent_fd = parent_fd
+                self._leaf = leaf
+                return
+        if pin_fd is not None:
+            try:
+                os.close(pin_fd)
+            except OSError:
+                pass
+
 
     def serve_forever(self) -> None:
         self.start()
@@ -472,7 +683,7 @@ class UnixSocketJSONServer:
                 except OSError:
                     if self.stop_event.is_set():
                         break
-                    raise
+                    raise DaemonUnavailable("daemon socket request loop failed") from None
                 self._handle_connection(conn)
         finally:
             self.close()
@@ -487,10 +698,10 @@ class UnixSocketJSONServer:
                 else:
                     request = json.loads(raw.decode("utf-8"))
                     response = dict(self.dispatcher(request))
-            except json.JSONDecodeError as exc:
+            except json.JSONDecodeError:
                 response = error_response(
                     "invalid_request",
-                    f"invalid JSON: {exc}",
+                    "invalid request JSON",
                     details={"field": "request"},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -500,8 +711,8 @@ class UnixSocketJSONServer:
                     details={"type": type(exc).__name__},
                 )
             try:
-                conn.sendall(stable_json_dumps(response).encode("utf-8") + b"\n")
-            except (BrokenPipeError, ConnectionResetError, TimeoutError, socket.timeout):
+                conn.sendall(public_json_dumps(response).encode("utf-8") + b"\n")
+            except OSError:
                 return
 
     def close(self) -> None:
@@ -510,13 +721,153 @@ class UnixSocketJSONServer:
         self._listener = None
         if listener is not None:
             listener.close()
-        current_identity = _socket_identity(self.socket_path)
-        if current_identity is not None and current_identity == self._identity:
+        identity = self._identity
+        pin_fd = self._pin_fd
+        parent_fd = self._parent_fd
+        leaf = self._leaf
+        if identity is not None:
+            if parent_fd is None or leaf is None:
+                raise DaemonUnavailable(
+                    "daemon socket cleanup failed",
+                    code=LocalStateErrorCode.OPERATION_FAILED,
+                )
             try:
-                self.socket_path.unlink()
-            except FileNotFoundError:
-                pass
+                unlink_verified_socket_at(parent_fd, leaf, identity)
+            except LocalStateError as exc:
+                if exc.code not in {
+                    LocalStateErrorCode.MISSING_ENTRY,
+                    LocalStateErrorCode.WRONG_TYPE,
+                    LocalStateErrorCode.WRONG_OWNER,
+                    LocalStateErrorCode.ENTRY_CHANGED,
+                }:
+                    raise DaemonUnavailable(
+                        "daemon socket cleanup failed",
+                        code=exc.code,
+                    ) from None
         self._identity = None
+        self._pin_fd = None
+        self._parent_fd = None
+        self._leaf = None
+        if pin_fd is not None:
+            try:
+                os.close(pin_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _validated_client_socket(
+    path: Path,
+    socket_group: str | None,
+) -> Iterator[tuple[int, str, EntryIdentity, int, str]]:
+    parent_fd: int | None = None
+    pin_fd: int | None = None
+    try:
+        try:
+            parent_fd, leaf = open_resolved_parent(path, path_only=True)
+            if socket_group is not None:
+                pin_fd, identity, expected_peer_uid = (
+                    pin_group_socket_for_client_at(
+                        parent_fd,
+                        leaf,
+                        socket_group,
+                    )
+                )
+            else:
+                pinned = pin_owned_socket_at(parent_fd, leaf)
+                if pinned is None:
+                    raise DaemonUnavailable(
+                        "daemon socket local state is invalid",
+                        code=LocalStateErrorCode.MISSING_ENTRY,
+                    )
+                pin_fd, identity = pinned
+                inspected = inspect_owned_socket_at(parent_fd, leaf)
+                current_identity = owned_socket_identity_at(parent_fd, leaf)
+                if (
+                    current_identity != identity
+                    or inspected.state is PermissionState.ABSENT
+                    or inspected.mode != 0o600
+                ):
+                    raise DaemonUnavailable(
+                        "daemon socket local state is invalid",
+                        code=(
+                            LocalStateErrorCode.ENTRY_CHANGED
+                            if current_identity != identity
+                            else LocalStateErrorCode.INSECURE_MODE
+                        ),
+                    )
+                expected_peer_uid = os.geteuid()
+            address = proc_fd_path(parent_fd, leaf)
+        except LocalStateError as exc:
+            raise _local_state_unavailable(exc) from None
+        yield parent_fd, leaf, identity, expected_peer_uid, address
+    finally:
+        if pin_fd is not None:
+            try:
+                os.close(pin_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+
+
+def _recheck_connected_socket(
+    parent_fd: int,
+    leaf: str,
+    expected: EntryIdentity,
+    socket_group: str | None,
+) -> None:
+    recheck_fd: int | None = None
+    try:
+        try:
+            if socket_group is None:
+                current = owned_socket_identity_at(parent_fd, leaf)
+            else:
+                recheck_fd, current, _owner_uid = pin_group_socket_for_client_at(
+                    parent_fd,
+                    leaf,
+                    socket_group,
+                )
+        except LocalStateError as exc:
+            raise _local_state_unavailable(exc) from None
+        if current != expected:
+            raise DaemonUnavailable(
+                "daemon socket local state is invalid",
+                code=LocalStateErrorCode.ENTRY_CHANGED,
+            )
+    finally:
+        if recheck_fd is not None:
+            try:
+                os.close(recheck_fd)
+            except OSError:
+                pass
+
+
+def _validate_connected_peer(conn: socket.socket, expected_uid: int) -> None:
+    if not hasattr(socket, "SO_PEERCRED"):
+        raise DaemonUnavailable(
+            "daemon peer validation is unsupported",
+            code=LocalStateErrorCode.UNSUPPORTED_PLATFORM,
+        )
+    credentials = struct.Struct("3i")
+    try:
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials.size)
+        _pid, peer_uid, _gid = credentials.unpack(raw)
+    except (OSError, struct.error):
+        raise DaemonUnavailable("daemon peer validation failed") from None
+    if peer_uid != expected_uid:
+        raise DaemonUnavailable(
+            "daemon peer ownership is invalid",
+            code=LocalStateErrorCode.WRONG_OWNER,
+        )
 
 
 class DaemonAPIClient:
@@ -528,10 +879,12 @@ class DaemonAPIClient:
         *,
         timeout_seconds: float = 1.0,
         max_response_bytes: int = MAX_REQUEST_BYTES,
+        socket_group: str | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
+        self.socket_group = socket_group
 
     def request(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         _ensure_unix_socket_supported()
@@ -542,23 +895,57 @@ class DaemonAPIClient:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8") + b"\n"
-        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            conn.settimeout(self.timeout_seconds)
-            conn.connect(str(self.socket_path))
-            conn.sendall(raw_payload)
-            raw_response = _read_json_frame(conn, max_bytes=self.max_response_bytes)
-        except (FileNotFoundError, ConnectionRefusedError, TimeoutError, socket.timeout, OSError) as exc:
-            raise DaemonUnavailable(str(exc)) from exc
-        finally:
-            conn.close()
+        with _validated_client_socket(
+            self.socket_path,
+            self.socket_group,
+        ) as (parent_fd, leaf, identity, expected_peer_uid, address):
+            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                conn.settimeout(self.timeout_seconds)
+                conn.connect(address)
+                _recheck_connected_socket(
+                    parent_fd,
+                    leaf,
+                    identity,
+                    self.socket_group,
+                )
+                _validate_connected_peer(conn, expected_peer_uid)
+            except (TimeoutError, socket.timeout):
+                conn.close()
+                raise DaemonUnavailable(
+                    "daemon socket request timed out",
+                    timed_out=True,
+                ) from None
+            except DaemonUnavailable:
+                conn.close()
+                raise
+            except OSError:
+                conn.close()
+                raise DaemonUnavailable("daemon socket is unavailable") from None
+            try:
+                conn.sendall(raw_payload)
+                raw_response = _read_json_frame(
+                    conn,
+                    max_bytes=self.max_response_bytes,
+                )
+            except (TimeoutError, socket.timeout):
+                raise DaemonUnavailable(
+                    "daemon socket request timed out",
+                    timed_out=True,
+                ) from None
+            except OSError:
+                raise DaemonProtocolError(
+                    "daemon request outcome is uncertain"
+                ) from None
+            finally:
+                conn.close()
 
         if not raw_response:
             raise DaemonProtocolError("empty daemon response")
         try:
             response = json.loads(raw_response.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise DaemonProtocolError("invalid daemon response JSON") from exc
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise DaemonProtocolError("invalid daemon response JSON") from None
         if not isinstance(response, dict):
             raise DaemonProtocolError("daemon response must be a JSON object")
         return response

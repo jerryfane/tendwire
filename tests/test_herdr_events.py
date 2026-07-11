@@ -15,7 +15,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from tendwire.backends.herdr_events import DEFAULT_SUBSCRIBE_METHOD, HerdrEventBackend, HerdrEventBackendError, normalize_event
+from tendwire.backends.herdr_events import (
+    DEFAULT_SUBSCRIBE_METHOD,
+    HerdrEventBackend,
+    HerdrEventBackendError,
+    HerdrEventId,
+    HerdrProducerSequence,
+    normalize_event,
+)
+from tendwire.backends.herdr_cli import HerdrContinuityUnavailableError
 from tendwire.backends.herdr_socket import (
     HerdrSocketClient,
     HerdrSocketDisconnectedError,
@@ -32,8 +40,10 @@ from tendwire.core.models import BackendHealth, Worker
 from tendwire.core.projector import project_from_observations
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
+    SnapshotObservationContext,
     init_store,
     latest_snapshot,
+    list_attention_items,
     list_worker_bindings,
     save_snapshot,
 )
@@ -91,11 +101,69 @@ _NO_OP_TABLES = (
     "connector_deliveries",
 )
 
+_PERSISTED_EVENT_EFFECT_TABLES = (
+    "snapshots",
+    "events",
+    "workers",
+    "worker_bindings",
+    "attention_items",
+    "connector_outbox",
+)
+
 
 def _table_count(db_path: Path, host_id: str, table: str) -> int:
     with sqlite3.connect(str(db_path)) as conn:
         return int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE host_id = ?", (host_id,)).fetchone()[0])
 
+def _persisted_event_effect_counts(backend: HerdrEventBackend) -> dict[str, int]:
+    return {
+        table: _table_count(backend.db_path, backend.config.host_id, table)
+        for table in _PERSISTED_EVENT_EFFECT_TABLES
+    }
+
+
+def _attention_lifecycle_rows(backend: HerdrEventBackend) -> tuple[tuple[Any, ...], ...]:
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        return tuple(
+            conn.execute(
+                """
+                SELECT
+                    generation,
+                    lifecycle_status,
+                    current_attention_id,
+                    first_seen_at,
+                    last_positive_at,
+                    first_missing_at,
+                    missing_observation_count,
+                    last_accepted_at,
+                    last_observation_key,
+                    max_notified_severity_rank
+                FROM attention_lifecycles
+                WHERE host_id = ?
+                ORDER BY family_key
+                """,
+                (backend.config.host_id,),
+            ).fetchall()
+        )
+
+
+def _attention_event_types(backend: HerdrEventBackend) -> list[str]:
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (backend.config.host_id,),
+        ).fetchall()
+    return [str(json.loads(row[0])["event_type"]) for row in rows]
+
+
+def _set_observation_time(monkeypatch: Any, value: str) -> None:
+    monkeypatch.setattr("tendwire.backends.herdr_cli.utc_timestamp", lambda: value)
+    monkeypatch.setattr("tendwire.backends.herdr_events.utc_timestamp", lambda: value)
 
 def _no_op_state(backend: HerdrEventBackend) -> tuple[str, tuple[tuple[Any, ...], ...], dict[str, int]]:
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -257,6 +325,17 @@ def _initial_pane_client() -> _StaticClient:
         agents=[],
     )
 
+def _status_event(status: str) -> dict[str, Any]:
+    """Return the confirmed idless Herdr EventEnvelope shape."""
+    return {
+        "event": "pane_agent_status_changed",
+        "data": {
+            "pane_id": "pane-1",
+            "agent": "Agent One",
+            "status": status,
+        },
+    }
+
 
 def test_startup_reconcile_uses_socket_client_persists_projection_and_private_bindings(tmp_path: Path) -> None:
     def handler(conn: _SocketConnection) -> None:
@@ -328,10 +407,11 @@ def test_startup_reconcile_uses_socket_client_persists_projection_and_private_bi
 
 @pytest.mark.parametrize("event_name", HERDR_OFFICIAL_EVENT_NAMES)
 def test_normalize_event_accepts_each_official_event_name(event_name: str) -> None:
-    event = normalize_event({"event": event_name, "payload": {}})
+    event = normalize_event({"event": event_name, "data": {}})
 
     assert event is not None
     assert event.name == event_name
+    assert event.producer_identity is None
 
 
 @pytest.mark.parametrize(
@@ -350,13 +430,13 @@ def test_normalize_event_tolerates_legacy_inbound_aliases_only_after_receive(
     raw_name: str,
     canonical_name: str,
 ) -> None:
-    event = normalize_event({"event": raw_name, "payload": {}})
+    event = normalize_event({"event": raw_name, "data": {}})
 
     assert event is not None
     assert event.name == canonical_name
 
 
-def test_normalize_event_accepts_live_idless_data_payload_shape() -> None:
+def test_normalize_event_accepts_confirmed_live_idless_event_data_shape() -> None:
     event = normalize_event(
         {
             "event": "pane_agent_status_changed",
@@ -367,6 +447,112 @@ def test_normalize_event_accepts_live_idless_data_payload_shape() -> None:
     assert event is not None
     assert event.name == "pane.agent_status_changed"
     assert event.payload == {"agent": "Agent One", "status": "blocked"}
+    assert event.producer_identity is None
+
+
+def test_normalize_event_prefers_confirmed_data_over_legacy_payload() -> None:
+    event = normalize_event(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {"status": "working"},
+            "payload": {"status": "idle"},
+        }
+    )
+
+    assert event is not None
+    assert event.payload == {"status": "working"}
+    assert event.producer_identity is None
+
+
+def test_normalize_event_keeps_receive_only_legacy_payload_compatibility() -> None:
+    event = normalize_event(
+        {
+            "event": "pane_agent_status_changed",
+            "payload": {"status": "idle"},
+        }
+    )
+
+    assert event is not None
+    assert event.payload == {"status": "idle"}
+    assert event.producer_identity is None
+
+
+def test_normalize_event_exposes_forward_compatible_producer_identity_types() -> None:
+    by_id = normalize_event(
+        {"event": "pane_agent_status_changed", "data": {}, "event_id": "event-1"}
+    )
+    by_sequence = normalize_event(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {},
+            "server_id": "server-1",
+            "sequence": 7,
+        }
+    )
+
+    assert by_id is not None
+    assert by_id.producer_identity == HerdrEventId("event-1")
+    assert by_sequence is not None
+    assert by_sequence.producer_identity == HerdrProducerSequence("server-1", "7")
+
+
+def test_normalize_event_never_uses_entity_data_as_producer_identity() -> None:
+    event = normalize_event(
+        {
+            "event": "pane_agent_status_changed",
+            "data": {
+                "event_id": "entity-event",
+                "server_id": "entity-server",
+                "sequence": 9,
+                "revision": 10,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.producer_identity is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"event_id": True},
+        {"event_id": 1},
+        {"event_id": 1.5},
+        {"event_id": "event id"},
+        {"event_id": {"id": "nested-event"}},
+        {"event_id": ["nested-event"]},
+        {"server_id": True, "sequence": 1},
+        {"server_id": "server id", "sequence": 1},
+        {"server_id": {"id": "nested-server"}, "sequence": 1},
+        {"server_id": "server-1", "sequence": True},
+        {"server_id": "server-1", "sequence": 1.5},
+        {"server_id": "server-1", "sequence": "1"},
+        {"server_id": "server-1", "sequence": {"value": 1}},
+        {"server_id": "server-1"},
+        {"sequence": 1},
+        {"event_id": True, "server_id": "server-1", "sequence": 1},
+    ],
+)
+def test_malformed_producer_metadata_is_idless_and_preserves_transitions(
+    tmp_path: Path,
+    metadata: dict[str, Any],
+) -> None:
+    backend = _backend(tmp_path, f"malformed-producer-{len(str(metadata))}")
+    backend.reconcile_once(client=_initial_pane_client())
+    accepted: list[bool] = []
+
+    for status in ("working", "idle", "working"):
+        envelope = {**_status_event(status), **metadata}
+        normalized = normalize_event(envelope)
+        assert normalized is not None
+        assert normalized.producer_identity is None
+        accepted.append(backend.queue_event_envelope(envelope))
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert accepted == [True, True, True]
+    assert snapshot.workers[0].status == "active"
 
 
 def test_backend_default_subscription_uses_official_shape_without_legacy_defaults(tmp_path: Path) -> None:
@@ -496,18 +682,15 @@ def test_pane_agent_detected_official_event_updates_worker_and_private_binding(t
     backend.reconcile_once(client=_StaticClient(workspaces=[{"id": "space-1", "name": "Build"}]))
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "agent_id": "agent-2",
-                    "name": "Agent Two",
-                    "workspace_id": "space-1",
-                    "pane_id": "pane-2",
-                    "status": "running",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "agent_id": "agent-2",
+                "name": "Agent Two",
+                "workspace_id": "space-1",
+                "pane_id": "pane-2",
+                "status": "running",
+            }
+        }}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -558,10 +741,7 @@ def test_supported_nested_agent_or_worker_canonical_fields_cannot_mint_continuit
     }
 
     assert backend.queue_event_envelope(
-        {
-            "event": event_name,
-            "payload": {entity_name: entity},
-        }
+        {"event": event_name, "data": {entity_name: entity}}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -613,23 +793,20 @@ def test_nested_compatibility_event_cannot_duplicate_authenticated_turn_owner(
     )
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "worker_id": "public-compatibility-claimant",
-                    "agent_id": "new-agent-target-secret",
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "worker_id": "public-compatibility-claimant",
+                "agent_id": "new-agent-target-secret",
+                "agent": "codex",
+                "agent_session": {
+                    "source": "new-source-secret",
                     "agent": "codex",
-                    "agent_session": {
-                        "source": "new-source-secret",
-                        "agent": "codex",
-                        "kind": "id",
-                        "value": "shared-session-secret",
-                    },
-                    "status": "running",
-                }
-            },
-        }
+                    "kind": "id",
+                    "value": "shared-session-secret",
+                },
+                "status": "running",
+            }
+        }}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -672,10 +849,7 @@ def test_official_pane_tuple_provenance_mints_continuity(
     payload = pane if entity_source == "top_level" else {"pane": pane}
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "payload": payload,
-        }
+        {"event": "pane.created", "data": payload}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -691,7 +865,7 @@ def test_official_pane_tuple_provenance_mints_continuity(
     ["pane.agent_detected", "pane.agent_status_changed"],
 )
 @pytest.mark.parametrize("key_failure", [False, True])
-def test_official_event_id_churn_reuses_single_authenticated_pane_owner(
+def test_official_idless_event_reuses_single_authenticated_pane_owner(
     tmp_path: Path,
     key_failure: bool,
     event_name: str,
@@ -763,10 +937,7 @@ def test_official_event_id_churn_reuses_single_authenticated_pane_owner(
         },
     }
     assert backend.queue_event_envelope(
-        {
-            "event": event_name,
-            "payload": event_payload,
-        }
+        {"event": event_name, "data": event_payload}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -786,16 +957,12 @@ def test_official_event_id_churn_reuses_single_authenticated_pane_owner(
         assert after.backend_health[0].counts == {"spaces": 1, "workers": 1}
 
         assert backend.queue_event_envelope(
-            {
-                "event": "workspace.updated",
-                "event_id": f"unrelated-{event_name}",
-                "payload": {
-                    "workspace": {
-                        "workspace_id": "wR9",
-                        "name": "Build Renamed",
-                    }
-                },
-            }
+            {"event": "workspace.updated", "data": {
+                "workspace": {
+                    "workspace_id": "wR9",
+                    "name": "Build Renamed",
+                }
+            }}
         )
         after_unrelated = latest_snapshot(backend.db_path, backend.config.host_id)
         assert after_unrelated is not None
@@ -810,11 +977,7 @@ def test_official_event_id_churn_reuses_single_authenticated_pane_owner(
         backend.config.installation_key_marker_path.write_bytes(marker)
         os.chmod(backend.config.installation_key_marker_path, 0o600)
         assert backend.queue_event_envelope(
-            {
-                "event": event_name,
-                "event_id": f"recovery-{event_name}",
-                "payload": event_payload,
-            }
+            {"event": event_name, "data": event_payload}
         )
         after = latest_snapshot(backend.db_path, backend.config.host_id)
         bindings = list_worker_bindings(
@@ -852,61 +1015,54 @@ def test_incremental_shared_private_owner_fails_closed_across_canonical_panes(
 
     for suffix, pane_id in (("a", "wR9:pA"), ("b", "wR9:pB")):
         assert backend.queue_event_envelope(
-            {
-                "event": "pane.created",
-                "payload": {
-                    "workspace_id": "wR9",
-                    "pane_id": pane_id,
-                    "terminal_id": (
-                        "shared-terminal-secret"
-                        if shared_owner == "terminal_id"
-                        else f"terminal-{suffix}-secret"
-                    ),
-                    "agent_id": f"agent-{suffix}-secret",
-                    "agent": "codex",
-                    "agent_session": {
-                        "source": f"source-{suffix}-secret",
-                        "agent": "codex",
-                        "kind": "id",
-                        "value": (
-                            "shared-session-secret"
-                            if shared_owner == "agent_session"
-                            else f"session-{suffix}-secret"
-                        ),
-                    },
-                    "status": "running",
-                },
-            }
-        )
-        if suffix == "a" and key_failure:
-            backend.config.installation_key_marker_path.unlink()
-    assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "event_id": f"repeat-{shared_owner}-{key_failure}",
-            "payload": {
+            {"event": "pane.created", "data": {
                 "workspace_id": "wR9",
-                "pane_id": "wR9:pB",
+                "pane_id": pane_id,
                 "terminal_id": (
                     "shared-terminal-secret"
                     if shared_owner == "terminal_id"
-                    else "terminal-b-secret"
+                    else f"terminal-{suffix}-secret"
                 ),
-                "agent_id": "agent-b-secret",
+                "agent_id": f"agent-{suffix}-secret",
                 "agent": "codex",
                 "agent_session": {
-                    "source": "source-b-secret",
+                    "source": f"source-{suffix}-secret",
                     "agent": "codex",
                     "kind": "id",
                     "value": (
                         "shared-session-secret"
                         if shared_owner == "agent_session"
-                        else "session-b-secret"
+                        else f"session-{suffix}-secret"
                     ),
                 },
                 "status": "running",
+            }}
+        )
+        if suffix == "a" and key_failure:
+            backend.config.installation_key_marker_path.unlink()
+    assert backend.queue_event_envelope(
+        {"event": "pane.created", "data": {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pB",
+            "terminal_id": (
+                "shared-terminal-secret"
+                if shared_owner == "terminal_id"
+                else "terminal-b-secret"
+            ),
+            "agent_id": "agent-b-secret",
+            "agent": "codex",
+            "agent_session": {
+                "source": "source-b-secret",
+                "agent": "codex",
+                "kind": "id",
+                "value": (
+                    "shared-session-secret"
+                    if shared_owner == "agent_session"
+                    else "session-b-secret"
+                ),
             },
-        }
+            "status": "running",
+        }}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -977,10 +1133,7 @@ def test_move_into_owned_pane_fails_closed_for_both_owners(
             "status": "running",
         }
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": payload,
-        }
+        {"event": "pane.moved", "data": payload}
     )
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1029,18 +1182,15 @@ def test_key_failure_precedes_move_conflict_mutation(tmp_path: Path) -> None:
     backend.config.installation_key_marker_path.unlink()
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": {
-                "previous_pane_id": "wR9:pB",
-                "pane": {
-                    "workspace_id": "wR9",
-                    "pane_id": "wR9:pA",
-                    "agent": "Agent B",
-                    "status": "running",
-                },
+        {"event": "pane.moved", "data": {
+            "previous_pane_id": "wR9:pB",
+            "pane": {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pA",
+                "agent": "Agent B",
+                "status": "running",
             },
-        }
+        }}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1120,25 +1270,22 @@ def test_authoritative_move_resolves_agent_targeted_source_by_previous_pane(
         )
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": {
-                "previous_pane_id": "wR9:pA",
-                "pane": {
-                    "workspace_id": "wD2",
-                    "pane_id": "wD2:p7",
-                    "terminal_id": "new-terminal-secret",
+        {"event": "pane.moved", "data": {
+            "previous_pane_id": "wR9:pA",
+            "pane": {
+                "workspace_id": "wD2",
+                "pane_id": "wD2:p7",
+                "terminal_id": "new-terminal-secret",
+                "agent": "codex",
+                "agent_session": {
+                    "source": "new-source-secret",
                     "agent": "codex",
-                    "agent_session": {
-                        "source": "new-source-secret",
-                        "agent": "codex",
-                        "kind": "id",
-                        "value": "new-session-secret",
-                    },
-                    "status": "running",
+                    "kind": "id",
+                    "value": "new-session-secret",
                 },
+                "status": "running",
             },
-        }
+        }}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1301,10 +1448,7 @@ def test_incomplete_pane_event_does_not_clear_continuity_failure(
     marker = backend.config.installation_key_marker_path.read_bytes()
     backend.config.installation_key_marker_path.unlink()
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.focused",
-            "payload": {"pane": pane},
-        }
+        {"event": "pane.focused", "data": {"pane": pane}}
     )
     failed = latest_snapshot(backend.db_path, backend.config.host_id)
     assert failed is not None
@@ -1313,11 +1457,7 @@ def test_incomplete_pane_event_does_not_clear_continuity_failure(
     backend.config.installation_key_marker_path.write_bytes(marker)
     os.chmod(backend.config.installation_key_marker_path, 0o600)
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "event_id": "incomplete-close-after-key-recovery",
-            "payload": {"pane": {"pane_id": "wR9:pA"}},
-        }
+        {"event": "pane.closed", "data": {"pane": {"pane_id": "wR9:pA"}}}
     )
 
     incomplete = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1357,21 +1497,13 @@ def test_over_cap_authenticated_retry_does_not_clear_continuity_failure(
     marker = backend.config.installation_key_marker_path.read_bytes()
     backend.config.installation_key_marker_path.unlink()
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "event_id": "over-cap-key-loss",
-            "payload": {"pane": pane_b},
-        }
+        {"event": "pane.created", "data": {"pane": pane_b}}
     )
 
     backend.config.installation_key_marker_path.write_bytes(marker)
     os.chmod(backend.config.installation_key_marker_path, 0o600)
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "event_id": "over-cap-key-retry",
-            "payload": {"pane": pane_b},
-        }
+        {"event": "pane.created", "data": {"pane": pane_b}}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1420,11 +1552,7 @@ def test_conflicting_close_does_not_revalidate_continuity(
     marker = backend.config.installation_key_marker_path.read_bytes()
     backend.config.installation_key_marker_path.unlink()
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.focused",
-            "event_id": "conflicting-close-key-loss",
-            "payload": {"pane": pane_a},
-        }
+        {"event": "pane.focused", "data": {"pane": pane_a}}
     )
 
     backend.config.installation_key_marker_path.write_bytes(marker)
@@ -1434,11 +1562,7 @@ def test_conflicting_close_does_not_revalidate_continuity(
         "terminal_id": pane_b["terminal_id"],
     }
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "event_id": "conflicting-close-retry",
-            "payload": {"pane": conflicting_close},
-        }
+        {"event": "pane.closed", "data": {"pane": conflicting_close}}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1487,11 +1611,7 @@ def test_conflicting_upsert_preserves_latched_authenticated_state(
     marker = backend.config.installation_key_marker_path.read_bytes()
     backend.config.installation_key_marker_path.unlink()
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.focused",
-            "event_id": "conflicting-upsert-key-loss",
-            "payload": {"pane": pane_a},
-        }
+        {"event": "pane.focused", "data": {"pane": pane_a}}
     )
 
     backend.config.installation_key_marker_path.write_bytes(marker)
@@ -1502,11 +1622,7 @@ def test_conflicting_upsert_preserves_latched_authenticated_state(
         "status": "blocked",
     }
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.focused",
-            "event_id": "conflicting-upsert-retry",
-            "payload": {"pane": conflicting_pane},
-        }
+        {"event": "pane.focused", "data": {"pane": conflicting_pane}}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1530,15 +1646,12 @@ def test_official_pane_event_generic_id_remains_private_binding_only(tmp_path: P
 
     assert (
         backend.queue_event_envelope(
-            {
-                "event": "pane.created",
-                "payload": {
-                    "id": "pane-secret",
-                    "agent": "Agent Two",
-                    "workspace_id": "space-1",
-                    "status": "running",
-                },
-            }
+            {"event": "pane.created", "data": {
+                "id": "pane-secret",
+                "agent": "Agent Two",
+                "workspace_id": "space-1",
+                "status": "running",
+            }}
         )
         is True
     )
@@ -1562,23 +1675,20 @@ def test_unknown_and_malformed_known_events_do_not_mutate_any_public_or_private_
     before = _no_op_state(backend)
 
     for envelope in (
-        {"event": "unknown.future", "payload": {"pane_id": "pane-secret", "stdout": "secret"}},
-        {"event": "workspace.created", "payload": {"pane_id": "pane-secret", "stdout": "secret"}},
-        {"event": "workspace.renamed", "payload": {"new_name": "secret"}},
-        {"event": "worktree.created", "payload": {"worktree_id": "worktree-secret", "stderr": "secret"}},
-        {"event": "pane.created", "payload": {"labels": ["agent"], "argv": ["secret"]}},
-        {"event": "pane.agent_detected", "payload": []},
-        {"event": "pane.agent_status_changed", "payload": {"status": "failed", "stderr": "secret"}},
-        {
-            "event": "pane.output_matched",
-            "payload": {
-                "pane_id": "pane-secret",
-                "terminal_id": "terminal-secret",
-                "stdout": "secret",
-                "stderr": "secret",
-                "token": "secret",
-            },
-        },
+        {"event": "unknown.future", "data": {"pane_id": "pane-secret", "stdout": "secret"}},
+        {"event": "workspace.created", "data": {"pane_id": "pane-secret", "stdout": "secret"}},
+        {"event": "workspace.renamed", "data": {"new_name": "secret"}},
+        {"event": "worktree.created", "data": {"worktree_id": "worktree-secret", "stderr": "secret"}},
+        {"event": "pane.created", "data": {"labels": ["agent"], "argv": ["secret"]}},
+        {"event": "pane.agent_detected", "data": []},
+        {"event": "pane.agent_status_changed", "data": {"status": "failed", "stderr": "secret"}},
+        {"event": "pane.output_matched", "data": {
+            "pane_id": "pane-secret",
+            "terminal_id": "terminal-secret",
+            "stdout": "secret",
+            "stderr": "secret",
+            "token": "secret",
+        }},
     ):
         backend.queue_event_envelope(envelope)
 
@@ -1598,10 +1708,7 @@ def test_worktree_events_only_update_existing_workspace_observations(tmp_path: P
 
     assert (
         backend.queue_event_envelope(
-            {
-                "event": "worktree.created",
-                "payload": {"workspace_id": "new-space", "name": "Should Not Appear"},
-            }
+            {"event": "worktree.created", "data": {"workspace_id": "new-space", "name": "Should Not Appear"}}
         )
         is True
     )
@@ -1612,14 +1719,11 @@ def test_worktree_events_only_update_existing_workspace_observations(tmp_path: P
 
     assert (
         backend.queue_event_envelope(
-            {
-                "event": "worktree.opened",
-                "payload": {
-                    "workspace_id": "space-1",
-                    "name": "Build Worktree",
-                    "status": "active",
-                },
-            }
+            {"event": "worktree.opened", "data": {
+                "workspace_id": "space-1",
+                "name": "Build Worktree",
+                "status": "active",
+            }}
         )
         is True
     )
@@ -1629,19 +1733,12 @@ def test_worktree_events_only_update_existing_workspace_observations(tmp_path: P
     assert updated.spaces[0].name == "Build Worktree"
     _assert_no_public_json_forbidden(json.loads(updated.to_json()))
 
-def test_run_forever_reconnects_and_resubscribes_after_event_disconnect(tmp_path: Path) -> None:
+def test_run_forever_reconnect_accepts_identical_idless_event_again(tmp_path: Path) -> None:
     config = _config(tmp_path, "reconnect-resubscribe")
     init_store(Path(config.db_path))
 
     class SequenceClient(_StaticClient):
-        def __init__(
-            self,
-            label: str,
-            events: list[Any],
-            *,
-            stop_on_subscribe: bool = False,
-            pane_status: str = "running",
-        ) -> None:
+        def __init__(self, label: str, events: list[Any], *, pane_status: str) -> None:
             super().__init__(
                 workspaces=[{"id": "space-1", "name": "Build"}],
                 panes=[
@@ -1655,7 +1752,6 @@ def test_run_forever_reconnects_and_resubscribes_after_event_disconnect(tmp_path
             )
             self.label = label
             self.events = list(events)
-            self.stop_on_subscribe = stop_on_subscribe
             self.subscriptions: list[tuple[str, dict[str, Any]]] = []
             self.read_calls = 0
             self.closed = False
@@ -1675,8 +1771,6 @@ def test_run_forever_reconnects_and_resubscribes_after_event_disconnect(tmp_path
             event_timeout: float | None = None,
         ) -> Any:
             self.subscriptions.append((method, dict(params)))
-            if self.stop_on_subscribe:
-                backend.stop_event.set()
             return SimpleNamespace(subscription_id=f"{self.label}-sub")
 
         def read_event(self, subscription_id: str, *, timeout: float | None = None) -> dict[str, Any]:
@@ -1685,21 +1779,13 @@ def test_run_forever_reconnects_and_resubscribes_after_event_disconnect(tmp_path
                 backend.stop_event.set()
                 raise HerdrSocketTimeoutError("idle")
             event = self.events.pop(0)
-            if event == "timeout":
-                raise HerdrSocketTimeoutError("idle")
             if event == "disconnect":
                 raise HerdrSocketDisconnectedError("disconnect")
-            return {"id": subscription_id, **event}
+            return dict(event)
 
-    first = SequenceClient(
-        "first",
-        [
-            "timeout",
-            {"event": "pane.agent_status_changed", "payload": {"agent": "Agent One", "status": "blocked"}},
-            "disconnect",
-        ],
-    )
-    second = SequenceClient("second", [], stop_on_subscribe=True, pane_status="blocked")
+    working = _status_event("working")
+    first = SequenceClient("first", [working, "disconnect"], pane_status="idle")
+    second = SequenceClient("second", [working], pane_status="idle")
     clients = [first, second]
     backend = HerdrEventBackend(
         config,
@@ -1713,12 +1799,13 @@ def test_run_forever_reconnects_and_resubscribes_after_event_disconnect(tmp_path
     expected = build_events_subscribe_params(HERDR_OFFICIAL_EVENT_NAMES)
     assert first.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
     assert second.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
-    assert first.read_calls == 3
+    assert first.read_calls == 2
+    assert second.read_calls == 2
     assert first.closed is True
     assert second.closed is True
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
     assert snapshot is not None
-    assert snapshot.workers[0].status == "blocked"
+    assert snapshot.workers[0].status == "active"
 
 
 def test_start_stop_are_idempotent_and_bounded_for_idle_subscription(tmp_path: Path) -> None:
@@ -1779,29 +1866,504 @@ def test_start_stop_are_idempotent_and_bounded_for_idle_subscription(tmp_path: P
     assert time.monotonic() - started < 2.0
 
 
-def test_agent_status_changed_updates_worker_once_for_duplicate_sequence(tmp_path: Path) -> None:
-    backend = _backend(tmp_path, "status-dedupe")
+@pytest.mark.parametrize("batched", [False, True], ids=["one-flush-per-event", "one-batch"])
+def test_real_idless_working_idle_working_preserves_every_transition(
+    tmp_path: Path,
+    monkeypatch: Any,
+    batched: bool,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"real-idless-transitions-{batched}",
+        debounce_seconds=60 if batched else 0,
+    )
+    backend.reconcile_once(client=_initial_pane_client())
+    bindings_before = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    applied: list[str] = []
+    original_apply = backend._apply_event
+
+    def recording_apply(event: Any) -> bool:
+        applied.append(str(event.payload["status"]))
+        return original_apply(event)
+
+    monkeypatch.setattr(backend, "_apply_event", recording_apply)
+    observed_statuses: list[str] = []
+    accepted = []
+    for status in ("working", "idle", "working"):
+        accepted.append(backend.queue_event_envelope(_status_event(status), flush=not batched))
+        if not batched:
+            snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+            assert snapshot is not None
+            observed_statuses.append(snapshot.workers[0].status)
+    if batched:
+        backend.flush()
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    bindings_after = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert snapshot is not None
+    assert accepted == [True, True, True]
+    assert applied == ["working", "idle", "working"]
+    if not batched:
+        assert observed_statuses == ["active", "idle", "active"]
+    assert snapshot.workers[0].status == "active"
+    assert len(snapshot.workers) == 1
+    assert bindings_after == bindings_before
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["separate-flushes", "one-batch"])
+def test_adjacent_idless_duplicates_do_not_duplicate_persisted_effects(
+    tmp_path: Path,
+    batched: bool,
+) -> None:
+    backend = _backend(
+        tmp_path,
+        f"idless-repeat-effects-{batched}",
+        debounce_seconds=60 if batched else 0,
+    )
+    backend.reconcile_once(client=_initial_pane_client())
+    before = _persisted_event_effect_counts(backend)
+    blocked = _status_event("blocked")
+
+    assert backend.queue_event_envelope(blocked, flush=not batched) is True
+    if batched:
+        assert backend.queue_event_envelope(blocked, flush=False) is True
+        backend.flush()
+        after = _persisted_event_effect_counts(backend)
+    else:
+        after_first = _persisted_event_effect_counts(backend)
+        assert backend.queue_event_envelope(blocked, flush=True) is True
+        after = _persisted_event_effect_counts(backend)
+        assert after == after_first
+
+    assert after["snapshots"] == before["snapshots"] + 1
+    assert after["events"] == before["events"] + 1
+    assert after["workers"] == before["workers"] == 1
+    assert after["worker_bindings"] == before["worker_bindings"] == 1
+    assert after["attention_items"] == before["attention_items"] + 1
+    assert after["connector_outbox"] == before["connector_outbox"] + 1
+
+
+def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    calls: list[SnapshotObservationContext] = []
+    original_save_snapshot = save_snapshot
+
+    def recording_save_snapshot(
+        db_path: Path,
+        snapshot: Any,
+        *,
+        observation: SnapshotObservationContext | None = None,
+    ) -> None:
+        assert observation is not None
+        calls.append(observation)
+        original_save_snapshot(db_path, snapshot, observation=observation)
+
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_events.save_snapshot",
+        recording_save_snapshot,
+    )
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+    backend = _backend(tmp_path, "herdr-observation-context")
+
+    backend.reconcile_once(client=_initial_pane_client())
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:10Z")
+    backend.queue_event_envelope(_status_event("blocked"))
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:20Z")
+    backend._mark_worker_cap_exceeded_locked(999)
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:30Z")
+    backend._mark_unhealthy("socket_disconnected")
+
+    assert [(call.authority, call.observed_at) for call in calls] == [
+        ("complete", "2026-01-01T00:00:00Z"),
+        ("positive", "2026-01-01T00:00:10Z"),
+        ("none", "2026-01-01T00:00:20Z"),
+        ("none", "2026-01-01T00:00:30Z"),
+    ]
+
+
+def test_incremental_positive_lifecycle_and_complete_absence_are_separate(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+    backend = _backend(tmp_path, "incremental-lifecycle")
+    backend.reconcile_once(client=_initial_pane_client())
+    assert _attention_lifecycle_rows(backend) == ()
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:10Z")
+    backend.queue_event_envelope(_status_event("blocked"))
+    opened = _attention_lifecycle_rows(backend)
+    assert len(opened) == 1
+    assert opened[0][0:2] == (1, "open")
+    assert opened[0][5:7] == (None, 0)
+    initial_rank = int(opened[0][9])
+    assert _attention_event_types(backend) == ["attention_created"]
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:20Z")
+    backend.queue_event_envelope(_status_event("failed"))
+    escalated = _attention_lifecycle_rows(backend)
+    assert len(escalated) == 1
+    assert escalated[0][0:2] == (1, "open")
+    assert int(escalated[0][9]) > initial_rank
+    assert _attention_event_types(backend) == [
+        "attention_created",
+        "attention_escalated",
+    ]
+    current = list_attention_items(backend.db_path, backend.config.host_id)
+    assert len(current) == 1
+    assert current[0]["severity"] == "critical"
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:30Z")
+    backend.reconcile_once(client=_initial_pane_client())
+    first_missing = _attention_lifecycle_rows(backend)
+    assert first_missing[0][0:2] == (1, "open")
+    assert first_missing[0][5] is not None
+    assert first_missing[0][6] == 1
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:40Z")
+    backend.queue_event_envelope(_status_event("blocked"))
+    cleared = _attention_lifecycle_rows(backend)
+    assert cleared[0][0:2] == (1, "open")
+    assert cleared[0][5:7] == (None, 0)
+    assert _attention_event_types(backend) == [
+        "attention_created",
+        "attention_escalated",
+    ]
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:50Z")
+    backend.queue_event_envelope(_status_event("idle"))
+    assert _attention_lifecycle_rows(backend) == cleared
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:01:40Z")
+    backend.reconcile_once(client=_initial_pane_client())
+    pending = _attention_lifecycle_rows(backend)
+    assert pending[0][0:2] == (1, "open")
+    assert pending[0][5] is not None
+    assert pending[0][6] == 1
+    pending_since = pending[0][5]
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:03:40Z")
+    backend.reconcile_once(client=_initial_pane_client())
+    resolved = _attention_lifecycle_rows(backend)
+    assert resolved[0][0:3] == (1, "resolved", None)
+    assert resolved[0][5:7] == (pending_since, 2)
+    assert list_attention_items(backend.db_path, backend.config.host_id) == []
+    assert _attention_event_types(backend) == [
+        "attention_created",
+        "attention_escalated",
+    ]
+
+
+def test_non_authoritative_herdr_saves_do_not_advance_pending_absence(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+    backend = _backend(tmp_path, "non-authoritative-lifecycle")
+    backend.reconcile_once(client=_initial_pane_client())
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:10Z")
+    backend.queue_event_envelope(_status_event("blocked"))
+    _set_observation_time(monkeypatch, "2026-01-01T00:01:40Z")
     backend.reconcile_once(client=_initial_pane_client())
 
-    first = {
-        "event": "pane.agent_status_changed",
-        "server_id": "srv-1",
-        "sequence": 10,
-        "payload": {"agent": "Agent One", "status": "blocked"},
-    }
-    duplicate = {
-        "event": "agent.status_changed",
-        "server_id": "srv-1",
-        "sequence": 10,
-        "payload": {"agent": "Agent One", "status": "failed"},
-    }
+    pending = _attention_lifecycle_rows(backend)
+    outbox = _attention_event_types(backend)
+    assert pending[0][5] is not None
+    assert pending[0][6] == 1
 
+    for timestamp, outcome in (
+        ("2026-01-01T00:03:40Z", "socket_disconnected"),
+        ("2026-01-01T00:04:40Z", "protocol_error"),
+        ("2026-01-01T00:05:40Z", "continuity_unavailable"),
+    ):
+        _set_observation_time(monkeypatch, timestamp)
+        backend._mark_unhealthy(outcome)
+        assert _attention_lifecycle_rows(backend) == pending
+        assert _attention_event_types(backend) == outbox
+
+    failed_worker = backend._workers[next(iter(backend._workers))]
+    backend._workers[failed_worker.id] = Worker(
+        id=failed_worker.id,
+        name=failed_worker.name,
+        status="failed",
+        space_id=failed_worker.space_id,
+        meta=failed_worker.meta,
+        last_seen_at=failed_worker.last_seen_at,
+        summary=failed_worker.summary,
+        backend_target=failed_worker.backend_target,
+    )
+    _set_observation_time(monkeypatch, "2026-01-01T00:06:40Z")
+    backend._persist_current_state(observed_at="2026-01-01T00:06:40Z")
+    assert _attention_lifecycle_rows(backend) == pending
+    assert _attention_event_types(backend) == outbox
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:07:40Z")
+    backend._mark_worker_cap_exceeded_locked(999)
+    assert _attention_lifecycle_rows(backend) == pending
+    assert _attention_event_types(backend) == outbox
+
+
+def test_event_flush_and_direct_persistence_use_the_same_lifecycle_executor(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    def exercise(host_id: str, *, direct: bool) -> tuple[Any, ...]:
+        _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+        backend = _backend(tmp_path, host_id)
+        backend.reconcile_once(client=_initial_pane_client())
+        for timestamp, status in (
+            ("2026-01-01T00:00:10Z", "blocked"),
+            ("2026-01-01T00:00:20Z", "failed"),
+        ):
+            _set_observation_time(monkeypatch, timestamp)
+            envelope = _status_event(status)
+            if direct:
+                event = normalize_event(envelope)
+                assert event is not None
+                assert backend._apply_event(event) is True
+                backend._persist_current_state(observed_at=timestamp)
+            else:
+                assert backend.queue_event_envelope(envelope) is True
+        lifecycle = _attention_lifecycle_rows(backend)
+        public = list_attention_items(backend.db_path, backend.config.host_id)
+        return (
+            lifecycle[0][0],
+            lifecycle[0][1],
+            lifecycle[0][5],
+            lifecycle[0][6],
+            lifecycle[0][9],
+            _attention_event_types(backend),
+            public[0]["severity"],
+            public[0]["status"],
+            public[0]["lifecycle_status"],
+        )
+
+    assert exercise("event-lifecycle-path", direct=False) == exercise(
+        "direct-lifecycle-path",
+        direct=True,
+    )
+
+
+def test_restart_preserves_pending_absence_until_complete_confirmation(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+    backend = _backend(tmp_path, "restart-pending-lifecycle")
+    backend.reconcile_once(client=_initial_pane_client())
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:10Z")
+    backend.queue_event_envelope(_status_event("blocked"))
+    _set_observation_time(monkeypatch, "2026-01-01T00:01:40Z")
+    backend.reconcile_once(client=_initial_pane_client())
+    pending = _attention_lifecycle_rows(backend)
+    assert pending[0][0:2] == (1, "open")
+    assert pending[0][5] is not None
+    assert pending[0][6] == 1
+    pending_since = pending[0][5]
+
+    restarted = HerdrEventBackend(
+        backend.config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    assert _attention_lifecycle_rows(restarted) == pending
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:03:40Z")
+    restarted.reconcile_once(client=_initial_pane_client())
+    resolved = _attention_lifecycle_rows(restarted)
+    assert resolved[0][0:3] == (1, "resolved", None)
+    assert resolved[0][5:7] == (pending_since, 2)
+    assert _attention_event_types(restarted) == ["attention_created"]
+
+
+
+@pytest.mark.parametrize("identity_kind", ["event_id", "producer_sequence"])
+def test_forward_compatible_producer_identity_dedupes_retries_with_bounded_lru(
+    tmp_path: Path,
+    identity_kind: str,
+) -> None:
+    config = _config(tmp_path, f"producer-dedupe-{identity_kind}")
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        dedupe_size=2,
+    )
+    backend.reconcile_once(client=_initial_pane_client())
+
+    def identity(value: int) -> dict[str, Any]:
+        if identity_kind == "event_id":
+            return {"event_id": f"event-{value}"}
+        return {"server_id": "server-1", "sequence": value}
+
+    first = {**_status_event("blocked"), **identity(1)}
+    retry = {**_status_event("failed"), **identity(1)}
     assert backend.queue_event_envelope(first) is True
-    assert backend.queue_event_envelope(duplicate) is False
+    assert backend.queue_event_envelope(retry) is False
+    assert backend.queue_event_envelope({**_status_event("idle"), **identity(2)}) is True
+    assert backend.queue_event_envelope({**_status_event("working"), **identity(3)}) is True
+    assert len(backend._producer_dedupe) == 2
+    assert backend.queue_event_envelope({**_status_event("waiting"), **identity(1)}) is True
+    assert len(backend._producer_dedupe) == 2
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
     assert snapshot is not None
+    assert snapshot.workers[0].status == "waiting"
+
+
+def test_pending_producer_identity_is_not_committed_before_successful_flush(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "pending-producer-dedupe", debounce_seconds=60)
+    backend.reconcile_once(client=_initial_pane_client())
+    identity = HerdrEventId("pending-event")
+    first = {**_status_event("blocked"), "event_id": identity.value}
+    duplicate = {**_status_event("failed"), "event_id": identity.value}
+
+    assert backend.queue_event_envelope(first, flush=False) is True
+    assert backend._producer_dedupe == {}
+    assert len(backend._pending_events) == 1
+    assert backend.queue_event_envelope(duplicate, flush=False) is False
+    assert backend._producer_dedupe == {}
+    assert len(backend._pending_events) == 1
+
+    backend.flush()
+
+    assert list(backend._producer_dedupe) == [identity]
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
     assert snapshot.workers[0].status == "blocked"
+
+
+def test_continuity_failure_leaves_producer_identity_retryable(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "continuity-producer-retry")
+    backend.reconcile_once(client=_initial_pane_client())
+    identity = HerdrEventId("continuity-retry")
+    envelope = {**_status_event("blocked"), "event_id": identity.value}
+    original_apply = backend._apply_event
+    fail_next = True
+
+    def fail_once(event: Any) -> bool:
+        nonlocal fail_next
+        if fail_next:
+            fail_next = False
+            raise HerdrContinuityUnavailableError("continuity unavailable")
+        return original_apply(event)
+
+    monkeypatch.setattr(backend, "_apply_event", fail_once)
+
+    assert backend.queue_event_envelope(envelope) is True
+    assert identity not in backend._producer_dedupe
+    failed = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert failed is not None
+    assert failed.workers[0].status == "active"
+    assert failed.backend_health[0].outcome == "continuity_unavailable"
+
+    assert backend.queue_event_envelope(envelope) is True
+    recovered = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert recovered is not None
+    assert recovered.workers[0].status == "blocked"
+    assert identity in backend._producer_dedupe
+    assert backend.queue_event_envelope(envelope) is False
+
+
+def test_snapshot_failure_leaves_identity_retryable_and_retry_persists_dirty_state(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "snapshot-producer-retry")
+    backend.reconcile_once(client=_initial_pane_client())
+    identity = HerdrEventId("snapshot-retry")
+    envelope = {**_status_event("blocked"), "event_id": identity.value}
+    original_persist = backend._persist_current_state
+    fail_next = True
+
+    def fail_once(*, observed_at: str | None = None) -> Any:
+        nonlocal fail_next
+        if fail_next:
+            fail_next = False
+            raise RuntimeError("snapshot unavailable")
+        return original_persist(observed_at=observed_at)
+
+    monkeypatch.setattr(backend, "_persist_current_state", fail_once)
+
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        backend.queue_event_envelope(envelope)
+    assert identity not in backend._producer_dedupe
+    stale = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert stale is not None
+    assert stale.workers[0].status == "active"
+    assert backend._workers[stale.workers[0].id].status == "blocked"
+
+    assert backend.queue_event_envelope(envelope) is True
+    persisted = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert persisted is not None
+    assert persisted.workers[0].status == "blocked"
+    assert identity in backend._producer_dedupe
+    assert backend.queue_event_envelope(envelope) is False
+
+
+def test_concurrent_queueing_applies_events_in_backend_lock_order(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "concurrent-event-order", debounce_seconds=60)
+    backend.reconcile_once(client=_initial_pane_client())
+    first_queued = threading.Event()
+    idle_queued = threading.Event()
+    accepted: dict[str, bool] = {}
+    applied: list[str] = []
+    original_apply = backend._apply_event
+
+    def recording_apply(event: Any) -> bool:
+        applied.append(str(event.payload["status"]))
+        return original_apply(event)
+
+    monkeypatch.setattr(backend, "_apply_event", recording_apply)
+
+    def queue_working_events() -> None:
+        accepted["first"] = backend.queue_event_envelope(_status_event("working"), flush=False)
+        first_queued.set()
+        if idle_queued.wait(1):
+            accepted["last"] = backend.queue_event_envelope(_status_event("working"), flush=False)
+
+    def queue_idle_event() -> None:
+        if first_queued.wait(1):
+            accepted["middle"] = backend.queue_event_envelope(_status_event("idle"), flush=False)
+            idle_queued.set()
+
+    working_thread = threading.Thread(target=queue_working_events)
+    idle_thread = threading.Thread(target=queue_idle_event)
+    working_thread.start()
+    idle_thread.start()
+    working_thread.join(timeout=1)
+    idle_thread.join(timeout=1)
+
+    assert working_thread.is_alive() is False
+    assert idle_thread.is_alive() is False
+    assert accepted == {"first": True, "middle": True, "last": True}
+    backend.flush()
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert applied == ["working", "idle", "working"]
+    assert snapshot.workers[0].status == "active"
+    assert len(snapshot.workers) == 1
+    assert len(list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")) == 1
 
 
 def test_pane_moved_preserves_public_worker_and_updates_private_binding(tmp_path: Path) -> None:
@@ -1813,15 +2375,12 @@ def test_pane_moved_preserves_public_worker_and_updates_private_binding(tmp_path
     binding = list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")[0]
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": {
-                "old_pane_id": "pane-1",
-                "pane_id": "pane-2",
-                "agent": "Agent One",
-                "workspace_id": "space-1",
-            },
-        }
+        {"event": "pane.moved", "data": {
+            "old_pane_id": "pane-1",
+            "pane_id": "pane-2",
+            "agent": "Agent One",
+            "workspace_id": "space-1",
+        }}
     )
 
     after = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1837,7 +2396,7 @@ def test_pane_closed_closes_worker_and_expires_matching_binding(tmp_path: Path) 
     backend = _backend(tmp_path, "pane-closed")
     backend.reconcile_once(client=_initial_pane_client())
 
-    backend.queue_event_envelope({"event": "pane.closed", "payload": {"pane_id": "pane-1"}})
+    backend.queue_event_envelope({"event": "pane.closed", "data": {"pane_id": "pane-1"}})
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
     assert snapshot is not None
@@ -1856,7 +2415,7 @@ def test_pane_exited_closes_worker_and_expires_matching_binding(tmp_path: Path) 
     backend = _backend(tmp_path, "pane-exited")
     backend.reconcile_once(client=_initial_pane_client())
 
-    backend.queue_event_envelope({"event": "pane.exited", "payload": {"pane_id": "pane-1"}})
+    backend.queue_event_envelope({"event": "pane.exited", "data": {"pane_id": "pane-1"}})
 
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
     assert snapshot is not None
@@ -1984,17 +2543,14 @@ def test_incremental_event_over_worker_cap_is_ignored_with_degraded_health(tmp_p
     backend.reconcile_once(client=_initial_pane_client())
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "agent_id": "agent-2",
-                    "name": "Agent Two",
-                    "workspace_id": "space-1",
-                    "pane_id": "pane-2",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "agent_id": "agent-2",
+                "name": "Agent Two",
+                "workspace_id": "space-1",
+                "pane_id": "pane-2",
+            }
+        }}
     )
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
 
@@ -2018,24 +2574,18 @@ def test_closed_worker_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -
     backend.reconcile_once(client=_initial_pane_client())
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "payload": {"pane": {"pane_id": "pane-1", "agent": "Agent One", "workspace_id": "space-1"}},
-        }
+        {"event": "pane.closed", "data": {"pane": {"pane_id": "pane-1", "agent": "Agent One", "workspace_id": "space-1"}}}
     )
     backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "agent_id": "agent-2",
-                    "name": "Agent Two",
-                    "workspace_id": "space-1",
-                    "pane_id": "pane-2",
-                    "status": "running",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "agent_id": "agent-2",
+                "name": "Agent Two",
+                "workspace_id": "space-1",
+                "pane_id": "pane-2",
+                "status": "running",
+            }
+        }}
     )
 
     before_reactivation = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -2046,17 +2596,14 @@ def test_closed_worker_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -
     }
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "agent": "Agent One",
-                    "workspace_id": "space-1",
-                    "pane_id": "pane-3",
-                    "status": "running",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "pane_id": "pane-3",
+                "status": "running",
+            }
+        }}
     )
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
 
@@ -2104,18 +2651,15 @@ def test_pane_moved_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -> N
     )
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "agent_id": "agent-2",
-                    "name": "Agent Two",
-                    "workspace_id": "space-1",
-                    "pane_id": "pane-2",
-                    "status": "running",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "agent_id": "agent-2",
+                "name": "Agent Two",
+                "workspace_id": "space-1",
+                "pane_id": "pane-2",
+                "status": "running",
+            }
+        }}
     )
     before_move = latest_snapshot(backend.db_path, backend.config.host_id)
     assert before_move is not None
@@ -2125,16 +2669,13 @@ def test_pane_moved_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -> N
     }
 
     backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": {
-                "old_pane_id": "pane-1",
-                "pane_id": "pane-3",
-                "agent": "Agent One",
-                "workspace_id": "space-1",
-                "status": "running",
-            },
-        }
+        {"event": "pane.moved", "data": {
+            "old_pane_id": "pane-1",
+            "pane_id": "pane-3",
+            "agent": "Agent One",
+            "workspace_id": "space-1",
+            "status": "running",
+        }}
     )
     snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
 
@@ -2184,7 +2725,7 @@ def test_debounce_batches_until_flush_and_shutdown_flushes(tmp_path: Path) -> No
     backend.reconcile_once(client=_initial_pane_client())
 
     backend.queue_event_envelope(
-        {"event": "pane.agent_status_changed", "payload": {"agent": "Agent One", "status": "blocked"}}
+        {"event": "pane.agent_status_changed", "data": {"agent": "Agent One", "status": "blocked"}}
     )
     pending = latest_snapshot(backend.db_path, backend.config.host_id)
     assert pending is not None
@@ -2213,7 +2754,7 @@ def test_idle_event_timeout_keeps_polling_without_marking_backend_unhealthy(tmp_
             return {
                 "id": subscription_id,
                 "event": "pane.agent_status_changed",
-                "payload": {"agent": "Agent One", "status": "blocked"},
+                "data": {"agent": "Agent One", "status": "blocked"},
             }
 
     client = IdleThenEventClient()
@@ -2378,10 +2919,7 @@ def test_status_event_with_pane_id_only_updates_bound_worker_not_a_phantom(tmp_p
     assert ids_before == ["claude-1", "claude-2"]
 
     event = normalize_event(
-        {
-            "event": "pane.agent_status_changed",
-            "payload": {"pane": {"pane_id": "w1:p2", "agent": "claude", "status": "idle"}},
-        }
+        {"event": "pane.agent_status_changed", "data": {"pane": {"pane_id": "w1:p2", "agent": "claude", "status": "idle"}}}
     )
     assert event is not None
     assert backend._apply_event(event) is True
@@ -2421,10 +2959,7 @@ def test_pane_id_only_status_event_resolves_codex_binding_via_pane_terminal_map(
     assert backend._pane_terminals == {"wX8:p1": "term-ctx"}
 
     event = normalize_event(
-        {
-            "event": "pane.agent_status_changed",
-            "payload": {"pane_id": "wX8:p1", "workspace_id": "wX8", "agent_status": "idle"},
-        }
+        {"event": "pane.agent_status_changed", "data": {"pane_id": "wX8:p1", "workspace_id": "wX8", "agent_status": "idle"}}
     )
     assert event is not None
     assert backend._apply_event(event) is True
@@ -2475,27 +3010,21 @@ def test_nested_agent_pane_claim_cannot_poison_terminal_close_matching(
     assert backend._pane_terminals == {"P1": "T1"}
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {
-                "agent": {
-                    "worker_id": "nested-agent-claimant",
-                    "pane_id": "Pfake",
-                    "terminal_id": "T1",
-                    "agent": "codex",
-                    "status": "working",
-                }
-            },
-        }
+        {"event": "pane.agent_detected", "data": {
+            "agent": {
+                "worker_id": "nested-agent-claimant",
+                "pane_id": "Pfake",
+                "terminal_id": "T1",
+                "agent": "codex",
+                "status": "working",
+            }
+        }}
     )
     assert backend._pane_terminals == {"P1": "T1"}
     assert backend._pane_owners == {"P1": {worker.id}}
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "payload": {"pane_id": "Pfake"},
-        }
+        {"event": "pane.closed", "data": {"pane_id": "Pfake"}}
     )
 
     current = backend._workers[worker.id]
@@ -2543,10 +3072,7 @@ def test_reconcile_maps_only_accepted_pane_info_rows(
     assert backend._pane_owners == {"P1": {worker.id}}
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "payload": {"pane_id": "Pfake"},
-        }
+        {"event": "pane.closed", "data": {"pane_id": "Pfake"}}
     )
 
     assert backend._workers[worker.id].status == worker.status
@@ -2590,28 +3116,22 @@ def test_accepted_move_removes_source_pane_terminal_alias_before_stale_close(
     worker = initial.workers[0]
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.moved",
-            "payload": {
-                source_field: source_value,
-                "pane": {
-                    "pane_id": "P2",
-                    "terminal_id": "T1",
-                    "workspace_id": "W1",
-                    "agent": "codex",
-                    "agent_status": "working",
-                },
+        {"event": "pane.moved", "data": {
+            source_field: source_value,
+            "pane": {
+                "pane_id": "P2",
+                "terminal_id": "T1",
+                "workspace_id": "W1",
+                "agent": "codex",
+                "agent_status": "working",
             },
-        }
+        }}
     )
     assert backend._pane_terminals == {"P2": "T1"}
     assert backend._pane_owners == {"P2": {worker.id}}
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.closed",
-            "payload": {"pane_id": "P1"},
-        }
+        {"event": "pane.closed", "data": {"pane_id": "P1"}}
     )
 
     assert backend._workers[worker.id].status == worker.status
@@ -2662,14 +3182,11 @@ def test_pane_only_status_preserves_unobserved_owner_aliases_for_later_conflict(
     assert binding.turn_target_kind == "codex_session_id"
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.agent_status_changed",
-            "payload": {
-                "workspace_id": "wR9",
-                "pane_id": "wR9:pA",
-                "status": "idle",
-            },
-        }
+        {"event": "pane.agent_status_changed", "data": {
+            "workspace_id": "wR9",
+            "pane_id": "wR9:pA",
+            "status": "idle",
+        }}
     )
     status_binding = next(iter(backend._bindings.values()))
     assert status_binding.private_fingerprint == binding.private_fingerprint
@@ -2685,25 +3202,22 @@ def test_pane_only_status_preserves_unobserved_owner_aliases_for_later_conflict(
     }
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "payload": {
-                "pane": {
-                    "workspace_id": "wR9",
-                    "pane_id": "wR9:pB",
-                    "terminal_id": "shared-terminal-secret",
-                    "agent_id": "new-agent-target-secret",
+        {"event": "pane.created", "data": {
+            "pane": {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pB",
+                "terminal_id": "shared-terminal-secret",
+                "agent_id": "new-agent-target-secret",
+                "agent": "codex",
+                "agent_session": {
+                    "source": "new-source-secret",
                     "agent": "codex",
-                    "agent_session": {
-                        "source": "new-source-secret",
-                        "agent": "codex",
-                        "kind": "id",
-                        "value": "new-session-secret",
-                    },
-                    "status": "working",
-                }
-            },
-        }
+                    "kind": "id",
+                    "value": "new-session-secret",
+                },
+                "status": "working",
+            }
+        }}
     )
 
     assert set(backend._workers) == {worker.id}
@@ -2753,20 +3267,17 @@ def test_nested_compatibility_replay_cannot_rehabilitate_ambiguous_binding(
     worker = initial.workers[0]
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.created",
-            "payload": {
-                "pane": {
-                    "workspace_id": "wR9",
-                    "pane_id": "wR9:pB",
-                    "terminal_id": "terminal-b-secret",
-                    "agent_id": "agent-target-b-secret",
-                    "agent": "codex",
-                    "agent_session": session,
-                    "status": "working",
-                }
-            },
-        }
+        {"event": "pane.created", "data": {
+            "pane": {
+                "workspace_id": "wR9",
+                "pane_id": "wR9:pB",
+                "terminal_id": "terminal-b-secret",
+                "agent_id": "agent-target-b-secret",
+                "agent": "codex",
+                "agent_session": session,
+                "status": "working",
+            }
+        }}
     )
     ambiguous = next(iter(backend._bindings.values()))
     assert ambiguous.worker_id == worker.id
@@ -2778,10 +3289,7 @@ def test_nested_compatibility_replay_cannot_rehabilitate_ambiguous_binding(
     assert backend._workers[worker.id].backend_target == ambiguous.backend_target()
 
     assert backend.queue_event_envelope(
-        {
-            "event": "pane.agent_detected",
-            "payload": {"agent": original_agent},
-        }
+        {"event": "pane.agent_detected", "data": {"agent": original_agent}}
     )
 
     replayed = next(iter(backend._bindings.values()))

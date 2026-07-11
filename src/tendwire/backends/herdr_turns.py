@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Config
-from ..core.turns import is_internal_automation_turn_payload, redact_private_prompt_text
+from ..core.models import stable_fingerprint
+from ..core.turns import InteractionChoice, is_internal_automation_turn_payload, redact_private_prompt_text
 from ..store.sqlite import (
     list_worker_bindings,
     merge_backend_pending,
@@ -37,14 +39,6 @@ _PANE_TURN_KIND = "pane_id"
 _MAX_CODEX_STREAM_MESSAGES = 4
 _OMP_TAIL_BYTES = 786432
 _OMP_TOOL_SNIPPET_CHARS = 160
-_OMP_SECRET_KEY_RE = re.compile(
-    r"(token|secret|password|passwd|api[_-]?key|authorization|credential|cookie|stdout|stderr|env)",
-    re.IGNORECASE,
-)
-_OMP_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|AUTH|CREDENTIAL|COOKIE)[A-Z0-9_]*)=([^\s;&|]+)"
-)
-_OMP_BEARER_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+")
 _PROMPTLESS_STATUS_FINAL_RE = re.compile(
     r"\b(?:"
     r"standing by|"
@@ -75,6 +69,21 @@ class _OmpSessionState:
     stream_parts: list[str] = field(default_factory=list)
     final_text: str = ""
     tool_count: int = 0
+    project_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class _PublicOmpToolProgress:
+    """Progress assembled only from constants and proven-safe relative paths."""
+
+    action: str
+    subject: str | None = None
+
+    def render(self, step: int) -> str:
+        body = f"{self.action}: {self.subject}" if self.subject else self.action
+        return f"step {step} · {body}"
+
+
 
 
 _OMP_SESSION_CACHE: dict[str, _OmpSessionState] = {}
@@ -97,57 +106,63 @@ _PENDING_TEXT_MAX = 2000
 
 
 def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Normalize an adapter-emitted pending_decision/pending_interaction (a REAL pane prompt with its
-    choices, captured by the herdres pending hook) into a neutral pending shape. Returns None when the
-    turn carries no pending prompt."""
+    """Build public pending display text without backend identifiers or action data."""
     decision = turn.get("pending_decision")
     if isinstance(decision, Mapping):
+        question = redact_private_prompt_text(
+            decision.get("prompt"),
+            max_chars=_PENDING_TEXT_MAX,
+        )
         options = decision.get("options") if isinstance(decision.get("options"), list) else []
-        choices = []
-        for option in options[:_PENDING_MAX_CHOICES]:
+        choices: list[dict[str, str]] = []
+        for ordinal, option in enumerate(options[:_PENDING_MAX_CHOICES]):
             if not isinstance(option, Mapping):
                 continue
-            # Agent-authored text (prompt/label) is free-form and can carry private paths, pane
-            # ids, or secrets; redact it to turn-text grade BEFORE it enters the store, matching how
-            # the contract handles user_text/assistant_final_text (best-effort for exotic secret
-            # shapes). The machine-send payload (send_text) is NOT published: it is the highest-risk
-            # field (verbatim strings the agent would send) and no public consumer needs it — the
-            # herdres number-reply flow sends the chosen digit, not this value.
-            label = redact_private_prompt_text(option.get("label"), max_chars=_PENDING_TEXT_MAX)
+            label = redact_private_prompt_text(
+                option.get("label"),
+                max_chars=_PENDING_TEXT_MAX,
+            )
             if not label:
                 continue
+            label = InteractionChoice(label=label).label
             choices.append(
                 {
-                    "choice_id": str(option.get("id") or "")[:80] or label[:80],
+                    "choice_id": f"choice-{stable_fingerprint({'question': question, 'ordinal': ordinal, 'label': label})}",
                     "label": label,
                 }
             )
-        question = redact_private_prompt_text(decision.get("prompt"), max_chars=_PENDING_TEXT_MAX)
         if not question and not choices:
             return None
-        option_ids = {str(option.get("id") or "") for option in options if isinstance(option, Mapping)}
-        kind = "approval" if "approve" in option_ids else "question"
+        option_ids = {
+            str(option.get("id") or "")
+            for option in options
+            if isinstance(option, Mapping)
+        }
         return {
             "question": question or "Input needed",
-            "kind": kind,
+            "kind": "approval" if "approve" in option_ids else "question",
             "choices": choices,
-            # decision_id (internal tool_use_id) is not published; no public consumer needs it.
             "meta": {"source": "backend"},
         }
     interaction = turn.get("pending_interaction")
     if isinstance(interaction, Mapping):
-        questions = interaction.get("questions") if isinstance(interaction.get("questions"), list) else []
-        parts = []
-        for q in questions[:4]:
-            if isinstance(q, Mapping):
-                part = redact_private_prompt_text(q.get("question"))
-                if part:
-                    parts.append(part)
+        questions = (
+            interaction.get("questions")
+            if isinstance(interaction.get("questions"), list)
+            else []
+        )
+        parts: list[str] = []
+        for item in questions[:4]:
+            if not isinstance(item, Mapping):
+                continue
+            part = redact_private_prompt_text(item.get("question"))
+            if part:
+                parts.append(part)
         question = " / ".join(parts)[:_PENDING_TEXT_MAX] or "Input needed (multi-question form)"
         return {
             "question": question,
             "kind": "review",
-            "choices": [],  # multi-question forms stay read-only (never key-driven)
+            "choices": [],
             "meta": {"source": "backend"},
         }
     return None
@@ -466,6 +481,80 @@ def _safe_omp_session_path(value: str) -> Path | None:
     return candidate
 
 
+def _omp_valid_git_directory(path: Path) -> bool:
+    """Require bounded, parseable Git HEAD evidence inside a git directory."""
+    try:
+        if not path.is_dir():
+            return False
+        with open(path / "HEAD", encoding="ascii") as handle:
+            head_text = handle.read(257)
+    except (OSError, UnicodeError):
+        return False
+    if len(head_text) > 256:
+        return False
+    lines = head_text.splitlines()
+    if len(lines) != 1:
+        return False
+    head = lines[0]
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head):
+        return True
+    if not head.startswith("ref: refs/"):
+        return False
+    reference = head[len("ref: ") :]
+    return bool(reference) and all(
+        part not in {"", ".", ".."} for part in reference.split("/")
+    ) and all(character.isalnum() or character in "._-/" for character in reference)
+
+
+def _omp_project_root(session_file: Path) -> Path | None:
+    """Return the nearest repository root proven by the session cwd."""
+    try:
+        with open(session_file, encoding="utf-8", errors="replace") as handle:
+            for _index in range(32):
+                line = handle.readline()
+                if not line or handle.tell() > 65536:
+                    break
+                try:
+                    entry = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(entry, Mapping) or entry.get("type") != "session":
+                    continue
+                cwd = entry.get("cwd")
+                if type(cwd) is not str or not cwd.strip():
+                    return None
+                resolved_cwd = Path(cwd).expanduser().resolve(strict=True)
+                if not resolved_cwd.is_dir():
+                    return None
+                for root in (resolved_cwd, *resolved_cwd.parents):
+                    git_marker = root / ".git"
+                    if git_marker.is_dir():
+                        return root if _omp_valid_git_directory(git_marker) else None
+                    if not git_marker.exists():
+                        continue
+                    if not git_marker.is_file():
+                        return None
+                    with open(git_marker, encoding="utf-8") as marker_handle:
+                        marker_text = marker_handle.read(4097)
+                    if len(marker_text) > 4096:
+                        return None
+                    marker_lines = marker_text.splitlines()
+                    if len(marker_lines) != 1 or not marker_lines[0].startswith("gitdir:"):
+                        return None
+                    reference = marker_lines[0][len("gitdir:") :].strip()
+                    if not reference:
+                        return None
+                    git_dir = Path(reference)
+                    if not git_dir.is_absolute():
+                        git_dir = git_marker.parent / git_dir
+                    resolved_git_dir = git_dir.resolve(strict=True)
+                    return root if _omp_valid_git_directory(resolved_git_dir) else None
+                return None
+    except (OSError, RuntimeError, UnicodeError, ValueError):
+        return None
+    return None
+
+
 def _omp_file_id(stat_result: os.stat_result) -> tuple[int, int]:
     return (int(stat_result.st_dev), int(stat_result.st_ino))
 
@@ -558,59 +647,171 @@ def _omp_thinking_snippet(message: Mapping[str, Any]) -> str:
     return ""
 
 
-def _omp_scrub_tool_text(value: str, *, limit: int = 120) -> str:
-    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
-    text = _OMP_SECRET_ASSIGNMENT_RE.sub(r"\1=<redacted>", text)
-    text = _OMP_BEARER_RE.sub(r"\1 <redacted>", text)
-    if len(text) > limit:
-        text = text[: limit - 3].rstrip() + "..."
-    return text
+_OMP_FILE_ACTIONS = {
+    "read": "read",
+    "read_file": "read",
+    "write": "write",
+    "write_file": "write",
+    "edit": "edit",
+    "edit_file": "edit",
+    "apply_patch": "edit",
+}
+_OMP_ACTIONS = {
+    "grep": "search",
+    "search": "search",
+    "ast_grep": "search",
+    "glob": "list files",
+    "list_files": "list files",
+    "browser": "browse",
+    "web_search": "search web",
+    "task": "delegate",
+    "agent": "delegate",
+    "lsp": "inspect code",
+}
+_OMP_PRIVATE_PATH_SEGMENTS = frozenset(
+    {
+        ".git",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".ssh",
+        "auth.json",
+        "credential",
+        "credentials",
+        "credentials.json",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+        "secret",
+        "secrets",
+        "secrets.json",
+        "token",
+        "tokens",
+    }
+)
 
 
-def _omp_public_tool_arg(value: Any) -> str:
-    if isinstance(value, (str, int, float, bool)):
-        return _omp_scrub_tool_text(str(value))
-    if isinstance(value, list):
-        parts = [_omp_public_tool_arg(item) for item in value[:3]]
-        return _omp_scrub_tool_text(" ".join(part for part in parts if part))
-    if not isinstance(value, Mapping):
+def _omp_path_segment_is_private(value: str) -> bool:
+    lowered = value.lower()
+    return (
+        lowered in _OMP_PRIVATE_PATH_SEGMENTS
+        or lowered.startswith(".env")
+        or lowered.endswith(".key")
+    )
+_OMP_SHELL_TOOLS = frozenset({"bash", "shell", "sh", "exec", "execute", "run"})
+
+
+def _omp_tool_name(item: Mapping[str, Any]) -> str:
+    raw = item.get("name")
+    if raw is None:
+        raw = item.get("toolName")
+    if raw is None:
+        raw = item.get("tool")
+    if type(raw) is not str:
         return ""
+    return re.sub(r"[^a-z0-9]+", "_", raw.strip().lower()).strip("_")
 
-    preferred_keys = ("command", "cmd", "path", "file_path", "filepath", "file", "query", "pattern", "url")
-    for key in preferred_keys:
-        if key not in value or _OMP_SECRET_KEY_RE.search(str(key)):
-            continue
-        text = _omp_public_tool_arg(value.get(key))
-        if text:
-            return text
 
-    parts: list[str] = []
-    for key, item in value.items():
-        key_text = str(key)
-        if _OMP_SECRET_KEY_RE.search(key_text) or not isinstance(item, (str, int, float, bool)):
-            continue
-        text = _omp_public_tool_arg(item)
-        if text:
-            parts.append(f"{key_text}={text}")
-        if len(parts) >= 2:
+def _omp_tool_arguments(item: Mapping[str, Any]) -> Mapping[str, Any]:
+    for key in ("arguments", "input", "args"):
+        value = item.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _omp_repo_relative_path(
+    arguments: Mapping[str, Any],
+    project_root: Path | None,
+) -> str | None:
+    if project_root is None:
+        return None
+    raw: Any = None
+    for key in ("path", "file_path", "filepath", "file"):
+        if key in arguments:
+            raw = arguments.get(key)
             break
-    return _omp_scrub_tool_text(" ".join(parts))
+    if type(raw) is not str:
+        return None
+    text = raw.strip()
+    if not text or text.startswith("~") or any(ord(character) < 32 for character in text):
+        return None
+    try:
+        root = project_root.resolve(strict=True)
+        candidate = Path(text)
+        if ".." in candidate.parts:
+            return None
+        resolved = candidate.resolve(strict=False) if candidate.is_absolute() else (root / candidate).resolve(strict=False)
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if any(_omp_path_segment_is_private(part) for part in relative.parts):
+        return None
+    public_path = relative.as_posix()
+    if not public_path or public_path == "." or len(public_path) > 120:
+        return None
+    allowed = frozenset("._-+@/ ")
+    if any(not (character.isascii() and (character.isalnum() or character in allowed)) for character in public_path):
+        return None
+    return public_path
 
 
-def _omp_tool_snippet(item: Mapping[str, Any], step: int) -> str:
-    raw_name = str(item.get("name") or item.get("toolName") or item.get("tool") or "tool")
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_name).strip("-")[:40] or "tool"
-    arguments = item.get("arguments")
-    if arguments is None:
-        arguments = item.get("input")
-    if arguments is None:
-        arguments = item.get("args")
-    detail = _omp_public_tool_arg(arguments)
-    body = f"{name}: {detail}" if detail else name
-    text = f"step {step} · {body}"
-    if len(text) > _OMP_TOOL_SNIPPET_CHARS:
-        text = text[: _OMP_TOOL_SNIPPET_CHARS - 3].rstrip() + "..."
-    return text
+def _omp_shell_progress(arguments: Mapping[str, Any]) -> _PublicOmpToolProgress:
+    command = arguments.get("command")
+    if command is None:
+        command = arguments.get("cmd")
+    if type(command) is not str or any(character in command for character in "\r\n;&|`$<>"):
+        return _PublicOmpToolProgress("run command")
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return _PublicOmpToolProgress("run command")
+    if not tokens:
+        return _PublicOmpToolProgress("run command")
+    if tokens[:2] == ["git", "status"] and all(
+        token in {"--short", "--porcelain", "--branch", "-s", "-sb"}
+        for token in tokens[2:]
+    ):
+        return _PublicOmpToolProgress("git status")
+    if tokens[0] == "pytest" or tokens[:3] in (["python", "-m", "pytest"], ["python3", "-m", "pytest"]):
+        return _PublicOmpToolProgress("test", "pytest")
+    if tokens[:3] == ["uv", "run", "pytest"]:
+        return _PublicOmpToolProgress("test", "pytest")
+    if len(tokens) >= 2 and tokens[0] in {"bun", "cargo", "go", "npm"} and tokens[1] == "test":
+        return _PublicOmpToolProgress("test", tokens[0])
+    if len(tokens) >= 2 and tokens[0] in {"cargo", "go"} and tokens[1] == "build":
+        return _PublicOmpToolProgress("build", tokens[0])
+    if tokens[:3] == ["npm", "run", "build"]:
+        return _PublicOmpToolProgress("build", "npm")
+    if tokens[0] == "make":
+        return _PublicOmpToolProgress("build", "make")
+    if tokens[:3] in (["python", "-m", "build"], ["python3", "-m", "build"]):
+        return _PublicOmpToolProgress("build", "python")
+    return _PublicOmpToolProgress("run command")
+
+
+def _omp_public_tool_progress(
+    item: Mapping[str, Any],
+    project_root: Path | None,
+) -> _PublicOmpToolProgress:
+    name = _omp_tool_name(item)
+    arguments = _omp_tool_arguments(item)
+    if name in _OMP_FILE_ACTIONS:
+        action = _OMP_FILE_ACTIONS[name]
+        subject = _omp_repo_relative_path(arguments, project_root)
+        return _PublicOmpToolProgress(action, subject) if subject else _PublicOmpToolProgress(f"{action} file")
+    if name in _OMP_SHELL_TOOLS:
+        return _omp_shell_progress(arguments)
+    return _PublicOmpToolProgress(_OMP_ACTIONS.get(name, "tool"))
+
+
+def _omp_tool_snippet(
+    item: Mapping[str, Any],
+    step: int,
+    project_root: Path | None = None,
+) -> str:
+    return _omp_public_tool_progress(item, project_root).render(step)
 
 
 def _apply_omp_progress_message(state: _OmpSessionState, message: Mapping[str, Any]) -> None:
@@ -632,7 +833,7 @@ def _apply_omp_progress_message(state: _OmpSessionState, message: Mapping[str, A
             continue
         if kind == "toolCall":
             state.tool_count += 1
-            snippet = _omp_tool_snippet(item, state.tool_count)
+            snippet = _omp_tool_snippet(item, state.tool_count, state.project_root)
             if snippet:
                 _append_unique_recent(state.stream_parts, snippet)
 
@@ -679,8 +880,13 @@ def _apply_omp_lines_to_state(state: _OmpSessionState, lines: list[str]) -> None
         _apply_omp_progress_message(state, message)
 
 
-def _read_omp_state_from_recent(session_file: Path, size: int, file_id: tuple[int, int]) -> _OmpSessionState:
-    state = _OmpSessionState(file_id=file_id)
+def _read_omp_state_from_recent(
+    session_file: Path,
+    size: int,
+    file_id: tuple[int, int],
+    project_root: Path | None,
+) -> _OmpSessionState:
+    state = _OmpSessionState(file_id=file_id, project_root=project_root)
     if size <= 0:
         return state
 
@@ -748,11 +954,12 @@ def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
     size = int(stat_result.st_size)
     file_id = _omp_file_id(stat_result)
     cache_key = str(session_file.resolve())
+    project_root = _omp_project_root(session_file)
 
     with _OMP_SESSION_CACHE_LOCK:
         state = _OMP_SESSION_CACHE.get(cache_key)
         if state is None or state.file_id != file_id or size < state.offset:
-            state = _read_omp_state_from_recent(session_file, size, file_id)
+            state = _read_omp_state_from_recent(session_file, size, file_id, project_root)
         else:
             lines, next_offset = _read_omp_jsonl_lines(
                 session_file,
@@ -762,6 +969,7 @@ def _read_omp_session_turn(path_value: str) -> Mapping[str, Any] | None:
             _apply_omp_lines_to_state(state, lines)
             state.offset = next_offset
             state.file_id = file_id
+            state.project_root = project_root
         _OMP_SESSION_CACHE[cache_key] = state
         return _omp_state_to_content(state)
 

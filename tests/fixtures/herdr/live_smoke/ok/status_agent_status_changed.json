@@ -1,6 +1,7 @@
 {
   "status": "ok",
-  "event_count": 1,
+  "event_count": 4,
   "changed_count": 1,
-  "status_buckets": ["blocked"]
+  "status_buckets": ["active"],
+  "replay_fixture": "../../event_replay/status_transitions.json"
 }

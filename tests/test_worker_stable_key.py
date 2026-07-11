@@ -25,8 +25,8 @@ from tendwire.backends.herdr_cli import (
 )
 from tendwire.backends.herdr_events import HerdrEventBackend
 from tendwire.config import Config
-from tendwire.core.models import worker_binding_private_fingerprint
-from tendwire.store.sqlite import init_store
+from tendwire.core.models import Worker, worker_binding_private_fingerprint
+from tendwire.store.sqlite import init_store, latest_snapshot, list_worker_bindings
 from tendwire.worker_identity import (
     InstallationKeyError,
     load_or_create_installation_key,
@@ -88,6 +88,19 @@ def _stable(worker: Any) -> str:
 
 def _mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, int, bytes | None]]:
+    snapshot: dict[str, tuple[int, int, bytes | None]] = {}
+    for entry in [root, *sorted(root.rglob("*"))]:
+        current = os.lstat(entry)
+        content = entry.read_bytes() if stat.S_ISREG(current.st_mode) else None
+        snapshot[str(entry.relative_to(root))] = (
+            current.st_ino,
+            stat.S_IMODE(current.st_mode),
+            content,
+        )
+    return snapshot
 
 
 def _reserved_meta_keys(value: Any, *, include_root: bool = True) -> list[str]:
@@ -841,6 +854,99 @@ def test_identity_requires_both_canonical_membership_and_herdr_alphabet(
     assert "stable_key_version" not in worker.meta
 
 
+def test_reconcile_and_identical_events_share_one_canonical_worker_fingerprint(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    config = _config(tmp_path / "state", host_id="fingerprint-stability")
+    config.data_dir.mkdir(parents=True, mode=0o700)
+    init_store(Path(config.db_path))
+
+    class PaneClient:
+        def workspace_list(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"workspaces": [{"id": pane["workspace_id"], "name": "Continuity"}]}
+
+        def tab_list(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"tabs": []}
+
+        def pane_list(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"panes": [deepcopy(pane)]}
+
+        def agent_list(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"agents": []}
+
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    client = PaneClient()
+    phases: list[tuple[Any, Any]] = []
+
+    def capture() -> None:
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        bindings = list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")
+        assert snapshot is not None
+        assert len(snapshot.workers) == len(bindings) == 1
+        phases.append((snapshot.workers[0], bindings[0]))
+
+    backend.reconcile_once(client=client)
+    capture()
+    envelope = {"event": "pane.focused", "data": {"pane": deepcopy(pane)}}
+    assert backend.queue_event_envelope(envelope) is True
+    capture()
+    backend.reconcile_once(client=client)
+    capture()
+    assert backend.queue_event_envelope(envelope) is True
+    capture()
+
+    workers = [worker for worker, _binding in phases]
+    bindings = [binding for _worker, binding in phases]
+    assert len({worker.id for worker in workers}) == 1
+    assert len({_stable(worker) for worker in workers}) == 1
+    assert len({worker.fingerprint for worker in workers}) == 1
+    assert len({binding.worker_fingerprint for binding in bindings}) == 1
+    assert all(binding.worker_id == worker.id for worker, binding in phases)
+    assert all(binding.worker_fingerprint == worker.fingerprint for worker, binding in phases)
+    assert len(
+        {
+            (
+                binding.target_kind,
+                binding.target_value,
+                binding.turn_target_kind,
+                binding.turn_target_value,
+                binding.private_fingerprint,
+                binding.sendable,
+                binding.reason,
+            )
+            for binding in bindings
+        }
+    ) == 1
+
+    worker = workers[0]
+    canonical = Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta=worker.meta,
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+    )
+    pre_key_meta = {
+        key: value
+        for key, value in worker.meta.items()
+        if key not in {"stable_key", "stable_key_version"}
+    }
+    pre_key = Worker(
+        id=worker.id,
+        name=worker.name,
+        status=worker.status,
+        space_id=worker.space_id,
+        meta=pre_key_meta,
+        last_seen_at=worker.last_seen_at,
+        summary=worker.summary,
+    )
+    assert worker.fingerprint == canonical.fingerprint
+    assert worker.fingerprint != pre_key.fingerprint
+
+
 def test_same_workspace_move_preserves_and_cross_workspace_move_changes_key(tmp_path: Path) -> None:
     fixture = _fixture()
     config = _config(tmp_path / "state")
@@ -920,7 +1026,7 @@ def test_complete_authoritative_move_retains_state_when_rederivation_fails(
     assert backend.queue_event_envelope(
         {
             "event": "pane.moved",
-            "payload": {
+            "data": {
                 "previous_pane_id": initial["pane_id"],
                 "pane": moved_pane,
             },
@@ -1026,7 +1132,7 @@ def test_key_loss_rejects_every_authoritative_pane_update(
     assert backend.queue_event_envelope(
         {
             "event": "pane.created",
-            "payload": {"pane": observed},
+            "data": {"pane": observed},
         },
         flush=True,
     )
@@ -1291,23 +1397,8 @@ def test_permissive_umask_still_creates_private_modes(tmp_path: Path) -> None:
     assert _mode(config.installation_key_sentinel_path) == 0o600
 
 
-@pytest.mark.parametrize(
-    ("target_name", "broad_mode"),
-    [
-        pytest.param(None, 0o710, id="data-directory-group"),
-        pytest.param(None, 0o701, id="data-directory-world"),
-        pytest.param("installation.key", 0o640, id="key-group"),
-        pytest.param("installation.key", 0o604, id="key-world"),
-        pytest.param("installation.key.sha256", 0o640, id="digest-group"),
-        pytest.param("installation.key.sha256", 0o604, id="digest-world"),
-        pytest.param("installation.key.initialized", 0o640, id="sentinel-group"),
-        pytest.param("installation.key.initialized", 0o604, id="sentinel-world"),
-    ],
-)
-def test_existing_broad_identity_modes_fail_without_rewriting_or_randomness(
+def test_existing_broad_identity_modes_are_narrowed_in_place_idempotently(
     tmp_path: Path,
-    target_name: str | None,
-    broad_mode: int,
 ) -> None:
     data_dir = tmp_path / "state"
     data_dir.mkdir(mode=0o700)
@@ -1318,16 +1409,17 @@ def test_existing_broad_identity_modes_fail_without_rewriting_or_randomness(
         "installation.key.initialized": data_dir / "installation.key.initialized",
     }
     paths["installation.key"].write_bytes(key)
-    paths["installation.key.sha256"].write_bytes(hashlib.sha256(key).hexdigest().encode("ascii"))
+    paths["installation.key.sha256"].write_bytes(
+        hashlib.sha256(key).hexdigest().encode("ascii"),
+    )
     paths["installation.key.initialized"].write_bytes(b"1")
+    os.chmod(data_dir, 0o755)
     for path in paths.values():
-        os.chmod(path, 0o600)
+        os.chmod(path, 0o644)
 
-    target = data_dir if target_name is None else paths[target_name]
-    os.chmod(target, broad_mode)
-    data_dir_mode = _mode(data_dir)
+    data_dir_inode = os.lstat(data_dir).st_ino
     before = {
-        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns, _mode(path))
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
         for name, path in paths.items()
     }
     generated_sizes: list[int] = []
@@ -1336,15 +1428,27 @@ def test_existing_broad_identity_modes_fail_without_rewriting_or_randomness(
         generated_sizes.append(size)
         return b"n" * size
 
-    with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
-        load_or_create_installation_key(data_dir, random_bytes=generated)
-
+    assert load_or_create_installation_key(data_dir, random_bytes=generated) == key
     assert generated_sizes == []
-    assert _mode(data_dir) == data_dir_mode
+    assert (os.lstat(data_dir).st_ino, _mode(data_dir)) == (data_dir_inode, 0o700)
     assert {
-        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns, _mode(path))
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
         for name, path in paths.items()
     } == before
+    assert {_mode(path) for path in paths.values()} == {0o600}
+
+    repaired = {
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
+        for name, path in paths.items()
+    }
+    assert load_or_create_installation_key(data_dir, random_bytes=generated) == key
+    assert generated_sizes == []
+    assert (os.lstat(data_dir).st_ino, _mode(data_dir)) == (data_dir_inode, 0o700)
+    assert {
+        name: (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
+        for name, path in paths.items()
+    } == repaired
+    assert {_mode(path) for path in paths.values()} == {0o600}
 
 
 def test_equal_or_stricter_private_identity_modes_are_accepted_without_widening(
@@ -1402,7 +1506,325 @@ def test_symlink_identity_files_and_data_dir_fail_closed(tmp_path: Path) -> None
     real_dir.mkdir(mode=0o700)
     linked_dir = tmp_path / "linked-dir"
     linked_dir.symlink_to(real_dir, target_is_directory=True)
-    assert "stable_key" not in _single_worker(_config(linked_dir), pane).meta
+    with pytest.raises(InstallationKeyError) as raised:
+        load_or_create_installation_key(linked_dir)
+    assert str(raised.value) == "installation identity is unavailable"
+
+
+@pytest.mark.parametrize("operation", ["load-or-create", "acknowledged-reset"])
+def test_identity_lifecycle_stays_on_pinned_data_directory_after_leaf_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    configured_parent = tmp_path / "configured"
+    configured_parent.mkdir()
+    data_dir = configured_parent / "state"
+    if operation == "acknowledged-reset":
+        assert load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: b"o" * size,
+        ) == b"o" * 32
+
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.mkdir(mode=0o750)
+    guard = replacement_target / "target.sentinel"
+    guard.write_bytes(b"must remain unchanged")
+    os.chmod(guard, 0o640)
+    target_before = _tree_snapshot(replacement_target)
+    detached_data_dir = configured_parent / "detached-state"
+    original_prepare = (
+        worker_identity.local_state.prepare_and_open_private_directory
+    )
+    prepare_calls = 0
+
+    def prepare_then_replace(
+        path: str | os.PathLike[str],
+    ) -> tuple[int, Any]:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        fd, result = original_prepare(path)
+        Path(path).rename(detached_data_dir)
+        Path(path).symlink_to(replacement_target, target_is_directory=True)
+        return fd, result
+
+    monkeypatch.setattr(
+        worker_identity.local_state,
+        "prepare_and_open_private_directory",
+        prepare_then_replace,
+    )
+
+    if operation == "load-or-create":
+        candidate = b"c" * 32
+        assert load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: candidate[:size],
+        ) == candidate
+        assert (detached_data_dir / "installation.key").read_bytes() == candidate
+        assert (
+            detached_data_dir / "installation.key.sha256"
+        ).read_bytes() == hashlib.sha256(candidate).hexdigest().encode("ascii")
+        assert (
+            detached_data_dir / "installation.key.initialized"
+        ).read_bytes() == b"1"
+    else:
+        reset_installation_key(
+            data_dir,
+            acknowledge_continuity_break=True,
+        )
+        assert list(detached_data_dir.iterdir()) == []
+
+    assert prepare_calls == 1
+    assert data_dir.is_symlink()
+    assert _tree_snapshot(replacement_target) == target_before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        pytest.param(False, id="absolute"),
+        pytest.param(True, id="relative"),
+    ],
+)
+def test_intermediate_symlink_above_identity_data_dir_blocks_load_or_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+) -> None:
+    protected_target = tmp_path / "protected-target"
+    protected_target.mkdir(mode=0o750)
+    guard = protected_target / "target.sentinel"
+    guard.write_bytes(b"must remain unchanged")
+    os.chmod(guard, 0o640)
+
+    configured_root = tmp_path / "configured"
+    configured_root.mkdir()
+    (configured_root / "redirect").symlink_to(
+        protected_target,
+        target_is_directory=True,
+    )
+    absolute_data_dir = configured_root / "redirect" / "one" / "two" / "state"
+    data_dir = (
+        Path("configured") / "redirect" / "one" / "two" / "state"
+        if relative
+        else absolute_data_dir
+    )
+    if relative:
+        monkeypatch.chdir(tmp_path)
+
+    before = _tree_snapshot(protected_target)
+    generated_sizes: list[int] = []
+    with pytest.raises(InstallationKeyError) as raised:
+        load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: generated_sizes.append(size) or b"x" * size,
+        )
+
+    assert str(raised.value) == "installation identity is unavailable"
+    assert "configured" not in str(raised.value)
+    assert "protected-target" not in str(raised.value)
+    assert generated_sizes == []
+    assert _tree_snapshot(protected_target) == before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        pytest.param(False, id="absolute"),
+        pytest.param(True, id="relative"),
+    ],
+)
+def test_intermediate_symlink_above_identity_data_dir_blocks_acknowledged_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+) -> None:
+    protected_target = tmp_path / "protected-target"
+    protected_target.mkdir(mode=0o750)
+    guard = protected_target / "target.sentinel"
+    guard.write_bytes(b"must remain unchanged")
+    os.chmod(guard, 0o640)
+    target_data_dir = protected_target / "one" / "two" / "state"
+    key = load_or_create_installation_key(
+        target_data_dir,
+        random_bytes=lambda size: b"r" * size,
+    )
+    assert key == b"r" * 32
+    preserved_temp = target_data_dir / ".tendwire-preserved.tmp"
+    preserved_temp.write_bytes(b"must not be removed")
+    os.chmod(preserved_temp, 0o640)
+    os.chmod(target_data_dir, 0o755)
+    for name in (
+        "installation.key",
+        "installation.key.sha256",
+        "installation.key.initialized",
+    ):
+        os.chmod(target_data_dir / name, 0o644)
+
+    configured_root = tmp_path / "configured"
+    configured_root.mkdir()
+    (configured_root / "redirect").symlink_to(
+        protected_target,
+        target_is_directory=True,
+    )
+    absolute_data_dir = configured_root / "redirect" / "one" / "two" / "state"
+    data_dir = (
+        Path("configured") / "redirect" / "one" / "two" / "state"
+        if relative
+        else absolute_data_dir
+    )
+    if relative:
+        monkeypatch.chdir(tmp_path)
+
+    before = _tree_snapshot(protected_target)
+    with pytest.raises(InstallationKeyError) as raised:
+        reset_installation_key(
+            data_dir,
+            acknowledge_continuity_break=True,
+        )
+
+    assert str(raised.value) == "installation identity is unavailable"
+    assert "configured" not in str(raised.value)
+    assert "protected-target" not in str(raised.value)
+    assert _tree_snapshot(protected_target) == before
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        pytest.param(False, id="absolute"),
+        pytest.param(True, id="relative"),
+    ],
+)
+def test_multi_level_missing_parent_identity_bootstrap_uses_resolved_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+) -> None:
+    absolute_data_dir = tmp_path / "bootstrap" / "one" / "two" / "state"
+    data_dir = (
+        Path("bootstrap") / "one" / "two" / "state"
+        if relative
+        else absolute_data_dir
+    )
+    if relative:
+        monkeypatch.chdir(tmp_path)
+    candidate = bytes(range(32))
+
+    assert load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: candidate[:size],
+    ) == candidate
+
+    for directory in (
+        tmp_path / "bootstrap",
+        tmp_path / "bootstrap" / "one",
+        tmp_path / "bootstrap" / "one" / "two",
+        absolute_data_dir,
+    ):
+        assert directory.is_dir()
+        assert _mode(directory) == 0o700
+    assert (absolute_data_dir / "installation.key").read_bytes() == candidate
+    assert (absolute_data_dir / "installation.key.sha256").read_bytes() == (
+        hashlib.sha256(candidate).hexdigest().encode("ascii")
+    )
+    assert (absolute_data_dir / "installation.key.initialized").read_bytes() == b"1"
+    assert {
+        _mode(absolute_data_dir / name)
+        for name in (
+            "installation.key",
+            "installation.key.sha256",
+            "installation.key.initialized",
+        )
+    } == {0o600}
+    assert list(absolute_data_dir.glob(".tendwire-*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        pytest.param(None, id="state-directory"),
+        pytest.param("installation.key", id="key"),
+        pytest.param("installation.key.sha256", id="digest"),
+        pytest.param("installation.key.initialized", id="sentinel"),
+    ],
+)
+def test_nonregular_identity_entries_fail_closed_without_randomness(
+    tmp_path: Path,
+    target_name: str | None,
+) -> None:
+    data_dir = tmp_path / "state"
+    target = data_dir
+    if target_name is None:
+        data_dir.write_bytes(b"not a directory")
+    else:
+        data_dir.mkdir(mode=0o700)
+        key = b"r" * 32
+        if target_name != "installation.key":
+            (data_dir / "installation.key").write_bytes(key)
+            os.chmod(data_dir / "installation.key", 0o600)
+        if target_name == "installation.key.initialized":
+            (data_dir / "installation.key.sha256").write_bytes(
+                hashlib.sha256(key).hexdigest().encode("ascii"),
+            )
+            os.chmod(data_dir / "installation.key.sha256", 0o600)
+        target = data_dir / target_name
+        target.mkdir()
+    generated_sizes: list[int] = []
+
+    with pytest.raises(InstallationKeyError) as raised:
+        load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: generated_sizes.append(size) or b"n" * size,
+        )
+
+    assert str(raised.value) == "installation identity is unavailable"
+    assert generated_sizes == []
+    if target_name is None:
+        assert target.read_bytes() == b"not a directory"
+    else:
+        assert target.is_dir()
+
+
+def test_wrong_owner_identity_directory_fails_closed_without_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "state"
+    key = load_or_create_installation_key(
+        data_dir,
+        random_bytes=lambda size: b"o" * size,
+    )
+    paths = (
+        data_dir / "installation.key",
+        data_dir / "installation.key.sha256",
+        data_dir / "installation.key.initialized",
+    )
+    before = tuple(
+        (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
+        for path in paths
+    )
+    actual_uid = os.geteuid()
+    monkeypatch.setattr(
+        worker_identity.local_state.os,
+        "geteuid",
+        lambda: actual_uid + 1,
+    )
+    generated_sizes: list[int] = []
+
+    with pytest.raises(InstallationKeyError) as raised:
+        load_or_create_installation_key(
+            data_dir,
+            random_bytes=lambda size: generated_sizes.append(size) or b"n" * size,
+        )
+
+    assert str(raised.value) == "installation identity is unavailable"
+    assert generated_sizes == []
+    assert tuple(
+        (path.read_bytes(), os.lstat(path).st_ino, os.lstat(path).st_mtime_ns)
+        for path in paths
+    ) == before
+    assert paths[0].read_bytes() == key
 
 
 def test_source_stable_key_family_is_recursively_stripped_then_replaced(tmp_path: Path) -> None:
@@ -1479,23 +1901,22 @@ def test_atomic_publication_never_exposes_partial_final_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data_dir = tmp_path / "state"
-    original_write_all = worker_identity._write_all
+    original_write_all = worker_identity.local_state._write_all
 
     def interrupted_write(fd: int, content: bytes) -> None:
         del fd, content
         raise OSError("simulated interrupted write")
 
-    monkeypatch.setattr(worker_identity, "_write_all", interrupted_write)
+    monkeypatch.setattr(worker_identity.local_state, "_write_all", interrupted_write)
     with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
         load_or_create_installation_key(data_dir)
 
     assert not (data_dir / "installation.key").exists()
     assert not (data_dir / "installation.key.sha256").exists()
-    assert list(data_dir.glob(".installation.key.*.tmp")) == []
     assert not (data_dir / "installation.key.initialized").exists()
-    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+    assert list(data_dir.glob(".tendwire-*.tmp")) == []
 
-    monkeypatch.setattr(worker_identity, "_write_all", original_write_all)
+    monkeypatch.setattr(worker_identity.local_state, "_write_all", original_write_all)
     assert len(load_or_create_installation_key(data_dir)) == 32
     assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
 
@@ -1506,14 +1927,14 @@ def test_interrupted_sentinel_publication_recovers_without_key_rotation(
 ) -> None:
     data_dir = tmp_path / "state"
     candidate = b"c" * 32
-    original_write_all = worker_identity._write_all
+    original_write_all = worker_identity.local_state._write_all
 
     def interrupt_sentinel(fd: int, content: bytes) -> None:
         if content == b"1":
             raise OSError("simulated interrupted sentinel write")
         original_write_all(fd, content)
 
-    monkeypatch.setattr(worker_identity, "_write_all", interrupt_sentinel)
+    monkeypatch.setattr(worker_identity.local_state, "_write_all", interrupt_sentinel)
     with pytest.raises(InstallationKeyError, match="installation identity is unavailable"):
         load_or_create_installation_key(
             data_dir,
@@ -1525,9 +1946,9 @@ def test_interrupted_sentinel_publication_recovers_without_key_rotation(
         candidate,
     ).hexdigest().encode("ascii")
     assert not (data_dir / "installation.key.initialized").exists()
-    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+    assert list(data_dir.glob(".tendwire-*.tmp")) == []
 
-    monkeypatch.setattr(worker_identity, "_write_all", original_write_all)
+    monkeypatch.setattr(worker_identity.local_state, "_write_all", original_write_all)
     recovered = load_or_create_installation_key(
         data_dir,
         random_bytes=lambda size: b"replacement-that-must-not-be-used"[:size],
@@ -1548,9 +1969,7 @@ def test_concurrent_creators_publish_one_complete_key_marker_and_sentinel(
     assert (data_dir / "installation.key").read_bytes() == key
     assert (data_dir / "installation.key.sha256").read_bytes() == hashlib.sha256(key).hexdigest().encode("ascii")
     assert (data_dir / "installation.key.initialized").read_bytes() == b"1"
-    assert list(data_dir.glob(".installation.key.*.tmp")) == []
-    assert list(data_dir.glob(".installation.key.sha256.*.tmp")) == []
-    assert list(data_dir.glob(".installation.key.initialized.*.tmp")) == []
+    assert list(data_dir.glob(".tendwire-*.tmp")) == []
 
 
 def test_public_output_excludes_private_identity_and_binding_fingerprint(tmp_path: Path) -> None:

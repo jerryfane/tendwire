@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,17 @@ CHECK_KEYS = {
     "event_count",
     "changed_count",
     "status_buckets",
+    "exact_shape",
+    "idless",
+    "order_preserved",
+    "final_status",
+    "final_source_status",
+    "persistence_unchanged",
+    "repeat_effect_count",
+    "repeat_snapshot_delta",
+    "repeat_event_delta",
+    "repeat_attention_delta",
+    "repeat_queue_delta",
     "updated_count",
     "worker_count_before",
     "worker_count_after",
@@ -1443,7 +1455,7 @@ def _deterministic_event_backend_checks(*, limitation: str | None = None) -> dic
             backend.queue_event_envelope(
                 {
                     "event": "pane.agent_status_changed",
-                    "payload": {"pane_id": "pane-1", "agent": "Smoke Agent", "status": "blocked"},
+                    "data": {"pane_id": "pane-1", "agent": "Smoke Agent", "status": "blocked"},
                 }
             )
             status_snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
@@ -1456,7 +1468,7 @@ def _deterministic_event_backend_checks(*, limitation: str | None = None) -> dic
             backend.queue_event_envelope(
                 {
                     "event": "pane.moved",
-                    "payload": {
+                    "data": {
                         "old_pane_id": "pane-1",
                         "pane_id": "pane-2",
                         "agent": "Smoke Agent",
@@ -1476,7 +1488,7 @@ def _deterministic_event_backend_checks(*, limitation: str | None = None) -> dic
                 and moved_worker_count == before_worker_count
             )
 
-            backend.queue_event_envelope({"event": "pane.exited", "payload": {"pane_id": "pane-2"}})
+            backend.queue_event_envelope({"event": "pane.exited", "data": {"pane_id": "pane-2"}})
             closed_snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
             active_bindings = list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")
             expired_bindings = list_worker_bindings(
@@ -1762,6 +1774,118 @@ def _bool_field(payload: Mapping[str, Any], key: str, *, default: bool = False) 
     value = payload.get(key, default)
     return bool(value)
 
+def _contains_synthetic_event_identity(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if any(key in value for key in ("event_id", "server_id", "sequence")):
+            return True
+        return any(_contains_synthetic_event_identity(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_synthetic_event_identity(child) for child in value)
+    return False
+
+
+def _status_replay_persistence_counts(db_path: Path, host_id: str) -> dict[str, int]:
+    tables = ("snapshots", "events", "attention_items", "connector_outbox")
+    with sqlite3.connect(db_path) as conn:
+        return {
+            table: int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE host_id = ?",
+                    (host_id,),
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+
+
+def _replay_fixture_status_events(path: Path) -> dict[str, Any]:
+    _ensure_src_on_path()
+    from tendwire.backends.herdr_events import HerdrEventBackend
+    from tendwire.config import Config
+    from tendwire.store.sqlite import init_store, latest_snapshot
+
+    envelopes = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(envelopes, list):
+        raise ValueError("status replay fixture must be a list")
+
+    source_sequence = ("working", "idle", "working", "working")
+    canonical_sequence = ("active", "idle", "active", "active")
+    exact_shape = len(envelopes) == len(source_sequence) and all(
+        isinstance(envelope, Mapping)
+        and set(envelope) == {"event", "data"}
+        and envelope.get("event") == "pane.agent_status_changed"
+        and isinstance(envelope.get("data"), Mapping)
+        for envelope in envelopes
+    )
+    idless = not _contains_synthetic_event_identity(envelopes)
+    source_statuses = tuple(
+        str(envelope["data"].get("status") or "")
+        for envelope in envelopes
+        if isinstance(envelope, Mapping) and isinstance(envelope.get("data"), Mapping)
+    )
+    adjacent_repeat = len(envelopes) >= 2 and envelopes[-1] == envelopes[-2]
+    if not (exact_shape and idless and source_statuses == source_sequence and adjacent_repeat):
+        raise ValueError("status replay fixture has an invalid event contract")
+
+    with tempfile.TemporaryDirectory(prefix="tendwire-herdr-fixture-") as tmp:
+        db_path = Path(tmp) / "smoke.db"
+        config = Config(
+            host_id="smoke-fixture",
+            data_dir=Path(tmp),
+            db_path=db_path,
+            herdr_timeout_seconds=0.2,
+            herdr_backend="socket",
+        )
+        init_store(db_path)
+        backend = HerdrEventBackend(config, debounce_seconds=0)
+        backend.reconcile_once(client=_SmokeStaticClient())
+
+        accepted: list[bool] = []
+        canonical_statuses: list[str] = []
+        before_repeat: dict[str, int] = {}
+        for index, envelope in enumerate(envelopes):
+            if index == len(envelopes) - 1:
+                before_repeat = _status_replay_persistence_counts(
+                    backend.db_path,
+                    backend.config.host_id,
+                )
+            accepted.append(backend.queue_event_envelope(envelope, flush=False))
+            backend.flush()
+            snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+            workers = list(snapshot.workers) if snapshot is not None else []
+            canonical_statuses.append(workers[0].status if len(workers) == 1 else "")
+
+        after_repeat = _status_replay_persistence_counts(
+            backend.db_path,
+            backend.config.host_id,
+        )
+        final_snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        final_workers = list(final_snapshot.workers) if final_snapshot is not None else []
+
+    repeat_row_deltas = {
+        key: after_repeat[key] - before_repeat[key]
+        for key in before_repeat
+    }
+    accepted_sequence = tuple(accepted)
+    observed_canonical_sequence = tuple(canonical_statuses)
+    return {
+        "envelope_count": len(envelopes),
+        "exact_shape": exact_shape,
+        "idless": idless,
+        "source_statuses": source_statuses,
+        "accepted": accepted_sequence,
+        "canonical_statuses": observed_canonical_sequence,
+        "order_preserved": (
+            accepted_sequence == (True,) * len(source_sequence)
+            and observed_canonical_sequence == canonical_sequence
+        ),
+        "final_source_status": source_statuses[-1],
+        "final_status": final_workers[0].status if len(final_workers) == 1 else "",
+        "changed_count": sum(1 for worker in final_workers if worker.status == "active"),
+        "status_buckets": sorted({worker.status for worker in final_workers}),
+        "repeat_row_deltas": repeat_row_deltas,
+    }
+
 
 def _fixture_create_attach_check(fixtures: Mapping[str, tuple[str, Any | None]]) -> dict[str, Any]:
     payload, error = _fixture_mapping(fixtures, "create_attach")
@@ -1862,16 +1986,57 @@ def _fixture_target_validation_check(fixtures: Mapping[str, tuple[str, Any | Non
     )
 
 
-def _fixture_status_check(fixtures: Mapping[str, tuple[str, Any | None]]) -> dict[str, Any]:
+def _fixture_status_check(
+    fixtures: Mapping[str, tuple[str, Any | None]],
+    fixture_dir: Path,
+) -> dict[str, Any]:
     payload, error = _fixture_mapping(fixtures, "status_agent_status_changed", ("status_agent_status_changed", "status_event"))
     if error is not None:
         return error
     assert payload is not None
-    event_count = _int_field(payload, "event_count", "events")
-    changed_count = _int_field(payload, "changed_count", "changed")
-    raw_buckets = payload.get("status_buckets", [])
-    status_buckets = sorted(str(item) for item in raw_buckets) if isinstance(raw_buckets, list) else []
-    ok = payload.get("status") == "ok" and event_count >= 1 and changed_count >= 1
+
+    replay_reference = payload.get("replay_fixture")
+    try:
+        if not isinstance(replay_reference, str) or not replay_reference:
+            raise ValueError("status replay fixture reference is missing")
+        replay_path = (fixture_dir / replay_reference).resolve()
+        fixture_root = fixture_dir.resolve().parents[1]
+        if replay_path.parent != (fixture_root / "event_replay").resolve():
+            raise ValueError("status replay fixture must remain in the event replay directory")
+        replay = _replay_fixture_status_events(replay_path)
+    except Exception:
+        return _check(
+            "status_agent_status_changed",
+            "failed",
+            required=True,
+            ok=False,
+            json_status="invalid",
+            detail="fixture_mismatch",
+            event_count=0,
+            changed_count=0,
+            status_buckets=[],
+            accepted_count=0,
+            exact_shape=False,
+            idless=False,
+            order_preserved=False,
+            persistence_unchanged=False,
+            repeat_effect_count=0,
+        )
+
+    repeat_deltas = replay["repeat_row_deltas"]
+    repeat_effect_count = sum(abs(int(value)) for value in repeat_deltas.values())
+    accepted_count = sum(1 for accepted in replay["accepted"] if accepted)
+    ok = (
+        payload.get("status") == "ok"
+        and replay["exact_shape"] is True
+        and replay["idless"] is True
+        and replay["order_preserved"] is True
+        and accepted_count == replay["envelope_count"]
+        and replay["final_source_status"] == "working"
+        and replay["final_status"] == "active"
+        and replay["changed_count"] == 1
+        and repeat_effect_count == 0
+    )
     return _check(
         "status_agent_status_changed",
         "ok" if ok else "failed",
@@ -1879,9 +2044,21 @@ def _fixture_status_check(fixtures: Mapping[str, tuple[str, Any | None]]) -> dic
         ok=ok,
         json_status="valid",
         detail="fixture_replayed" if ok else "fixture_mismatch",
-        event_count=event_count,
-        changed_count=changed_count,
-        status_buckets=status_buckets,
+        event_count=replay["envelope_count"],
+        changed_count=replay["changed_count"],
+        status_buckets=replay["status_buckets"],
+        accepted_count=accepted_count,
+        exact_shape=replay["exact_shape"],
+        idless=replay["idless"],
+        order_preserved=replay["order_preserved"],
+        final_status=replay["final_status"],
+        final_source_status=replay["final_source_status"],
+        persistence_unchanged=repeat_effect_count == 0,
+        repeat_effect_count=repeat_effect_count,
+        repeat_snapshot_delta=repeat_deltas["snapshots"],
+        repeat_event_delta=repeat_deltas["events"],
+        repeat_attention_delta=repeat_deltas["attention_items"],
+        repeat_queue_delta=repeat_deltas["connector_outbox"],
     )
 
 
@@ -2048,7 +2225,7 @@ def _fixture_payload(options: SmokeOptions, env: Mapping[str, str]) -> dict[str,
         _fixture_send_addressing_check(fixtures),
         _fixture_target_validation_check(fixtures),
         _fixture_event_subscription_check(fixtures),
-        _fixture_status_check(fixtures),
+        _fixture_status_check(fixtures, options.fixture_dir if options.fixture_dir is not None else Path()),
         _fixture_pane_moved_check(fixtures),
         _fixture_close_exited_check(fixtures),
         _fixture_degraded_check(fixtures),

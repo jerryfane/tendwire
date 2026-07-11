@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..core.models import sanitize_forbidden_fields
+from ..core.models import sanitize_public_mapping, sanitize_public_value
 from ..store.sqlite import (
     ack_connector_delivery,
     defer_connector_delivery,
@@ -35,7 +35,6 @@ def _int(value: Any, default: int, *, minimum: int = 1, maximum: int = 100) -> i
     return max(minimum, min(parsed, maximum))
 
 
-_DROP = object()
 _CONNECTOR_REF_PREFIX = "twref1."
 _CONNECTOR_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 _CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -68,32 +67,8 @@ def _contains_forbidden_public_text(value: str) -> bool:
     return any(token in lowered or token.replace("_", "") in compact for token in _FORBIDDEN_PUBLIC_TEXT)
 
 
-def _clean_public_value(value: Any) -> Any:
-    clean = sanitize_forbidden_fields(value)
-    if isinstance(clean, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in clean.items():
-            sanitized = _clean_public_value(item)
-            if sanitized is not _DROP:
-                result[str(key)] = sanitized
-        return result
-    if isinstance(clean, list):
-        result_list: list[Any] = []
-        for item in clean:
-            sanitized = _clean_public_value(item)
-            if sanitized is not _DROP:
-                result_list.append(sanitized)
-        return result_list
-    if isinstance(clean, str) and _contains_forbidden_public_text(clean):
-        return _DROP
-    return clean
-
-
 def _clean_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    clean = _clean_public_value(dict(value))
-    return dict(clean) if isinstance(clean, Mapping) else {}
+    return sanitize_public_mapping(value, backend_neutral=True)
 
 
 def _error(status: str, *, host_id: str, name: str = "", ref: str | None = None) -> dict[str, Any]:
@@ -110,7 +85,7 @@ def _error(status: str, *, host_id: str, name: str = "", ref: str | None = None)
     }
     if ref is not None:
         payload["ref"] = ref
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_value(payload)
 
 
 def _ref(value: Any) -> str:
@@ -185,27 +160,23 @@ class ConnectorOutboxAPI:
             if not ref:
                 continue
             items.append(
-                sanitize_forbidden_fields(
-                    {
-                        "ref": ref,
-                        "key": str(item.get("key") or ""),
-                        "attempt": int(item.get("attempt") or 0),
-                        "leased_until": str(item.get("leased_until") or ""),
-                        "available_at": str(item.get("available_at") or ""),
-                        "payload": _clean_mapping(item.get("payload")),
-                    }
-                )
+                sanitize_public_value({
+                    "ref": ref,
+                    "key": str(item.get("key") or ""),
+                    "attempt": int(item.get("attempt") or 0),
+                    "leased_until": str(item.get("leased_until") or ""),
+                    "available_at": str(item.get("available_at") or ""),
+                    "payload": _clean_mapping(item.get("payload")),
+                })
             )
-        return sanitize_forbidden_fields(
-            {
-                "schema_version": 1,
-                "ok": bool(store_result.get("ok", False)),
-                "status": str(store_result.get("status") or "ok"),
-                "host_id": self.host_id,
-                "name": name,
-                "items": items,
-            }
-        )
+        return sanitize_public_value({
+            "schema_version": 1,
+            "ok": bool(store_result.get("ok", False)),
+            "status": str(store_result.get("status") or "ok"),
+            "host_id": self.host_id,
+            "name": name,
+            "items": items,
+        })
 
     def reclaim(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(params or {})

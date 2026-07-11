@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -246,6 +247,42 @@ FORBIDDEN_FIELD_NAMES = frozenset(
         "passwords",
         "api_keys",
         "api_key",
+        "tool_id",
+        "tool_ids",
+        "tool_use_id",
+        "tool_use_ids",
+        "tool_call_id",
+        "tool_call_ids",
+        "decision_id",
+        "decision_ids",
+        "pending_decision_id",
+        "pending_decision_ids",
+        "cwd",
+        "workdir",
+        "working_dir",
+        "working_directory",
+        "project_root",
+        "repository_root",
+        "repo_root",
+        "path",
+        "paths",
+        "file_path",
+        "file_paths",
+        "filepath",
+        "filepaths",
+        "socket_path",
+        "socket_paths",
+        "url",
+        "urls",
+        "endpoint",
+        "endpoints",
+        "network_endpoint",
+        "network_endpoints",
+        "ip",
+        "ip_address",
+        "port",
+        "headers",
+        "output",
     }
 )
 _FORBIDDEN_FIELD_COMPACT = frozenset(name.replace("_", "") for name in FORBIDDEN_FIELD_NAMES)
@@ -284,12 +321,170 @@ _BACKEND_MESSAGE_LABEL_RE = re.compile(
 _RAW_COMMAND_HEAD_RE = re.compile(
     r"^(?:sudo\s+)?(?:env\s+)?"
     r"(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python\d*|node|npm|npx|git|gh|docker|"
-    r"kubectl|make|pytest|herdr|tendwire|tmux|screen)(?:\s|$)",
+    r"kubectl|make|pytest|herdr|tendwire|tmux|screen|curl|wget|ssh|scp|rsync|rm|cat|sed)(?:\s|$)",
     re.IGNORECASE,
 )
 _RAW_COMMAND_OPTION_RE = re.compile(r"\s--?[A-Za-z0-9][A-Za-z0-9_-]*")
 _SHELL_META_RE = re.compile(r"[;&|`$<>]")
 _PUBLIC_DROP = object()
+_PUBLIC_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+_PUBLIC_COMPOUND_PRIVATE_RE = re.compile(
+    r"(?i)\b(?:pane[_ -]?id|terminal[_ -]?id|session[_ -]?id|"
+    r"tool[_ -]?(?:use|call)[_ -]?id|pending[_ -]?decision[_ -]?id|"
+    r"backend[_ -]?target|private[_ -]?fingerprint|chat[_ -]?id|topic[_ -]?id|"
+    r"message[_ -]?id|thread[_ -]?id|socket[_ -]?path|working[_ -]?directory)"
+    r"\s*(?:[:=]|\s)\s*(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)"
+)
+_PUBLIC_LABELLED_PRIVATE_RE = re.compile(
+    r"(?i)\b(?:cwd|workdir|argv|environment|env|stdin|stdout|stderr|command|token|"
+    r"secret|password|api[_ -]?key|authorization|credential)\s*[:=]\s*"
+    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)"
+)
+_PUBLIC_CREDENTIAL_URL_RE = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@[^\s<>()]+"
+)
+_PUBLIC_SOCKET_URI_RE = re.compile(r"(?i)\b(?:unix|socket|file)://[^\s<>()]+")
+_PUBLIC_PATH_RE = re.compile(
+    r"(?<![\w/:])/(?:[\w.@+-]+)(?:/[\w.@+-]+)+"
+    r"|(?<![\w/])/(?:etc|root|home|var|opt|srv|usr|tmp|run|proc|sys|mnt|media|boot|dev|private)\b"
+    r"|(?<!\w)~/(?:[\w.@+-]+/)*[\w.@+-]+"
+    r"|\b(?:home|Users|root)/(?:[\w.@+-]+/)+[\w.@+-]+"
+    r"|\b[A-Za-z]:\\[^\s\"']+"
+    r"|\\\\[^\s\"']+"
+)
+_PUBLIC_PRIVATE_ENDPOINT_RE = re.compile(
+    r"\b(?:10(?:\.\d{1,3}){3}|127(?:\.\d{1,3}){3}|169\.254(?:\.\d{1,3}){2}|"
+    r"192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})"
+    r"(?::\d{1,5})?\b"
+    r"|(?i:\b(?:fc|fd)[0-9a-f:]*:[0-9a-f:]+\b|\bfe80:[0-9a-f:]+\b|(?<!:)::1\b)"
+)
+_PUBLIC_PROVIDER_CREDENTIAL_RE = re.compile(
+    r"\bsk-[A-Za-z0-9_-]{6,}\b"
+    r"|\bgh[oprsu]_[A-Za-z0-9]{6,}\b"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{6,}\b"
+    r"|\bAKIA[0-9A-Z]{12,}\b"
+    r"|\bAIza[0-9A-Za-z_-]{10,}\b"
+    r"|\bglpat-[A-Za-z0-9_-]{8,}\b"
+    r"|\bnpm_[A-Za-z0-9]{20,}\b"
+    r"|\bpypi-[A-Za-z0-9_-]{20,}\b"
+    r"|\b\d{6,}:[A-Za-z0-9_-]{20,}\b"
+)
+_PUBLIC_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"
+)
+_PUBLIC_BEARER_RE = re.compile(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_PUBLIC_ENV_ASSIGNMENT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}=(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s;&|]+)"
+)
+_PUBLIC_TELEGRAM_CHAT_ID_RE = re.compile(r"-100\d{10,}")
+
+_PUBLIC_PRIVATE_IDENTIFIER_RE = re.compile(
+    r"\b(?:toolu|tool_use|call|session|sess)_[A-Za-z0-9_-]{6,}\b"
+    r"|\bw(?=[0-9a-z]*\d)[0-9a-z]+:[a-z][0-9a-z]*\b"
+    r"|\bterm[_-][0-9a-z_-]{4,}\b"
+    rf"|(?<!\d){_PUBLIC_TELEGRAM_CHAT_ID_RE.pattern}\b",
+    re.IGNORECASE,
+)
+_PUBLIC_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w][\w.-]*\b")
+_PUBLIC_SENSITIVE_TEXT_RES = (
+    _PUBLIC_COMPOUND_PRIVATE_RE,
+    _PUBLIC_LABELLED_PRIVATE_RE,
+    _PUBLIC_CREDENTIAL_URL_RE,
+    _PUBLIC_SOCKET_URI_RE,
+    _PUBLIC_PATH_RE,
+    _PUBLIC_PRIVATE_ENDPOINT_RE,
+    _PUBLIC_PROVIDER_CREDENTIAL_RE,
+    _PUBLIC_JWT_RE,
+    _PUBLIC_BEARER_RE,
+    _PUBLIC_ENV_ASSIGNMENT_RE,
+    _PUBLIC_PRIVATE_IDENTIFIER_RE,
+    _PUBLIC_EMAIL_RE,
+)
+_PUBLIC_SENSITIVE_TEXT_RE = re.compile(
+    "|".join(
+        (
+            f"(?i:{pattern.pattern.removeprefix('(?i)')})"
+            if pattern.flags & re.IGNORECASE
+            else f"(?:{pattern.pattern})"
+        )
+        for pattern in _PUBLIC_SENSITIVE_TEXT_RES
+    )
+)
+_PUBLIC_SENSITIVE_CROSSING_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:pane[_ -]?id|terminal[_ -]?id|session[_ -]?id|"
+    r"tool[_ -]?(?:use|call)[_ -]?id|pending[_ -]?decision[_ -]?id|"
+    r"backend[_ -]?target|private[_ -]?fingerprint|chat[_ -]?id|topic[_ -]?id|"
+    r"message[_ -]?id|thread[_ -]?id|socket[_ -]?path|working[_ -]?directory)"
+    r"\s*(?:[:=]|\s)\s*(?:\"[^\"\n]*|'[^'\n]*'|[^\s,;]*)"
+    r"|\b(?:cwd|workdir|argv|environment|env|stdin|stdout|stderr|command|token|"
+    r"secret|password|api[_ -]?key|authorization|credential)\s*[:=]\s*"
+    r"(?:\"[^\"\n]*|'[^'\n]*'|[^\s,;]*)"
+    r"|\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s<>()]*"
+    r"|\b(?:sk-|gh[oprsu]_|xox[baprs]-|AKIA|AIza|glpat-|npm_|pypi-)"
+    r"[A-Za-z0-9_-]*"
+    r"|(?<!\d)\d{6,}:[A-Za-z0-9_-]*"
+    r"|\beyJ[A-Za-z0-9_.-]*"
+    r"|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*"
+    r"|(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}="
+    r"(?:\"[^\"\n]*|'[^'\n]*'|[^\s;&|]*)"
+    r")\Z"
+)
+_PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
+    {
+        "action_id",
+        "active_tab_id",
+        "attention_id",
+        "choice_id",
+        "content_fingerprint",
+        "delivery_state",
+        "fingerprint",
+        "host_id",
+        "id",
+        "max_outbox_attempts",
+        "origin_command_id",
+        "outbox_claim_ttl_seconds",
+        "output_excerpt_chars",
+        "raw_status",
+        "request_id",
+        "row_id",
+        "source_turn_id",
+        "space_id",
+        "transport_state",
+        "worker_fingerprint",
+        "worker_id",
+    }
+)
+_PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
+    "_id",
+    "_ids",
+    "_fingerprint",
+    "_fingerprints",
+)
+_PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
+_PUBLIC_FREE_TEXT_KEYS = frozenset(
+    {
+        "assistant_final_text",
+        "assistant_stream_text",
+        "description",
+        "detail",
+        "fields",
+        "label",
+        "message",
+        "name",
+        "question",
+        "raw_status",
+        "reason",
+        "status_line",
+        "request_id",
+        "summary",
+        "title",
+        "user_text",
+    }
+)
+_PUBLIC_OPAQUE_ID_RE = re.compile(
+    r"^(?:attn|choice|pending|space|turn|turnsrc|worker)-[0-9a-f]{24}$"
+)
 
 WORKER_BINDING_ACTIVE_EXPIRES_AT = "9999-12-31T23:59:59+00:00"
 
@@ -492,14 +687,22 @@ def _contains_forbidden_public_text(value: str) -> bool:
     return bool(set(tokens) & (_TEXT_FORBIDDEN_FIELD_NAMES - {"command"}))
 
 
+def _is_public_structural_mapping_key(value: str) -> bool:
+    return value in {"id", "ids", "fingerprint", "fingerprints"} or value.endswith(
+        _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES
+    )
+
+
 def _is_forbidden_public_mapping_key(value: str) -> bool:
     key_text = str(value)
     tokens = _public_text_tokens(value)
     if not tokens:
         return False
     normalized = "_".join(tokens)
-    if key_text == normalized and normalized in {"active_tab_id", "raw_status"}:
+    if key_text == normalized and normalized in _PUBLIC_ALLOWED_MAPPING_KEYS:
         return False
+    if _is_public_structural_mapping_key(normalized):
+        return True
     if _contains_forbidden_public_text(value):
         return True
     sensitive_key_tokens = _FORBIDDEN_BACKEND_NAME_TEXT | {
@@ -511,29 +714,34 @@ def _is_forbidden_public_mapping_key(value: str) -> bool:
         "raw",
         "route",
         "telegram",
+        "provider",
+        "transport",
     }
     return bool(set(tokens) & sensitive_key_tokens)
 
 
 def _public_safe_text(value: Any, *, default: str = "") -> str:
-    text = _string_value(value).strip()
+    raw = _string_value(value).strip()
+    if not raw or _contains_forbidden_public_text(raw):
+        return default
+    text = sanitize_public_text(raw)
     if not text or _contains_forbidden_public_text(text):
         return default
-    return " ".join(text.split())
+    return text
 
 
 def _public_safe_identity(value: Any, *, prefix: str, default: str = "unknown") -> str:
-    text = _string_value(value, default).strip()
-    if not text:
-        text = default
-    if not _contains_forbidden_public_text(text):
+    raw = _string_value(value, default).strip() or default
+    text = sanitize_public_text(raw)
+    if text == raw and not _contains_forbidden_public_text(text):
         return " ".join(text.split())
-    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': text})}"
+    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': raw})}"
 
 
 def _public_safe_fingerprint(value: Any) -> str:
-    text = _string_value(value).strip()
-    if not text or _contains_forbidden_public_text(text):
+    raw = _string_value(value).strip()
+    text = sanitize_public_text(raw)
+    if not text or text != raw or _contains_forbidden_public_text(text):
         return ""
     return " ".join(text.split())
 
@@ -551,33 +759,188 @@ def _optional_public_safe_text(value: Any) -> str | None:
     return text or None
 
 
-def _sanitize_public_value(value: Any) -> Any:
-    clean = sanitize_forbidden_fields(value)
-    if isinstance(clean, Mapping):
+def _contains_connector_private_text(value: str) -> bool:
+    return bool(
+        set(_public_text_tokens(value))
+        & {"backend", "connector", "delivery", "herdr", "herdres", "provider", "telegram", "transport"}
+    )
+
+
+def _redact_and_truncate_public_text(text: str, max_chars: int | None) -> str:
+    """Redact a bounded prefix plus any sensitive value crossing its boundary."""
+    if max_chars is None:
+        return _PUBLIC_SENSITIVE_TEXT_RE.sub("[redacted]", text)
+
+    limit = max(0, max_chars)
+    if not text or limit == 0:
+        return ""
+    if len(text) <= limit:
+        return _PUBLIC_SENSITIVE_TEXT_RE.sub("[redacted]", text)
+
+    marker = "\n[truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    prefix_limit = limit - len(marker)
+    prefix = text[:prefix_limit]
+    crossing = _PUBLIC_SENSITIVE_CROSSING_RE.search(prefix)
+    if crossing is None:
+        redacted = _PUBLIC_SENSITIVE_TEXT_RE.sub("[redacted]", prefix)
+    else:
+        safe_head = _PUBLIC_SENSITIVE_TEXT_RE.sub(
+            "[redacted]",
+            prefix[: crossing.start()],
+        )
+        redacted = safe_head + "[redacted]"
+    return redacted[:prefix_limit].rstrip() + marker
+
+
+def sanitize_public_text(
+    value: Any,
+    *,
+    max_chars: int | None = None,
+    collapse_whitespace: bool = False,
+) -> str:
+    """Redact recognizable private values while preserving ordinary public prose.
+
+    This deliberately does not claim to detect arbitrary shapeless secrets copied
+    into free-form model text. Known private source shapes, labelled private data,
+    provider credentials, endpoints, and generated metadata are blocked here;
+    tool adapters must still construct progress from allowlisted fields.
+
+    Redaction semantically precedes truncation, including when an arbitrarily long
+    credential crosses the visible boundary.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = unicodedata.normalize("NFKC", value).replace("\x00", "")
+    text = _PUBLIC_ZERO_WIDTH_RE.sub("", text)
+    text = _redact_and_truncate_public_text(text, max_chars)
+    if collapse_whitespace:
+        text = " ".join(text.split())
+    else:
+        text = text.strip()
+    return text
+
+
+def sanitize_public_value(
+    value: Any,
+    *,
+    backend_neutral: bool = False,
+    _field: str = "",
+    _nested: bool = False,
+) -> Any:
+    """Return one recursively sanitized JSON-safe public value.
+
+    Mapping keys are untrusted text and are retained only when their original
+    spelling is already public-safe. Recognizable numeric Telegram chat IDs are
+    private. Ordinary numeric topic/message IDs are ambiguous and require key
+    provenance at the adapter boundary.
+    """
+    if isinstance(value, datetime):
+        return utc_timestamp(value)
+    if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for key, item in clean.items():
+        for key, item in value.items():
             key_text = str(key)
-            if _is_forbidden_public_mapping_key(key_text):
+            if sanitize_public_text(
+                key_text,
+                max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS,
+            ) != key_text:
                 continue
-            sanitized = _sanitize_public_value(item)
+            structured_outbox = key_text == "outbox" and isinstance(item, Mapping)
+            if not structured_outbox and (
+                _is_forbidden_field_name(key_text)
+                or _is_forbidden_public_mapping_key(key_text)
+            ):
+                continue
+            sanitized = sanitize_public_value(
+                item,
+                backend_neutral=backend_neutral,
+                _field=key_text,
+                _nested=True,
+            )
             if sanitized is not _PUBLIC_DROP:
                 result[key_text] = sanitized
         return result
-    if isinstance(clean, list):
+    if isinstance(value, tuple | list):
         result_list: list[Any] = []
-        for item in clean:
-            sanitized = _sanitize_public_value(item)
+        for item in value:
+            sanitized = sanitize_public_value(
+                item,
+                backend_neutral=backend_neutral,
+                _field=_field,
+                _nested=True,
+            )
             if sanitized is not _PUBLIC_DROP:
                 result_list.append(sanitized)
         return result_list
-    if isinstance(clean, str):
-        return _PUBLIC_DROP if _contains_forbidden_public_text(clean) else clean
-    return clean
+    if isinstance(value, set | frozenset):
+        result_set = [
+            sanitize_public_value(
+                item,
+                backend_neutral=backend_neutral,
+                _field=_field,
+                _nested=True,
+            )
+            for item in value
+        ]
+        return sorted(
+            (item for item in result_set if item is not _PUBLIC_DROP),
+            key=stable_json_dumps,
+        )
+    if isinstance(value, str):
+        text = sanitize_public_text(value, max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS)
+        field_text = str(_field)
+        normalized_field = field_text.strip().lower().replace("-", "_")
+        if backend_neutral and (
+            "[redacted]" in text
+            or _contains_connector_private_text(value)
+            or _contains_connector_private_text(text)
+        ):
+            return _PUBLIC_DROP if _nested else None
+        if (
+            field_text in _PUBLIC_ALLOWED_MAPPING_KEYS
+            and _is_public_structural_mapping_key(field_text)
+        ):
+            if "[redacted]" in text or _looks_like_raw_command(text):
+                return _PUBLIC_DROP if _nested else None
+            return text
+        if normalized_field in _PUBLIC_FREE_TEXT_KEYS:
+            return text
+        if "[redacted]" in text:
+            return _PUBLIC_DROP if _nested else None
+        if _PUBLIC_OPAQUE_ID_RE.fullmatch(text):
+            return text
+        if _contains_forbidden_public_text(text) or _looks_like_raw_command(text):
+            return _PUBLIC_DROP if _nested else None
+        return text
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and _PUBLIC_TELEGRAM_CHAT_ID_RE.fullmatch(str(value))
+    ):
+        return _PUBLIC_DROP if _nested else None
+    if value is None or isinstance(value, int | float | bool):
+        return value
+    return _PUBLIC_DROP if _nested else None
 
 
-def _sanitize_public_mapping(value: Any) -> dict[str, Any]:
-    clean = _sanitize_public_value(value if isinstance(value, Mapping) else {})
+def sanitize_public_mapping(value: Any, *, backend_neutral: bool = False) -> dict[str, Any]:
+    clean = sanitize_public_value(
+        value if isinstance(value, Mapping) else {},
+        backend_neutral=backend_neutral,
+    )
     return clean if isinstance(clean, dict) else {}
+
+def public_json_dumps(value: Any, *, indent: int | None = None) -> str:
+    """Serialize a final public value after recursive value sanitization."""
+    return json.dumps(
+        sanitize_public_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        indent=indent,
+    )
 
 
 def _string_value(value: Any, default: str = "") -> str:
@@ -683,7 +1046,7 @@ def _backend_health_counts(value: Any) -> dict[str, int]:
 def _status_and_meta(status: Any, meta: Any) -> tuple[str, dict[str, Any]]:
     raw_status = _string_value(status, "unknown").strip()
     normalized = normalize_status(raw_status)
-    clean_meta = _sanitize_public_mapping(meta)
+    clean_meta = sanitize_public_mapping(meta)
     if raw_status and raw_status.lower().replace("_", "-") != normalized:
         public_raw_status = _public_safe_text(raw_status)
         if public_raw_status:
@@ -698,7 +1061,7 @@ def _merge_meta(data: Mapping[str, Any], known_keys: set[str]) -> dict[str, Any]
     }
     if isinstance(explicit_meta, Mapping):
         merged.update(explicit_meta)
-    return _sanitize_public_mapping(merged)
+    return sanitize_public_mapping(merged)
 
 
 def _strip_snapshot_content_volatile(value: Any) -> Any:
@@ -791,7 +1154,7 @@ class SuggestedAction:
         command_alias = _optional_string(command)
         public_tendwire_action = _public_tendwire_action_value(tendwire_action)
         explicit_tendwire_action = public_tendwire_action is not None
-        params = _sanitize_public_mapping(params)
+        params = sanitize_public_mapping(params)
         action_id = _public_safe_text(action_id) or stable_fingerprint(
             {"label": label, "tendwire_action": public_tendwire_action or "", "params": params}
         )
@@ -816,19 +1179,19 @@ class SuggestedAction:
         payload = {
             "action_id": self.action_id,
             "label": self.label,
-            "params": _sanitize_public_mapping(self.params),
+            "params": sanitize_public_mapping(self.params),
         }
         public_tendwire_action = _public_tendwire_action_value(self.tendwire_action)
         if self.has_public_tendwire_action and public_tendwire_action is not None:
             payload["tendwire_action"] = public_tendwire_action
-        return payload
+        return sanitize_public_mapping(payload)
 
     @classmethod
     def from_dict(cls, data: "SuggestedAction | Mapping[str, Any]") -> "SuggestedAction":
         if isinstance(data, SuggestedAction):
             return data
         command = data.get("command") if isinstance(data, Mapping) else None
-        clean = _sanitize_public_mapping(data if isinstance(data, Mapping) else {})
+        clean = sanitize_public_mapping(data if isinstance(data, Mapping) else {})
         return cls(
             action_id=_string_value(clean.get("action_id")),
             label=_string_value(clean.get("label")),
@@ -876,15 +1239,15 @@ class Space:
         object.__setattr__(self, "fingerprint", fingerprint)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "id": self.id,
             "name": self.name,
             "status": self.status,
             "updated_at": self.updated_at,
             "status_line": self.status_line,
             "fingerprint": self.fingerprint,
-            "meta": _sanitize_public_mapping(self.meta),
-        }
+            "meta": sanitize_public_mapping(self.meta),
+        })
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Space":
@@ -949,7 +1312,7 @@ class Worker:
         object.__setattr__(self, "backend_target", backend_target)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "id": self.id,
             "name": self.name,
             "status": self.status,
@@ -957,8 +1320,8 @@ class Worker:
             "last_seen_at": self.last_seen_at,
             "summary": self.summary,
             "fingerprint": self.fingerprint,
-            "meta": _sanitize_public_mapping(self.meta),
-        }
+            "meta": sanitize_public_mapping(self.meta),
+        })
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Worker":
@@ -1064,7 +1427,7 @@ class AttentionSignal:
         return self.severity
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "id": self.id,
             "kind": self.kind,
             "severity": self.severity,
@@ -1074,8 +1437,8 @@ class AttentionSignal:
             "updated_at": self.updated_at,
             "suggested_actions": [action.to_dict() for action in self.suggested_actions],
             "fingerprint": self.fingerprint,
-            "meta": _sanitize_public_mapping(self.meta),
-        }
+            "meta": sanitize_public_mapping(self.meta),
+        })
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AttentionSignal":
@@ -1143,7 +1506,7 @@ class BackendHealth:
         }
         if self.counts:
             payload["counts"] = dict(self.counts)
-        return payload
+        return sanitize_public_mapping(payload)
 
     @classmethod
     def from_dict(cls, data: "BackendHealth | Mapping[str, Any]") -> "BackendHealth":
@@ -1225,7 +1588,7 @@ class Snapshot:
         return stable_fingerprint(self._content_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "schema_version": self.schema_version,
             "host_id": self.host_id,
             "updated_at": self.updated_at,
@@ -1234,10 +1597,10 @@ class Snapshot:
             "attention": [signal.to_dict() for signal in self.attention],
             "backend_health": [health.to_dict() for health in self.backend_health],
             "content_fingerprint": self.content_fingerprint,
-        }
+        })
 
     def to_json(self, indent: int | None = None) -> str:
-        return stable_json_dumps(self.to_dict(), indent=indent)
+        return public_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Snapshot":

@@ -44,6 +44,10 @@ def test_extract_pending_decision():
     assert pending["question"] == "Which database should we use?"
     assert pending["kind"] == "question"
     assert [c["label"] for c in pending["choices"]] == ["Postgres", "SQLite", "Tell me differently"]
+    choice_ids = [c["choice_id"] for c in pending["choices"]]
+    assert all(choice_id.startswith("choice-") for choice_id in choice_ids)
+    assert choice_ids == [c["choice_id"] for c in _backend_pending_from_turn(_decision_turn())["choices"]]
+    assert not ({"1", "2", "custom"} & set(choice_ids))
     # The machine-send payload (send_text) is not published; choices carry only id + label.
     assert all("value" not in c for c in pending["choices"])
     # decision_id (internal tool_use_id) is not published in public pending.
@@ -112,6 +116,7 @@ def _leaky_decision_turn() -> dict:
                 {"id": "approve", "label": "Use secret sk-live-SENTINELSECRET123ABC", "send_text": "sk-live-SENTINELSECRET123ABC"},
                 {"id": "postgres", "label": "Postgres", "send_text": "Postgres"},
                 {"id": "run", "label": "Deploy to 10.4.2.9:5432", "send_text": "tmux send-keys -t w4V:p1 'rm -rf /home/smith/.ssh'"},
+                {"id": "shell", "label": "bash -lc 'echo untrusted option'", "send_text": "echo untrusted option"},
             ],
         }
     }
@@ -127,6 +132,8 @@ def test_ingestion_redacts_private_data_from_pending():
     labels = [c["label"] for c in pending["choices"]]
     assert "Postgres" in labels
     assert "[redacted]" in pending["question"]
+    assert "bash -lc" not in blob
+    assert "echo untrusted option" not in blob
 
 
 def test_get_pending_public_json_has_no_private_leak(tmp_path: Path):

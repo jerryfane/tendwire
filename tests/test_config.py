@@ -87,6 +87,20 @@ def test_pr16_runtime_knobs_reject_invalid_values(field: str, value: object, mes
         Config(**{field: value})
 
 
+def test_socket_group_defaults_private_and_normalizes_without_lookup(monkeypatch) -> None:
+    monkeypatch.delenv("TENDWIRE_SOCKET_GROUP", raising=False)
+    unresolved_group = "tendwire-no-such-config-group-7f6d4b2c"
+
+    assert Config().socket_group is None
+    assert load_config().socket_group is None
+    assert Config(socket_group=f"  {unresolved_group}  ").socket_group == unresolved_group
+
+    monkeypatch.setenv("TENDWIRE_SOCKET_GROUP", "  daemon-clients  ")
+    assert load_config().socket_group == "daemon-clients"
+    assert load_config(socket_group="  explicit-clients  ").socket_group == "explicit-clients"
+    assert load_config(socket_group="   ").socket_group is None
+
+
 def test_herdr_backend_defaults_to_cli(monkeypatch) -> None:
     monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
 

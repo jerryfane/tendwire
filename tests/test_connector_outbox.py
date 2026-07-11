@@ -8,12 +8,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tendwire.core.models import AttentionSignal, Snapshot
 from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.store.sqlite import (
+    SnapshotObservationContext,
+    ack_connector_delivery,
+    defer_connector_delivery,
     fail_connector_delivery,
     init_store,
     poll_connector_outbox,
     reclaim_expired_connector_leases,
+    save_snapshot,
 )
 
 
@@ -219,7 +224,7 @@ def test_ack_delivers_sanitized_response_and_blocks_future_poll(tmp_path: Path) 
     assert rows[0][0] == "delivered"
     assert rows[0][2] == "delivered"
     stored = json.loads(rows[0][1])
-    assert stored["response"]["ref"] == "opaque-provider-ref"
+    assert "ref" not in stored["response"]
     assert stored["response"]["nested"]["safe"] == "kept"
     assert stored["response"]["nested"]["dot_list"] == ["safe"]
     assert stored["response"]["nested"]["space_list"] == ["safe"]
@@ -414,3 +419,329 @@ def test_connector_api_rejects_non_neutral_public_names_without_echoing_them(tmp
         assert "ref" not in payload
         _assert_no_forbidden(payload)
     assert still_pollable["items"][0]["key"] == "job-1"
+
+
+def test_lifecycle_delivery_key_survives_fail_defer_reclaim_and_ack(tmp_path: Path) -> None:
+    db_path = tmp_path / "lifecycle-delivery.db"
+    host_id = "host-lifecycle"
+    observed_at = "2026-01-01T00:00:00+00:00"
+    snapshot = Snapshot(
+        host_id=host_id,
+        updated_at=observed_at,
+        attention=[
+            AttentionSignal(
+                kind="worker_status",
+                severity="warning",
+                status="waiting",
+                reason="Review the worker",
+                source="worker:worker-1",
+                updated_at=observed_at,
+                meta={"worker_id": "worker-1", "needs_human": True},
+                host_id=host_id,
+            )
+        ],
+    )
+    observation = SnapshotObservationContext(authority="complete", observed_at=observed_at)
+    save_snapshot(db_path, snapshot, observation=observation)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        generated = conn.execute(
+            """
+            SELECT delivery_key, status
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+
+    assert len(generated) == 1
+    stable_key = generated[0][0]
+    assert stable_key.startswith("attention:attention_created:")
+    assert generated[0][1] == "queued"
+
+    first = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=10,
+        now="2026-01-01T00:00:01+00:00",
+    )["items"][0]
+    assert first["key"] == stable_key
+    assert first["attempt"] == 1
+    assert first["payload"]["event_type"] == "attention_created"
+
+    save_snapshot(db_path, snapshot, observation=observation)
+    with sqlite3.connect(str(db_path)) as conn:
+        leased_rows = conn.execute(
+            """
+            SELECT delivery_key, status
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+    assert leased_rows == [(stable_key, "leased")]
+
+    failed = fail_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=first["ref"],
+        delay_seconds=1,
+        now="2026-01-01T00:00:02+00:00",
+    )
+    second = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=10,
+        now="2026-01-01T00:00:03+00:00",
+    )["items"][0]
+    deferred = defer_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=second["ref"],
+        available_at="2026-01-01T00:00:05+00:00",
+        now="2026-01-01T00:00:04+00:00",
+    )
+    third = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=10,
+        now="2026-01-01T00:00:05+00:00",
+    )["items"][0]
+
+    not_expired = reclaim_expired_connector_leases(
+        db_path,
+        host_id,
+        "attention",
+        now="2026-01-01T00:00:14+00:00",
+    )
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        host_id,
+        "attention",
+        now="2026-01-01T00:00:15+00:00",
+    )
+    fourth = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=10,
+        now="2026-01-01T00:00:15+00:00",
+    )["items"][0]
+    acknowledged = ack_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=fourth["ref"],
+        response={"safe": "delivered"},
+        now="2026-01-01T00:00:16+00:00",
+    )
+    after_ack = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        now="2026-01-01T00:00:17+00:00",
+    )
+
+    keyed_responses = (first, failed, second, deferred, third, fourth, acknowledged)
+    assert {response["key"] for response in keyed_responses} == {stable_key}
+    assert [first["attempt"], second["attempt"], third["attempt"], fourth["attempt"]] == [1, 2, 3, 4]
+    assert len({first["ref"], second["ref"], third["ref"], fourth["ref"]}) == 4
+    assert failed["status"] == "retry_scheduled"
+    assert deferred["status"] == "deferred"
+    assert not_expired["reclaimed"] == 0
+    assert reclaimed["reclaimed"] == 1
+    assert acknowledged["status"] == "acknowledged"
+    assert after_ack["items"] == []
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_rows = conn.execute(
+            """
+            SELECT delivery_key, status
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+        delivery_rows = conn.execute(
+            """
+            SELECT delivery_key, attempt, status
+            FROM connector_deliveries
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+
+    assert outbox_rows == [(stable_key, "delivered")]
+    assert [row[0] for row in delivery_rows] == [stable_key] * 4
+    assert [row[1] for row in delivery_rows] == [1, 2, 3, 4]
+    assert [row[2] for row in delivery_rows] == ["failed", "deferred", "expired", "delivered"]
+
+
+def test_migration_terminalizes_noncanonical_live_leases_through_public_helpers(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "leased-duplicate-migration.db"
+    host_id = "host-migration-leases"
+    observed_at = "2026-01-01T00:00:00+00:00"
+    snapshot = Snapshot(
+        host_id=host_id,
+        updated_at=observed_at,
+        attention=[
+            AttentionSignal(
+                kind="worker_status",
+                severity="warning",
+                status="waiting",
+                reason="Review the worker",
+                source="worker:worker-1",
+                updated_at=observed_at,
+                host_id=host_id,
+            )
+        ],
+    )
+    save_snapshot(
+        db_path,
+        snapshot,
+        observation=SnapshotObservationContext(
+            authority="complete",
+            observed_at=observed_at,
+        ),
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        for suffix in range(1, 4):
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                )
+                SELECT
+                    host_id, connector, ?, 'queued', payload_json,
+                    '{}', created_at, updated_at, NULL
+                FROM connector_outbox
+                WHERE host_id = ? AND connector = 'attention'
+                ORDER BY id
+                LIMIT 1
+                """,
+                (f"legacy-duplicate-{suffix}", host_id),
+            )
+
+    canonical = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=100,
+        now="2026-01-01T00:00:01+00:00",
+    )["items"][0]
+    failed_lease = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=100,
+        now="2026-01-01T00:00:02+00:00",
+    )["items"][0]
+    deferred_lease = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=100,
+        now="2026-01-01T00:00:03+00:00",
+    )["items"][0]
+    expiring_lease = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        lease_seconds=5,
+        now="2026-01-01T00:00:04+00:00",
+    )["items"][0]
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 4")
+    init_store(db_path)
+
+    failed = fail_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=failed_lease["ref"],
+        delay_seconds=0,
+        now="2026-01-01T00:00:05+00:00",
+    )
+    deferred = defer_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=deferred_lease["ref"],
+        delay_seconds=0,
+        now="2026-01-01T00:00:06+00:00",
+    )
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        host_id,
+        "attention",
+        now="2026-01-01T00:00:09+00:00",
+    )
+    acknowledged = ack_connector_delivery(
+        db_path,
+        host_id=host_id,
+        name="attention",
+        ref=canonical["ref"],
+        now="2026-01-01T00:00:10+00:00",
+    )
+    after = poll_connector_outbox(
+        db_path,
+        host_id,
+        "attention",
+        now="2026-01-01T00:00:11+00:00",
+    )
+
+    assert failed["status"] == "superseded"
+    assert failed["key"] == failed_lease["key"]
+    assert deferred["status"] == "superseded"
+    assert deferred["key"] == deferred_lease["key"]
+    assert reclaimed["reclaimed"] == 1
+    assert acknowledged["status"] == "acknowledged"
+    assert acknowledged["key"] == canonical["key"]
+    assert after["items"] == []
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_rows = conn.execute(
+            """
+            SELECT delivery_key, status
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+        delivery_rows = conn.execute(
+            """
+            SELECT delivery_key, status
+            FROM connector_deliveries
+            WHERE host_id = ? AND connector = 'attention'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+
+    assert outbox_rows == [
+        (canonical["key"], "delivered"),
+        (failed_lease["key"], "superseded"),
+        (deferred_lease["key"], "superseded"),
+        (expiring_lease["key"], "superseded"),
+    ]
+    assert delivery_rows == [
+        (canonical["key"], "delivered"),
+        (failed_lease["key"], "failed"),
+        (deferred_lease["key"], "deferred"),
+        (expiring_lease["key"], "expired"),
+    ]

@@ -42,6 +42,35 @@ The connector outbox is a neutral boundary. It stores public connector jobs and
 public-safe delivery state; concrete Telegram delivery, topic routing, retries,
 and rate limits stay in Herdres or another connector process.
 
+## Local-State Permissions and Socket Sharing
+
+The default POSIX trust boundary is one account. Tendwire keeps the state
+directory at mode `0700`, all regular private state files and the SQLite
+database family at mode `0600`, and the daemon socket at mode `0600`. Private
+objects are created with restrictive permissions and validated before they are
+published.
+
+Tendwire may safely narrow an existing entry owned by the service account:
+the repaired mode is the bitwise intersection of its current mode and the
+required mode, so a stricter mode is never widened. Tendwire refuses symlinks,
+wrong owners, and wrong entry types instead of following a link, changing
+ownership, or replacing an unsafe object. Permission errors and reports do not
+include private paths, link targets, numeric owners, contents, or secret values.
+
+Group socket access is disabled by default. An operator may set
+`TENDWIRE_SOCKET_GROUP` or pass `--socket-group GROUP` to `tendwire daemon`.
+Tendwire resolves that existing group and verifies that the service account is
+already a current member before any group or mode change. Successful opt-in
+changes only the socket to mode `0660`; it does not make the database or other
+state group-readable.
+
+This is a capability boundary, not read-only sharing: every validated member of
+the socket group can invoke the full daemon API, including mutating commands and
+connector operations. Place the socket in a dedicated parent owned by the
+service account, assigned to the selected group, group-traversable, and
+inaccessible to all other users (for example, mode `0710`). Never place a
+Tendwire socket in shared `/tmp`.
+
 ## Secrets
 
 Do not commit local environment files, SQLite stores, sockets, logs, caches, or

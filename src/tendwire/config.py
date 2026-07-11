@@ -40,6 +40,7 @@ class Config:
     max_workers: int = DEFAULT_MAX_WORKERS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
+    socket_group: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "herdr_bin", os.path.expanduser(self.herdr_bin))
@@ -54,6 +55,9 @@ class Config:
             object.__setattr__(self, "db_path", Path(self.db_path).expanduser())
         if self.socket_path is not None:
             object.__setattr__(self, "socket_path", Path(self.socket_path).expanduser())
+        if self.socket_group is not None:
+            normalized_socket_group = str(self.socket_group).strip()
+            object.__setattr__(self, "socket_group", normalized_socket_group or None)
 
         if self.herdr_timeout_seconds <= 0:
             raise ValueError("herdr_timeout_seconds must be positive")
@@ -154,6 +158,7 @@ def load_config(
     data_dir: str | Path | None = None,
     db_path: str | Path | None = None,
     socket_path: str | Path | None = None,
+    socket_group: str | None = None,
     herdr_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
     event_debounce_seconds: float | str | None = None,
@@ -170,6 +175,7 @@ def load_config(
     env_data_dir = os.environ.get("TENDWIRE_DATA_DIR")
     env_db_path = os.environ.get("TENDWIRE_DB_PATH")
     env_socket_path = os.environ.get("TENDWIRE_SOCKET_PATH")
+    env_socket_group = os.environ.get("TENDWIRE_SOCKET_GROUP")
     env_herdr_timeout_seconds = os.environ.get("TENDWIRE_HERDR_TIMEOUT_SECONDS")
     env_herdr_backend = os.environ.get("TENDWIRE_HERDR_BACKEND")
 
@@ -196,6 +202,10 @@ def load_config(
         resolved_socket_path = Path(env_socket_path)
     else:
         resolved_socket_path = None
+    if socket_group is not None:
+        resolved_socket_group = socket_group
+    else:
+        resolved_socket_group = env_socket_group
 
     raw_timeout = herdr_timeout_seconds
     if raw_timeout is None:
@@ -257,4 +267,5 @@ def load_config(
             "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
             DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
         ),
+        socket_group=resolved_socket_group,
     )

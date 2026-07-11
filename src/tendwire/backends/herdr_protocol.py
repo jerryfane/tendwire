@@ -278,7 +278,13 @@ def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def validate_event(envelope: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate an event envelope while preserving the raw event payload."""
+    """Validate an event envelope while preserving its raw data.
+
+    The confirmed Herdr ``EventEnvelope`` consists of ``event`` and ``data``.
+    A generic ``id`` is tolerated as subscription correlation only; it is not
+    authoritative producer event identity. Unknown top-level fields remain
+    available for forward-compatible consumers.
+    """
     request_id = envelope.get("id")
     if request_id is not None and (not isinstance(request_id, str) or not request_id):
         raise HerdrEnvelopeError("Herdr event id must be a non-empty string when present")

@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import pytest
+
+from tendwire.local_state import (
+    LocalStateError,
+    LocalStateErrorCode,
+    prepare_sqlite_family,
+)
 
 from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
@@ -15,9 +25,12 @@ from tendwire.core.models import WorkerBinding
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
+    SnapshotObservationContext,
+    ack_connector_delivery,
     append_event,
     attention_payload_from_store,
     cleanup_event_retention,
+    defer_connector_delivery,
     exhaust_connector_retries,
     expire_stale_worker_bindings,
     expire_worker_bindings,
@@ -28,6 +41,7 @@ from tendwire.store.sqlite import (
     list_attention_items,
     list_hosts,
     list_worker_bindings,
+    reclaim_expired_connector_leases,
     poll_connector_outbox,
     reserve_command_receipt,
     resolve_worker_binding,
@@ -50,6 +64,7 @@ _PR6_TABLES = {
     "turns",
     "pending_interactions",
     "attention_items",
+    "attention_lifecycles",
     "commands",
     "command_receipts",
     "connector_outbox",
@@ -94,7 +109,610 @@ def _unique_index_columns(conn: sqlite3.Connection, table: str) -> dict[str, tup
     return indexes
 
 
-def test_store_initializes_v4_pr6_schema_with_attention_lifecycle_indexes(tmp_path: Path) -> None:
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+def _create_private_empty_file(path: Path) -> None:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+
+
+def _tree_metadata(root: Path) -> tuple[tuple[str, int, int, int, int], ...]:
+    return tuple(
+        sorted(
+            (
+                str(path.relative_to(root)),
+                stat.S_IFMT(current.st_mode),
+                stat.S_IMODE(current.st_mode),
+                current.st_size,
+                current.st_mtime_ns,
+            )
+            for path in root.rglob("*")
+            for current in (path.lstat(),)
+        )
+    )
+
+
+def _invoke_creation_capable_store_path(name: str, db_path: Path) -> None:
+    config = Config(host_id="host-a", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[{"id": "worker-1", "name": "Worker One"}],
+    )
+    if name == "init_store":
+        init_store(db_path)
+    elif name == "append_event":
+        append_event(db_path, "host-a", "store.test", {"safe": True})
+    elif name == "upsert_command_pending_turn":
+        store_sqlite.upsert_command_pending_turn(
+            db_path,
+            "host-a",
+            snapshot.workers[0],
+            request_id="request-1",
+            instruction_text="Continue.",
+        )
+    elif name == "save_snapshot":
+        save_snapshot(db_path, snapshot)
+    elif name == "upsert_worker_bindings":
+        upsert_worker_bindings(db_path, [_worker_binding()])
+    elif name == "expire_worker_bindings":
+        expire_worker_bindings(db_path, "host-a")
+    elif name == "expire_stale_worker_bindings":
+        expire_stale_worker_bindings(
+            db_path,
+            "host-a",
+            backend="herdr",
+            current_private_fingerprints=[],
+        )
+    elif name == "reserve_command_receipt":
+        reserve_command_receipt(
+            db_path,
+            "host-a",
+            "request-1",
+            "send_instruction",
+            "payload-fingerprint",
+            '{"status":"pending"}',
+        )
+    elif name == "save_command_receipt":
+        save_command_receipt(
+            db_path,
+            "host-a",
+            "request-1",
+            "send_instruction",
+            "payload-fingerprint",
+            STATUS_ACCEPTED,
+            '{"status":"accepted"}',
+        )
+    else:
+        raise AssertionError(f"unknown creation-capable path: {name}")
+
+
+def test_store_secure_creation_ignores_permissive_umask_for_live_sqlite_family(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "private-state"
+    db_path = state_dir / "tendwire.db"
+    previous_umask = os.umask(0)
+    try:
+        init_store(db_path)
+        with store_sqlite._connect(db_path) as conn:
+            assert _user_version(conn) == 5
+            assert _mode(Path(f"{db_path}-wal")) == 0o600
+            assert _mode(Path(f"{db_path}-shm")) == 0o600
+    finally:
+        os.umask(previous_umask)
+
+    assert _mode(state_dir) == 0o700
+    assert _mode(db_path) == 0o600
+
+
+def test_creation_boundary_repairs_live_sidecars_after_wal_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "tendwire.db"
+    init_store(db_path)
+    original_repair = store_sqlite.repair_sqlite_family_at
+    repaired_live_family = False
+
+    def broaden_then_repair(parent_fd: int, leaf: str) -> Any:
+        nonlocal repaired_live_family
+        os.chmod(f"{leaf}-wal", 0o644, dir_fd=parent_fd)
+        os.chmod(f"{leaf}-shm", 0o644, dir_fd=parent_fd)
+        result = original_repair(parent_fd, leaf)
+        repaired_live_family = True
+        return result
+
+    monkeypatch.setattr(store_sqlite, "repair_sqlite_family_at", broaden_then_repair)
+
+    with store_sqlite._connect(db_path, prepare=True):
+        assert _mode(Path(f"{db_path}-wal")) == 0o600
+        assert _mode(Path(f"{db_path}-shm")) == 0o600
+
+    assert repaired_live_family is True
+
+
+def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "broad-state"
+    state_dir.mkdir()
+    os.chmod(state_dir, 0o755)
+    db_path = state_dir / "tendwire.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("CREATE TABLE preserved (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO preserved (value) VALUES ('kept')")
+    conn.close()
+    os.chmod(db_path, 0o644)
+    inode = db_path.stat().st_ino
+
+    init_store(db_path)
+    first_modes = (_mode(state_dir), _mode(db_path))
+    with sqlite3.connect(str(db_path)) as conn:
+        first_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
+        first_version = _user_version(conn)
+    conn.close()
+
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        second_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
+        second_version = _user_version(conn)
+    conn.close()
+
+    assert first_modes == (0o700, 0o600)
+    assert (_mode(state_dir), _mode(db_path)) == first_modes
+    assert db_path.stat().st_ino == inode
+    assert (first_value, second_value) == ("kept", "kept")
+    assert (first_version, second_version) == (5, 5)
+
+
+def test_sqlite_family_preparation_does_not_widen_stricter_modes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "strict-state"
+    state_dir.mkdir()
+    db_path = state_dir / "tendwire.db"
+    _create_private_empty_file(db_path)
+    os.chmod(state_dir, 0o500)
+    os.chmod(db_path, 0o400)
+
+    prepare_sqlite_family(db_path)
+
+    assert _mode(state_dir) == 0o500
+    assert _mode(db_path) == 0o400
+
+
+def test_sqlite_backup_and_vacuum_preserve_private_modes_under_permissive_umask(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "state" / "source.db"
+    backup_path = tmp_path / "state" / "backup.db"
+    init_store(source_path)
+    with store_sqlite._connect(source_path) as conn:
+        conn.execute("CREATE TABLE backup_probe (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO backup_probe (value) VALUES ('kept')")
+
+    previous_umask = os.umask(0)
+    try:
+        prepare_sqlite_family(backup_path)
+        with store_sqlite._connect(source_path) as source:
+            with sqlite3.connect(str(backup_path)) as destination:
+                source.backup(destination)
+        with store_sqlite._connect(source_path, isolation_level=None) as conn:
+            conn.execute("VACUUM")
+            for suffix in ("", "-wal", "-shm"):
+                member = Path(f"{source_path}{suffix}")
+                if member.exists():
+                    assert _mode(member) == 0o600
+    finally:
+        os.umask(previous_umask)
+
+    for database_path in (source_path, backup_path):
+        assert _mode(database_path) == 0o600
+        for suffix in ("-wal", "-shm", "-journal"):
+            member = Path(f"{database_path}{suffix}")
+            if member.exists():
+                assert _mode(member) == 0o600
+    with sqlite3.connect(str(backup_path)) as conn:
+        assert conn.execute("SELECT value FROM backup_probe").fetchone()[0] == "kept"
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("entry_type", ["symlink", "directory"])
+def test_store_refuses_wrong_type_or_symlink_for_every_sqlite_family_member(
+    tmp_path: Path,
+    suffix: str,
+    entry_type: str,
+) -> None:
+    state_dir = tmp_path / "private-state"
+    state_dir.mkdir(mode=0o700)
+    os.chmod(state_dir, 0o700)
+    db_path = state_dir / "secret.db"
+    family_path = Path(f"{db_path}{suffix}")
+    if suffix:
+        _create_private_empty_file(db_path)
+    if entry_type == "symlink":
+        target = tmp_path / "outside-target"
+        _create_private_empty_file(target)
+        family_path.symlink_to(target)
+    else:
+        family_path.mkdir()
+
+    with pytest.raises(LocalStateError) as caught:
+        init_store(db_path)
+
+    assert caught.value.code is LocalStateErrorCode.WRONG_TYPE
+    assert str(db_path) not in str(caught.value)
+    if entry_type == "symlink":
+        assert family_path.is_symlink()
+    else:
+        assert family_path.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("state_mode", "db_mode"),
+    [(0o755, 0o600), (0o700, 0o644)],
+)
+def test_store_read_refuses_broad_state_without_repairing(
+    tmp_path: Path,
+    state_mode: int,
+    db_mode: int,
+) -> None:
+    state_dir = tmp_path / "private-state"
+    db_path = state_dir / "tendwire.db"
+    init_store(db_path)
+    os.chmod(state_dir, state_mode)
+    os.chmod(db_path, db_mode)
+
+    with pytest.raises(LocalStateError) as caught:
+        latest_snapshot(db_path)
+
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert (_mode(state_dir), _mode(db_path)) == (state_mode, db_mode)
+
+
+def test_store_broad_parent_error_has_actionable_path_free_remediation(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "private-state"
+    db_path = state_dir / "tendwire.db"
+    init_store(db_path)
+    os.chmod(state_dir, 0o755)
+
+    with pytest.raises(LocalStateError) as caught:
+        latest_snapshot(db_path)
+
+    message = str(caught.value)
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert "`tendwire daemon`" in message
+    assert "restrict permissions manually" in message
+    assert "doctor --fix-permissions" not in message
+    assert str(state_dir) not in message
+    assert str(db_path) not in message
+
+
+def test_store_read_refuses_broad_sidecar_without_repairing(tmp_path: Path) -> None:
+    state_dir = tmp_path / "private-state"
+    db_path = state_dir / "tendwire.db"
+    init_store(db_path)
+    journal_path = Path(f"{db_path}-journal")
+    _create_private_empty_file(journal_path)
+    os.chmod(journal_path, 0o644)
+
+    with pytest.raises(LocalStateError) as caught:
+        latest_snapshot(db_path)
+
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert _mode(journal_path) == 0o644
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        "init_store",
+        "append_event",
+        "upsert_command_pending_turn",
+        "save_snapshot",
+        "upsert_worker_bindings",
+        "expire_worker_bindings",
+        "expire_stale_worker_bindings",
+        "reserve_command_receipt",
+        "save_command_receipt",
+    ],
+)
+def test_every_creation_capable_store_path_prepares_private_sqlite_state(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    state_dir = tmp_path / entrypoint
+    db_path = state_dir / "tendwire.db"
+
+    _invoke_creation_capable_store_path(entrypoint, db_path)
+
+    assert _mode(state_dir) == 0o700
+    assert _mode(db_path) == 0o600
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == 5
+
+
+@pytest.mark.parametrize("operation", ["init", "read"])
+@pytest.mark.parametrize("configured_kind", ["absolute", "controlled-relative"])
+def test_store_refuses_intermediate_symlink_without_mutating_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    configured_kind: str,
+) -> None:
+    target_parent = tmp_path / "target" / "private"
+    target_parent.mkdir(parents=True, mode=0o700)
+    os.chmod(target_parent, 0o700)
+    leaf = f"tendwire-{os.getpid()}-{tmp_path.name}.db"
+    target_db = target_parent / leaf
+    if operation == "read":
+        init_store(target_db)
+    else:
+        (target_parent / "sentinel").write_text("unchanged", encoding="utf-8")
+
+    configured_root = tmp_path / "configured"
+    configured_root.mkdir(mode=0o700)
+    linked_parent = configured_root / "linked"
+    linked_parent.symlink_to(target_parent, target_is_directory=True)
+    configured_db = linked_parent / leaf
+    before = _tree_metadata(target_parent)
+    root_artifact = Path(os.sep) / leaf
+    assert not root_artifact.exists()
+
+    if configured_kind == "controlled-relative":
+        monkeypatch.chdir(configured_root)
+        requested_db = Path("linked") / leaf
+    else:
+        requested_db = configured_db
+
+    with pytest.raises(LocalStateError) as caught:
+        if operation == "init":
+            init_store(requested_db)
+        else:
+            latest_snapshot(requested_db)
+
+    assert caught.value.code is LocalStateErrorCode.WRONG_TYPE
+    assert _tree_metadata(target_parent) == before
+    assert linked_parent.is_symlink()
+    assert not root_artifact.exists()
+    for private_path in (configured_db, linked_parent, target_parent, target_db):
+        assert str(private_path) not in str(caught.value)
+
+
+@pytest.mark.parametrize("configured_kind", ["absolute", "controlled-relative"])
+def test_store_read_treats_absent_nested_parent_as_missing_without_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_kind: str,
+) -> None:
+    absolute_db = tmp_path / "absent" / "nested" / "tendwire.db"
+    if configured_kind == "controlled-relative":
+        monkeypatch.chdir(tmp_path)
+        requested_db = Path("absent/nested/tendwire.db")
+    else:
+        requested_db = absolute_db
+    before = set(os.listdir("/proc/self/fd"))
+
+    assert latest_snapshot(requested_db) is None
+
+    assert not (tmp_path / "absent").exists()
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+def test_store_initializes_bare_relative_db_in_controlled_cwd_without_root_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controlled = tmp_path / "controlled"
+    controlled.mkdir(mode=0o700)
+    os.chmod(controlled, 0o700)
+    monkeypatch.chdir(controlled)
+    relative_db = Path("controlled-relative.db")
+    root_artifact = Path("/controlled-relative.db")
+    assert not root_artifact.exists()
+
+    init_store(relative_db)
+
+    assert relative_db.is_file()
+    assert _mode(relative_db) == 0o600
+    assert not root_artifact.exists()
+    with store_sqlite._connect(relative_db) as conn:
+        assert _user_version(conn) == 5
+
+
+def test_store_rejects_bare_relative_db_from_writable_cwd_without_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writable = tmp_path / "writable"
+    writable.mkdir(mode=0o700)
+    monkeypatch.chdir(writable)
+    os.chmod(writable, 0o777)
+    try:
+        with pytest.raises(LocalStateError) as caught:
+            init_store(Path("unsafe-relative.db"))
+    finally:
+        os.chmod(writable, 0o700)
+
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert not (writable / "unsafe-relative.db").exists()
+    assert str(writable) not in str(caught.value)
+
+
+def test_store_uri_quotes_pinned_database_leaf(tmp_path: Path) -> None:
+    state_dir = tmp_path / "quoted"
+    db_path = state_dir / "question?hash#percent%.db"
+
+    init_store(db_path)
+
+    with store_sqlite._connect(db_path) as conn:
+        assert _user_version(conn) == 5
+    assert db_path.is_file()
+    assert [path.name for path in state_dir.iterdir()] == [
+        "question?hash#percent%.db",
+    ]
+
+
+@pytest.mark.parametrize("prepare", [False, True])
+def test_store_connection_stays_on_pinned_parent_after_ancestor_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prepare: bool,
+) -> None:
+    current_root = tmp_path / "current"
+    replacement_root = tmp_path / "replacement"
+    current_db = current_root / "state" / "anchored.db"
+    replacement_db = replacement_root / "state" / "anchored.db"
+    for db_path, marker in ((current_db, "pinned"), (replacement_db, "replacement")):
+        init_store(db_path)
+        with store_sqlite._connect(db_path, prepare=True) as conn:
+            conn.execute("CREATE TABLE anchor_marker (value TEXT NOT NULL)")
+            conn.execute("INSERT INTO anchor_marker (value) VALUES (?)", (marker,))
+        for suffix in ("-wal", "-shm", "-journal"):
+            member = Path(f"{db_path}{suffix}")
+            if member.exists():
+                member.unlink()
+
+    displaced_root = tmp_path / "displaced"
+    original_proc_fd_path = store_sqlite.proc_fd_path
+    substituted = False
+
+    def substitute_ancestor(parent_fd: int, leaf: str) -> str:
+        nonlocal substituted
+        if not substituted:
+            current_root.rename(displaced_root)
+            replacement_root.rename(current_root)
+            substituted = True
+        return original_proc_fd_path(parent_fd, leaf)
+
+    monkeypatch.setattr(store_sqlite, "proc_fd_path", substitute_ancestor)
+
+    with store_sqlite._connect(current_db, prepare=prepare) as conn:
+        assert conn.execute("SELECT value FROM anchor_marker").fetchone()[0] == "pinned"
+        conn.execute("CREATE TABLE anchored_write (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO anchored_write (value) VALUES ('retained-fd')")
+        conn.commit()
+        pinned_db = displaced_root / "state" / "anchored.db"
+        assert Path(f"{pinned_db}-wal").is_file()
+        assert Path(f"{pinned_db}-shm").is_file()
+        assert not Path(f"{current_db}-wal").exists()
+        assert not Path(f"{current_db}-shm").exists()
+
+    pinned_db = displaced_root / "state" / "anchored.db"
+    with sqlite3.connect(str(pinned_db)) as conn:
+        assert conn.execute("SELECT value FROM anchored_write").fetchone()[0] == "retained-fd"
+    with sqlite3.connect(str(current_db)) as conn:
+        assert conn.execute("SELECT value FROM anchor_marker").fetchone()[0] == "replacement"
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'anchored_write'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_memory_store_does_not_create_filesystem_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    def reject_filesystem_resolution(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("memory databases must not resolve filesystem paths")
+
+    monkeypatch.setattr(store_sqlite, "open_resolved_parent", reject_filesystem_resolution)
+    monkeypatch.setattr(
+        store_sqlite, "prepare_resolved_private_parent", reject_filesystem_resolution
+    )
+    monkeypatch.setattr(store_sqlite, "proc_fd_path", reject_filesystem_resolution)
+
+    init_store(Path(":memory:"))
+
+    assert not (tmp_path / ":memory:").exists()
+
+
+def test_shared_named_memory_uri_uses_sqlite_uri_without_creating_a_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    def reject_filesystem_resolution(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("memory URI must not resolve filesystem paths")
+
+    monkeypatch.setattr(store_sqlite, "open_resolved_parent", reject_filesystem_resolution)
+    monkeypatch.setattr(
+        store_sqlite, "prepare_resolved_private_parent", reject_filesystem_resolution
+    )
+    monkeypatch.setattr(store_sqlite, "proc_fd_path", reject_filesystem_resolution)
+    db_uri = "file:tendwire-shared?mode=memory&cache=shared"
+
+    with store_sqlite._connect(db_uri) as writer:
+        writer.execute("CREATE TABLE shared_values (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO shared_values (value) VALUES ('visible')")
+        writer.commit()
+        with store_sqlite._connect(db_uri) as reader:
+            value = reader.execute("SELECT value FROM shared_values").fetchone()[0]
+
+    assert value == "visible"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_similar_memory_text_remains_a_secure_filesystem_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db_path = Path("file:ordinary?mode=memory-copy")
+    previous_umask = os.umask(0)
+    try:
+        init_store(db_path)
+    finally:
+        os.umask(previous_umask)
+
+    assert db_path.is_file()
+    assert _mode(db_path) == 0o600
+
+
+def test_connect_closes_when_live_sqlite_family_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "tendwire.db"
+    init_store(db_path)
+    before = set(os.listdir("/proc/self/fd"))
+    original_inspect = store_sqlite.inspect_sqlite_family_at
+    inspection_count = 0
+
+    def broaden_live_wal(parent_fd: int, leaf: str) -> Any:
+        nonlocal inspection_count
+        inspection_count += 1
+        if inspection_count == 2:
+            os.chmod(f"{leaf}-wal", 0o644, dir_fd=parent_fd)
+        return original_inspect(parent_fd, leaf)
+
+    created: list[sqlite3.Connection] = []
+    original_connect = sqlite3.connect
+
+    def capture_connection(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = original_connect(*args, **kwargs)
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(store_sqlite, "inspect_sqlite_family_at", broaden_live_wal)
+    monkeypatch.setattr(store_sqlite.sqlite3, "connect", capture_connection)
+
+    with pytest.raises(LocalStateError) as caught:
+        store_sqlite._connect(db_path)
+
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert len(created) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        created[0].execute("SELECT 1")
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+def test_store_initializes_v5_schema_with_companion_attention_lifecycle(tmp_path: Path) -> None:
     db_path = tmp_path / "tendwire.db"
 
     init_store(db_path)
@@ -102,7 +720,7 @@ def test_store_initializes_v4_pr6_schema_with_attention_lifecycle_indexes(tmp_pa
     with sqlite3.connect(str(db_path)) as conn:
         assert _PR6_TABLES <= _table_names(conn)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-        assert _user_version(conn) == 4
+        assert _user_version(conn) == 5
         assert {"host_id", "created_at", "payload", "content_fingerprint"} <= columns
         indexed = _indexed_columns(conn, "snapshots")
         assert "host_id" in indexed
@@ -156,6 +774,27 @@ def test_store_initializes_v4_pr6_schema_with_attention_lifecycle_indexes(tmp_pa
         } <= attention_columns
         attention_indexed = _indexed_columns(conn, "attention_items")
         assert {"lifecycle_status", "last_seen_at", "fingerprint"} <= attention_indexed
+        lifecycle_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(attention_lifecycles)")
+        }
+        assert lifecycle_columns == {
+            "host_id",
+            "family_key",
+            "generation",
+            "lifecycle_status",
+            "current_attention_id",
+            "first_seen_at",
+            "last_positive_at",
+            "first_missing_at",
+            "missing_observation_count",
+            "last_accepted_at",
+            "last_observation_key",
+            "max_notified_severity_rank",
+        }
+        assert {"lifecycle_status", "current_attention_id"} <= _indexed_columns(
+            conn, "attention_lifecycles"
+        )
 
 
 def test_store_connections_apply_wal_busy_timeout_and_foreign_keys(tmp_path: Path) -> None:
@@ -373,6 +1012,29 @@ def test_attention_payload_from_store_buckets_unsafe_row_text(tmp_path: Path) ->
                 ),
             ),
         )
+        family_key = store_sqlite._attention_family_key(
+            "storehost",
+            {"source": "telegram:chat", "kind": "herdres_delivery"},
+        )
+        conn.execute(
+            """
+            INSERT INTO attention_lifecycles (
+                host_id, family_key, generation, lifecycle_status,
+                current_attention_id, first_seen_at, last_positive_at,
+                first_missing_at, missing_observation_count, last_accepted_at,
+                last_observation_key, max_notified_severity_rank
+            ) VALUES (?, ?, 1, 'open', ?, ?, ?, NULL, 0, ?, ?, 1)
+            """,
+            (
+                "storehost",
+                family_key,
+                "attn-unsafe",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "observation-key",
+            ),
+        )
 
     payload = attention_payload_from_store(db_path, "storehost")
     assert payload is not None
@@ -384,11 +1046,287 @@ def test_attention_payload_from_store_buckets_unsafe_row_text(tmp_path: Path) ->
     assert item["reason"] == ""
     assert item["meta"] == {"kept": "visible"}
     assert "resolved_reason" not in item
-    assert "telegram" not in encoded
+    assert item["suggested_actions"][0]["label"] == "notify telegram"
     assert "herdres" not in encoded
     assert "delivery" not in encoded
     assert "token" not in encoded
     assert "route" not in encoded
+
+
+def _provider_shaped_store_secret() -> str:
+    return "".join(("s", "k", "-", "sentinel", "-store-secret"))
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        _provider_shaped_store_secret(),
+        " ".join(("Bearer", _provider_shaped_store_secret())),
+        "".join(
+            (
+                "https://user:",
+                "sentinel",
+                "-store-password",
+                "@example.invalid/private",
+            )
+        ),
+    ],
+    ids=("provider-token", "authorization", "credential-url"),
+)
+def test_store_public_json_boundaries_share_recursive_sanitizer(
+    tmp_path: Path,
+    unsafe_value: str,
+) -> None:
+    db_path = tmp_path / "public-boundaries.db"
+    safe_markdown = "**Useful update** — [docs](https://example.com/tendwire/guide)"
+    config = Config(host_id="public-host", db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        spaces=[
+            {
+                "id": "space-public",
+                "name": safe_markdown,
+                "status": "active",
+                "meta": {"note": unsafe_value},
+            }
+        ],
+        workers=[
+            {
+                "id": "worker-public",
+                "name": safe_markdown,
+                "status": "blocked",
+                "space_id": "space-public",
+                "summary": safe_markdown,
+                "meta": {"needs_human": True, "note": unsafe_value},
+            }
+        ],
+        backend_health=[
+            {
+                "name": "generic",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+                "message": f"{safe_markdown}\ncredential={unsafe_value}",
+                "counts": {"workers": 1},
+            }
+        ],
+        timestamp=datetime.fromisoformat("2026-01-01T00:00:00+00:00"),
+    )
+
+    _save_observation(db_path, snapshot, "positive", snapshot.updated_at)
+    append_event(
+        db_path,
+        "public-host",
+        "private.adapter",
+        {
+            "note": unsafe_value,
+            "pane_id": "private-pane",
+            "markdown": safe_markdown,
+        },
+        aggregate_type="worker",
+        aggregate_id="worker-public",
+        observed_at="2026-01-01T00:01:00+00:00",
+    )
+    binding = WorkerBinding(
+        host_id="public-host",
+        worker_id="worker-public",
+        worker_fingerprint=snapshot.workers[0].fingerprint,
+        backend="private-backend",
+        target_kind="opaque",
+        target_value=unsafe_value,
+        sendable=True,
+        observed_at="2026-01-01T00:01:00+00:00",
+        private_fingerprint="private-binding-fingerprint",
+    )
+    upsert_worker_bindings(db_path, [binding])
+    private_result_json = json.dumps(
+        {"note": unsafe_value, "pane_id": "private-pane"},
+        sort_keys=True,
+    )
+    save_command_receipt(
+        db_path,
+        host_id="public-host",
+        request_id="private-receipt",
+        action="send_instruction",
+        payload_fingerprint="private-receipt-fingerprint",
+        status="accepted",
+        result_json=private_result_json,
+    )
+
+    assert merge_turn_content(
+        db_path,
+        "public-host",
+        "worker-public",
+        {
+            "assistant_final_text": f"{safe_markdown}\ncredential={unsafe_value}",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:02:00+00:00",
+    ) == 1
+    assert store_sqlite.merge_backend_pending(
+        db_path,
+        "public-host",
+        "worker-public",
+        {
+            "id": f"pending-{'a' * 24}",
+            "question": f"{safe_markdown}\ncredential={unsafe_value}",
+            "note": unsafe_value,
+            "choices": [
+                {
+                    "id": f"choice-{'b' * 24}",
+                    "label": safe_markdown,
+                    "note": unsafe_value,
+                }
+            ],
+        },
+    )
+
+    reader_columns = (
+        ("snapshots", "payload"),
+        ("turns", "payload_json"),
+        ("attention_items", "payload_json"),
+        ("backend_pending", "payload_json"),
+        ("connector_outbox", "payload_json"),
+    )
+    legacy_public_rows: list[tuple[str, str, int, str]] = []
+    with sqlite3.connect(str(db_path)) as conn:
+        for table, column in reader_columns:
+            rows = conn.execute(
+                f"SELECT rowid, {column} FROM {table} WHERE host_id = ?",
+                ("public-host",),
+            ).fetchall()
+            assert rows, f"{table}.{column} should be readable"
+            for row_id, raw_value in rows:
+                legacy_public_rows.append((table, column, int(row_id), str(raw_value)))
+                poisoned = json.loads(raw_value)
+                poisoned["legacy_note"] = unsafe_value
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                    (json.dumps(poisoned, sort_keys=True), int(row_id)),
+                )
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET private_state_json = ?
+            WHERE host_id = ? AND connector = ?
+            """,
+            (
+                json.dumps({"note": unsafe_value}, sort_keys=True),
+                "public-host",
+                "attention",
+            ),
+        )
+
+    polled = poll_connector_outbox(
+        db_path,
+        "public-host",
+        "attention",
+        now="2026-01-01T00:03:00+00:00",
+    )
+    assert polled["items"]
+
+    restored = latest_snapshot(db_path, "public-host")
+    assert restored is not None
+    turns = turns_payload_from_store(db_path, "public-host", snapshot=restored)
+    attention = attention_payload_from_store(db_path, "public-host")
+    assert attention is not None
+    attention_items = list_attention_items(db_path, "public-host")
+    backend_pending = store_sqlite.list_backend_pending(db_path, "public-host")
+    tail = tail_event_metadata(db_path, "public-host", limit=20)
+    public_readers = {
+        "snapshot": restored.to_dict(),
+        "turns": turns,
+        "attention": attention,
+        "attention_items": attention_items,
+        "backend_pending": backend_pending,
+        "tail": tail,
+        "outbox": polled,
+    }
+    for value in public_readers.values():
+        assert unsafe_value not in json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    for boundary in ("snapshot", "turns", "attention", "backend_pending", "outbox"):
+        assert safe_markdown in json.dumps(
+            public_readers[boundary],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    assert "payload_json" not in json.dumps(tail, sort_keys=True)
+    with sqlite3.connect(str(db_path)) as conn:
+        for table, column, row_id, raw_value in legacy_public_rows:
+            conn.execute(
+                f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                (raw_value, row_id),
+            )
+
+    public_columns = (
+        ("snapshots", "payload"),
+        ("spaces", "payload_json"),
+        ("workers", "payload_json"),
+        ("turns", "payload_json"),
+        ("pending_interactions", "payload_json"),
+        ("attention_items", "payload_json"),
+        ("backend_health", "payload_json"),
+        ("backend_pending", "payload_json"),
+        ("connector_outbox", "payload_json"),
+        ("connector_deliveries", "response_json"),
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        for table, column in public_columns:
+            values = [
+                str(row[0])
+                for row in conn.execute(
+                    f"SELECT {column} FROM {table} WHERE host_id = ?",
+                    ("public-host",),
+                ).fetchall()
+            ]
+            assert values, f"{table}.{column} should be populated"
+            assert all(unsafe_value not in value for value in values)
+
+        event_payload = json.loads(
+            conn.execute(
+                """
+                SELECT payload_json
+                FROM events
+                WHERE host_id = ? AND event_type = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("public-host", "private.adapter"),
+            ).fetchone()[0]
+        )
+        outbox_private = json.loads(
+            conn.execute(
+                """
+                SELECT private_state_json
+                FROM connector_outbox
+                WHERE host_id = ? AND connector = ?
+                ORDER BY id
+                LIMIT 1
+                """,
+                ("public-host", "attention"),
+            ).fetchone()[0]
+        )
+
+    assert event_payload["note"] == unsafe_value
+    assert event_payload["pane_id"] == "private-pane"
+    assert outbox_private["note"] == unsafe_value
+    assert "lease_token" in outbox_private
+    private_bindings = list_worker_bindings(
+        db_path,
+        "public-host",
+        backend="private-backend",
+    )
+    assert private_bindings[0].target_value == unsafe_value
+    receipt = get_command_receipt(
+        db_path,
+        "public-host",
+        "private-receipt",
+        "send_instruction",
+    )
+    assert receipt is not None
+    assert json.loads(receipt["result_json"])["note"] == unsafe_value
 
 
 def test_store_maintenance_dry_run_and_exhausted_outbox_status(tmp_path: Path) -> None:
@@ -576,7 +1514,7 @@ def test_store_migrates_v1_schema_and_persists_content_fingerprint(tmp_path: Pat
     save_snapshot(db_path, snapshot)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == 4
+        assert _user_version(conn) == 5
         row = conn.execute(
             "SELECT host_id, content_fingerprint, payload FROM snapshots ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -693,7 +1631,7 @@ def test_store_migrates_partial_v3_db_with_legacy_data_idempotently(tmp_path: Pa
 
     with sqlite3.connect(str(db_path)) as conn:
         assert _PR6_TABLES <= _table_names(conn)
-        assert _user_version(conn) == 4
+        assert _user_version(conn) == 5
         assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM worker_bindings").fetchone()[0] == 1
@@ -761,117 +1699,38 @@ def _connector_outbox_rows(db_path: Path) -> list[tuple[str, str, str]]:
         ).fetchall()
 
 
-def test_store_migrates_legacy_attention_rows_with_lifecycle_backfill(tmp_path: Path) -> None:
-    db_path = tmp_path / "legacy-attention.db"
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE attention_items (
-                host_id TEXT NOT NULL,
-                attention_id TEXT NOT NULL,
-                source TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                status TEXT NOT NULL,
-                updated_at TEXT,
-                fingerprint TEXT NOT NULL,
-                snapshot_content_fingerprint TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                PRIMARY KEY (host_id, attention_id)
-            );
-            INSERT INTO attention_items (
-                host_id, attention_id, source, kind, severity, status,
-                updated_at, fingerprint, snapshot_content_fingerprint,
-                observed_at, payload_json
-            ) VALUES (
-                'legacy-host', 'attn-legacy', 'worker:legacy', 'worker_status',
-                'warning', 'blocked', NULL, 'fp-legacy', 'snapshot-fp',
-                '2026-01-01T00:00:00+00:00',
-                '{"id":"attn-legacy","kind":"worker_status","severity":"warning","status":"blocked","source":"worker:legacy","fingerprint":"fp-legacy"}'
-            );
-            PRAGMA user_version = 3;
-            """
-        )
-
-    init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(attention_items)")}
-        row = conn.execute(
-            """
-            SELECT first_seen_at, last_seen_at, last_changed_at,
-                   resolved_at, lifecycle_status, resolved_reason, signal_count,
-                   payload_json
-            FROM attention_items
-            WHERE host_id = 'legacy-host' AND attention_id = 'attn-legacy'
-            """
-        ).fetchone()
-
-    assert {
-        "first_seen_at",
-        "last_seen_at",
-        "last_changed_at",
-        "resolved_at",
-        "lifecycle_status",
-        "resolved_reason",
-        "signal_count",
-    } <= columns
-    assert row[:7] == (
-        "2026-01-01T00:00:00+00:00",
-        "2026-01-01T00:00:00+00:00",
-        "2026-01-01T00:00:00+00:00",
-        None,
-        "open",
-        None,
-        1,
-    )
-    assert json.loads(row[7])["id"] == "attn-legacy"
-
-
-def test_store_attention_lifecycle_repeats_update_seen_without_duplicate_rows_or_outbox(
-    tmp_path: Path,
+def _save_observation(
+    db_path: Path,
+    snapshot: Any,
+    authority: str,
+    observed_at: str,
 ) -> None:
-    db_path = tmp_path / "attention-repeat.db"
-    config = Config(host_id="attention-host", db_path=db_path)
-    first = _snapshot_with_worker_status(
-        config,
-        status="blocked",
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    repeated = _snapshot_with_worker_status(
-        config,
-        status="blocked",
-        observed_at="2026-01-01T00:05:00+00:00",
+    save_snapshot(
+        db_path,
+        snapshot,
+        observation=SnapshotObservationContext(
+            authority=authority,  # type: ignore[arg-type]
+            observed_at=observed_at,
+        ),
     )
 
-    save_snapshot(db_path, first)
-    first_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
-    save_snapshot(db_path, repeated)
-    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
-    payload = attention_payload_from_store(db_path, "attention-host")
-    outbox_rows = _connector_outbox_rows(db_path)
 
-    assert len(first_rows) == 1
-    assert len(rows) == 1
-    assert rows[0]["id"] == first_rows[0]["id"]
-    assert rows[0]["fingerprint"] == first_rows[0]["fingerprint"]
-    assert rows[0]["lifecycle_status"] == "open"
-    assert rows[0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
-    assert rows[0]["last_seen_at"] == "2026-01-01T00:05:00+00:00"
-    assert rows[0]["last_changed_at"] == "2026-01-01T00:00:00+00:00"
-    assert rows[0]["resolved_at"] is None
-    assert rows[0]["signal_count"] == 2
-    assert payload is not None
-    assert payload["attention"][0]["first_seen_at"] == "2026-01-01T00:00:00+00:00"
-    assert len(outbox_rows) == 1
-    assert outbox_rows[0][0] == "attention"
-    assert "attention_created" in outbox_rows[0][1]
-    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
-    assert "sentinel-private" not in outbox_rows[0][2]
+def _lifecycle_rows(db_path: Path) -> list[tuple[Any, ...]]:
+    with sqlite3.connect(str(db_path)) as conn:
+        return conn.execute(
+            """
+            SELECT host_id, family_key, generation, lifecycle_status,
+                   current_attention_id, first_seen_at, last_positive_at,
+                   first_missing_at, missing_observation_count,
+                   last_accepted_at, last_observation_key,
+                   max_notified_severity_rank
+            FROM attention_lifecycles
+            ORDER BY host_id, family_key
+            """
+        ).fetchall()
 
 
-def test_store_attention_payload_synthesizes_snapshot_attention_without_lifecycle_rows(
+def test_store_default_context_is_non_authoritative_and_snapshot_fallback_remains(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "attention-snapshot-only.db"
@@ -882,177 +1741,1624 @@ def test_store_attention_payload_synthesizes_snapshot_attention_without_lifecycl
         observed_at="2026-01-01T00:00:00+00:00",
     )
     save_snapshot(db_path, snapshot)
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("DELETE FROM attention_items WHERE host_id = ?", ("attention-host",))
 
-    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    assert _lifecycle_rows(db_path) == []
+    assert list_attention_items(db_path, "attention-host") == []
     payload = attention_payload_from_store(db_path, "attention-host")
-
-    assert rows == []
     assert payload is not None
-    assert len(payload["attention"]) == 1
-    item = payload["attention"][0]
-    assert item["id"] == snapshot.attention[0].id
-    assert item["fingerprint"] == snapshot.attention[0].fingerprint
-    assert item["status"] == "blocked"
-    assert item["lifecycle_status"] == "open"
-    assert item["first_seen_at"] == snapshot.updated_at
-    assert item["last_seen_at"] == snapshot.updated_at
-    assert item["last_changed_at"] == snapshot.updated_at
-    assert item["signal_count"] == 1
-    assert item["resolved_at"] is None
-    assert "sentinel-private" not in json.dumps(payload, sort_keys=True)
+    assert payload["attention"][0]["id"] == snapshot.attention[0].id
 
 
-def test_store_attention_escalation_resolves_old_signal_and_dedups_repeats(
+def test_store_late_first_miss_then_positive_stays_generation_one(tmp_path: Path) -> None:
+    db_path = tmp_path / "late-first-miss.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    _save_observation(
+        db_path,
+        _snapshot_with_worker_status(
+            config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+        ),
+        "complete",
+        "2026-01-01T00:00:00+00:00",
+    )
+    _save_observation(
+        db_path,
+        _snapshot_with_worker_status(
+            config, status=None, observed_at="2026-01-01T01:00:00+00:00"
+        ),
+        "complete",
+        "2026-01-01T01:00:00+00:00",
+    )
+    assert _lifecycle_rows(db_path)[0][7:9] == (
+        "2026-01-01T01:00:00+00:00",
+        1,
+    )
+    _save_observation(
+        db_path,
+        _snapshot_with_worker_status(
+            config, status="blocked", observed_at="2026-01-01T01:01:00+00:00"
+        ),
+        "positive",
+        "2026-01-01T01:01:00+00:00",
+    )
+
+    lifecycle = _lifecycle_rows(db_path)[0]
+    assert lifecycle[2:4] == (1, "open")
+    assert lifecycle[7:9] == (None, 0)
+    assert len(_connector_outbox_rows(db_path)) == 1
+
+
+def test_store_resolution_requires_distinct_misses_and_120_seconds(tmp_path: Path) -> None:
+    db_path = tmp_path / "miss-threshold.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    present = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+    )
+    _save_observation(db_path, present, "complete", present.updated_at)
+    miss_10 = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:00:10+00:00"
+    )
+    _save_observation(db_path, miss_10, "complete", miss_10.updated_at)
+    _save_observation(db_path, miss_10, "complete", miss_10.updated_at)
+    assert _lifecycle_rows(db_path)[0][8] == 1
+    miss_129 = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:02:09+00:00"
+    )
+    _save_observation(db_path, miss_129, "complete", miss_129.updated_at)
+    assert _lifecycle_rows(db_path)[0][3:4] == ("open",)
+    assert _lifecycle_rows(db_path)[0][8] == 2
+    miss_130 = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:02:10+00:00"
+    )
+    _save_observation(db_path, miss_130, "complete", miss_130.updated_at)
+
+    lifecycle = _lifecycle_rows(db_path)[0]
+    assert lifecycle[3:5] == ("resolved", None)
+    assert list_attention_items(db_path, "attention-host") == []
+    audit = list_attention_items(
+        db_path, "attention-host", include_resolved=True
+    )
+    assert audit[0]["resolved_reason"] == "gone"
+
+
+def test_store_restart_positive_resets_pending_and_old_clock_cannot_resolve(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "attention-escalation.db"
+    db_path = tmp_path / "restart-pending.db"
     config = Config(host_id="attention-host", db_path=db_path)
+    for status, at, authority in (
+        ("blocked", "2026-01-01T00:00:00+00:00", "complete"),
+        (None, "2026-01-01T00:00:10+00:00", "complete"),
+    ):
+        snapshot = _snapshot_with_worker_status(config, status=status, observed_at=at)
+        _save_observation(db_path, snapshot, authority, at)
+    init_store(db_path)
+    positive = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:01:00+00:00"
+    )
+    _save_observation(db_path, positive, "positive", positive.updated_at)
+    init_store(db_path)
+    later_miss = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:03:00+00:00"
+    )
+    _save_observation(db_path, later_miss, "complete", later_miss.updated_at)
 
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status="blocked",
-            observed_at="2026-01-01T00:00:00+00:00",
-        ),
+    lifecycle = _lifecycle_rows(db_path)[0]
+    assert lifecycle[2:4] == (1, "open")
+    assert lifecycle[7:9] == ("2026-01-01T00:03:00+00:00", 1)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["degraded", "unavailable", "malformed", "unknown", "partial"],
+)
+def test_store_none_authority_is_lifecycle_byte_equivalent(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    db_path = tmp_path / f"none-{outcome}.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    present = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
     )
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status="failed",
-            observed_at="2026-01-01T00:10:00+00:00",
-        ),
+    _save_observation(db_path, present, "complete", present.updated_at)
+    before_lifecycle = _lifecycle_rows(db_path)
+    before_attention = list_attention_items(
+        db_path, "attention-host", include_resolved=True
     )
-    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    before_outbox = _connector_outbox_rows(db_path)
+    degraded = _snapshot_with_worker_status(
+        config,
+        status=None,
+        observed_at="2026-01-01T00:05:00+00:00",
+        health_status="degraded",
+        outcome=outcome,
+    )
+    _save_observation(db_path, degraded, "none", degraded.updated_at)
+
+    assert _lifecycle_rows(db_path) == before_lifecycle
+    assert list_attention_items(
+        db_path, "attention-host", include_resolved=True
+    ) == before_attention
+    assert _connector_outbox_rows(db_path) == before_outbox
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
+
+
+def test_store_incremental_positive_can_escalate_and_clear_but_omission_cannot_miss(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "positive-authority.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    blocked = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+    )
+    _save_observation(db_path, blocked, "positive", blocked.updated_at)
+    omitted = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:01:00+00:00"
+    )
+    _save_observation(db_path, omitted, "positive", omitted.updated_at)
+    assert _lifecycle_rows(db_path)[0][7:9] == (None, 0)
+    first_miss = _snapshot_with_worker_status(
+        config, status=None, observed_at="2026-01-01T00:02:00+00:00"
+    )
+    _save_observation(db_path, first_miss, "complete", first_miss.updated_at)
+    failed = _snapshot_with_worker_status(
+        config, status="failed", observed_at="2026-01-01T00:03:00+00:00"
+    )
+    _save_observation(db_path, failed, "positive", failed.updated_at)
+
+    assert _lifecycle_rows(db_path)[0][7:9] == (None, 0)
+    assert [json.loads(row[2])["event_type"] for row in _connector_outbox_rows(db_path)] == [
+        "attention_created",
+        "attention_escalated",
+    ]
+
+
+def test_store_order_guards_reject_stale_duplicate_and_equal_time_conflict(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ordering.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    first = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:10:00+00:00"
+    )
+    _save_observation(db_path, first, "complete", first.updated_at)
+    baseline = _lifecycle_rows(db_path)
+    stale = _snapshot_with_worker_status(
+        config, status="failed", observed_at="2026-01-01T00:09:00+00:00"
+    )
+    _save_observation(db_path, stale, "positive", stale.updated_at)
+    _save_observation(db_path, first, "complete", first.updated_at)
+    conflict = _snapshot_with_worker_status(
+        config, status="failed", observed_at=first.updated_at
+    )
+    _save_observation(db_path, conflict, "positive", conflict.updated_at)
+    init_store(db_path)
+
+    assert _lifecycle_rows(db_path) == baseline
+    assert len(_connector_outbox_rows(db_path)) == 1
+    newer = _snapshot_with_worker_status(
+        config, status="failed", observed_at="2026-01-01T00:11:00+00:00"
+    )
+    _save_observation(db_path, newer, "positive", newer.updated_at)
+    assert _lifecycle_rows(db_path)[0][9] == newer.updated_at
+
+
+def test_store_escalation_downgrade_one_generation_one_current_pointer(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "escalation.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    for status, at in (
+        ("blocked", "2026-01-01T00:00:00+00:00"),
+        ("failed", "2026-01-01T00:01:00+00:00"),
+        ("failed", "2026-01-01T00:02:00+00:00"),
+        ("blocked", "2026-01-01T00:03:00+00:00"),
+    ):
+        snapshot = _snapshot_with_worker_status(config, status=status, observed_at=at)
+        _save_observation(db_path, snapshot, "positive", at)
+
+    assert _lifecycle_rows(db_path)[0][2:4] == (1, "open")
     current = list_attention_items(db_path, "attention-host")
-    outbox_rows = _connector_outbox_rows(db_path)
-
-    assert len(rows) == 2
     assert len(current) == 1
-    assert current[0]["severity"] == "critical"
-    assert current[0]["status"] == "failed"
-    assert current[0]["first_seen_at"] == "2026-01-01T00:10:00+00:00"
-    assert current[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
-    resolved = [row for row in rows if row["lifecycle_status"] == "resolved"]
-    assert len(resolved) == 1
-    assert resolved[0]["severity"] == "warning"
-    assert resolved[0]["status"] == "blocked"
-    assert resolved[0]["resolved_at"] == "2026-01-01T00:10:00+00:00"
-    assert resolved[0]["resolved_reason"] == "gone"
-    assert len(outbox_rows) == 2
-    assert "attention_created" in outbox_rows[0][1]
-    assert "attention_escalated" in outbox_rows[1][1]
-
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status="failed",
-            observed_at="2026-01-01T00:20:00+00:00",
-        ),
+    assert current[0]["status"] == "blocked"
+    audit = list_attention_items(
+        db_path, "attention-host", include_resolved=True
     )
-    repeated_current = list_attention_items(db_path, "attention-host")
-    assert repeated_current[0]["signal_count"] == 2
-    assert repeated_current[0]["last_seen_at"] == "2026-01-01T00:20:00+00:00"
-    assert repeated_current[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
-    assert len(_connector_outbox_rows(db_path)) == 2
+    assert len(audit) == 2
+    assert {row.get("resolved_reason") for row in audit if row["lifecycle_status"] == "resolved"} == {
+        "superseded"
+    }
+    events = [json.loads(row[2])["event_type"] for row in _connector_outbox_rows(db_path)]
+    assert events == ["attention_created", "attention_escalated"]
 
 
-def test_store_attention_disappearance_resolves_only_from_authoritative_healthy_snapshot(
+def test_store_confirmed_resolution_recurrence_increments_generation_once(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "attention-disappearance.db"
+    db_path = tmp_path / "recurrence.db"
     config = Config(host_id="attention-host", db_path=db_path)
-
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status="blocked",
-            observed_at="2026-01-01T00:00:00+00:00",
-        ),
+    sequence = (
+        ("blocked", "2026-01-01T00:00:00+00:00"),
+        (None, "2026-01-01T00:01:00+00:00"),
+        (None, "2026-01-01T00:03:00+00:00"),
+        ("blocked", "2026-01-01T00:04:00+00:00"),
+        ("blocked", "2026-01-01T00:05:00+00:00"),
     )
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status=None,
-            observed_at="2026-01-01T00:05:00+00:00",
-            health_status="degraded",
-            outcome="malformed_json",
-        ),
-    )
-    degraded_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
+    for status, at in sequence:
+        snapshot = _snapshot_with_worker_status(config, status=status, observed_at=at)
+        _save_observation(
+            db_path,
+            snapshot,
+            "complete" if status is None else "positive",
+            at,
+        )
 
-    assert len(degraded_rows) == 1
-    assert degraded_rows[0]["lifecycle_status"] == "open"
-    assert degraded_rows[0]["last_changed_at"] == "2026-01-01T00:00:00+00:00"
-    assert degraded_rows[0]["resolved_at"] is None
-
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
-            config,
-            status=None,
-            observed_at="2026-01-01T00:10:00+00:00",
-            outcome="empty_healthy",
-        ),
-    )
-    resolved_rows = list_attention_items(db_path, "attention-host", include_resolved=True)
-    current_rows = list_attention_items(db_path, "attention-host")
-
-    assert current_rows == []
-    assert len(resolved_rows) == 1
-    assert resolved_rows[0]["lifecycle_status"] == "resolved"
-    assert resolved_rows[0]["resolved_at"] == "2026-01-01T00:10:00+00:00"
-    assert resolved_rows[0]["resolved_reason"] == "gone"
-    assert resolved_rows[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
+    assert _lifecycle_rows(db_path)[0][2:4] == (2, "open")
+    initial_keys = [
+        row[1]
+        for row in _connector_outbox_rows(db_path)
+        if "attention_created" in row[1]
+    ]
+    assert len(initial_keys) == len(set(initial_keys)) == 2
 
 
-def test_store_attention_recreate_enqueues_new_lifecycle_delivery(tmp_path: Path) -> None:
-    db_path = tmp_path / "attention-recreate.db"
+def test_store_snapshot_lifecycle_outbox_transaction_rolls_back_and_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "atomic.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER abort_attention_outbox
+            BEFORE INSERT ON connector_outbox
+            WHEN NEW.connector = 'attention'
+            BEGIN
+                SELECT RAISE(ABORT, 'outbox rejected');
+            END
+            """
+        )
     config = Config(host_id="attention-host", db_path=db_path)
+    snapshot = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="outbox rejected"):
+        _save_observation(db_path, snapshot, "complete", snapshot.updated_at)
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM attention_lifecycles").fetchone()[0] == 0
+        conn.execute("DROP TRIGGER abort_attention_outbox")
+    _save_observation(db_path, snapshot, "complete", snapshot.updated_at)
+    assert len(_lifecycle_rows(db_path)) == 1
+    assert len(_connector_outbox_rows(db_path)) == 1
 
-    save_snapshot(
-        db_path,
-        _snapshot_with_worker_status(
+
+def test_store_concurrent_identical_saves_produce_one_transition(tmp_path: Path) -> None:
+    db_path = tmp_path / "concurrent-attention.db"
+    init_store(db_path)
+    config = Config(host_id="attention-host", db_path=db_path)
+    snapshot = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+    )
+    errors: list[BaseException] = []
+
+    def save() -> None:
+        try:
+            _save_observation(db_path, snapshot, "complete", snapshot.updated_at)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(_lifecycle_rows(db_path)) == 1
+    assert len(_connector_outbox_rows(db_path)) == 1
+
+
+def test_store_family_isolation_across_hosts_workers_and_kinds(tmp_path: Path) -> None:
+    db_path = tmp_path / "family-isolation.db"
+    config_a = Config(host_id="host-a", db_path=db_path)
+    config_b = Config(host_id="host-b", db_path=db_path)
+    at = "2026-01-01T00:00:00+00:00"
+    for config in (config_a, config_b):
+        projected = project_from_raw(
             config,
+            workers=[
+                {"id": "worker-1", "name": "One", "status": "blocked"},
+                {"id": "worker-2", "name": "Two", "status": "blocked"},
+            ],
+            timestamp=datetime.fromisoformat(at),
+        )
+        if config.host_id == "host-a":
+            data = projected.to_dict()
+            other_kind = dict(data["attention"][0])
+            other_kind.update(
+                {
+                    "id": "attention-other-kind",
+                    "fingerprint": "fingerprint-other-kind",
+                    "kind": "other_condition",
+                }
+            )
+            data["attention"].append(other_kind)
+            projected = store_sqlite.Snapshot.from_dict(data)
+        _save_observation(db_path, projected, "complete", at)
+
+    rows = _lifecycle_rows(db_path)
+    assert len(rows) == 5
+    assert len({(row[0], row[1]) for row in rows}) == 5
+    assert sum(row[0] == "host-a" for row in rows) == 3
+
+
+def test_store_same_family_variant_selection_is_order_independent(tmp_path: Path) -> None:
+    selected_ids: list[str] = []
+    for reverse in (False, True):
+        db_path = tmp_path / f"variants-{reverse}.db"
+        config = Config(host_id="attention-host", db_path=db_path)
+        snapshot = _snapshot_with_worker_status(
+            config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+        )
+        data = snapshot.to_dict()
+        critical = dict(data["attention"][0])
+        critical.update(
+            {
+                "id": "critical-variant",
+                "fingerprint": "critical-fingerprint",
+                "severity": "critical",
+                "status": "failed",
+                "updated_at": "2026-01-01T00:00:01+00:00",
+            }
+        )
+        variants = [data["attention"][0], critical]
+        data["attention"] = list(reversed(variants)) if reverse else variants
+        snapshot = store_sqlite.Snapshot.from_dict(data)
+        _save_observation(db_path, snapshot, "complete", snapshot.updated_at)
+        current = list_attention_items(db_path, "attention-host")
+        assert len(current) == 1
+        selected_ids.append(current[0]["id"])
+    assert selected_ids == ["critical-variant", "critical-variant"]
+
+
+@pytest.mark.parametrize("observed_at", ["not-a-time", "2026-01-01T00:01:00"])
+def test_store_invalid_or_naive_lifecycle_time_is_noop(
+    tmp_path: Path,
+    observed_at: str,
+) -> None:
+    db_path = tmp_path / f"invalid-time-{observed_at.replace(':', '-')}.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    first = _snapshot_with_worker_status(
+        config, status="blocked", observed_at="2026-01-01T00:00:00+00:00"
+    )
+    _save_observation(db_path, first, "complete", first.updated_at)
+    before = (
+        _lifecycle_rows(db_path),
+        list_attention_items(db_path, "attention-host", include_resolved=True),
+        _connector_outbox_rows(db_path),
+    )
+    failed = _snapshot_with_worker_status(
+        config, status="failed", observed_at="2026-01-01T00:01:00+00:00"
+    )
+    _save_observation(db_path, failed, "positive", observed_at)
+    after = (
+        _lifecycle_rows(db_path),
+        list_attention_items(db_path, "attention-host", include_resolved=True),
+        _connector_outbox_rows(db_path),
+    )
+    assert after == before
+
+
+def test_store_strict_order_preserves_subsecond_observations(tmp_path: Path) -> None:
+    db_path = tmp_path / "subsecond-order.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    for at in (
+        "2026-01-01T00:00:00.000001+00:00",
+        "2026-01-01T00:00:00.000002+00:00",
+    ):
+        snapshot = _snapshot_with_worker_status(
+            config, status="blocked", observed_at=at
+        )
+        _save_observation(db_path, snapshot, "positive", at)
+    lifecycle = _lifecycle_rows(db_path)[0]
+    current = list_attention_items(db_path, "attention-host")[0]
+    assert lifecycle[9] == "2026-01-01T00:00:00.000002+00:00"
+    assert current["signal_count"] == 2
+    assert current["last_seen_at"] == lifecycle[9]
+
+
+def test_store_deterministic_30_minute_flap_has_one_episode_and_initial(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "flap.db"
+    config = Config(host_id="attention-host", db_path=db_path)
+    start = datetime.fromisoformat("2026-01-01T00:00:00+00:00")
+    for minute in range(31):
+        at = (start + store_sqlite.timedelta(minutes=minute)).isoformat()
+        status = "blocked" if minute % 2 == 0 else None
+        snapshot = _snapshot_with_worker_status(config, status=status, observed_at=at)
+        _save_observation(
+            db_path,
+            snapshot,
+            "positive" if status is not None else "complete",
+            at,
+        )
+
+    lifecycle = _lifecycle_rows(db_path)[0]
+    assert lifecycle[2:4] == (1, "open")
+    assert lifecycle[7:9] == (None, 0)
+    assert len(list_attention_items(db_path, "attention-host")) == 1
+    assert len(_connector_outbox_rows(db_path)) == 1
+
+
+def _reset_store_to_v4(db_path: Path) -> None:
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TABLE attention_lifecycles")
+        conn.execute("PRAGMA user_version = 4")
+
+
+def _insert_legacy_attention(
+    conn: sqlite3.Connection,
+    *,
+    attention_id: str,
+    source: str,
+    severity: str,
+    status: str,
+    lifecycle_status: str,
+    at: str,
+    first_seen_at: str | None = None,
+    signal_count: int = 1,
+    last_seen_at: str | None = None,
+    last_changed_at: str | None = None,
+) -> None:
+    payload = {
+        "id": attention_id,
+        "source": source,
+        "kind": "worker_status",
+        "severity": severity,
+        "status": status,
+        "fingerprint": f"fp-{attention_id}",
+    }
+    # last_seen_at drives the migration's positive_at; last_changed_at drives its
+    # change/resolve progress. Allowing them to differ from `at` is what lets a
+    # test build a resolved episode whose resolution is newer than its last
+    # positive (the ordering the collapsed default hides).
+    seen_at = last_seen_at or at
+    changed_at = last_changed_at or at
+    resolved_at = (changed_at if lifecycle_status != "open" else None)
+    conn.execute(
+        """
+        INSERT INTO attention_items (
+            host_id, attention_id, source, kind, severity, status, updated_at,
+            fingerprint, snapshot_content_fingerprint, observed_at,
+            first_seen_at, last_seen_at, last_changed_at, resolved_at,
+            lifecycle_status, resolved_reason, signal_count, payload_json
+        ) VALUES (
+            'legacy-host', ?, ?, 'worker_status', ?, ?, ?, ?, 'snapshot-fp', ?,
+            ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            attention_id,
+            source,
+            severity,
+            status,
+            at,
+            f"fp-{attention_id}",
+            at,
+            first_seen_at or at,
+            seen_at,
+            changed_at,
+            resolved_at,
+            lifecycle_status,
+            "gone" if lifecycle_status != "open" else None,
+            signal_count,
+            json.dumps(payload, sort_keys=True),
+        ),
+    )
+
+
+def test_store_v4_collision_migration_is_deterministic_and_preserves_audit(
+    tmp_path: Path,
+) -> None:
+    winners: list[tuple[Any, ...]] = []
+    for reverse in (False, True):
+        db_path = tmp_path / f"collision-{reverse}.db"
+        _reset_store_to_v4(db_path)
+        candidates = [
+            {
+                "attention_id": "attn-blocked",
+                "severity": "warning",
+                "status": "blocked",
+                "lifecycle_status": "open",
+                "at": "2026-01-01T00:01:00+00:00",
+                "first_seen_at": "2026-01-01T00:00:00+00:00",
+                "signal_count": 3,
+            },
+            {
+                "attention_id": "attn-failed",
+                "severity": "critical",
+                "status": "failed",
+                "lifecycle_status": "open",
+                "at": "2026-01-01T00:02:00+00:00",
+                "first_seen_at": "2026-01-01T00:01:00+00:00",
+                "signal_count": 4,
+            },
+            {
+                "attention_id": "attn-resolved",
+                "severity": "critical",
+                "status": "failed",
+                "lifecycle_status": "resolved",
+                "at": "2026-01-01T00:03:00+00:00",
+                "signal_count": 2,
+            },
+        ]
+        with sqlite3.connect(str(db_path)) as conn:
+            for candidate in (
+                reversed(candidates) if reverse else candidates
+            ):
+                _insert_legacy_attention(
+                    conn,
+                    source="worker:legacy",
+                    **candidate,
+                )
+        init_store(db_path)
+        init_store(db_path)
+        with sqlite3.connect(str(db_path)) as conn:
+            lifecycle = conn.execute(
+                """
+                SELECT generation, lifecycle_status, current_attention_id,
+                       first_seen_at, last_positive_at,
+                       max_notified_severity_rank
+                FROM attention_lifecycles
+                """
+            ).fetchone()
+            public_rows = conn.execute(
+                """
+                SELECT attention_id, lifecycle_status, resolved_reason,
+                       signal_count
+                FROM attention_items ORDER BY attention_id
+                """
+            ).fetchall()
+            assert _user_version(conn) == 5
+        winners.append((lifecycle, public_rows))
+
+    assert winners[0] == winners[1]
+    lifecycle, public_rows = winners[0]
+    assert lifecycle == (
+        1,
+        "resolved",
+        None,
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T00:03:00+00:00",
+        2,
+    )
+    assert public_rows == [
+        ("attn-blocked", "resolved", "superseded", 3),
+        ("attn-failed", "resolved", "superseded", 4),
+        ("attn-resolved", "resolved", "gone", 2),
+    ]
+
+
+_MIG_T0 = "2026-01-01T00:00:00+00:00"
+_MIG_T5 = "2026-01-01T00:05:00+00:00"
+_MIG_T10 = "2026-01-01T00:10:00+00:00"
+_MIG_T11 = "2026-01-01T00:11:00+00:00"
+
+
+def _migrate_resolved_skewed_episode(db_path: Path) -> None:
+    """Legacy resolved episode whose resolution (t10) is newer than its last
+    positive (t0), migrated to v5."""
+    _reset_store_to_v4(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-legacy",
+            source="worker:legacy",
+            severity="warning",
             status="blocked",
-            observed_at="2026-01-01T00:00:00+00:00",
-        ),
+            lifecycle_status="resolved",
+            at=_MIG_T0,
+            first_seen_at=_MIG_T0,
+            last_seen_at=_MIG_T0,
+            last_changed_at=_MIG_T10,
+            signal_count=2,
+        )
+    init_store(db_path)
+
+
+def _migrated_lifecycle_row(db_path: Path) -> tuple[Any, ...]:
+    with sqlite3.connect(str(db_path)) as conn:
+        return conn.execute(
+            """
+            SELECT generation, lifecycle_status, current_attention_id,
+                   last_positive_at, last_accepted_at
+            FROM attention_lifecycles
+            """
+        ).fetchone()
+
+
+def _attention_outbox_job_count(db_path: Path) -> int:
+    with sqlite3.connect(str(db_path)) as conn:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM connector_outbox WHERE connector = 'attention'"
+            ).fetchone()[0]
+        )
+
+
+def _legacy_worker_snapshot(status: str, timestamp: str):
+    from datetime import datetime
+
+    config = Config(host_id="legacy-host", db_path=Path("unused"))
+    return project_from_raw(
+        config,
+        workers=[{"id": "legacy", "name": "Legacy Worker", "status": status}],
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": timestamp,
+                "counts": {"workers": 1},
+            }
+        ],
+        timestamp=datetime.fromisoformat(timestamp),
     )
+
+
+def test_migration_resolved_episode_seeds_accepted_watermark_from_resolution(
+    tmp_path: Path,
+) -> None:
+    """The migrated watermark is the resolution progress (t10), not the last
+    positive (t0), and a delayed positive at t5 cannot reopen the lifecycle."""
+    db_path = tmp_path / "skewed-resolved.db"
+    _migrate_resolved_skewed_episode(db_path)
+
+    assert _migrated_lifecycle_row(db_path) == (
+        1,
+        "resolved",
+        None,
+        _MIG_T0,   # last_positive_at = actual latest positive
+        _MIG_T10,  # last_accepted_at = newest lifecycle progress (resolution)
+    )
+    assert _attention_outbox_job_count(db_path) == 0
+
+    # A delayed positive observation timestamped t5 (< the authoritative t10
+    # resolution) must be ignored: no reopen, no generation 2, no job.
     save_snapshot(
         db_path,
-        _snapshot_with_worker_status(
-            config,
-            status=None,
-            observed_at="2026-01-01T00:05:00+00:00",
-            outcome="empty_healthy",
-        ),
+        _legacy_worker_snapshot("blocked", _MIG_T5),
+        observation=SnapshotObservationContext(authority="positive", observed_at=_MIG_T5),
     )
+    assert _migrated_lifecycle_row(db_path) == (1, "resolved", None, _MIG_T0, _MIG_T10)
+    assert _attention_outbox_job_count(db_path) == 0
+
+
+def test_migration_resolved_episode_genuine_later_positive_opens_one_generation(
+    tmp_path: Path,
+) -> None:
+    """A genuine positive after the resolution watermark opens generation 2 and
+    enqueues exactly one notification."""
+    db_path = tmp_path / "genuine-reopen.db"
+    _migrate_resolved_skewed_episode(db_path)
+    assert _attention_outbox_job_count(db_path) == 0
+
     save_snapshot(
         db_path,
-        _snapshot_with_worker_status(
-            config,
+        _legacy_worker_snapshot("blocked", _MIG_T11),
+        observation=SnapshotObservationContext(authority="positive", observed_at=_MIG_T11),
+    )
+    generation, status, current, _positive, accepted = _migrated_lifecycle_row(db_path)
+    assert (generation, status) == (2, "open")
+    assert current is not None
+    assert accepted == _MIG_T11
+    assert _attention_outbox_job_count(db_path) == 1
+
+
+def test_migration_resolved_episode_delayed_complete_miss_is_inert(
+    tmp_path: Path,
+) -> None:
+    """A delayed 'complete' (missing) observation before the resolution watermark
+    cannot mutate the migrated resolved lifecycle."""
+    db_path = tmp_path / "delayed-complete.db"
+    _migrate_resolved_skewed_episode(db_path)
+
+    save_snapshot(
+        db_path,
+        _legacy_worker_snapshot("idle", _MIG_T5),
+        observation=SnapshotObservationContext(authority="complete", observed_at=_MIG_T5),
+    )
+    assert _migrated_lifecycle_row(db_path) == (1, "resolved", None, _MIG_T0, _MIG_T10)
+    assert _attention_outbox_job_count(db_path) == 0
+
+
+def _legacy_attention_job_payload(
+    *,
+    event_type: str = "attention_created",
+    severity: str = "warning",
+    attention_id: str = "attn-legacy",
+    transition_at: str = "2026-01-01T00:00:00+00:00",
+) -> str:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "event_type": event_type,
+            "host_id": "legacy-host",
+            "attention": {
+                "id": attention_id,
+                "source": "worker:legacy",
+                "kind": "worker_status",
+                "severity": severity,
+                "status": "blocked",
+                "fingerprint": "fp-attn-legacy",
+            },
+            "transition_at": transition_at,
+        },
+        sort_keys=True,
+    )
+
+
+def test_store_v4_migration_consolidates_duplicate_jobs_and_preserves_terminal_audit(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migration-jobs.db"
+    _reset_store_to_v4(db_path)
+    created_payload = _legacy_attention_job_payload()
+    escalation_payload = _legacy_attention_job_payload(
+        event_type="attention_escalated", severity="critical"
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-legacy",
+            source="worker:legacy",
+            severity="warning",
             status="blocked",
-            observed_at="2026-01-01T00:10:00+00:00",
+            lifecycle_status="open",
+            at="2026-01-01T00:00:00+00:00",
+        )
+        outbox_ids: dict[str, int] = {}
+        for index, status in enumerate(
+            ("queued", "retry", "deferred", "delivered", "dead_letter")
+        ):
+            cursor = conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
+                """,
+                (
+                    f"legacy-created-{index}",
+                    status,
+                    created_payload,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            outbox_ids[status] = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, 'legacy-host', 'attention', 'legacy-created-3', 1,
+                      'delivered', '{}', '{}', ?, ?)
+            """,
+            (
+                outbox_ids["delivered"],
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        leased_cursor = conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'legacy-created-leased',
+                      'leased', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                created_payload,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, 'legacy-host', 'attention', 'legacy-created-leased', 1,
+                      'leased', '{}', '{}', ?, NULL)
+            """,
+            (
+                int(leased_cursor.lastrowid),
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        for index in range(8):
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, 'queued', ?, '{}', ?, ?, NULL)
+                """,
+                (
+                    f"legacy-escalation-{index}",
+                    escalation_payload,
+                    "2026-01-01T00:01:00+00:00",
+                    "2026-01-01T00:01:00+00:00",
+                ),
+            )
+
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        created_statuses = conn.execute(
+            """
+            SELECT status, private_state_json FROM connector_outbox
+            WHERE delivery_key LIKE 'legacy-created-%'
+            ORDER BY id
+            """
+        ).fetchall()
+        escalation_statuses = conn.execute(
+            """
+            SELECT status, delivery_key FROM connector_outbox
+            WHERE json_extract(payload_json, '$.event_type') = 'attention_escalated'
+            ORDER BY id
+            """
+        ).fetchall()
+        delivered_count = conn.execute(
+            "SELECT COUNT(*) FROM connector_deliveries WHERE status = 'delivered'"
+        ).fetchone()[0]
+    assert created_statuses == [
+        ("superseded", "{}"),
+        ("superseded", "{}"),
+        ("superseded", "{}"),
+        ("delivered", "{}"),
+        ("dead_letter", "{}"),
+        (
+            "leased",
+            next(
+                private
+                for status, private in created_statuses
+                if status == "leased"
+            ),
         ),
+    ]
+    leased_state = json.loads(created_statuses[-1][1])
+    assert leased_state["migration_canonical"] is False
+    assert leased_state["terminal_after_lease"] is True
+    assert sum(status == "queued" for status, _ in escalation_statuses) == 1
+    assert sum(status == "superseded" for status, _ in escalation_statuses) == 8
+    assert delivered_count == 1
+
+
+def test_store_v4_delivered_old_does_not_suppress_active_current_recurrence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migration-delivered-old.db"
+    _reset_store_to_v4(db_path)
+    old_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:00:00+00:00",
     )
+    current_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-current",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:10:00+00:00",
+            first_seen_at="2026-01-01T00:00:00+00:00",
+        )
+        delivered_ids: list[int] = []
+        for key in ("old-delivered-audit", "old-delivered-outbox-only"):
+            cursor = conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, 'delivered', ?, '{}',
+                          ?, ?, NULL)
+                """,
+                (
+                    key,
+                    old_payload,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            delivered_ids.append(int(cursor.lastrowid))
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, 'legacy-host', 'attention', 'old-delivered-audit', 1,
+                      'delivered', '{}', '{}', ?, ?)
+            """,
+            (
+                delivered_ids[0],
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'current-recurrence',
+                      'queued', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                current_payload,
+                "2026-01-01T00:10:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+            ),
+        )
+    init_store(db_path)
 
-    rows = list_attention_items(db_path, "attention-host", include_resolved=True)
-    outbox_rows = _connector_outbox_rows(db_path)
-    delivery_keys = [row[1] for row in outbox_rows]
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT delivery_key, status, payload_json
+            FROM connector_outbox ORDER BY id
+            """
+        ).fetchall()
+    assert [row[1] for row in rows] == [
+        "delivered",
+        "delivered",
+        "superseded",
+        "queued",
+    ]
+    assert json.loads(rows[-1][2])["attention"]["id"] == "attn-current"
+    assert rows[-1][0].startswith("attention:attention_created:")
 
-    assert len(rows) == 1
-    assert rows[0]["lifecycle_status"] == "open"
-    assert rows[0]["last_changed_at"] == "2026-01-01T00:10:00+00:00"
-    assert len(outbox_rows) == 2
-    assert len(set(delivery_keys)) == 2
-    assert all("attention_created" in key for key in delivery_keys)
-    assert all("sentinel-private" not in row[2] for row in outbox_rows)
+
+@pytest.mark.parametrize("with_delivery_audit", [False, True])
+def test_store_v4_delivered_current_episode_suppresses_duplicate(
+    tmp_path: Path,
+    with_delivery_audit: bool,
+) -> None:
+    db_path = tmp_path / f"migration-delivered-current-{with_delivery_audit}.db"
+    _reset_store_to_v4(db_path)
+    payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-current",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:10:00+00:00",
+        )
+        delivered_cursor = conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'current-delivered',
+                      'delivered', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                payload,
+                "2026-01-01T00:10:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+            ),
+        )
+        if with_delivery_audit:
+            conn.execute(
+                """
+                INSERT INTO connector_deliveries (
+                    outbox_id, host_id, connector, delivery_key, attempt,
+                    status, response_json, private_state_json, created_at,
+                    delivered_at
+                ) VALUES (?, 'legacy-host', 'attention', 'current-delivered',
+                          1, 'delivered', '{}', '{}', ?, ?)
+                """,
+                (
+                    int(delivered_cursor.lastrowid),
+                    "2026-01-01T00:10:00+00:00",
+                    "2026-01-01T00:10:01+00:00",
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'current-duplicate',
+                      'queued', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                payload,
+                "2026-01-01T00:10:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+            ),
+        )
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        statuses = conn.execute(
+            "SELECT status FROM connector_outbox ORDER BY id"
+        ).fetchall()
+    assert statuses == [("delivered",), ("superseded",)]
+
+
+@pytest.mark.parametrize(
+    ("dead_at", "expected_statuses"),
+    [
+        (
+            "2026-01-01T00:00:00+00:00",
+            [("dead_letter",), ("superseded",), ("queued",)],
+        ),
+        (
+            "2026-01-01T00:10:00+00:00",
+            [("dead_letter",), ("superseded",)],
+        ),
+    ],
+)
+def test_store_v4_dead_letter_suppresses_only_proven_current_episode(
+    tmp_path: Path,
+    dead_at: str,
+    expected_statuses: list[tuple[str]],
+) -> None:
+    db_path = tmp_path / f"migration-dead-{dead_at[14:19].replace(':', '-')}.db"
+    _reset_store_to_v4(db_path)
+    dead_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at=dead_at,
+    )
+    current_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-current",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:10:00+00:00",
+            first_seen_at="2026-01-01T00:00:00+00:00",
+        )
+        for key, status, payload in (
+            ("current-dead", "dead_letter", dead_payload),
+            ("current-active", "queued", current_payload),
+        ):
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
+                """,
+                (
+                    key,
+                    status,
+                    payload,
+                    "2026-01-01T00:10:00+00:00",
+                    "2026-01-01T00:10:00+00:00",
+                ),
+            )
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        statuses = conn.execute(
+            "SELECT status FROM connector_outbox ORDER BY id"
+        ).fetchall()
+    assert statuses == expected_statuses
+
+
+def test_store_v4_resolved_lifecycle_terminalizes_all_active_jobs(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migration-resolved-active.db"
+    _reset_store_to_v4(db_path)
+    payload = _legacy_attention_job_payload(
+        attention_id="attn-resolved",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-resolved",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="resolved",
+            at="2026-01-01T00:10:00+00:00",
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'resolved-active', 'queued',
+                      ?, '{}', ?, ?, NULL)
+            """,
+            (
+                payload,
+                "2026-01-01T00:10:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+            ),
+        )
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        lifecycle_status = conn.execute(
+            "SELECT lifecycle_status FROM attention_lifecycles"
+        ).fetchone()[0]
+        outbox_status = conn.execute(
+            "SELECT status FROM connector_outbox"
+        ).fetchone()[0]
+    assert (lifecycle_status, outbox_status) == ("resolved", "superseded")
+
+
+
+
+@pytest.mark.parametrize("terminal_action", ["fail", "defer", "expiry"])
+def test_store_v4_current_pollable_outranks_stale_live_lease(
+    tmp_path: Path,
+    terminal_action: str,
+) -> None:
+    db_path = tmp_path / f"migration-stale-lease-{terminal_action}.db"
+    init_store(db_path)
+    old_payload = _legacy_attention_job_payload(
+        attention_id="attn-old",
+        transition_at="2026-01-01T00:00:00+00:00",
+    )
+    current_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-current",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:10:00+00:00",
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'old-leased', 'queued',
+                      ?, '{}', ?, ?, NULL)
+            """,
+            (
+                old_payload,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    old_item = poll_connector_outbox(
+        db_path,
+        "legacy-host",
+        "attention",
+        lease_seconds=30,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'current-queued', 'queued',
+                      ?, '{}', ?, ?, NULL)
+            """,
+            (
+                current_payload,
+                "2026-01-01T00:10:00+00:00",
+                "2026-01-01T00:10:00+00:00",
+            ),
+        )
+        conn.execute("DROP TABLE attention_lifecycles")
+        conn.execute("PRAGMA user_version = 4")
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT delivery_key, status, private_state_json
+            FROM connector_outbox ORDER BY id
+            """
+        ).fetchall()
+    assert [row[1] for row in rows] == ["leased", "superseded", "queued"]
+    stale_state = json.loads(rows[0][2])
+    assert stale_state["migration_canonical"] is False
+    assert stale_state["terminal_after_lease"] is True
+    if terminal_action == "fail":
+        result = fail_connector_delivery(
+            db_path,
+            host_id="legacy-host",
+            name="attention",
+            ref=old_item["ref"],
+            now="2026-01-01T00:00:10+00:00",
+        )
+        assert result["status"] == "superseded"
+    elif terminal_action == "defer":
+        result = defer_connector_delivery(
+            db_path,
+            host_id="legacy-host",
+            name="attention",
+            ref=old_item["ref"],
+            now="2026-01-01T00:00:10+00:00",
+        )
+        assert result["status"] == "superseded"
+    else:
+        result = reclaim_expired_connector_leases(
+            db_path,
+            "legacy-host",
+            "attention",
+            now="2026-01-01T00:00:31+00:00",
+        )
+        assert result["reclaimed"] == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        statuses = conn.execute(
+            "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
+        ).fetchall()
+    assert dict(statuses) == {"queued": 1, "superseded": 2}
+
+
+def test_store_v4_generated_flap_damage_migrates_bounded_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migration-generated-flap.db"
+    _reset_store_to_v4(db_path)
+    current_payload = _legacy_attention_job_payload(
+        attention_id="attn-current",
+        transition_at="2026-01-01T00:10:00+00:00",
+    )
+    old_payload = _legacy_attention_job_payload(
+        attention_id="attn-old",
+        transition_at="2026-01-01T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        for index in range(509):
+            _insert_legacy_attention(
+                conn,
+                attention_id=f"attn-flap-{index:04d}",
+                source="worker:legacy",
+                severity="warning",
+                status="blocked",
+                lifecycle_status="open",
+                at="2026-01-01T00:00:00+00:00",
+                signal_count=2,
+            )
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-current",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:10:00+00:00",
+            signal_count=172,
+        )
+        for index in range(600):
+            status = ("queued", "retry", "deferred")[index % 3]
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, ?, ?, '{}', ?, ?, NULL)
+                """,
+                (
+                    f"flap-active-{index:04d}",
+                    status,
+                    current_payload,
+                    "2026-01-01T00:10:00+00:00",
+                    "2026-01-01T00:10:00+00:00",
+                ),
+            )
+        delivered_cursor = conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'flap-old-delivered',
+                      'delivered', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                old_payload,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt, status,
+                response_json, private_state_json, created_at, delivered_at
+            ) VALUES (?, 'legacy-host', 'attention', 'flap-old-delivered', 1,
+                      'delivered', '{}', '{}', ?, ?)
+            """,
+            (
+                int(delivered_cursor.lastrowid),
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'flap-old-dead',
+                      'dead_letter', ?, '{}', ?, ?, NULL)
+            """,
+            (
+                old_payload,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    def migration_evidence() -> tuple[Any, ...]:
+        with sqlite3.connect(str(db_path)) as conn:
+            lifecycle = conn.execute(
+                """
+                SELECT COUNT(*), lifecycle_status, current_attention_id
+                FROM attention_lifecycles
+                """
+            ).fetchone()
+            attention = conn.execute(
+                """
+                SELECT COUNT(*),
+                       MAX(CASE WHEN lifecycle_status = 'open'
+                                THEN signal_count ELSE 0 END)
+                FROM attention_items
+                """
+            ).fetchone()
+            outbox = dict(
+                conn.execute(
+                    "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
+                ).fetchall()
+            )
+            delivered_audit = conn.execute(
+                """
+                SELECT COUNT(*) FROM connector_deliveries
+                WHERE status = 'delivered'
+                """
+            ).fetchone()[0]
+            canonical_payload = conn.execute(
+                """
+                SELECT payload_json FROM connector_outbox
+                WHERE status = 'queued'
+                """
+            ).fetchall()
+            return (
+                lifecycle,
+                attention,
+                outbox,
+                delivered_audit,
+                canonical_payload,
+                _user_version(conn),
+            )
+
+    init_store(db_path)
+    first = migration_evidence()
+    init_store(db_path)
+    second = migration_evidence()
+    with sqlite3.connect(str(db_path)) as conn:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+    assert first == second
+    lifecycle, attention, outbox, delivered_audit, canonical_payload, version = first
+    assert lifecycle == (1, "open", "attn-current")
+    assert attention == (510, 1190)
+    assert outbox == {
+        "dead_letter": 1,
+        "delivered": 1,
+        "queued": 1,
+        "superseded": 600,
+    }
+    assert delivered_audit == 1
+    assert len(canonical_payload) == 1
+    assert json.loads(canonical_payload[0][0])["attention"]["id"] == "attn-current"
+    assert version == 5
+    assert integrity == "ok"
+
+
+def test_store_v4_migration_retains_single_and_multiple_live_leases_safely(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "migration-leases.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_legacy_attention(
+            conn,
+            attention_id="attn-legacy",
+            source="worker:legacy",
+            severity="warning",
+            status="blocked",
+            lifecycle_status="open",
+            at="2026-01-01T00:00:00+00:00",
+        )
+        created_payload = _legacy_attention_job_payload()
+        escalation_payload = _legacy_attention_job_payload(
+            event_type="attention_escalated", severity="critical"
+        )
+        for index in range(5):
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES ('legacy-host', 'attention', ?, 'queued', ?, '{}', ?, ?, NULL)
+                """,
+                (
+                    f"leased-created-{index}",
+                    created_payload,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at, next_attempt_at
+            ) VALUES ('legacy-host', 'attention', 'leased-escalation', 'queued',
+                      ?, '{}', ?, ?, NULL)
+            """,
+            (
+                escalation_payload,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    leased = poll_connector_outbox(
+        db_path,
+        "legacy-host",
+        "attention",
+        limit=6,
+        lease_seconds=600,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"]
+    assert len(leased) == 6
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TABLE attention_lifecycles")
+        conn.execute("PRAGMA user_version = 4")
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        leased_rows = conn.execute(
+            """
+            SELECT id, delivery_key, private_state_json
+            FROM connector_outbox WHERE status = 'leased' ORDER BY id
+            """
+        ).fetchall()
+        pollable = conn.execute(
+            """
+            SELECT COUNT(*) FROM connector_outbox
+            WHERE status IN ('queued', 'retry', 'deferred')
+            """
+        ).fetchone()[0]
+    assert len(leased_rows) == 6
+    assert pollable == 0
+    created_rows = [row for row in leased_rows if "created" in row[1]]
+    created_states = [json.loads(row[2]) for row in created_rows]
+    assert sum(bool(state["migration_canonical"]) for state in created_states) == 1
+    assert sum(bool(state.get("terminal_after_lease")) for state in created_states) == 4
+    escalation_state = json.loads(
+        next(row[2] for row in leased_rows if row[1] == "leased-escalation")
+    )
+    assert escalation_state["migration_canonical"] is True
+    assert "terminal_after_lease" not in escalation_state
+
+    items_by_key = {item["key"]: item for item in leased}
+    canonical_created = next(
+        row for row in created_rows if json.loads(row[2])["migration_canonical"]
+    )
+    duplicate_created = [
+        row
+        for row in created_rows
+        if json.loads(row[2]).get("terminal_after_lease")
+    ]
+    canonical_ack = ack_connector_delivery(
+        db_path,
+        host_id="legacy-host",
+        name="attention",
+        ref=items_by_key[canonical_created[1]]["ref"],
+        now="2026-01-01T00:00:05+00:00",
+    )
+    assert canonical_ack["status"] == "acknowledged"
+    with sqlite3.connect(str(db_path)) as conn:
+        sibling_states = [
+            json.loads(row[0])
+            for row in conn.execute(
+                """
+                SELECT private_state_json FROM connector_outbox
+                WHERE status = 'leased'
+                  AND delivery_key LIKE 'leased-created-%'
+                """
+            ).fetchall()
+        ]
+    assert len(sibling_states) == 4
+    assert all(state["terminal_after_lease"] for state in sibling_states)
+
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="legacy-host",
+        name="attention",
+        ref=items_by_key[duplicate_created[0][1]]["ref"],
+        now="2026-01-01T00:00:10+00:00",
+    )
+    deferred = defer_connector_delivery(
+        db_path,
+        host_id="legacy-host",
+        name="attention",
+        ref=items_by_key[duplicate_created[1][1]]["ref"],
+        now="2026-01-01T00:00:20+00:00",
+    )
+    assert failed["status"] == deferred["status"] == "superseded"
+    with sqlite3.connect(str(db_path)) as conn:
+        expiring = duplicate_created[2]
+        delivery = conn.execute(
+            """
+            SELECT id, private_state_json FROM connector_deliveries
+            WHERE outbox_id = ? AND status = 'leased'
+            """,
+            (expiring[0],),
+        ).fetchone()
+        delivery_state = json.loads(delivery[1])
+        delivery_state["lease_expires_at"] = "2026-01-01T00:00:30+00:00"
+        conn.execute(
+            "UPDATE connector_deliveries SET private_state_json = ? WHERE id = ?",
+            (json.dumps(delivery_state, sort_keys=True), delivery[0]),
+        )
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        "legacy-host",
+        "attention",
+        now="2026-01-01T00:01:00+00:00",
+    )
+    assert reclaimed["reclaimed"] == 1
+    duplicate_ack = ack_connector_delivery(
+        db_path,
+        host_id="legacy-host",
+        name="attention",
+        ref=items_by_key[duplicate_created[3][1]]["ref"],
+        now="2026-01-01T00:01:30+00:00",
+    )
+    assert duplicate_ack["status"] == "acknowledged"
+    single_ack = ack_connector_delivery(
+        db_path,
+        host_id="legacy-host",
+        name="attention",
+        ref=items_by_key["leased-escalation"]["ref"],
+        now="2026-01-01T00:02:00+00:00",
+    )
+    assert single_ack["status"] == canonical_ack["status"] == "acknowledged"
+    with sqlite3.connect(str(db_path)) as conn:
+        statuses = conn.execute(
+            "SELECT status, COUNT(*) FROM connector_outbox GROUP BY status"
+        ).fetchall()
+    assert dict(statuses) == {"delivered": 3, "superseded": 3}
 
 
 def _worker_binding(
@@ -1307,9 +3613,9 @@ def test_store_save_snapshot_updates_pr6_projections_and_prunes_by_host(tmp_path
         ],
     )
 
-    save_snapshot(db_path, snapshot_a_old)
-    save_snapshot(db_path, snapshot_b)
-    save_snapshot(db_path, snapshot_a_new)
+    _save_observation(db_path, snapshot_a_old, "positive", snapshot_a_old.updated_at)
+    _save_observation(db_path, snapshot_b, "positive", snapshot_b.updated_at)
+    _save_observation(db_path, snapshot_a_new, "positive", snapshot_a_new.updated_at)
 
     with sqlite3.connect(str(db_path)) as conn:
         host_a_workers = conn.execute(
@@ -1469,10 +3775,12 @@ def test_source_turn_without_matching_prompt_does_not_inherit_old_command_origin
         observed_at="2026-01-01T00:01:00+00:00",
     )
     payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
-    source_rows = [turn for turn in payload["turns"] if turn.get("source_turn_id") == "source-unmatched"]
+    source_rows = [turn for turn in payload["turns"] if turn.get("assistant_final_text") == "Monitor changed state."]
 
     assert updated == 1
     assert len(source_rows) == 1
+    assert source_rows[0]["source_turn_id"].startswith("turnsrc-")
+    assert "source-unmatched" not in json.dumps(payload, sort_keys=True)
     assert source_rows[0]["assistant_final_text"] == "Monitor changed state."
     assert source_rows[0].get("origin_command_id") is None
     assert source_rows[0]["source"] == "snapshot"
@@ -1511,10 +3819,12 @@ def test_source_turn_with_matching_prompt_keeps_command_origin(tmp_path: Path) -
         observed_at="2026-01-01T00:01:00+00:00",
     )
     payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
-    source_rows = [turn for turn in payload["turns"] if turn.get("source_turn_id") == "source-matched"]
+    source_rows = [turn for turn in payload["turns"] if turn.get("assistant_final_text") == "Done."]
 
     assert updated == 1
     assert len(source_rows) == 1
+    assert source_rows[0]["source_turn_id"].startswith("turnsrc-")
+    assert "source-matched" not in json.dumps(payload, sort_keys=True)
     assert source_rows[0]["origin_command_id"] == "req-1"
     assert source_rows[0]["source"] == "command"
 
@@ -1911,21 +4221,77 @@ def test_source_turn_history_is_capped(tmp_path: Path) -> None:
     assert source_rows[0]["assistant_final_text"] == "answer 9"
 
 
-def test_connect_context_manager_closes_connection(tmp_path: Path) -> None:
-    """Regression: ``with _connect(...) as conn:`` must CLOSE the connection on exit.
+@pytest.mark.parametrize("failure_phase", ["construction", "pragma"])
+def test_connect_closes_parent_fd_on_construction_and_pragma_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    db_path = tmp_path / "fd-failure.db"
+    init_store(db_path)
+    before = set(os.listdir("/proc/self/fd"))
+    original_connect = sqlite3.connect
+    created: list[sqlite3.Connection] = []
 
-    sqlite3's context manager commits/rolls back but does not close the
-    connection. Relying on GC to close it leaks the db + WAL file descriptors
-    under the long-running daemon (polled every few seconds) until the process
-    hits its open-file limit and crashes on accept() (EMFILE). ``_connect`` now
-    closes on ``__exit__``.
-    """
+    def controlled_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if failure_phase == "construction":
+            raise RuntimeError("controlled construction failure")
+        conn = original_connect(*args, **kwargs)
+        created.append(conn)
+        return conn
+
+    def fail_pragmas(conn: sqlite3.Connection, db_path: Path | str) -> None:
+        raise RuntimeError("controlled pragma failure")
+
+    monkeypatch.setattr(store_sqlite.sqlite3, "connect", controlled_connect)
+    if failure_phase == "pragma":
+        monkeypatch.setattr(store_sqlite, "_apply_connection_pragmas", fail_pragmas)
+
+    with pytest.raises(RuntimeError):
+        store_sqlite._connect(db_path)
+
+    assert set(os.listdir("/proc/self/fd")) == before
+    for conn in created:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_connect_factory_mismatch_closes_connection_and_parent_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "factory-mismatch.db"
+    init_store(db_path)
+    before = set(os.listdir("/proc/self/fd"))
+
+    class UnexpectedConnection:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    unexpected = UnexpectedConnection()
+    monkeypatch.setattr(store_sqlite.sqlite3, "connect", lambda *args, **kwargs: unexpected)
+
+    with pytest.raises(LocalStateError) as caught:
+        store_sqlite._connect(db_path)
+
+    assert unexpected.closed is True
+    assert caught.value.code is LocalStateErrorCode.OPERATION_FAILED
+    assert str(db_path) not in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    assert set(os.listdir("/proc/self/fd")) == before
+
+
+def test_connect_context_manager_closes_connection(tmp_path: Path) -> None:
+    """The connection and its retained parent descriptor close on context exit."""
     db_path = tmp_path / "fd-leak.db"
     init_store(db_path)
+    before = set(os.listdir("/proc/self/fd"))
+
     with store_sqlite._connect(db_path) as conn:
         assert conn.execute("SELECT 1").fetchone() == (1,)
-    try:
+
+    with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
-    except sqlite3.ProgrammingError:
-        return
-    raise AssertionError("_connect left the connection open after the with-block (fd leak)")
+    assert set(os.listdir("/proc/self/fd")) == before

@@ -328,7 +328,7 @@ def test_subscription_ack_events_and_stream_termination(tmp_path: Path) -> None:
         client.close()
 
 
-def test_subscription_accepts_uncorrelated_legacy_event_frames(tmp_path: Path) -> None:
+def test_subscription_accepts_uncorrelated_idless_event_data_frames(tmp_path: Path) -> None:
     events = [
         {"event": "pane_agent_status_changed", "data": {"status": "blocked"}},
         {"event": "pane_closed", "data": {"pane_id": "p-1"}},

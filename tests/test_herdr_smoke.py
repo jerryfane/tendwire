@@ -12,6 +12,7 @@ SMOKE_SCRIPT = PROJECT_ROOT / "scripts" / "herdr_smoke.py"
 FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "herdr" / "live_smoke"
 OK_FIXTURES = FIXTURE_ROOT / "ok"
 NEGATIVE_FIXTURES = FIXTURE_ROOT / "negative_private"
+RAW_STATUS_FIXTURE = PROJECT_ROOT / "tests" / "fixtures" / "herdr" / "event_replay" / "status_transitions.json"
 
 REQUIRED_CHECKS = {
     "create_attach",
@@ -67,6 +68,8 @@ PRIVATE_MARKERS = (
     "private fingerprint abc123",
     "pane-secret",
     "agent-secret",
+    "pane-1",
+    "status_transitions.json",
 )
 
 
@@ -481,7 +484,22 @@ def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypat
     assert _check_by_name(data, "observe")["worker_count"] == 2
     assert _check_by_name(data, "send_addressing")["send_attempts"] == 1
     assert _check_by_name(data, "target_validation")["rejected_send_attempts"] == 0
-    assert _check_by_name(data, "status_agent_status_changed")["changed_count"] == 1
+    status_check = _check_by_name(data, "status_agent_status_changed")
+    assert status_check["changed_count"] == 1
+    assert status_check["event_count"] == 4
+    assert status_check["accepted_count"] == 4
+    assert status_check["exact_shape"] is True
+    assert status_check["idless"] is True
+    assert status_check["order_preserved"] is True
+    assert status_check["final_source_status"] == "working"
+    assert status_check["final_status"] == "active"
+    assert status_check["status_buckets"] == ["active"]
+    assert status_check["persistence_unchanged"] is True
+    assert status_check["repeat_effect_count"] == 0
+    assert status_check["repeat_snapshot_delta"] == 0
+    assert status_check["repeat_event_delta"] == 0
+    assert status_check["repeat_attention_delta"] == 0
+    assert status_check["repeat_queue_delta"] == 0
     assert _check_by_name(data, "pane_moved_binding_update")["preserved"] is True
     assert _check_by_name(data, "close_exited")["exited_count"] == 1
     assert _check_by_name(data, "degraded_backend_preserves_workers")["preserved"] is True
@@ -503,6 +521,42 @@ def test_fixture_replay_is_deterministic_and_public_safe(smoke_module, monkeypat
         assert raw_name not in public_text
 
 
+def test_raw_status_fixture_replays_exact_idless_envelopes_without_duplicate_effects(smoke_module):
+    aggregate = json.loads((OK_FIXTURES / "status_agent_status_changed.json").read_text())
+    replay_path = (OK_FIXTURES / aggregate["replay_fixture"]).resolve()
+    assert replay_path == RAW_STATUS_FIXTURE.resolve()
+
+    envelopes = json.loads(replay_path.read_text())
+    assert len(envelopes) == 4
+    assert all(list(envelope) == ["event", "data"] for envelope in envelopes)
+    assert all(envelope["event"] == "pane.agent_status_changed" for envelope in envelopes)
+    assert [envelope["data"]["status"] for envelope in envelopes] == [
+        "working",
+        "idle",
+        "working",
+        "working",
+    ]
+    assert envelopes[-1] == envelopes[-2]
+    assert smoke_module._contains_synthetic_event_identity(envelopes) is False
+
+    replay = smoke_module._replay_fixture_status_events(replay_path)
+    assert replay["exact_shape"] is True
+    assert replay["idless"] is True
+    assert replay["source_statuses"] == ("working", "idle", "working", "working")
+    assert replay["accepted"] == (True, True, True, True)
+    assert replay["canonical_statuses"] == ("active", "idle", "active", "active")
+    assert replay["order_preserved"] is True
+    assert replay["final_source_status"] == "working"
+    assert replay["final_status"] == "active"
+    assert replay["changed_count"] == 1
+    assert replay["repeat_row_deltas"] == {
+        "snapshots": 0,
+        "events": 0,
+        "attention_items": 0,
+        "connector_outbox": 0,
+    }
+
+
 def test_deterministic_target_validation_sends_only_valid_case(smoke_module):
     calls = []
 
@@ -517,7 +571,18 @@ def test_deterministic_target_validation_sends_only_valid_case(smoke_module):
     assert calls == ["valid"]
 
 
-def test_deterministic_event_backend_covers_move_close_exited_and_degraded(smoke_module):
+def test_deterministic_event_backend_covers_move_close_exited_and_degraded(smoke_module, monkeypatch):
+    smoke_module._ensure_src_on_path()
+    from tendwire.backends.herdr_events import HerdrEventBackend
+
+    recorded_envelopes = []
+    original_queue = HerdrEventBackend.queue_event_envelope
+
+    def recording_queue(self, envelope, *, flush=None):
+        recorded_envelopes.append(dict(envelope))
+        return original_queue(self, envelope, flush=flush)
+
+    monkeypatch.setattr(HerdrEventBackend, "queue_event_envelope", recording_queue)
     checks = smoke_module._deterministic_event_backend_checks()
 
     assert checks["status_agent_status_changed"]["changed_count"] == 1
@@ -527,6 +592,14 @@ def test_deterministic_event_backend_covers_move_close_exited_and_degraded(smoke
     assert checks["close_exited"]["exited_count"] == 1
     assert checks["degraded_backend_preserves_workers"]["preserved"] is True
     assert checks["degraded_backend_preserves_workers"]["worker_count_before"] == checks["degraded_backend_preserves_workers"]["worker_count_after"]
+
+    assert [envelope["event"] for envelope in recorded_envelopes] == [
+        "pane.agent_status_changed",
+        "pane.moved",
+        "pane.exited",
+    ]
+    assert all(set(envelope) == {"event", "data"} for envelope in recorded_envelopes)
+    assert smoke_module._contains_synthetic_event_identity(recorded_envelopes) is False
 
 
 def test_event_subscription_builder_rejects_unknown_and_legacy_names(smoke_module):

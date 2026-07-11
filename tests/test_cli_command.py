@@ -36,6 +36,15 @@ from tendwire.store.sqlite import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cli_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    private_home = tmp_path / "home"
+    private_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(private_home))
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path / "tendwire-data"))
+    monkeypatch.delenv("TENDWIRE_DB_PATH", raising=False)
+
+
 def _fake_herdr_state(config: Any) -> tuple[list[Space], list[Worker]]:
     workers = [
         Worker(

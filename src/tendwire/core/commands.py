@@ -17,6 +17,10 @@ from .models import (
     FORBIDDEN_FIELD_NAMES,
     Snapshot,
     Worker,
+    public_json_dumps,
+    sanitize_public_mapping,
+    sanitize_public_text,
+    sanitize_public_value,
     sanitize_forbidden_fields,
     stable_fingerprint,
     stable_json_dumps,
@@ -107,7 +111,7 @@ def sanitize_command_result(value: Any) -> Any:
     Command results share the same public forbidden-key superset as snapshots,
     turns, and pending interactions so public JSON surfaces do not drift.
     """
-    return sanitize_forbidden_fields(value)
+    return sanitize_public_value(value)
 
 
 def _clean_mapping(value: Any) -> dict[str, Any] | None:
@@ -116,6 +120,12 @@ def _clean_mapping(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return {str(k): v for k, v in value.items()}
     return {}
+
+
+def _clean_public_mapping(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return sanitize_public_mapping(value)
 
 
 def _find_forbidden_fields(value: Any, path: str = "$") -> list[str]:
@@ -139,11 +149,13 @@ def error_value(
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a neutral, sanitized error object."""
-    return {
-        "code": _string_value(code, STATUS_REJECTED),
-        "message": _string_value(message),
-        "details": sanitize_forbidden_fields(details) if details else {},
-    }
+    return sanitize_public_mapping(
+        {
+            "code": _string_value(code, STATUS_REJECTED),
+            "message": _string_value(message),
+            "details": details or {},
+        }
+    )
 
 
 def instruction_text_error(code: str, message: str) -> dict[str, Any]:
@@ -457,9 +469,13 @@ class CommandEnvelope:
         object.__setattr__(self, "action", _string_value(self.action))
         object.__setattr__(self, "request_id", _optional_string(self.request_id))
         object.__setattr__(self, "dry_run", bool(self.dry_run))
-        object.__setattr__(self, "result", _clean_mapping(self.result))
-        object.__setattr__(self, "error", _clean_mapping(self.error))
-        object.__setattr__(self, "warnings", [str(w) for w in self.warnings])
+        object.__setattr__(self, "result", _clean_public_mapping(self.result))
+        object.__setattr__(self, "error", _clean_public_mapping(self.error))
+        object.__setattr__(
+            self,
+            "warnings",
+            [clean for warning in self.warnings if (clean := sanitize_public_text(warning))],
+        )
         object.__setattr__(self, "schema_version", int(self.schema_version))
 
     def to_dict(self) -> dict[str, Any]:
@@ -478,7 +494,7 @@ class CommandEnvelope:
         )
 
     def to_json(self, indent: int | None = None) -> str:
-        return stable_json_dumps(self.to_dict(), indent=indent)
+        return public_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommandEnvelope":

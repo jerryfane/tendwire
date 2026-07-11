@@ -7,13 +7,25 @@ import signal
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import Config
 from .core.commands import CommandEnvelope
-from .core.models import Snapshot, sanitize_forbidden_fields, utc_timestamp
+from .core.models import Snapshot, sanitize_public_mapping, utc_timestamp
 from .daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
+from .local_state import repair_config_state
+
+
+def _valid_observation_timestamp(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
 
 
 def default_socket_path(config: Config) -> Path:
@@ -64,6 +76,7 @@ class TendwireDaemon:
     ) -> None:
         self.config = config
         self.socket_path = Path(socket_path) if socket_path is not None else default_socket_path(config)
+        self._prepare_socket_parent = socket_path is None and config.socket_path is None
         self.hooks = hooks or DaemonHooks()
         self.stop_event = stop_event or threading.Event()
         self.started_at = utc_timestamp()
@@ -80,13 +93,21 @@ class TendwireDaemon:
         return self._server
 
     def start(self) -> None:
+        if self._server is not None and self._server.listening:
+            return
+        if self.stop_event.is_set():
+            raise RuntimeError("daemon cannot start after shutdown")
         if self.config.db_path is None:
             raise RuntimeError("daemon requires a sqlite db path")
-        self.hooks.init_store(Path(self.config.db_path))
-        if self.config.herdr_backend == "socket":
-            self._snapshot = self._start_socket_event_backend()
-        else:
-            self._snapshot = self.hooks.observe_initial_snapshot(self.config)
+        repair_config_state(
+            self.config.data_dir,
+            self.config.db_path,
+            private_files=(
+                self.config.installation_key_path,
+                self.config.installation_key_marker_path,
+                self.config.installation_key_sentinel_path,
+            ),
+        )
 
         api = TendwireDaemonAPI(
             get_snapshot=self.get_snapshot,
@@ -97,12 +118,46 @@ class TendwireDaemon:
             get_pending=self.get_pending,
             connector_call=self.connector_call,
         )
-        self._server = UnixSocketJSONServer(
+        server = UnixSocketJSONServer(
             self.socket_path,
             api.dispatch,
             stop_event=self.stop_event,
+            socket_group=self.config.socket_group,
+            prepare_parent=self._prepare_socket_parent,
         )
-        self._server.start()
+        self._server = server
+        try:
+            server.start()
+        except Exception:
+            try:
+                server.close()
+            except Exception:
+                pass
+            else:
+                self._server = None
+            raise
+        try:
+            self.hooks.init_store(Path(self.config.db_path))
+            if self.config.herdr_backend == "socket":
+                self._snapshot = self._start_socket_event_backend()
+            else:
+                self._snapshot = self.hooks.observe_initial_snapshot(self.config)
+        except Exception:
+            backend = self._event_backend
+            self._event_backend = None
+            if backend is not None:
+                try:
+                    backend.stop()
+                except Exception:
+                    pass
+            try:
+                server.close()
+            except Exception:
+                pass
+            else:
+                self._server = None
+            self._snapshot = None
+            raise
 
     def serve_forever(self) -> None:
         if self._server is None:
@@ -114,10 +169,15 @@ class TendwireDaemon:
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self._event_backend is not None:
-            self._event_backend.stop()
-        if self._server is not None:
-            self._server.close()
+        server = self._server
+        backend = self._event_backend
+        self._event_backend = None
+        try:
+            if server is not None:
+                server.close()
+        finally:
+            if backend is not None:
+                backend.stop()
 
     def _start_socket_event_backend(self) -> Snapshot:
         if self.hooks.event_backend_factory is None:
@@ -128,7 +188,7 @@ class TendwireDaemon:
             backend = self.hooks.event_backend_factory(self.config, self.stop_event)
         self._event_backend = backend
         backend.start(wait_for_reconcile=True)
-        from .store.sqlite import latest_snapshot, save_snapshot
+        from .store.sqlite import SnapshotObservationContext, latest_snapshot, save_snapshot
 
         snapshot = latest_snapshot(Path(self.config.db_path), self.config.host_id)
         if snapshot is not None:
@@ -145,7 +205,14 @@ class TendwireDaemon:
             self.config,
             backend_health=[backend_health],
         )
-        save_snapshot(Path(self.config.db_path), snapshot)
+        save_snapshot(
+            Path(self.config.db_path),
+            snapshot,
+            observation=SnapshotObservationContext(
+                authority="none",
+                observed_at=_valid_observation_timestamp(backend_health.observed_at),
+            ),
+        )
         return snapshot
 
     def get_snapshot(self) -> Snapshot:
@@ -227,7 +294,7 @@ class TendwireDaemon:
             },
             "backend_health": [health.to_dict() for health in snapshot.backend_health],
         }
-        return sanitize_forbidden_fields(payload)
+        return sanitize_public_mapping(payload)
 
     def get_attention(self) -> Mapping[str, Any]:
         if self.config.db_path is not None:

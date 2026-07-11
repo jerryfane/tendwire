@@ -43,8 +43,10 @@ from .core.projector import project_from_observations
 from .core.models import (
     BackendHealth,
     WorkerBinding,
-    sanitize_forbidden_fields,
+    public_json_dumps,
+    sanitize_public_mapping,
     separate_duplicate_worker_bindings,
+    stable_json_dumps,
     utc_timestamp,
 )
 from .core.turns import (
@@ -52,7 +54,7 @@ from .core.turns import (
     pending_payload_from_snapshot,
     turns_payload_from_snapshot,
 )
-from .core.models import stable_json_dumps
+from .local_state import repair_config_state
 from .store.sqlite import (
     attention_payload_from_store,
     envelope_to_receipt_json,
@@ -232,6 +234,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Unix socket path to listen on (default: data_dir/tendwire.sock).",
     )
+    daemon_parser.add_argument(
+        "--socket-group",
+        dest="socket_group",
+        default=argparse.SUPPRESS,
+        metavar="GROUP",
+        help="Share the daemon socket with a validated local group.",
+    )
 
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -349,7 +358,8 @@ def _legacy_backend_health(spaces: list[Any], workers: list[Any]) -> list[Backen
 def _fetch_snapshot_observation_with_bindings(
     config: Config,
     stored_bindings: list[WorkerBinding],
-) -> tuple[list[Any], list[Any], list[WorkerBinding], list[BackendHealth]]:
+) -> tuple[list[Any], list[Any], list[WorkerBinding], list[BackendHealth], bool]:
+    complete_barrier = False
     if fetch_herdr_state is not _DEFAULT_FETCH_HERDR_STATE:
         spaces, workers, bindings = _fetch_state_with_bindings(config, stored_bindings)
         backend_health = _legacy_backend_health(spaces, workers)
@@ -367,19 +377,20 @@ def _fetch_snapshot_observation_with_bindings(
             workers = list(getattr(observation, "workers", []) or [])
             bindings = list(getattr(observation, "bindings", []) or [])
             backend_health = list(getattr(observation, "backend_health", []) or [])
+            complete_barrier = bool(backend_health)
             if not backend_health:
                 backend_health = _legacy_backend_health(spaces, workers)
 
     health = _herdr_health_from_items(backend_health)
     if health.status == "healthy":
-        return spaces, workers, bindings, backend_health
+        return spaces, workers, bindings, backend_health, complete_barrier
 
     # Failed observations are not an authority for routing or continuity.
     # Never persist their bindings, and retain the last authenticated public
     # state when one has already been stored.
     bindings = []
     if config.db_path is None:
-        return spaces, workers, bindings, backend_health
+        return spaces, workers, bindings, backend_health, complete_barrier
 
     db_path = Path(config.db_path)
     latest = latest_snapshot(db_path, config.host_id)
@@ -410,7 +421,7 @@ def _fetch_snapshot_observation_with_bindings(
     ]
     if not any(item.name == _HERDR_BACKEND for item in backend_health):
         backend_health.append(retained_health)
-    return spaces, workers, bindings, backend_health
+    return spaces, workers, bindings, backend_health, complete_barrier
 
 
 def _fetch_command_observation_with_bindings(
@@ -480,9 +491,11 @@ def observe_public_snapshot(
     # worker ids stable across snapshots. Skipping them re-letters duplicate
     # worker names (claude, claude-1, ...) from scratch on every observation.
     stored_bindings = _load_worker_bindings(config)
-    spaces, workers, bindings, backend_health = _fetch_snapshot_observation_with_bindings(
-        config,
-        stored_bindings,
+    spaces, workers, bindings, backend_health, complete_barrier = (
+        _fetch_snapshot_observation_with_bindings(
+            config,
+            stored_bindings,
+        )
     )
     snapshot = project_from_observations(
         config,
@@ -492,11 +505,26 @@ def observe_public_snapshot(
     )
 
     if store_snapshot:
-        from .store.sqlite import save_snapshot
+        from .store.sqlite import SnapshotObservationContext, save_snapshot
 
         if config.db_path is None:
             raise RuntimeError("snapshot persistence requires a db path")
-        save_snapshot(config.db_path, snapshot)
+        health = _herdr_health_from_items(backend_health)
+        authority = (
+            "complete"
+            if complete_barrier
+            and health.status == "healthy"
+            and health.outcome in {"healthy_non_empty", "empty_healthy"}
+            else "none"
+        )
+        save_snapshot(
+            config.db_path,
+            snapshot,
+            observation=SnapshotObservationContext(
+                authority=authority,
+                observed_at=health.observed_at,
+            ),
+        )
         _persist_binding_observation(
             config,
             bindings,
@@ -523,21 +551,28 @@ def _try_daemon_attempt(
         if config.herdr_backend != "socket":
             return _DaemonAttempt(error_kind="unavailable")
         socket_path = config.data_dir / "tendwire.sock"
-        if not socket_path.exists():
-            return _DaemonAttempt(error_kind="unavailable")
 
     try:
         from .daemon_api import DaemonAPIClient, DaemonAPIError, DaemonUnavailable
     except Exception:
         return _DaemonAttempt(error_kind="unavailable")
     try:
-        response = DaemonAPIClient(
-            socket_path,
-            timeout_seconds=_daemon_client_timeout_seconds(config, method),
-        ).request(method, params or {})
+        timeout_seconds = _daemon_client_timeout_seconds(config, method)
+        if config.socket_group is None:
+            client = DaemonAPIClient(
+                socket_path,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            client = DaemonAPIClient(
+                socket_path,
+                timeout_seconds=timeout_seconds,
+                socket_group=config.socket_group,
+            )
+        response = client.request(method, params or {})
     except DaemonUnavailable as exc:
         cause = exc.__cause__
-        if isinstance(cause, (TimeoutError, socket.timeout)):
+        if exc.timed_out or isinstance(cause, (TimeoutError, socket.timeout)):
             return _DaemonAttempt(error_kind="timeout")
         return _DaemonAttempt(error_kind="unavailable")
     except DaemonAPIError:
@@ -546,7 +581,7 @@ def _try_daemon_attempt(
         return _DaemonAttempt(error_kind="protocol")
     result = response.get("result")
     if isinstance(result, dict):
-        return _DaemonAttempt(result=sanitize_forbidden_fields(result))
+        return _DaemonAttempt(result=sanitize_public_mapping(result))
     return _DaemonAttempt(error_kind="protocol")
 
 
@@ -593,7 +628,7 @@ def cmd_snapshot(
     if json_output:
         daemon_result = None if store_snapshot else _try_daemon_result(config, "snapshot.get")
         if daemon_result is not None:
-            print(stable_json_dumps(daemon_result, indent=2))
+            print(public_json_dumps(daemon_result, indent=2))
         else:
             snapshot = observe_public_snapshot(config, store_snapshot=store_snapshot)
             print(snapshot.to_json(indent=2))
@@ -640,17 +675,17 @@ def cmd_attention(
     if not store_snapshot:
         daemon_result = _try_daemon_result(config, "attention.list")
         if daemon_result is not None:
-            print(stable_json_dumps(daemon_result, indent=2))
+            print(public_json_dumps(daemon_result, indent=2))
             return 0
     if store_snapshot:
         observe_public_snapshot(config, store_snapshot=True)
     if config.db_path is not None:
         payload = attention_payload_from_store(config.db_path, config.host_id)
         if payload is not None:
-            print(stable_json_dumps(payload, indent=2))
+            print(public_json_dumps(payload, indent=2))
             return 0
     snapshot = _current_public_snapshot(config)
-    print(stable_json_dumps(attention_payload_from_snapshot(snapshot), indent=2))
+    print(public_json_dumps(attention_payload_from_snapshot(snapshot), indent=2))
     return 0
 
 
@@ -857,9 +892,11 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
         )
     else:
         stored_bindings = _load_worker_bindings(config)
-        spaces, workers, current_bindings, backend_health = _fetch_snapshot_observation_with_bindings(
-            config,
-            stored_bindings,
+        spaces, workers, current_bindings, backend_health, _complete_barrier = (
+            _fetch_snapshot_observation_with_bindings(
+                config,
+                stored_bindings,
+            )
         )
         workers = rehydrate_workers_from_bindings(
             workers,
@@ -953,7 +990,7 @@ def cmd_command(
             daemon_attempt = _try_daemon_attempt(config, "command.submit", request_payload)
             daemon_result = daemon_attempt.result
             if daemon_result is not None:
-                print(stable_json_dumps(daemon_result, indent=2))
+                print(public_json_dumps(daemon_result, indent=2))
                 return 0 if bool(daemon_result.get("ok")) else 1
             if daemon_required_request is not None:
                 envelope = _daemon_backend_failure_envelope(
@@ -998,7 +1035,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
     params = _connector_params_from_args(args)
     daemon_result = _try_daemon_result(config, method, params)
     if daemon_result is not None:
-        print(stable_json_dumps(daemon_result, indent=2))
+        print(public_json_dumps(daemon_result, indent=2))
         return 0 if daemon_result.get("ok") is not False else 1
     if config.db_path is None:
         payload = {
@@ -1012,7 +1049,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
                 "message": "command requires --db-path or a reachable daemon",
             },
         }
-        print(stable_json_dumps(payload, indent=2))
+        print(public_json_dumps(payload, indent=2))
         return 1
     from .connectors import ConnectorOutboxAPI
     from .store.sqlite import init_store
@@ -1024,7 +1061,7 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         default_lease_seconds=config.connector_claim_ttl_seconds,
         max_attempts=config.max_outbox_attempts,
     ).dispatch(method, params)
-    print(stable_json_dumps(payload, indent=2))
+    print(public_json_dumps(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -1041,7 +1078,7 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
                 "message": "command requires --db-path or a configured store",
             },
         }
-        print(stable_json_dumps(payload, indent=2))
+        print(public_json_dumps(payload, indent=2))
         return 1
     if args.store_action == "status":
         payload = store_status(config.db_path, config.host_id)
@@ -1066,7 +1103,7 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             "status": "invalid_params",
             "host_id": config.host_id,
         }
-    print(stable_json_dumps(payload, indent=2))
+    print(public_json_dumps(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -1090,8 +1127,19 @@ def main(argv: list[str] | None = None) -> int:
         herdr_bin=args.herdr_bin,
         db_path=getattr(args, "db_path", None),
         socket_path=getattr(args, "socket_path", None),
+        socket_group=getattr(args, "socket_group", None),
         herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
+    if args.command not in {"daemon", "doctor"}:
+        repair_config_state(
+            config.data_dir,
+            config.db_path,
+            private_files=(
+                config.installation_key_path,
+                config.installation_key_marker_path,
+                config.installation_key_sentinel_path,
+            ),
+        )
 
     if args.command == "snapshot":
         return cmd_snapshot(

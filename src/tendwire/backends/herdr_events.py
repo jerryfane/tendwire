@@ -23,7 +23,6 @@ from ..core.models import (
     Worker,
     WorkerBinding,
     normalize_status,
-    private_stable_sha256,
     utc_timestamp,
 )
 from ..worker_identity import (
@@ -34,6 +33,7 @@ from ..worker_identity import (
 )
 from ..core.projector import project_from_observations
 from ..store.sqlite import (
+    SnapshotObservationContext,
     expire_stale_worker_bindings,
     expire_worker_bindings,
     latest_snapshot,
@@ -126,12 +126,30 @@ class HerdrEventBackendHealth:
 
 
 @dataclass(frozen=True)
+class HerdrEventId:
+    """Forward-compatible authoritative producer event identifier."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class HerdrProducerSequence:
+    """Forward-compatible producer-scoped sequence identifier."""
+
+    producer_id: str
+    sequence: str
+
+
+HerdrProducerIdentity = HerdrEventId | HerdrProducerSequence
+
+
+@dataclass(frozen=True)
 class NormalizedHerdrEvent:
-    """A validated, deduplicated Herdr event description."""
+    """A validated Herdr event with optional durable producer identity."""
 
     name: str
     payload: Mapping[str, Any]
-    dedupe_key: str
+    producer_identity: HerdrProducerIdentity | None
 
 
 def _compact_key(value: object) -> str:
@@ -277,43 +295,59 @@ def _canonical_event_name(raw_name: Any) -> str | None:
     return aliases.get(_event_alias_key(event_name))
 
 
-def _server_sequence_key(envelope: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
-    server_id = _first_text(envelope, ("server_id", "serverId", "source_id", "sourceId"))
-    if server_id is None:
-        server_id = _first_text(payload, ("server_id", "serverId", "source_id", "sourceId"))
-    sequence = _first_text(envelope, ("sequence", "seq", "offset", "revision"))
-    if sequence is None:
-        sequence = _first_text(payload, ("sequence", "seq", "offset", "revision"))
-    if server_id and sequence:
-        return f"server:{server_id}:{sequence}"
-    return None
+def _strict_producer_id(value: object) -> str | None:
+    if type(value) is not str or not value or any(character.isspace() for character in value):
+        return None
+    return value
 
 
-def _event_id_key(envelope: Mapping[str, Any], payload: Mapping[str, Any]) -> str | None:
-    event_id = _first_text(envelope, ("event_id", "eventId", "event_uid", "eventUid"))
-    if event_id is None:
-        event_id = _first_text(payload, ("event_id", "eventId", "event_uid", "eventUid"))
-    return f"event:{event_id}" if event_id else None
+def _strict_producer_sequence(value: object) -> str | None:
+    if type(value) is not int or value < 0:
+        return None
+    return str(value)
+
+
+def _producer_identity(envelope: Mapping[str, Any]) -> HerdrProducerIdentity | None:
+    """Return only valid explicit top-level producer identity when present.
+
+    Herdr's confirmed EventEnvelope has only ``event`` and ``data``. The
+    identity fields handled here are forward-compatible optional metadata;
+    malformed metadata leaves the event idless, and entity fields inside
+    ``data`` are never durable event identity.
+    """
+    if "event_id" in envelope:
+        event_id = _strict_producer_id(envelope.get("event_id"))
+        return HerdrEventId(event_id) if event_id is not None else None
+    server_present = "server_id" in envelope
+    sequence_present = "sequence" in envelope
+    if not server_present and not sequence_present:
+        return None
+    producer_id = _strict_producer_id(envelope.get("server_id"))
+    sequence = _strict_producer_sequence(envelope.get("sequence"))
+    if not server_present or not sequence_present or producer_id is None or sequence is None:
+        return None
+    return HerdrProducerSequence(producer_id, sequence)
 
 
 def normalize_event(envelope: Mapping[str, Any]) -> NormalizedHerdrEvent | None:
-    """Normalize a raw Herdr event envelope; unsupported events return None."""
+    """Normalize a Herdr event envelope; unsupported events return ``None``.
+
+    Confirmed Herdr envelopes use ``event`` and ``data`` and are intentionally
+    idless. ``payload`` remains receive-only compatibility for older clients.
+    """
     name = _canonical_event_name(envelope.get("event"))
     if name is None:
         return None
-    payload = envelope.get("payload", envelope.get("data", {}))
+    payload = envelope.get("data") if "data" in envelope else envelope.get("payload", {})
     if payload is None:
         payload = {}
     if not isinstance(payload, Mapping):
         return None
-    payload_map = dict(payload)
-    dedupe_key = _server_sequence_key(envelope, payload_map)
-    if dedupe_key is None:
-        dedupe_key = _event_id_key(envelope, payload_map)
-    if dedupe_key is None:
-        digest = private_stable_sha256({"event": name, "payload": payload_map})[:24]
-        dedupe_key = f"fallback:{digest}"
-    return NormalizedHerdrEvent(name=name, payload=payload_map, dedupe_key=dedupe_key)
+    return NormalizedHerdrEvent(
+        name=name,
+        payload=dict(payload),
+        producer_identity=_producer_identity(envelope),
+    )
 
 
 def _worker_copy(
@@ -387,6 +421,41 @@ def _observed_worker_count(workers: Sequence[Worker]) -> int:
 
 def _binding_target(binding: WorkerBinding) -> tuple[str, str]:
     return (binding.target_kind, binding.target_value)
+
+def _worker_state_equal(left: Worker, right: Worker) -> bool:
+    """Compare effective worker state while ignoring observation timestamps."""
+    return left.fingerprint == right.fingerprint and left.backend_target == right.backend_target
+
+
+def _binding_state_equal(left: WorkerBinding, right: WorkerBinding) -> bool:
+    """Compare effective private routing while ignoring observation timestamps."""
+    return (
+        left.host_id,
+        left.worker_id,
+        left.worker_fingerprint,
+        left.backend,
+        left.target_kind,
+        left.target_value,
+        left.turn_target_kind,
+        left.turn_target_value,
+        left.sendable,
+        left.reason,
+        left.expires_at,
+        left.private_fingerprint,
+    ) == (
+        right.host_id,
+        right.worker_id,
+        right.worker_fingerprint,
+        right.backend,
+        right.target_kind,
+        right.target_value,
+        right.turn_target_kind,
+        right.turn_target_value,
+        right.sendable,
+        right.reason,
+        right.expires_at,
+        right.private_fingerprint,
+    )
 
 
 
@@ -510,7 +579,7 @@ class HerdrEventBackend:
         self._lock = threading.RLock()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
-        self._dedupe: OrderedDict[str, None] = OrderedDict()
+        self._producer_dedupe: OrderedDict[HerdrProducerIdentity, None] = OrderedDict()
         self._pending_events: list[NormalizedHerdrEvent] = []
         self._spaces: dict[str, Space] = {}
         self._workers: dict[str, Worker] = {}
@@ -794,7 +863,14 @@ class HerdrEventBackend:
                     workers=snapshot_workers,
                     backend_health=[health],
                 )
-                save_snapshot(self.db_path, snapshot)
+                save_snapshot(
+                    self.db_path,
+                    snapshot,
+                    observation=SnapshotObservationContext(
+                        authority="complete",
+                        observed_at=health.observed_at or snapshot.updated_at,
+                    ),
+                )
                 self._last_reconcile_at = snapshot.updated_at
                 self._last_snapshot_at = snapshot.updated_at
                 self._schedule_next_reconcile()
@@ -910,8 +986,13 @@ class HerdrEventBackend:
         if event is None:
             return False
         with self._lock:
-            if self._seen_duplicate(event.dedupe_key):
+            if (
+                event.producer_identity is not None
+                and self._is_duplicate_producer_identity(event.producer_identity)
+            ):
                 return False
+            # Confirmed Herdr envelopes are idless. Every such event is queued;
+            # current-state idempotence, not historical content, prevents side effects.
             self._pending_events.append(event)
             self._last_event_at = utc_timestamp()
             should_flush = self.debounce_seconds <= 0 if flush is None else flush
@@ -919,33 +1000,46 @@ class HerdrEventBackend:
             self.flush()
         return True
 
-    def _seen_duplicate(self, key: str) -> bool:
-        if key in self._dedupe:
-            self._dedupe.move_to_end(key)
+    def _is_duplicate_producer_identity(self, identity: HerdrProducerIdentity) -> bool:
+        if identity in self._producer_dedupe:
+            self._producer_dedupe.move_to_end(identity)
             return True
-        self._dedupe[key] = None
-        while len(self._dedupe) > self.dedupe_size:
-            self._dedupe.popitem(last=False)
-        return False
+        return any(event.producer_identity == identity for event in self._pending_events)
+
+    def _commit_producer_identities(self, events: Sequence[NormalizedHerdrEvent]) -> None:
+        for event in events:
+            identity = event.producer_identity
+            if identity is None:
+                continue
+            self._producer_dedupe[identity] = None
+            self._producer_dedupe.move_to_end(identity)
+        while len(self._producer_dedupe) > self.dedupe_size:
+            self._producer_dedupe.popitem(last=False)
 
     def flush(self) -> None:
+        # Draining, application, persistence, and producer-ID commitment share
+        # one lock scope so later batches cannot overtake an earlier flush.
         with self._lock:
+            if not self._pending_events:
+                return
             events = list(self._pending_events)
+            accepted_at = utc_timestamp()
             self._pending_events.clear()
-        if not events:
-            return
-        try:
-            with self._lock:
+            has_producer_identity = any(event.producer_identity is not None for event in events)
+            try:
                 self._event_continuity_revalidated = False
                 changed = False
                 for event in events:
                     changed = self._apply_event(event) or changed
-                if changed:
-                    self._persist_current_state()
-        except (HerdrContinuityUnavailableError, InstallationKeyError):
-            self._mark_unhealthy("continuity_unavailable")
-        finally:
-            with self._lock:
+                # Producer identities become durable only after this barrier.
+                # It also persists dirty memory when a failed first attempt made
+                # a retry appear idempotent before any snapshot reached storage.
+                if changed or has_producer_identity:
+                    self._persist_current_state(observed_at=accepted_at)
+                self._commit_producer_identities(events)
+            except (HerdrContinuityUnavailableError, InstallationKeyError):
+                self._mark_unhealthy("continuity_unavailable")
+            finally:
                 self._event_continuity_revalidated = False
 
     def _apply_event(self, event: NormalizedHerdrEvent) -> bool:
@@ -1047,6 +1141,8 @@ class HerdrEventBackend:
                 updated_at=space.updated_at or utc_timestamp(),
                 status_line=space.status_line or existing.status_line,
             )
+        if existing is not None and space.fingerprint == existing.fingerprint:
+            return False
         self._spaces[space.id] = space
         return True
 
@@ -1301,6 +1397,7 @@ class HerdrEventBackend:
             and not self._event_continuity_revalidated
         ):
             return False
+        changed = False
         binding_updates: list[WorkerBinding] = []
         bindings_by_worker: dict[str, list[WorkerBinding]] = {}
         for private_fingerprint, binding in list(self._bindings.items()):
@@ -1322,8 +1419,11 @@ class HerdrEventBackend:
                 expires_at=binding.expires_at,
                 private_fingerprint=binding.private_fingerprint,
             )
+            if _binding_state_equal(binding, ambiguous):
+                continue
             self._bindings[private_fingerprint] = ambiguous
             binding_updates.append(ambiguous)
+            changed = True
 
         for worker_id in worker_ids:
             worker = self._workers.get(worker_id)
@@ -1344,14 +1444,18 @@ class HerdrEventBackend:
                         "sendable": False,
                         "reason": "ambiguous_pane_match",
                     }
-            self._workers[worker_id] = _worker_copy(
+            ambiguous_worker = _worker_copy(
                 worker,
                 meta=_strip_stable_key_fields(worker.meta),
                 backend_target=ambiguous_target,
             )
+            if _worker_state_equal(worker, ambiguous_worker):
+                continue
+            self._workers[worker_id] = ambiguous_worker
+            changed = True
         if binding_updates:
             upsert_worker_bindings(self.db_path, binding_updates)
-        return True
+        return changed
 
 
     def _upsert_worker_from_item(
@@ -1491,7 +1595,12 @@ class HerdrEventBackend:
         if self._would_exceed_worker_cap(worker, existing=existing):
             self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
             return False
-        self._workers[worker.id] = worker
+        changed = existing is None or not _worker_state_equal(existing, worker)
+        if changed:
+            self._workers[worker.id] = worker
+        else:
+            assert existing is not None
+            worker = existing
         if update_binding and binding is not None:
             if stable_owner_reused:
                 stale_private_fingerprints = [
@@ -1510,6 +1619,7 @@ class HerdrEventBackend:
                     )
                     for private_fingerprint in stale_private_fingerprints:
                         self._bindings.pop(private_fingerprint, None)
+                    changed = True
                 binding = self._binding_with_worker(binding, worker)
             elif matched_binding is not None and (
                 not authoritative_identity
@@ -1519,8 +1629,11 @@ class HerdrEventBackend:
                 binding = self._binding_with_worker(matched_binding, worker)
             else:
                 binding = self._binding_with_worker(binding, worker)
-            self._bindings[binding.private_fingerprint] = binding
-            upsert_worker_bindings(self.db_path, [binding])
+            current_binding = self._bindings.get(binding.private_fingerprint)
+            if current_binding is None or not _binding_state_equal(current_binding, binding):
+                self._bindings[binding.private_fingerprint] = binding
+                upsert_worker_bindings(self.db_path, [binding])
+                changed = True
         if authoritative_identity:
             self._remember_item_owner(
                 item,
@@ -1529,8 +1642,10 @@ class HerdrEventBackend:
             )
             self._note_pane_terminal(item)
             if _authenticated_local_stable_key(worker) is not None:
+                if self._health.outcome == "continuity_unavailable":
+                    changed = True
                 self._event_continuity_revalidated = True
-        return True
+        return changed
 
     def _binding_with_worker(self, binding: WorkerBinding, worker: Worker) -> WorkerBinding:
         return WorkerBinding(
@@ -1907,7 +2022,10 @@ class HerdrEventBackend:
             self._mark_worker_cap_exceeded_locked(_observed_worker_count(list(self._workers.values())) + 1)
             return False
         closed = _closed_worker(worker)
-        self._workers[closed.id] = closed
+        current = self._workers.get(closed.id)
+        changed = current is None or not _worker_state_equal(current, closed)
+        if changed:
+            self._workers[closed.id] = closed
         if binding is not None:
             expire_worker_bindings(
                 self.db_path,
@@ -1918,7 +2036,8 @@ class HerdrEventBackend:
                 reason=reason,
             )
             self._bindings.pop(binding.private_fingerprint, None)
-        else:
+            changed = True
+        elif changed:
             expire_worker_bindings(
                 self.db_path,
                 self.config.host_id,
@@ -1932,10 +2051,13 @@ class HerdrEventBackend:
             and observed_worker is not None
             and _authenticated_local_stable_key(observed_worker) is not None
         ):
+            if self._health.outcome == "continuity_unavailable":
+                changed = True
             self._event_continuity_revalidated = True
-        return True
+        return changed
 
-    def _persist_current_state(self) -> Snapshot:
+    def _persist_current_state(self, *, observed_at: str | None = None) -> Snapshot:
+        accepted_at = observed_at or utc_timestamp()
         spaces = list(self._spaces.values())
         workers = list(self._workers.values())
         if (
@@ -1949,14 +2071,32 @@ class HerdrEventBackend:
                 if spaces or _observed_worker_count(workers)
                 else "empty_healthy"
             )
-            health = herdr_backend_health(outcome, spaces=spaces, workers=workers)
+            health = herdr_backend_health(
+                outcome,
+                observed_at=accepted_at,
+                spaces=spaces,
+                workers=workers,
+            )
         snapshot = project_from_observations(
             self.config,
             spaces=spaces,
             workers=workers,
             backend_health=[health],
         )
-        save_snapshot(self.db_path, snapshot)
+        previous = latest_snapshot(self.db_path, self.config.host_id)
+        if (
+            previous is not None
+            and previous.content_fingerprint == snapshot.content_fingerprint
+        ):
+            return previous
+        save_snapshot(
+            self.db_path,
+            snapshot,
+            observation=SnapshotObservationContext(
+                authority="positive" if health.status == "healthy" else "none",
+                observed_at=health.observed_at or accepted_at,
+            ),
+        )
         self._last_snapshot_at = snapshot.updated_at
         self._health = HerdrEventBackendHealth(
             status=health.status,
@@ -1998,7 +2138,14 @@ class HerdrEventBackend:
             workers=workers,
             backend_health=[health],
         )
-        save_snapshot(self.db_path, snapshot)
+        save_snapshot(
+            self.db_path,
+            snapshot,
+            observation=SnapshotObservationContext(
+                authority="none",
+                observed_at=health.observed_at or now,
+            ),
+        )
         self._spaces = {space.id: space for space in snapshot.spaces}
         self._workers = {worker.id: worker for worker in snapshot.workers}
         self._health = HerdrEventBackendHealth(
@@ -2038,7 +2185,14 @@ class HerdrEventBackend:
                 workers=workers,
                 backend_health=[health],
             )
-            save_snapshot(self.db_path, snapshot)
+            save_snapshot(
+                self.db_path,
+                snapshot,
+                observation=SnapshotObservationContext(
+                    authority="none",
+                    observed_at=health.observed_at or snapshot.updated_at,
+                ),
+            )
             self._last_snapshot_at = snapshot.updated_at
             self._spaces = {space.id: space for space in snapshot.spaces}
             self._workers = {worker.id: worker for worker in snapshot.workers}

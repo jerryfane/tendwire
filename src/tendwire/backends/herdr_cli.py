@@ -28,9 +28,16 @@ from ..core.models import (
     WorkerBinding,
     normalize_status,
     separate_duplicate_worker_bindings,
+    sanitize_public_text,
     stable_fingerprint,
     utc_timestamp,
     worker_binding_private_fingerprint,
+)
+from ..local_state import (
+    LocalStateErrorCode,
+    LocalStateKind,
+    PermissionState,
+    inspect_config_state,
 )
 from ..worker_identity import (
     InstallationKeyError,
@@ -446,26 +453,172 @@ def _command_payload_variants(variants: Sequence[Sequence[str]], config: Config)
 
 
 def _safe_text_sample(value: str | None) -> str | None:
-    """Return a short diagnostic text sample with obvious sensitive markers redacted."""
-    if not value:
+    """Return a short diagnostic sample through the shared public sanitizer."""
+    if not value or _contains_forbidden_connector_text(value):
         return None
-    sample = value.strip()
-    if not sample:
-        return None
-    lowered = sample.lower()
-    if _contains_forbidden_connector_text(lowered):
-        return None
-    redacted_words: list[str] = []
-    for word in sample.split():
-        word_lower = word.lower()
-        if "token" in word_lower or "secret" in word_lower or "password" in word_lower:
-            redacted_words.append("[redacted]")
-        else:
-            redacted_words.append(word)
-    sanitized = " ".join(redacted_words)
-    if len(sanitized) > 200:
-        sanitized = sanitized[:197] + "..."
-    return sanitized
+    sanitized = sanitize_public_text(
+        value,
+        max_chars=200,
+        collapse_whitespace=True,
+    )
+    return sanitized or None
+
+
+_LOCAL_STATE_COMPLIANT_REMEDIATION = "No action required."
+_LOCAL_STATE_UNINITIALIZED_REMEDIATION = (
+    "No action required while local state is uninitialized."
+)
+_LOCAL_STATE_STOPPED_REMEDIATION = "No action required while the daemon is stopped."
+_LOCAL_STATE_REPAIR_REMEDIATION = (
+    "Restart Tendwire to repair local state permissions."
+)
+_LOCAL_STATE_UNSAFE_REMEDIATION = (
+    "Move unsafe local state aside and restore from a trusted backup."
+)
+_LOCAL_STATE_CHECK_GROUPS = (
+    (
+        "state_directory_permissions",
+        frozenset({LocalStateKind.STATE_DIRECTORY}),
+        "not_initialized",
+        _LOCAL_STATE_UNINITIALIZED_REMEDIATION,
+    ),
+    (
+        "database_permissions",
+        frozenset(
+            {
+                LocalStateKind.DATABASE,
+                LocalStateKind.DATABASE_WAL,
+                LocalStateKind.DATABASE_SHM,
+                LocalStateKind.DATABASE_JOURNAL,
+            }
+        ),
+        "not_initialized",
+        _LOCAL_STATE_UNINITIALIZED_REMEDIATION,
+    ),
+    (
+        "identity_permissions",
+        frozenset({LocalStateKind.PRIVATE_FILE}),
+        "not_initialized",
+        _LOCAL_STATE_UNINITIALIZED_REMEDIATION,
+    ),
+    (
+        "daemon_socket_permissions",
+        frozenset({LocalStateKind.SOCKET, LocalStateKind.SOCKET_GROUP}),
+        "not_running",
+        _LOCAL_STATE_STOPPED_REMEDIATION,
+    ),
+)
+
+
+def _local_state_check(
+    name: str,
+    kinds: frozenset[LocalStateKind],
+    neutral_outcome: str,
+    neutral_remediation: str,
+    *,
+    entries: Sequence[Any],
+    issues: Sequence[Any],
+) -> dict[str, Any]:
+    """Fold one fixed local-state category into a path-free doctor record."""
+    category_entries = [entry for entry in entries if entry.kind in kinds]
+    category_issues = [issue for issue in issues if issue.kind in kinds]
+    issue_codes = {issue.code for issue in category_issues}
+    if issue_codes - {LocalStateErrorCode.INSECURE_MODE}:
+        return {
+            "name": name,
+            "ok": False,
+            "outcome": "unsafe",
+            "remediation": _LOCAL_STATE_UNSAFE_REMEDIATION,
+        }
+    if (
+        LocalStateErrorCode.INSECURE_MODE in issue_codes
+        or any(
+            entry.state is PermissionState.REPAIR_REQUIRED
+            for entry in category_entries
+        )
+    ):
+        return {
+            "name": name,
+            "ok": False,
+            "outcome": "repair_required",
+            "remediation": _LOCAL_STATE_REPAIR_REMEDIATION,
+        }
+    if not category_entries or all(
+        entry.state is PermissionState.ABSENT for entry in category_entries
+    ):
+        return {
+            "name": name,
+            "ok": True,
+            "outcome": neutral_outcome,
+            "remediation": neutral_remediation,
+        }
+    return {
+        "name": name,
+        "ok": True,
+        "outcome": "compliant",
+        "remediation": _LOCAL_STATE_COMPLIANT_REMEDIATION,
+    }
+
+
+def _local_state_checks(config: Config) -> tuple[list[dict[str, Any]], bool]:
+    """Inspect configured state once and return fixed, path-free doctor records."""
+    try:
+        if config.db_path is None:
+            raise ValueError
+        socket_path = config.socket_path or config.data_dir / "tendwire.sock"
+        report = inspect_config_state(
+            config.data_dir,
+            config.db_path,
+            socket_path=socket_path,
+            private_files=(
+                config.installation_key_path,
+                config.installation_key_marker_path,
+                config.installation_key_sentinel_path,
+            ),
+            socket_group=config.socket_group,
+        )
+    except Exception:
+        checks = [
+            {
+                "name": name,
+                "ok": False,
+                "outcome": "unsafe",
+                "remediation": _LOCAL_STATE_UNSAFE_REMEDIATION,
+            }
+            for name, _kinds, _neutral, _remediation in _LOCAL_STATE_CHECK_GROUPS
+        ]
+        return checks, False
+
+    checks = [
+        _local_state_check(
+            name,
+            kinds,
+            neutral_outcome,
+            neutral_remediation,
+            entries=report.entries,
+            issues=report.issues,
+        )
+        for name, kinds, neutral_outcome, neutral_remediation in _LOCAL_STATE_CHECK_GROUPS
+    ]
+    return checks, report.ok
+
+
+def _public_herdr_bin(value: str) -> str:
+    """Retain the doctor key while redacting configured path-shaped values."""
+    sanitized = sanitize_public_text(
+        value,
+        max_chars=200,
+        collapse_whitespace=True,
+    )
+    return sanitized or "[redacted]"
+
+
+def _finish_diagnostics(result: dict[str, Any], config: Config) -> dict[str, Any]:
+    local_checks, local_ok = _local_state_checks(config)
+    result["checks"].extend(local_checks)
+    if not local_ok and result["status"] == "ok":
+        result["status"] = "degraded"
+    return result
 
 
 def _diagnostic_item_count(payload: Any, keys: Sequence[str]) -> int:
@@ -552,7 +705,7 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema_version": 1,
         "command": "doctor",
-        "herdr_bin": config.herdr_bin,
+        "herdr_bin": _public_herdr_bin(config.herdr_bin),
         "timeout_seconds": config.herdr_timeout_seconds,
         "aggregate_deadline_seconds": config.herdr_timeout_seconds * len(planned),
         "status": "ok",
@@ -575,7 +728,7 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
             }
             for name, args, _keys in planned
         ]
-        return result
+        return _finish_diagnostics(result, config)
 
     budget = _ProbeBudget.from_config(config, planned_probes=len(planned))
     checks: list[dict[str, Any]] = []
@@ -633,7 +786,7 @@ def diagnose_herdr(config: Config) -> dict[str, Any]:
         result["status"] = "timeout"
     elif any(not check["ok"] for check in checks):
         result["status"] = "degraded"
-    return result
+    return _finish_diagnostics(result, config)
 
 
 def _strip_connector_fields(value: Any) -> Any:
@@ -1138,7 +1291,6 @@ def _worker_with_stable_key(
         meta=meta,
         last_seen_at=worker.last_seen_at,
         summary=worker.summary,
-        fingerprint=worker.fingerprint,
         backend_target=worker.backend_target,
     )
 
@@ -1430,13 +1582,17 @@ def _workers_and_bindings_from_records(
             if require_authenticated_continuity:
                 raise
             installation_key = None
-    workers = [
-        _worker_with_stable_key(config, record, installation_key)
+    finalized = [
+        _record_with_worker(
+            record,
+            _worker_with_stable_key(config, record, installation_key),
+        )
         for record in deduplicated
     ]
+    workers = [record.worker for record in finalized]
     bindings = [
         binding
-        for record in deduplicated
+        for record in finalized
         if (binding := _binding_from_worker_record(config, record, observed_at)) is not None
     ]
     return workers, separate_duplicate_worker_bindings(bindings)

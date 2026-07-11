@@ -7,13 +7,31 @@ provided for optional persistence and is kept intentionally stdlib-only.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
+import stat
 from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import parse_qsl, quote, urlsplit
 
+from ..local_state import (
+    LocalStateError,
+    LocalStateErrorCode,
+    PermissionState,
+    local_state_error,
+    inspect_sqlite_family_at,
+    open_private_file_at,
+    open_resolved_parent,
+    prepare_resolved_private_parent,
+    prepare_sqlite_family_at,
+    proc_fd_path,
+    repair_sqlite_family_at,
+    validate_owned_directory_stat,
+)
 from ..core.commands import CommandEnvelope
 from ..core.models import (
     FINGERPRINT_HEX_CHARS,
@@ -22,9 +40,9 @@ from ..core.models import (
     WorkerBinding,
     normalize_severity,
     separate_duplicate_worker_bindings,
-    sanitize_forbidden_fields,
+    sanitize_public_mapping,
+    sanitize_public_value,
     stable_fingerprint,
-    stable_json_dumps,
     utc_timestamp,
 )
 from ..core.turns import (
@@ -37,12 +55,21 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 4
+STORE_SCHEMA_VERSION = 5
 ATTENTION_LIFECYCLE_OPEN = "open"
 ATTENTION_LIFECYCLE_RESOLVED = "resolved"
 ATTENTION_RESOLVED_REASON_GONE = "gone"
+ATTENTION_RESOLVED_REASON_SUPERSEDED = "superseded"
 ATTENTION_OUTBOX_CONNECTOR = "attention"
+ATTENTION_MISSING_REQUIRED = 2
+ATTENTION_MISSING_GRACE_SECONDS = 120
 _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+
+
+@dataclass(frozen=True)
+class SnapshotObservationContext:
+    authority: Literal["none", "positive", "complete"] = "none"
+    observed_at: str | None = None
 
 CREATE_SNAPSHOTS_TABLE = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -227,6 +254,43 @@ CREATE TABLE IF NOT EXISTS attention_items (
 );
 """
 
+CREATE_ATTENTION_LIFECYCLES_TABLE = """
+CREATE TABLE IF NOT EXISTS attention_lifecycles (
+    host_id TEXT NOT NULL,
+    family_key TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('open','resolved')),
+    current_attention_id TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_positive_at TEXT NOT NULL,
+    first_missing_at TEXT,
+    missing_observation_count INTEGER NOT NULL DEFAULT 0 CHECK (missing_observation_count >= 0),
+    last_accepted_at TEXT NOT NULL,
+    last_observation_key TEXT NOT NULL,
+    max_notified_severity_rank INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (host_id, family_key),
+    CHECK (
+        (lifecycle_status = 'open' AND current_attention_id IS NOT NULL)
+        OR (lifecycle_status = 'resolved' AND current_attention_id IS NULL)
+    ),
+    CHECK (
+        (missing_observation_count = 0 AND first_missing_at IS NULL)
+        OR (missing_observation_count > 0 AND first_missing_at IS NOT NULL)
+    )
+);
+"""
+
+CREATE_ATTENTION_LIFECYCLE_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_lifecycles_host_status "
+        "ON attention_lifecycles(host_id, lifecycle_status)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_attention_lifecycles_host_current "
+        "ON attention_lifecycles(host_id, current_attention_id)"
+    ),
+)
+
 CREATE_COMMANDS_TABLE = """
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,16 +438,94 @@ CREATE_PR6_INDEXES = (
 )
 
 
-def _ensure_dir(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+_SQLITE_FAMILY_SUFFIXES = ("", "-wal", "-shm", "-journal")
 
 
-def _is_memory_db(db_path: Path) -> bool:
+def _is_memory_db(db_path: Path | str) -> bool:
     raw = str(db_path)
-    return raw == ":memory:" or (raw.startswith("file:") and "mode=memory" in raw)
+    if raw == ":memory:":
+        return True
+    if not raw.startswith("file:"):
+        return False
+    try:
+        query = urlsplit(raw).query
+    except ValueError:
+        return False
+    mode: str | None = None
+    for name, value in parse_qsl(query, keep_blank_values=True):
+        if name == "mode":
+            mode = value
+    return mode == "memory"
 
 
-def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path) -> None:
+def _validate_parent_fd(parent_fd: int, *, private: bool) -> None:
+    try:
+        current = os.fstat(parent_fd)
+    except OSError:
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+    validate_owned_directory_stat(current)
+    forbidden = ~0o700 if private else stat.S_IWGRP | stat.S_IWOTH
+    if stat.S_IMODE(current.st_mode) & forbidden:
+        raise local_state_error(LocalStateErrorCode.INSECURE_MODE) from None
+
+
+def _bare_relative_parent(db_path: Path | str) -> bool:
+    try:
+        raw = os.fspath(db_path)
+        return isinstance(raw, str) and not raw.startswith(os.sep) and Path(raw).parent == Path(".")
+    except (TypeError, ValueError):
+        return False
+
+
+def _open_filesystem_db(
+    db_path: Path | str, *, prepare: bool
+) -> tuple[int, str]:
+    if prepare and not _bare_relative_parent(db_path):
+        parent_fd, leaf, _result = prepare_resolved_private_parent(db_path)
+    else:
+        parent_fd, leaf = open_resolved_parent(db_path)
+        try:
+            _validate_parent_fd(parent_fd, private=not prepare)
+        except Exception:
+            os.close(parent_fd)
+            raise
+    try:
+        if prepare:
+            prepare_sqlite_family_at(parent_fd, leaf)
+        _validate_sqlite_family_at(parent_fd, leaf)
+        return parent_fd, leaf
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _validate_sqlite_family_at(parent_fd: int, leaf: str) -> None:
+    inspected = inspect_sqlite_family_at(parent_fd, leaf)
+    for suffix, result in zip(_SQLITE_FAMILY_SUFFIXES, inspected, strict=True):
+        if result.state is PermissionState.ABSENT and suffix:
+            continue
+        member_fd = open_private_file_at(parent_fd, f"{leaf}{suffix}")
+        os.close(member_fd)
+
+
+def _sqlite_store_exists(db_path: Path | str) -> bool:
+    if _is_memory_db(db_path):
+        return False
+    try:
+        parent_fd, leaf = open_resolved_parent(db_path)
+    except LocalStateError as exc:
+        if exc.code is LocalStateErrorCode.MISSING_ENTRY:
+            return False
+        raise
+    try:
+        _validate_parent_fd(parent_fd, private=True)
+        inspected = inspect_sqlite_family_at(parent_fd, leaf)
+        return inspected[0].state is not PermissionState.ABSENT
+    finally:
+        os.close(parent_fd)
+
+
+def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path | str) -> None:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     if not _is_memory_db(db_path):
@@ -392,12 +534,21 @@ def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path) -> None:
 
 
 class _ClosingConnection(sqlite3.Connection):
-    """sqlite3's ``with conn:`` commits/rolls back but does
-    NOT close the connection, so every ``with _connect(...) as conn:`` site leaked
-    its db + WAL file descriptors. Under the long-running daemon (polled every few
-    seconds) these piled up until the process hit its open-file limit and crashed
-    on ``accept()`` (EMFILE), which surfaced as "request_state_uncertain" sends.
-    Closing on __exit__ bounds the FD count."""
+    """Connection that owns its resolved database parent descriptor until close."""
+
+    _parent_fd: int | None = None
+
+    def _own_parent_fd(self, parent_fd: int) -> None:
+        self._parent_fd = parent_fd
+
+    def close(self) -> None:
+        parent_fd = self._parent_fd
+        self._parent_fd = None
+        try:
+            super().close()
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
         try:
@@ -407,60 +558,90 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _connect(
-    db_path: Path,
+    db_path: Path | str,
     *,
     isolation_level: str | None = "",
+    prepare: bool = False,
 ) -> sqlite3.Connection:
-    conn = sqlite3.connect(
-        str(db_path),
-        timeout=30.0,
-        isolation_level=isolation_level,
-        factory=_ClosingConnection,
-    )
-    _apply_connection_pragmas(conn, db_path)
-    return conn
+    raw_db_path = str(db_path)
+    memory_db = _is_memory_db(raw_db_path)
+    parent_fd: int | None = None
+    leaf: str | None = None
+    if memory_db:
+        connect_target = raw_db_path
+        connect_uri = raw_db_path.startswith("file:")
+    else:
+        parent_fd, leaf = _open_filesystem_db(db_path, prepare=prepare)
+        try:
+            anchored_path = proc_fd_path(parent_fd, leaf)
+            connect_target = f"file:{quote(anchored_path, safe='/')}?mode=rw"
+        except Exception:
+            os.close(parent_fd)
+            raise
+        connect_uri = True
+    try:
+        conn = sqlite3.connect(
+            connect_target,
+            timeout=30.0,
+            isolation_level=isolation_level,
+            factory=_ClosingConnection,
+            uri=connect_uri,
+        )
+    except Exception:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    if not isinstance(conn, _ClosingConnection):
+        try:
+            conn.close()
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+    if parent_fd is not None:
+        conn._own_parent_fd(parent_fd)
+        parent_fd = None
+    try:
+        _apply_connection_pragmas(conn, db_path)
+        if leaf is not None:
+            # This harmless read activates the live WAL family before validation.
+            conn.execute("PRAGMA user_version").fetchone()
+            assert conn._parent_fd is not None
+            if prepare:
+                repair_sqlite_family_at(conn._parent_fd, leaf)
+            else:
+                _validate_sqlite_family_at(conn._parent_fd, leaf)
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def _canonical_json(data: Any) -> str:
-    return stable_json_dumps(data)
+    """Serialize private or pre-sanitized data without silently dropping fields."""
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 _CONNECTOR_LEASE_STATUS = "leased"
 _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
 _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
+_CONNECTOR_SUPERSEDED_OUTBOX_STATUS = "superseded"
 _CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
     {
         _CONNECTOR_LEASE_STATUS,
         _CONNECTOR_TERMINAL_OUTBOX_STATUS,
         _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+        _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
         *_CONNECTOR_POLLABLE_STATUSES,
     }
 )
 _CONNECTOR_REF_PREFIX = "twref1."
-_CONNECTOR_PUBLIC_DROP = object()
-_STORE_PUBLIC_DROP = object()
-_CONNECTOR_FORBIDDEN_PUBLIC_TEXT = (
-    "telegram",
-    "herdr",
-    "herdres",
-    "backend_target",
-    "pane_id",
-    "session_id",
-    "terminal_id",
-    "chat_id",
-    "topic_id",
-    "message_id",
-    "bot_token",
-    "shell",
-    "argv",
-    "connector",
-    "delivery",
-)
-_STORE_METADATA_FORBIDDEN_PUBLIC_TEXT = (
-    *_CONNECTOR_FORBIDDEN_PUBLIC_TEXT,
-    "private",
-    "raw",
-)
 
 
 def _json_object(raw: Any) -> dict[str, Any]:
@@ -513,120 +694,47 @@ def _connector_public_ref() -> str:
     return f"{_CONNECTOR_REF_PREFIX}{secrets.token_hex(32)}"
 
 
-def _compact_public_text(value: str) -> str:
-    return "".join(char for char in value.lower() if char.isalnum())
-
-
-def _connector_contains_forbidden_public_text(value: str) -> bool:
-    lowered = value.lower()
-    compact = _compact_public_text(lowered)
-    return any(
-        token in lowered or token.replace("_", "") in compact
-        for token in _CONNECTOR_FORBIDDEN_PUBLIC_TEXT
-    )
-
 
 def _connector_public_reason(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text or _connector_contains_forbidden_public_text(text):
-        return ""
-    return text
+    clean = sanitize_public_mapping(
+        {"reason": str(value or "").strip()},
+        backend_neutral=True,
+    ).get("reason")
+    return clean if isinstance(clean, str) else ""
 
 
 def _store_public_label(value: Any, *, allowed: Collection[str] | None = None) -> str:
     lowered = str(value or "").strip().lower().replace("-", "_")
-    clean = "".join(
+    label = "".join(
         char if char.isalnum() or char in {"_", "."} else "_"
         for char in lowered
     )
-    clean = "_".join(part for part in clean.split("_") if part).strip("._")[:64]
-    if not clean:
+    label = "_".join(part for part in label.split("_") if part).strip("._")[:64]
+    if not label or (allowed is not None and label not in allowed):
         return "unknown"
-    compact = clean.replace("_", "").replace(".", "")
-    if any(
-        token in clean or token.replace("_", "") in compact
-        for token in _STORE_METADATA_FORBIDDEN_PUBLIC_TEXT
-    ):
-        return "unknown"
-    if allowed is not None and clean not in allowed:
-        return "unknown"
-    return clean
+    clean = sanitize_public_value(label, backend_neutral=True)
+    return clean if isinstance(clean, str) and clean == label else "unknown"
 
 
-def _store_contains_forbidden_public_text(value: str) -> bool:
-    lowered = value.lower()
-    compact = _compact_public_text(lowered)
-    return any(
-        token in lowered or token.replace("_", "") in compact
-        for token in _STORE_METADATA_FORBIDDEN_PUBLIC_TEXT
-    )
-
-
-def _store_public_text(value: Any, *, default: str = "") -> str:
+def _store_public_text(
+    value: Any,
+    *,
+    default: str = "",
+    free_text: bool = False,
+) -> str:
     text = str(value or "").strip()
-    if not text or _store_contains_forbidden_public_text(text):
-        return default
-    return text
+    if free_text:
+        clean = sanitize_public_mapping(
+            {"reason": text},
+            backend_neutral=True,
+        ).get("reason")
+    else:
+        clean = sanitize_public_value(text, backend_neutral=True)
+    return clean if isinstance(clean, str) and clean else default
 
 
-def _store_sanitize_public_value(value: Any) -> Any:
-    clean = sanitize_forbidden_fields(value)
-    if isinstance(clean, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in clean.items():
-            sanitized = _store_sanitize_public_value(item)
-            if sanitized is not _STORE_PUBLIC_DROP:
-                result[str(key)] = sanitized
-        return result
-    if isinstance(clean, list):
-        result_list: list[Any] = []
-        for item in clean:
-            sanitized = _store_sanitize_public_value(item)
-            if sanitized is not _STORE_PUBLIC_DROP:
-                result_list.append(sanitized)
-        return result_list
-    if isinstance(clean, str) and _store_contains_forbidden_public_text(clean):
-        return _STORE_PUBLIC_DROP
-    return clean
 
 
-def _store_sanitize_public_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    clean = _store_sanitize_public_value(dict(value))
-    return dict(clean) if isinstance(clean, Mapping) else {}
-
-
-def _connector_sanitize_public_value(value: Any) -> Any:
-    clean = sanitize_forbidden_fields(value)
-    if isinstance(clean, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in clean.items():
-            sanitized = _connector_sanitize_public_value(item)
-            if sanitized is not _CONNECTOR_PUBLIC_DROP:
-                result[str(key)] = sanitized
-        return result
-    if isinstance(clean, list):
-        result_list: list[Any] = []
-        for item in clean:
-            sanitized = _connector_sanitize_public_value(item)
-            if sanitized is not _CONNECTOR_PUBLIC_DROP:
-                result_list.append(sanitized)
-        return result_list
-    if isinstance(clean, str) and _connector_contains_forbidden_public_text(clean):
-        return _CONNECTOR_PUBLIC_DROP
-    return clean
-
-
-def _connector_sanitize_public_mapping(value: Any) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    clean = _connector_sanitize_public_value(dict(value))
-    return dict(clean) if isinstance(clean, Mapping) else {}
-
-
-def _connector_sanitize_payload(raw: Any) -> dict[str, Any]:
-    return _connector_sanitize_public_mapping(_json_object(raw))
 
 
 def _connector_private_with_lease(
@@ -680,7 +788,7 @@ def _connector_response(
         payload["attempt"] = int(attempt)
     if available_at is not None:
         payload["available_at"] = str(available_at)
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_value(payload)
 
 
 def _connector_error_response(
@@ -695,7 +803,7 @@ def _connector_error_response(
         "code": str(status),
         "message": "reference is not valid for the requested operation",
     }
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_value(payload)
 
 
 def _connector_reclaim_expired_leases_conn(
@@ -742,7 +850,9 @@ def _connector_reclaim_expired_leases_conn(
             """,
             (
                 "expired",
-                _canonical_json({"schema_version": 1, "status": "expired"}),
+                _canonical_json(
+                    sanitize_public_mapping({"schema_version": 1, "status": "expired"})
+                ),
                 now,
                 int(delivery_id),
                 _CONNECTOR_LEASE_STATUS,
@@ -753,14 +863,20 @@ def _connector_reclaim_expired_leases_conn(
         if int(outbox_id or 0) > 0 and (
             current_delivery_id is None or int(current_delivery_id or 0) == int(delivery_id)
         ) and str(outbox_status or "") == _CONNECTOR_LEASE_STATUS:
+            terminal_after_lease = bool(outbox_state.get("terminal_after_lease"))
             conn.execute(
                 """
                 UPDATE connector_outbox
-                SET status = ?, updated_at = ?, private_state_json = ?
+                SET status = ?, next_attempt_at = NULL, updated_at = ?,
+                    private_state_json = ?
                 WHERE id = ? AND status = ?
                 """,
                 (
-                    "queued",
+                    (
+                        _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+                        if terminal_after_lease
+                        else "queued"
+                    ),
                     now,
                     _connector_private_clear_current(outbox_private),
                     int(outbox_id),
@@ -830,15 +946,15 @@ def reclaim_expired_connector_leases(
     now: str | None = None,
 ) -> dict[str, Any]:
     """Expire stale connector leases and return their outbox rows to polling."""
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
             "host_id": str(host_id),
             "name": str(name or ""),
             "reclaimed": 0,
-        }
+        })
     current_time = _connector_now(now)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -854,16 +970,14 @@ def reclaim_expired_connector_leases(
         except Exception:
             conn.rollback()
             raise
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "host_id": str(host_id),
-            "name": str(name or ""),
-            "reclaimed": int(reclaimed),
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "name": str(name or ""),
+        "reclaimed": int(reclaimed),
+    })
 
 
 def exhaust_connector_retries(
@@ -875,15 +989,15 @@ def exhaust_connector_retries(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Move host-scoped retryable outbox rows beyond max attempts to a neutral terminal state."""
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
             "host_id": str(host_id),
             "dry_run": bool(dry_run),
             "updated": 0,
-        }
+        })
     current_time = _connector_now(now)
     attempt_limit = max(1, int(max_attempts))
     with _connect(db_path, isolation_level=None) as conn:
@@ -925,17 +1039,15 @@ def exhaust_connector_retries(
         except Exception:
             conn.rollback()
             raise
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "host_id": str(host_id),
-            "dry_run": bool(dry_run),
-            "max_attempts": attempt_limit,
-            "updated": int(updated),
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "dry_run": bool(dry_run),
+        "max_attempts": attempt_limit,
+        "updated": int(updated),
+    })
 
 
 def poll_connector_outbox(
@@ -949,15 +1061,15 @@ def poll_connector_outbox(
     now: str | None = None,
 ) -> dict[str, Any]:
     """Atomically lease due connector outbox rows for one neutral queue name."""
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
             "host_id": str(host_id),
             "name": str(name),
             "items": [],
-        }
+        })
     current_time = _connector_now(now)
     lease_expires_at = _connector_add_seconds(current_time, max(1, int(lease_seconds)))
     row_limit = max(1, min(int(limit), 100))
@@ -1032,7 +1144,7 @@ def poll_connector_outbox(
                         str(row[1]),
                         attempt,
                         _CONNECTOR_LEASE_STATUS,
-                        "{}",
+                        _canonical_json(sanitize_public_mapping({})),
                         _connector_private_with_lease(
                             {},
                             delivery_id=None,
@@ -1096,21 +1208,24 @@ def poll_connector_outbox(
                         "leased_until": lease_expires_at,
                         "ref": public_ref,
                         "available_at": current_time,
-                        "payload": _connector_sanitize_payload(row[2]),
+                        "payload": sanitize_public_mapping(
+                            _json_object(row[2]),
+                            backend_neutral=True,
+                        ),
                     }
                 )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-    return {
+    return sanitize_public_value({
         "schema_version": 1,
         "ok": True,
         "status": "ok",
         "host_id": str(host_id),
         "name": str(name),
         "items": items,
-    }
+    })
 
 
 def _connector_validate_live_ref_conn(
@@ -1173,10 +1288,10 @@ def _connector_update_ref(
     max_attempts: int | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return _connector_error_response(status="store_unavailable", host_id=host_id, name=name, ref=ref)
     current_time = _connector_now(now)
-    sanitized_response = _connector_sanitize_public_mapping(response or {})
+    sanitized_response = sanitize_public_mapping(response or {}, backend_neutral=True)
     sanitized_reason = _connector_public_reason(reason)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -1205,13 +1320,11 @@ def _connector_update_ref(
             attempt = int(row[5] or 0)
             if action == "ack":
                 response_json = _canonical_json(
-                    sanitize_forbidden_fields(
-                        {
-                            "schema_version": 1,
-                            "status": "acknowledged",
-                            "response": dict(sanitized_response),
-                        }
-                    )
+                    sanitize_public_value({
+                        "schema_version": 1,
+                        "status": "acknowledged",
+                        "response": dict(sanitized_response),
+                    })
                 )
                 conn.execute(
                     """
@@ -1234,6 +1347,52 @@ def _connector_update_ref(
                         int(outbox_id),
                     ),
                 )
+                migration_group = str(
+                    _json_object(row[9]).get("migration_group") or ""
+                )
+                if migration_group:
+                    conn.execute(
+                        """
+                        UPDATE connector_outbox
+                        SET status = ?, next_attempt_at = NULL, updated_at = ?
+                        WHERE id != ? AND status IN ('queued', 'retry', 'deferred')
+                          AND json_extract(private_state_json, '$.migration_group') = ?
+                        """,
+                        (
+                            _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
+                            current_time,
+                            outbox_id,
+                            migration_group,
+                        ),
+                    )
+                    leased_siblings = conn.execute(
+                        """
+                        SELECT id, private_state_json
+                        FROM connector_outbox
+                        WHERE id != ? AND status = 'leased'
+                          AND json_extract(
+                              private_state_json, '$.migration_group'
+                          ) = ?
+                        """,
+                        (outbox_id, migration_group),
+                    ).fetchall()
+                    for sibling_id, sibling_private in leased_siblings:
+                        conn.execute(
+                            """
+                            UPDATE connector_outbox
+                            SET private_state_json = ?
+                            WHERE id = ? AND status = 'leased'
+                            """,
+                            (
+                                _migration_private_state(
+                                    sibling_private,
+                                    group=migration_group,
+                                    canonical=False,
+                                    terminal_after_lease=True,
+                                ),
+                                int(sibling_id),
+                            ),
+                        )
                 conn.commit()
                 return _connector_response(
                     ok=True,
@@ -1261,16 +1420,20 @@ def _connector_update_ref(
                 if exhausted
                 else ("retry" if action == "fail" else "deferred")
             )
+            terminal_after_lease = bool(
+                _json_object(row[9]).get("terminal_after_lease")
+            )
+            if terminal_after_lease:
+                result_status = "superseded"
+                outbox_status = _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
             response_json = _canonical_json(
-                sanitize_forbidden_fields(
-                    {
-                        "schema_version": 1,
-                        "status": result_status,
-                        "reason": sanitized_reason,
-                        "available_at": available_at,
-                        "response": dict(sanitized_response),
-                    }
-                )
+                sanitize_public_value({
+                    "schema_version": 1,
+                    "status": result_status,
+                    "reason": sanitized_reason,
+                    "available_at": None if terminal_after_lease else available_at,
+                    "response": dict(sanitized_response),
+                })
             )
             conn.execute(
                 """
@@ -1288,7 +1451,7 @@ def _connector_update_ref(
                 """,
                 (
                     outbox_status,
-                    None if exhausted else available_at,
+                    None if exhausted or terminal_after_lease else available_at,
                     current_time,
                     _connector_private_clear_current(row[9]),
                     int(outbox_id),
@@ -1303,7 +1466,7 @@ def _connector_update_ref(
                 ref=ref,
                 key=delivery_key,
                 attempt=attempt,
-                available_at=None if exhausted else available_at,
+                available_at=None if exhausted or terminal_after_lease else available_at,
             )
         except Exception:
             conn.rollback()
@@ -1548,12 +1711,10 @@ def _latest_command_receipt_row(
 
 
 def _snapshot_payload(data: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
-    payload_data = dict(data)
+    payload_data = sanitize_public_mapping(data)
     payload_data.setdefault("schema_version", SCHEMA_VERSION)
     fingerprint = _content_fingerprint(payload_data)
-    raw = payload_data.get("content_fingerprint")
-    if not isinstance(raw, str) or not raw:
-        payload_data["content_fingerprint"] = fingerprint
+    payload_data["content_fingerprint"] = fingerprint
     return payload_data, fingerprint
 
 
@@ -1861,8 +2022,7 @@ def append_event(
     content_fingerprint: str | None = None,
 ) -> int:
     """Append a private store event and return its row id."""
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
         return _append_event_conn(
             conn,
@@ -1975,80 +2135,254 @@ def _attention_lifecycle_payload(
     if resolved_reason is not None:
         payload["resolved_reason"] = resolved_reason
     payload["signal_count"] = max(1, int(signal_count))
-    return sanitize_forbidden_fields(payload)
-
-
-def _snapshot_attention_is_authoritative_healthy(payload_data: Mapping[str, Any]) -> bool:
-    health_items = payload_data.get("backend_health", [])
-    if not isinstance(health_items, list) or not health_items:
-        return False
-    for item in health_items:
-        if not isinstance(item, Mapping):
-            return False
-        if str(item.get("status") or "unknown") != "healthy":
-            return False
-    return True
+    return sanitize_public_value(payload)
 
 
 def _attention_severity_rank(value: Any) -> int:
     return _ATTENTION_SEVERITY_RANK.get(normalize_severity(value), 0)
 
 
-def _attention_transition_event_type(
-    conn: sqlite3.Connection,
+def _strict_utc_timestamp(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _attention_family_key(host_id: str, item: Mapping[str, Any]) -> str:
+    source = _store_public_text(item.get("source"), default="unknown")
+    kind = _store_public_label(item.get("kind"))
+    return stable_fingerprint(
+        {
+            "domain": "tendwire.attention.lifecycle-family.v1",
+            "host_id": str(host_id),
+            "source": source,
+            "kind": kind,
+        }
+    )
+
+
+def _attention_observation_key(
     *,
     host_id: str,
-    attention_id: str,
-    source: str,
-    kind: str,
-    severity: str,
+    authority: str,
+    observed_at: str,
+    content_fingerprint: str,
 ) -> str:
-    rows = conn.execute(
-        """
-        SELECT severity
-        FROM attention_items
-        WHERE host_id = ?
-          AND source = ?
-          AND kind = ?
-          AND attention_id != ?
-          AND lifecycle_status = ?
-        """,
-        (
-            str(host_id),
-            str(source),
-            str(kind),
-            str(attention_id),
-            ATTENTION_LIFECYCLE_OPEN,
+    return stable_fingerprint(
+        {
+            "domain": "tendwire.attention.observation.v1",
+            "host_id": str(host_id),
+            "authority": str(authority),
+            "observed_at": observed_at,
+            "snapshot_content_fingerprint": str(content_fingerprint),
+        }
+    )
+
+
+@dataclass(frozen=True)
+class _AttentionLifecycleState:
+    host_id: str
+    family_key: str
+    generation: int
+    lifecycle_status: str
+    current_attention_id: str | None
+    first_seen_at: str
+    last_positive_at: str
+    first_missing_at: str | None
+    missing_observation_count: int
+    last_accepted_at: str
+    last_observation_key: str
+    max_notified_severity_rank: int
+
+
+@dataclass(frozen=True)
+class _AttentionObservation:
+    host_id: str
+    family_key: str
+    authority: str
+    observed_at: str
+    observation_key: str
+    signal: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _AttentionTransition:
+    action: str
+    next_state: _AttentionLifecycleState | None
+    upsert_signal: Mapping[str, Any] | None = None
+    superseded_attention_id: str | None = None
+    resolve_attention_id: str | None = None
+    delivery: tuple[str, str] | None = None
+
+
+def _plan_attention_transition(
+    state: _AttentionLifecycleState | None,
+    observation: _AttentionObservation,
+) -> _AttentionTransition:
+    signal = observation.signal
+    if state is not None:
+        if observation.observed_at < state.last_accepted_at:
+            return _AttentionTransition("no-op", state)
+        if observation.observed_at == state.last_accepted_at:
+            return _AttentionTransition("no-op", state)
+
+    if signal is not None:
+        attention_id = _attention_id_from_item(signal)
+        severity = normalize_severity(signal.get("severity"))
+        severity_rank = _attention_severity_rank(severity)
+        if state is None:
+            next_state = _AttentionLifecycleState(
+                host_id=observation.host_id,
+                family_key=observation.family_key,
+                generation=1,
+                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+                current_attention_id=attention_id,
+                first_seen_at=observation.observed_at,
+                last_positive_at=observation.observed_at,
+                first_missing_at=None,
+                missing_observation_count=0,
+                last_accepted_at=observation.observed_at,
+                last_observation_key=observation.observation_key,
+                max_notified_severity_rank=severity_rank,
+            )
+            return _AttentionTransition(
+                "open",
+                next_state,
+                upsert_signal=signal,
+                delivery=("attention_created", "initial"),
+            )
+
+        if state.lifecycle_status == ATTENTION_LIFECYCLE_RESOLVED:
+            next_state = _AttentionLifecycleState(
+                host_id=state.host_id,
+                family_key=state.family_key,
+                generation=state.generation + 1,
+                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+                current_attention_id=attention_id,
+                first_seen_at=observation.observed_at,
+                last_positive_at=observation.observed_at,
+                first_missing_at=None,
+                missing_observation_count=0,
+                last_accepted_at=observation.observed_at,
+                last_observation_key=observation.observation_key,
+                max_notified_severity_rank=severity_rank,
+            )
+            return _AttentionTransition(
+                "open",
+                next_state,
+                upsert_signal=signal,
+                delivery=("attention_created", "initial"),
+            )
+
+        escalated = severity_rank > state.max_notified_severity_rank
+        next_state = _AttentionLifecycleState(
+            host_id=state.host_id,
+            family_key=state.family_key,
+            generation=state.generation,
+            lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+            current_attention_id=attention_id,
+            first_seen_at=state.first_seen_at,
+            last_positive_at=observation.observed_at,
+            first_missing_at=None,
+            missing_observation_count=0,
+            last_accepted_at=observation.observed_at,
+            last_observation_key=observation.observation_key,
+            max_notified_severity_rank=max(
+                state.max_notified_severity_rank, severity_rank
+            ),
+        )
+        return _AttentionTransition(
+            "escalate" if escalated else "update",
+            next_state,
+            upsert_signal=signal,
+            superseded_attention_id=(
+                state.current_attention_id
+                if state.current_attention_id != attention_id
+                else None
+            ),
+            delivery=(
+                ("attention_escalated", f"severity:{severity}")
+                if escalated
+                else None
+            ),
+        )
+
+    if state is None or state.lifecycle_status != ATTENTION_LIFECYCLE_OPEN:
+        return _AttentionTransition("no-op", state)
+    if observation.authority != "complete":
+        return _AttentionTransition("no-op", state)
+
+    first_missing_at = state.first_missing_at or observation.observed_at
+    missing_count = state.missing_observation_count + 1
+    elapsed = (
+        datetime.fromisoformat(observation.observed_at)
+        - datetime.fromisoformat(first_missing_at)
+    ).total_seconds()
+    resolves = (
+        missing_count >= ATTENTION_MISSING_REQUIRED
+        and elapsed >= ATTENTION_MISSING_GRACE_SECONDS
+    )
+    next_state = _AttentionLifecycleState(
+        host_id=state.host_id,
+        family_key=state.family_key,
+        generation=state.generation,
+        lifecycle_status=(
+            ATTENTION_LIFECYCLE_RESOLVED
+            if resolves
+            else ATTENTION_LIFECYCLE_OPEN
         ),
-    ).fetchall()
-    new_rank = _attention_severity_rank(severity)
-    if any(new_rank > _attention_severity_rank(row[0]) for row in rows):
-        return "attention_escalated"
-    return "attention_created"
+        current_attention_id=None if resolves else state.current_attention_id,
+        first_seen_at=state.first_seen_at,
+        last_positive_at=state.last_positive_at,
+        first_missing_at=first_missing_at,
+        missing_observation_count=missing_count,
+        last_accepted_at=observation.observed_at,
+        last_observation_key=observation.observation_key,
+        max_notified_severity_rank=state.max_notified_severity_rank,
+    )
+    return _AttentionTransition(
+        "resolve" if resolves else (
+            "start-missing" if state.first_missing_at is None else "advance-missing"
+        ),
+        next_state,
+        resolve_attention_id=state.current_attention_id if resolves else None,
+    )
 
 
 def _enqueue_attention_lifecycle_job_conn(
     conn: sqlite3.Connection,
     *,
-    host_id: str,
+    state: _AttentionLifecycleState,
     event_type: str,
-    attention_id: str,
+    stage: str,
     attention_payload: Mapping[str, Any],
     transition_at: str,
 ) -> None:
-    lifecycle_key = stable_fingerprint(
+    transition_key = stable_fingerprint(
         {
+            "domain": "tendwire.attention.transition.v1",
+            "host_id": state.host_id,
+            "family_key": state.family_key,
+            "generation": state.generation,
             "event_type": event_type,
-            "attention_id": attention_id,
-            "transition_at": transition_at,
+            "stage": stage,
         }
-    )[:16]
-    delivery_key = f"attention:{event_type}:{attention_id}:{lifecycle_key}"
-    payload = sanitize_forbidden_fields(
+    )
+    delivery_key = f"attention:{event_type}:{transition_key}"
+    payload = sanitize_public_value(
         {
             "schema_version": 1,
             "event_type": event_type,
-            "host_id": str(host_id),
+            "host_id": state.host_id,
             "attention": dict(attention_payload),
             "transition_at": transition_at,
         }
@@ -2056,271 +2390,342 @@ def _enqueue_attention_lifecycle_job_conn(
     conn.execute(
         """
         INSERT INTO connector_outbox (
-            host_id,
-            connector,
-            delivery_key,
-            status,
-            payload_json,
-            private_state_json,
-            created_at,
-            updated_at,
-            next_attempt_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            host_id, connector, delivery_key, status, payload_json,
+            private_state_json, created_at, updated_at, next_attempt_at
+        ) VALUES (?, ?, ?, 'queued', ?, '{}', ?, ?, NULL)
         ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
         """,
         (
-            str(host_id),
+            state.host_id,
             ATTENTION_OUTBOX_CONNECTOR,
             delivery_key,
-            "queued",
             _canonical_json(payload),
-            "{}",
             transition_at,
             transition_at,
-            None,
         ),
     )
 
 
-def _upsert_attention_item_conn(
+def _upsert_attention_projection_conn(
     conn: sqlite3.Connection,
     *,
-    host_id: str,
+    state: _AttentionLifecycleState,
     item: Mapping[str, Any],
     content_fingerprint: str,
     observed_at: str,
-) -> str:
+    prior_signal_count: int = 0,
+) -> dict[str, Any]:
+    item = sanitize_public_mapping(item)
     attention_id = _attention_id_from_item(item)
-    source = str(item.get("source") or "")
-    kind = str(item.get("kind") or "unknown")
-    severity = str(item.get("severity") or "info")
+    source = _store_public_text(item.get("source"), default="unknown")
+    kind = _store_public_label(item.get("kind"))
+    severity = normalize_severity(item.get("severity"))
     signal_status = str(item.get("status") or "unknown")
-    updated_at = item.get("updated_at")
     fingerprint = str(item.get("fingerprint") or "")
-    payload_json = _canonical_json(dict(item))
     existing = conn.execute(
         """
-        SELECT
-            fingerprint,
-            lifecycle_status,
-            signal_count,
-            last_changed_at,
-            severity,
-            status
+        SELECT fingerprint, lifecycle_status, signal_count, last_changed_at,
+               severity, status
         FROM attention_items
         WHERE host_id = ? AND attention_id = ?
         """,
-        (str(host_id), attention_id),
+        (state.host_id, attention_id),
     ).fetchone()
-
-    if existing is None:
-        transition_event = _attention_transition_event_type(
-            conn,
-            host_id=host_id,
-            attention_id=attention_id,
-            source=source,
-            kind=kind,
-            severity=severity,
-        )
-        conn.execute(
-            """
-            INSERT INTO attention_items (
-                host_id,
-                attention_id,
-                source,
-                kind,
-                severity,
-                status,
-                updated_at,
-                fingerprint,
-                snapshot_content_fingerprint,
-                observed_at,
-                first_seen_at,
-                last_seen_at,
-                last_changed_at,
-                resolved_at,
-                lifecycle_status,
-                resolved_reason,
-                signal_count,
-                payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(host_id),
-                attention_id,
-                source,
-                kind,
-                severity,
-                signal_status,
-                updated_at,
-                fingerprint,
-                str(content_fingerprint),
-                observed_at,
-                observed_at,
-                observed_at,
-                observed_at,
-                None,
-                ATTENTION_LIFECYCLE_OPEN,
-                None,
-                1,
-                payload_json,
-            ),
-        )
-        _enqueue_attention_lifecycle_job_conn(
-            conn,
-            host_id=host_id,
-            event_type=transition_event,
-            attention_id=attention_id,
-            attention_payload=_attention_lifecycle_payload(
-                item,
-                attention_id=attention_id,
-                observed_at=observed_at,
-                first_seen_at=observed_at,
-                last_seen_at=observed_at,
-                last_changed_at=observed_at,
-                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
-                signal_count=1,
-            ),
-            transition_at=observed_at,
-        )
-        return attention_id
-
-    previous_fingerprint = str(existing[0] or "")
-    previous_lifecycle_status = str(existing[1] or ATTENTION_LIFECYCLE_OPEN)
-    previous_signal_count = int(existing[2] or 0)
-    previous_last_changed_at = str(existing[3] or observed_at)
-    previous_severity = str(existing[4] or "info")
-    previous_signal_status = str(existing[5] or "unknown")
+    signal_count = max(
+        max(0, int(prior_signal_count)),
+        0 if existing is None else max(0, int(existing[2] or 0)),
+    ) + 1
     changed = (
-        previous_lifecycle_status != ATTENTION_LIFECYCLE_OPEN
-        or previous_fingerprint != fingerprint
-        or previous_severity != severity
-        or previous_signal_status != signal_status
+        existing is None
+        or str(existing[0] or "") != fingerprint
+        or str(existing[1] or "") != ATTENTION_LIFECYCLE_OPEN
+        or normalize_severity(existing[4]) != severity
+        or str(existing[5] or "") != signal_status
     )
-    last_changed_at = observed_at if changed else previous_last_changed_at
-    signal_count = max(0, previous_signal_count) + 1
+    last_changed_at = (
+        observed_at if changed else str(existing[3] or observed_at)
+    )
     conn.execute(
         """
-        UPDATE attention_items
-        SET
-            source = ?,
-            kind = ?,
-            severity = ?,
-            status = ?,
-            updated_at = ?,
-            fingerprint = ?,
-            snapshot_content_fingerprint = ?,
-            observed_at = ?,
-            last_seen_at = ?,
-            last_changed_at = ?,
+        INSERT INTO attention_items (
+            host_id, attention_id, source, kind, severity, status, updated_at,
+            fingerprint, snapshot_content_fingerprint, observed_at,
+            first_seen_at, last_seen_at, last_changed_at, resolved_at,
+            lifecycle_status, resolved_reason, signal_count, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'open', NULL, ?, ?)
+        ON CONFLICT(host_id, attention_id) DO UPDATE SET
+            source = excluded.source,
+            kind = excluded.kind,
+            severity = excluded.severity,
+            status = excluded.status,
+            updated_at = excluded.updated_at,
+            fingerprint = excluded.fingerprint,
+            snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
+            observed_at = excluded.observed_at,
+            first_seen_at = excluded.first_seen_at,
+            last_seen_at = excluded.last_seen_at,
+            last_changed_at = excluded.last_changed_at,
             resolved_at = NULL,
-            lifecycle_status = ?,
+            lifecycle_status = 'open',
             resolved_reason = NULL,
-            signal_count = ?,
-            payload_json = ?
-        WHERE host_id = ? AND attention_id = ?
+            signal_count = excluded.signal_count,
+            payload_json = excluded.payload_json
         """,
         (
+            state.host_id,
+            attention_id,
             source,
             kind,
             severity,
             signal_status,
-            updated_at,
+            item.get("updated_at"),
             fingerprint,
             str(content_fingerprint),
             observed_at,
+            state.first_seen_at,
             observed_at,
             last_changed_at,
-            ATTENTION_LIFECYCLE_OPEN,
             signal_count,
-            payload_json,
-            str(host_id),
-            attention_id,
+            _canonical_json(dict(item)),
         ),
     )
-    if previous_lifecycle_status != ATTENTION_LIFECYCLE_OPEN:
-        _enqueue_attention_lifecycle_job_conn(
-            conn,
-            host_id=host_id,
-            event_type="attention_created",
-            attention_id=attention_id,
-            attention_payload=_attention_lifecycle_payload(
-                item,
-                attention_id=attention_id,
-                observed_at=observed_at,
-                first_seen_at=observed_at,
-                last_seen_at=observed_at,
-                last_changed_at=last_changed_at,
-                lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
-                signal_count=signal_count,
-            ),
-            transition_at=observed_at,
-        )
-    return attention_id
+    return _attention_lifecycle_payload(
+        item,
+        attention_id=attention_id,
+        observed_at=observed_at,
+        first_seen_at=state.first_seen_at,
+        last_seen_at=observed_at,
+        last_changed_at=last_changed_at,
+        lifecycle_status=ATTENTION_LIFECYCLE_OPEN,
+        signal_count=signal_count,
+    )
 
 
-def _resolve_missing_attention_items_conn(
+def _attention_state_from_row(row: Any) -> _AttentionLifecycleState:
+    return _AttentionLifecycleState(
+        host_id=str(row[0]),
+        family_key=str(row[1]),
+        generation=int(row[2]),
+        lifecycle_status=str(row[3]),
+        current_attention_id=str(row[4]) if row[4] is not None else None,
+        first_seen_at=str(row[5]),
+        last_positive_at=str(row[6]),
+        first_missing_at=str(row[7]) if row[7] is not None else None,
+        missing_observation_count=int(row[8]),
+        last_accepted_at=str(row[9]),
+        last_observation_key=str(row[10]),
+        max_notified_severity_rank=int(row[11]),
+    )
+
+
+def _apply_attention_observation_conn(
     conn: sqlite3.Connection,
     *,
-    host_id: str,
-    current_attention_ids: Iterable[str],
+    snapshot: Snapshot,
+    payload_data: Mapping[str, Any],
     content_fingerprint: str,
-    observed_at: str,
-    authoritative: bool,
-) -> int:
-    if not authoritative:
-        return 0
-    current = sorted({str(value) for value in current_attention_ids})
-    if current:
-        placeholders = ",".join("?" for _ in current)
-        cursor = conn.execute(
-            f"""
-            UPDATE attention_items
-            SET
-                lifecycle_status = ?,
-                resolved_at = ?,
-                resolved_reason = ?,
-                last_changed_at = ?,
-                snapshot_content_fingerprint = ?
-            WHERE host_id = ?
-              AND lifecycle_status = ?
-              AND attention_id NOT IN ({placeholders})
-            """,
-            [
-                ATTENTION_LIFECYCLE_RESOLVED,
-                observed_at,
-                ATTENTION_RESOLVED_REASON_GONE,
-                observed_at,
-                str(content_fingerprint),
-                str(host_id),
-                ATTENTION_LIFECYCLE_OPEN,
-                *current,
-            ],
+    observation: SnapshotObservationContext,
+) -> None:
+    authority = (
+        observation.authority
+        if observation.authority in {"none", "positive", "complete"}
+        else "none"
+    )
+    if authority == "none":
+        return
+    observed_at = _strict_utc_timestamp(observation.observed_at)
+    if observed_at is None:
+        return
+    host_id = str(snapshot.host_id)
+    observation_key = _attention_observation_key(
+        host_id=host_id,
+        authority=authority,
+        observed_at=observed_at,
+        content_fingerprint=content_fingerprint,
+    )
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for raw_item in payload_data.get("attention", []):
+        if not isinstance(raw_item, Mapping):
+            continue
+        item = sanitize_public_mapping(raw_item)
+        family_key = _attention_family_key(host_id, item)
+        grouped.setdefault(family_key, []).append(item)
+
+    def candidate_rank(item: Mapping[str, Any]) -> tuple[int, str, str]:
+        updated_at = _strict_utc_timestamp(item.get("updated_at")) or ""
+        return (
+            _attention_severity_rank(item.get("severity")),
+            updated_at,
+            "".join(chr(0x10FFFF - ord(ch)) for ch in _attention_id_from_item(item)),
         )
-    else:
-        cursor = conn.execute(
-            """
-            UPDATE attention_items
-            SET
-                lifecycle_status = ?,
-                resolved_at = ?,
-                resolved_reason = ?,
-                last_changed_at = ?,
-                snapshot_content_fingerprint = ?
-            WHERE host_id = ?
-              AND lifecycle_status = ?
-            """,
-            (
-                ATTENTION_LIFECYCLE_RESOLVED,
-                observed_at,
-                ATTENTION_RESOLVED_REASON_GONE,
-                observed_at,
-                str(content_fingerprint),
-                str(host_id),
-                ATTENTION_LIFECYCLE_OPEN,
+
+    selected = {
+        family_key: max(items, key=candidate_rank)
+        for family_key, items in grouped.items()
+    }
+    rows = conn.execute(
+        """
+        SELECT host_id, family_key, generation, lifecycle_status,
+               current_attention_id, first_seen_at, last_positive_at,
+               first_missing_at, missing_observation_count, last_accepted_at,
+               last_observation_key, max_notified_severity_rank
+        FROM attention_lifecycles
+        WHERE host_id = ?
+        """,
+        (host_id,),
+    ).fetchall()
+    states = {
+        state.family_key: state
+        for state in (_attention_state_from_row(row) for row in rows)
+    }
+    family_keys = set(selected)
+    if authority == "complete":
+        family_keys.update(
+            key
+            for key, state in states.items()
+            if state.lifecycle_status == ATTENTION_LIFECYCLE_OPEN
+        )
+
+    for family_key in sorted(family_keys):
+        state = states.get(family_key)
+        signal = selected.get(family_key)
+        transition = _plan_attention_transition(
+            state,
+            _AttentionObservation(
+                host_id=host_id,
+                family_key=family_key,
+                authority=authority,
+                observed_at=observed_at,
+                observation_key=observation_key,
+                signal=signal,
             ),
         )
-    return int(cursor.rowcount or 0)
+        next_state = transition.next_state
+        if transition.action == "no-op" or next_state is None:
+            continue
+        if state is None:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO attention_lifecycles (
+                    host_id, family_key, generation, lifecycle_status,
+                    current_attention_id, first_seen_at, last_positive_at,
+                    first_missing_at, missing_observation_count, last_accepted_at,
+                    last_observation_key, max_notified_severity_rank
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    next_state.host_id,
+                    next_state.family_key,
+                    next_state.generation,
+                    next_state.lifecycle_status,
+                    next_state.current_attention_id,
+                    next_state.first_seen_at,
+                    next_state.last_positive_at,
+                    next_state.first_missing_at,
+                    next_state.missing_observation_count,
+                    next_state.last_accepted_at,
+                    next_state.last_observation_key,
+                    next_state.max_notified_severity_rank,
+                ),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                UPDATE attention_lifecycles
+                SET generation = ?, lifecycle_status = ?,
+                    current_attention_id = ?, first_seen_at = ?,
+                    last_positive_at = ?, first_missing_at = ?,
+                    missing_observation_count = ?, last_accepted_at = ?,
+                    last_observation_key = ?, max_notified_severity_rank = ?
+                WHERE host_id = ? AND family_key = ? AND generation = ?
+                  AND lifecycle_status = ? AND last_accepted_at < ?
+                """,
+                (
+                    next_state.generation,
+                    next_state.lifecycle_status,
+                    next_state.current_attention_id,
+                    next_state.first_seen_at,
+                    next_state.last_positive_at,
+                    next_state.first_missing_at,
+                    next_state.missing_observation_count,
+                    next_state.last_accepted_at,
+                    next_state.last_observation_key,
+                    next_state.max_notified_severity_rank,
+                    state.host_id,
+                    state.family_key,
+                    state.generation,
+                    state.lifecycle_status,
+                    observed_at,
+                ),
+            )
+        if int(cursor.rowcount or 0) != 1:
+            continue
+
+        prior_signal_count = 0
+        if transition.superseded_attention_id is not None:
+            prior_row = conn.execute(
+                """
+                SELECT signal_count FROM attention_items
+                WHERE host_id = ? AND attention_id = ?
+                """,
+                (host_id, transition.superseded_attention_id),
+            ).fetchone()
+            prior_signal_count = int(prior_row[0] or 0) if prior_row else 0
+        if transition.superseded_attention_id is not None:
+            conn.execute(
+                """
+                UPDATE attention_items
+                SET lifecycle_status = 'resolved', resolved_at = ?,
+                    resolved_reason = ?, last_changed_at = ?
+                WHERE host_id = ? AND attention_id = ? AND lifecycle_status = 'open'
+                """,
+                (
+                    observed_at,
+                    ATTENTION_RESOLVED_REASON_SUPERSEDED,
+                    observed_at,
+                    host_id,
+                    transition.superseded_attention_id,
+                ),
+            )
+        public_payload: dict[str, Any] | None = None
+        if transition.upsert_signal is not None:
+            public_payload = _upsert_attention_projection_conn(
+                conn,
+                state=next_state,
+                item=transition.upsert_signal,
+                content_fingerprint=content_fingerprint,
+                observed_at=observed_at,
+                prior_signal_count=prior_signal_count,
+            )
+        if transition.resolve_attention_id is not None:
+            conn.execute(
+                """
+                UPDATE attention_items
+                SET lifecycle_status = 'resolved', resolved_at = ?,
+                    resolved_reason = ?, last_changed_at = ?,
+                    snapshot_content_fingerprint = ?
+                WHERE host_id = ? AND attention_id = ? AND lifecycle_status = 'open'
+                """,
+                (
+                    observed_at,
+                    ATTENTION_RESOLVED_REASON_GONE,
+                    observed_at,
+                    str(content_fingerprint),
+                    host_id,
+                    transition.resolve_attention_id,
+                ),
+            )
+        if transition.delivery is not None and public_payload is not None:
+            _enqueue_attention_lifecycle_job_conn(
+                conn,
+                state=next_state,
+                event_type=transition.delivery[0],
+                stage=transition.delivery[1],
+                attention_payload=public_payload,
+                transition_at=observed_at,
+            )
+        states[family_key] = next_state
 
 
 def _upsert_snapshot_projections(
@@ -2330,7 +2735,12 @@ def _upsert_snapshot_projections(
     *,
     snapshot_id: int,
     content_fingerprint: str,
+    private_snapshot_data: Mapping[str, Any] | None = None,
 ) -> None:
+    private_event_snapshot = dict(
+        payload_data if private_snapshot_data is None else private_snapshot_data
+    )
+    payload_data = sanitize_public_mapping(payload_data)
     host_id = str(snapshot.host_id)
     observed_at = str(snapshot.updated_at)
 
@@ -2345,7 +2755,7 @@ def _upsert_snapshot_projections(
         payload={
             "snapshot_id": int(snapshot_id),
             "content_fingerprint": str(content_fingerprint),
-            "snapshot": dict(payload_data),
+            "snapshot": private_event_snapshot,
         },
     )
 
@@ -2436,30 +2846,10 @@ def _upsert_snapshot_projections(
         )
     _prune_host_projection(conn, "workers", "worker_id", host_id, worker_ids)
 
-    attention_ids: set[str] = set()
-    for item in payload_data.get("attention", []):
-        if not isinstance(item, Mapping):
-            continue
-        attention_id = _upsert_attention_item_conn(
-            conn,
-            host_id=host_id,
-            item=item,
-            content_fingerprint=content_fingerprint,
-            observed_at=observed_at,
-        )
-        attention_ids.add(attention_id)
-    _resolve_missing_attention_items_conn(
-        conn,
-        host_id=host_id,
-        current_attention_ids=attention_ids,
-        content_fingerprint=content_fingerprint,
-        observed_at=observed_at,
-        authoritative=_snapshot_attention_is_authoritative_healthy(payload_data),
-    )
 
     turn_ids: set[str] = set()
     for turn in turns_from_snapshot(snapshot):
-        item = turn.to_dict()
+        item = sanitize_public_mapping(turn.to_dict())
         turn_id = str(item.get("id") or "unknown")
         turn_ids.add(turn_id)
         conn.execute(
@@ -2509,7 +2899,7 @@ def _upsert_snapshot_projections(
 
     pending_ids: set[str] = set()
     for pending in pending_from_snapshot(snapshot):
-        item = pending.to_dict()
+        item = sanitize_public_mapping(pending.to_dict())
         pending_id = str(item.get("id") or "unknown")
         pending_ids.add(pending_id)
         conn.execute(
@@ -2731,7 +3121,7 @@ def find_recent_matching_command_submission(
     exclude_request_id: str = "",
 ) -> dict[str, Any] | None:
     """Return a recent same-worker/same-text accepted command, if one exists."""
-    if not db_path.exists() or not str(worker_id).strip() or not str(instruction_text):
+    if not _sqlite_store_exists(db_path) or not str(worker_id).strip() or not str(instruction_text):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -2768,14 +3158,12 @@ def find_recent_matching_command_submission(
             continue
         if instruction.get("text") != instruction_text:
             continue
-        return sanitize_forbidden_fields(
-            {
-                "request_id": str(row[0] or ""),
-                "status": str(row[1] or ""),
-                "created_at": str(row[3] or ""),
-                "updated_at": str(row[4] or ""),
-            }
-        )
+        return sanitize_public_value({
+            "request_id": str(row[0] or ""),
+            "status": str(row[1] or ""),
+            "created_at": str(row[3] or ""),
+            "updated_at": str(row[4] or ""),
+        })
     return None
 
 
@@ -2801,7 +3189,7 @@ def _backfill_command_audit(conn: sqlite3.Connection) -> None:
         _upsert_command_audit_from_receipt_row(conn, row)
 
 
-def _backfill_attention_lifecycle(conn: sqlite3.Connection) -> None:
+def _backfill_legacy_attention_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE attention_items
@@ -2835,7 +3223,656 @@ def _backfill_attention_lifecycle(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_private_state(
+    raw: Any,
+    *,
+    group: str,
+    canonical: bool,
+    terminal_after_lease: bool = False,
+) -> str:
+    state = _json_object(raw)
+    state["migration_group"] = group
+    state["migration_canonical"] = bool(canonical)
+    if terminal_after_lease:
+        state["terminal_after_lease"] = True
+    else:
+        state.pop("terminal_after_lease", None)
+    return _canonical_json(state)
+
+
+def _legacy_attention_job_identity(
+    row_host_id: str,
+    payload_json: Any,
+) -> tuple[str, str, str, str, str, str | None] | None:
+    payload = sanitize_public_mapping(_json_object(payload_json), backend_neutral=True)
+    if str(payload.get("host_id") or "") != str(row_host_id):
+        return None
+    event_type = str(payload.get("event_type") or "")
+    if event_type not in {"attention_created", "attention_escalated"}:
+        return None
+    attention = payload.get("attention")
+    if not isinstance(attention, Mapping):
+        return None
+    source = _store_public_text(attention.get("source"), default="")
+    kind = _store_public_label(attention.get("kind"))
+    if not source or kind == "unknown":
+        return None
+    family_key = _attention_family_key(str(row_host_id), attention)
+    stage = (
+        "initial"
+        if event_type == "attention_created"
+        else f"severity:{normalize_severity(attention.get('severity'))}"
+    )
+    return (
+        str(row_host_id),
+        family_key,
+        event_type,
+        stage,
+        _attention_id_from_item(attention),
+        _strict_utc_timestamp(payload.get("transition_at")),
+    )
+
+
+def _migrate_v4_attention_rows_conn(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS temp.attention_v5_rows")
+    conn.execute(
+        """
+        CREATE TEMP TABLE attention_v5_rows (
+            host_id TEXT NOT NULL,
+            family_key TEXT NOT NULL,
+            attention_id TEXT NOT NULL,
+            is_open INTEGER NOT NULL,
+            positive_at TEXT,
+            changed_at TEXT,
+            first_seen_at TEXT,
+            severity_rank INTEGER NOT NULL,
+            signal_count INTEGER NOT NULL
+        )
+        """
+    )
+    cursor = conn.execute(
+        """
+        SELECT host_id, attention_id, source, kind, severity, lifecycle_status,
+               updated_at, observed_at, first_seen_at, last_seen_at,
+               last_changed_at, signal_count
+        FROM attention_items
+        ORDER BY host_id, attention_id
+        """
+    )
+    while True:
+        batch = cursor.fetchmany(500)
+        if not batch:
+            break
+        values: list[tuple[Any, ...]] = []
+        for row in batch:
+            host_id = str(row[0])
+            item = {"source": row[2], "kind": row[3]}
+            positive_at = (
+                _strict_utc_timestamp(row[9])
+                or _strict_utc_timestamp(row[7])
+                or _strict_utc_timestamp(row[6])
+            )
+            values.append(
+                (
+                    host_id,
+                    _attention_family_key(host_id, item),
+                    str(row[1]),
+                    int(str(row[5] or "open") == ATTENTION_LIFECYCLE_OPEN),
+                    positive_at,
+                    _strict_utc_timestamp(row[10]),
+                    _strict_utc_timestamp(row[8]),
+                    _attention_severity_rank(row[4]),
+                    max(1, int(row[11] or 1)),
+                )
+            )
+        conn.executemany(
+            """
+            INSERT INTO attention_v5_rows (
+                host_id, family_key, attention_id, is_open, positive_at,
+                changed_at, first_seen_at, severity_rank, signal_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+    family_cursor = conn.execute(
+        """
+        SELECT host_id, family_key
+        FROM attention_v5_rows
+        GROUP BY host_id, family_key
+        ORDER BY host_id, family_key
+        """
+    )
+    while True:
+        families = family_cursor.fetchmany(500)
+        if not families:
+            break
+        for host_id_raw, family_key_raw in families:
+            host_id = str(host_id_raw)
+            family_key = str(family_key_raw)
+            candidates = conn.execute(
+                """
+                SELECT attention_id, is_open, positive_at, changed_at,
+                       first_seen_at, severity_rank, signal_count
+                FROM attention_v5_rows
+                WHERE host_id = ? AND family_key = ?
+                ORDER BY attention_id
+                """,
+                (host_id, family_key),
+            )
+            winner: tuple[Any, ...] | None = None
+            earliest_first: str | None = None
+            latest_positive: str | None = None
+            latest_progress: str | None = None
+            total_signals = 0
+            max_severity = -1
+            while True:
+                candidate_batch = candidates.fetchmany(500)
+                if not candidate_batch:
+                    break
+                for candidate in candidate_batch:
+                    total_signals += max(1, int(candidate[6] or 1))
+                    max_severity = max(max_severity, int(candidate[5]))
+                    if candidate[4] and (
+                        earliest_first is None or str(candidate[4]) < earliest_first
+                    ):
+                        earliest_first = str(candidate[4])
+                    if candidate[2] and (
+                        latest_positive is None or str(candidate[2]) > latest_positive
+                    ):
+                        latest_positive = str(candidate[2])
+                    progress_at = max(
+                        str(candidate[2] or ""),
+                        str(candidate[3] or ""),
+                    )
+                    if progress_at and (
+                        latest_progress is None or progress_at > latest_progress
+                    ):
+                        latest_progress = progress_at
+                    rank = (
+                        progress_at,
+                        int(candidate[1]),
+                        str(candidate[2] or ""),
+                        str(candidate[3] or ""),
+                        int(candidate[5]),
+                        int(candidate[6]),
+                        "".join(
+                            chr(0x10FFFF - ord(ch)) for ch in str(candidate[0])
+                        ),
+                    )
+                    if winner is None or rank > winner[0]:
+                        winner = (rank, *candidate)
+            if winner is None or latest_positive is None:
+                continue
+            winner_attention_id = str(winner[1])
+            is_open = bool(winner[2])
+            first_seen_at = earliest_first or latest_positive
+            # The lifecycle watermark (last_accepted_at) must be the newest
+            # lifecycle progress — max(latest positive, latest change/resolve) —
+            # not merely the latest positive. A resolved episode whose resolution
+            # (t10) is newer than its last positive (t0) would otherwise seed the
+            # watermark at t0, letting a delayed positive at t5 (< the authoritative
+            # resolution) pass the observation guard and spuriously reopen
+            # generation 2 with a fresh notification. last_positive_at stays the
+            # actual latest positive; the observation key is anchored to the
+            # accepted progress so replaying the authoritative resolution is a no-op.
+            accepted_progress = latest_progress or latest_positive
+            observation_key = stable_fingerprint(
+                {
+                    "domain": "tendwire.attention.observation.v1",
+                    "host_id": host_id,
+                    "authority": "migration",
+                    "observed_at": accepted_progress,
+                    "snapshot_content_fingerprint": family_key,
+                }
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO attention_lifecycles (
+                    host_id, family_key, generation, lifecycle_status,
+                    current_attention_id, first_seen_at, last_positive_at,
+                    first_missing_at, missing_observation_count, last_accepted_at,
+                    last_observation_key, max_notified_severity_rank
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
+                """,
+                (
+                    host_id,
+                    family_key,
+                    (
+                        ATTENTION_LIFECYCLE_OPEN
+                        if is_open
+                        else ATTENTION_LIFECYCLE_RESOLVED
+                    ),
+                    winner_attention_id if is_open else None,
+                    first_seen_at,
+                    latest_positive,
+                    accepted_progress,
+                    observation_key,
+                    max_severity,
+                ),
+            )
+            if is_open:
+                conn.execute(
+                    """
+                    UPDATE attention_items
+                    SET first_seen_at = ?, last_seen_at = ?,
+                        signal_count = ?, lifecycle_status = 'open',
+                        resolved_at = NULL, resolved_reason = NULL
+                    WHERE host_id = ? AND attention_id = ?
+                    """,
+                    (
+                        first_seen_at,
+                        latest_positive,
+                        total_signals,
+                        host_id,
+                        winner_attention_id,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE attention_items
+                    SET lifecycle_status = 'resolved',
+                        resolved_at = COALESCE(NULLIF(resolved_at, ''), ?),
+                        resolved_reason = ?,
+                        last_changed_at = ?
+                    WHERE host_id = ? AND lifecycle_status = 'open'
+                      AND attention_id != ?
+                      AND attention_id IN (
+                          SELECT attention_id FROM attention_v5_rows
+                          WHERE host_id = ? AND family_key = ? AND is_open = 1
+                      )
+                    """,
+                    (
+                        latest_positive,
+                        ATTENTION_RESOLVED_REASON_SUPERSEDED,
+                        latest_positive,
+                        host_id,
+                        winner_attention_id,
+                        host_id,
+                        family_key,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE attention_items
+                    SET lifecycle_status = 'resolved',
+                        resolved_at = COALESCE(NULLIF(resolved_at, ''), ?),
+                        resolved_reason = CASE
+                            WHEN attention_id = ? THEN COALESCE(resolved_reason, 'gone')
+                            ELSE ?
+                        END,
+                        last_changed_at = ?
+                    WHERE host_id = ? AND lifecycle_status = 'open'
+                      AND attention_id IN (
+                          SELECT attention_id FROM attention_v5_rows
+                          WHERE host_id = ? AND family_key = ? AND is_open = 1
+                      )
+                    """,
+                    (
+                        latest_positive,
+                        winner_attention_id,
+                        ATTENTION_RESOLVED_REASON_SUPERSEDED,
+                        latest_positive,
+                        host_id,
+                        host_id,
+                        family_key,
+                    ),
+                )
+    conn.execute("DROP TABLE temp.attention_v5_rows")
+
+
+def _migrate_v4_attention_outbox_conn(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS temp.attention_v5_jobs")
+    conn.execute(
+        """
+        CREATE TEMP TABLE attention_v5_jobs (
+            outbox_id INTEGER PRIMARY KEY,
+            host_id TEXT NOT NULL,
+            family_key TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            attention_id TEXT NOT NULL,
+            transition_at TEXT,
+            group_key TEXT NOT NULL
+        )
+        """
+    )
+    cursor = conn.execute(
+        """
+        SELECT id, host_id, payload_json
+        FROM connector_outbox
+        WHERE connector = ?
+        ORDER BY id
+        """,
+        (ATTENTION_OUTBOX_CONNECTOR,),
+    )
+    while True:
+        batch = cursor.fetchmany(500)
+        if not batch:
+            break
+        values: list[tuple[Any, ...]] = []
+        for outbox_id, host_id, payload_json in batch:
+            identity = _legacy_attention_job_identity(str(host_id), payload_json)
+            if identity is None:
+                continue
+            (
+                identity_host,
+                family_key,
+                event_type,
+                stage,
+                attention_id,
+                transition_at,
+            ) = identity
+            group_key = stable_fingerprint(
+                {
+                    "domain": "tendwire.attention.migration-group.v1",
+                    "host_id": identity_host,
+                    "family_key": family_key,
+                    "generation": 1,
+                    "event_type": event_type,
+                    "stage": stage,
+                }
+            )
+            values.append(
+                (
+                    int(outbox_id),
+                    identity_host,
+                    family_key,
+                    event_type,
+                    stage,
+                    attention_id,
+                    transition_at,
+                    group_key,
+                )
+            )
+            if event_type == "attention_escalated":
+                severity = stage.removeprefix("severity:")
+                conn.execute(
+                    """
+                    UPDATE attention_lifecycles
+                    SET max_notified_severity_rank =
+                        MAX(max_notified_severity_rank, ?)
+                    WHERE host_id = ? AND family_key = ?
+                    """,
+                    (
+                        _attention_severity_rank(severity),
+                        identity_host,
+                        family_key,
+                    ),
+                )
+        conn.executemany(
+            """
+            INSERT INTO attention_v5_jobs (
+                outbox_id, host_id, family_key, event_type, stage,
+                attention_id, transition_at, group_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+    group_cursor = conn.execute(
+        """
+        SELECT host_id, family_key, event_type, stage, group_key
+        FROM attention_v5_jobs
+        GROUP BY host_id, family_key, event_type, stage, group_key
+        ORDER BY group_key
+        """
+    )
+    while True:
+        groups = group_cursor.fetchmany(500)
+        if not groups:
+            break
+        for host_id, family_key, event_type, stage, group_key in groups:
+            candidate_rows = conn.execute(
+                """
+                SELECT o.id, o.status, o.payload_json, o.private_state_json,
+                       j.attention_id, j.transition_at
+                FROM connector_outbox o
+                JOIN attention_v5_jobs j ON j.outbox_id = o.id
+                WHERE j.group_key = ?
+                  AND o.status IN ('queued', 'retry', 'deferred', 'leased')
+                ORDER BY o.id
+                """,
+                (group_key,),
+            ).fetchall()
+            if not candidate_rows:
+                continue
+            lifecycle_row = conn.execute(
+                """
+                SELECT l.lifecycle_status, l.current_attention_id,
+                       l.first_seen_at, l.last_positive_at, l.last_accepted_at,
+                       i.last_changed_at, i.last_seen_at, i.observed_at,
+                       i.updated_at
+                FROM attention_lifecycles l
+                LEFT JOIN attention_items i
+                  ON i.host_id = l.host_id
+                 AND i.attention_id = l.current_attention_id
+                WHERE l.host_id = ? AND l.family_key = ?
+                """,
+                (host_id, family_key),
+            ).fetchone()
+            lifecycle_open = (
+                lifecycle_row is not None
+                and str(lifecycle_row[0]) == ATTENTION_LIFECYCLE_OPEN
+                and lifecycle_row[1] is not None
+            )
+            current_attention_id = (
+                str(lifecycle_row[1]) if lifecycle_open else ""
+            )
+            current_anchor_candidates = (
+                [
+                    canonical
+                    for canonical in (
+                        _strict_utc_timestamp(value)
+                        # Include the lifecycle's persisted last_accepted_at
+                        # (index 4) alongside the attention_items timestamps so
+                        # the current-episode anchor reflects the authoritative
+                        # accepted-progress watermark even when the row's own
+                        # timestamps are skewed (e.g. a delayed positive).
+                        for value in lifecycle_row[4:9]
+                    )
+                    if canonical is not None
+                ]
+                if lifecycle_open
+                else []
+            )
+            current_episode_anchor = (
+                max(current_anchor_candidates)
+                if current_anchor_candidates
+                else ""
+            )
+            terminalized_current_episode = False
+            if lifecycle_open:
+                terminal_rows = conn.execute(
+                    """
+                    SELECT j.attention_id, j.transition_at
+                    FROM connector_outbox o
+                    JOIN attention_v5_jobs j ON j.outbox_id = o.id
+                    WHERE j.group_key = ?
+                      AND o.status IN ('delivered', 'dead_letter')
+                    """,
+                    (group_key,),
+                ).fetchall()
+                terminalized_current_episode = bool(current_episode_anchor) and any(
+                    str(terminal_attention_id) == current_attention_id
+                    and bool(terminal_transition_at)
+                    and str(terminal_transition_at) >= current_episode_anchor
+                    for terminal_attention_id, terminal_transition_at in terminal_rows
+                )
+
+            leased_rows = [
+                row
+                for row in candidate_rows
+                if str(row[1]) == _CONNECTOR_LEASE_STATUS
+                and conn.execute(
+                    """
+                    SELECT 1 FROM connector_deliveries
+                    WHERE outbox_id = ? AND status = 'leased'
+                    LIMIT 1
+                    """,
+                    (int(row[0]),),
+                ).fetchone()
+                is not None
+            ]
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = ?, next_attempt_at = NULL
+                WHERE id IN (
+                    SELECT j.outbox_id FROM attention_v5_jobs j
+                    WHERE j.group_key = ?
+                ) AND (
+                    status IN ('queued', 'retry', 'deferred')
+                    OR (
+                        status = 'leased'
+                        AND id NOT IN (
+                            SELECT d.outbox_id FROM connector_deliveries d
+                            WHERE d.status = 'leased' AND d.outbox_id IS NOT NULL
+                        )
+                    )
+                )
+                """,
+                (_CONNECTOR_SUPERSEDED_OUTBOX_STATUS, group_key),
+            )
+
+            def active_rank(row: Any) -> tuple[int, str, int, int]:
+                return (
+                    int(str(row[4]) == current_attention_id),
+                    str(row[5] or ""),
+                    int(str(row[1]) == _CONNECTOR_LEASE_STATUS),
+                    -int(row[0]),
+                )
+
+            if not lifecycle_open or terminalized_current_episode:
+                for leased_row in leased_rows:
+                    conn.execute(
+                        """
+                        UPDATE connector_outbox
+                        SET private_state_json = ?
+                        WHERE id = ? AND status = 'leased'
+                        """,
+                        (
+                            _migration_private_state(
+                                leased_row[3],
+                                group=str(group_key),
+                                canonical=False,
+                                terminal_after_lease=True,
+                            ),
+                            int(leased_row[0]),
+                        ),
+                    )
+                continue
+
+            pollable_candidates = [
+                row
+                for row in candidate_rows
+                if str(row[1]) in _CONNECTOR_POLLABLE_STATUSES
+            ]
+            active_candidates = [*pollable_candidates, *leased_rows]
+            if not active_candidates:
+                continue
+            selected = max(active_candidates, key=active_rank)
+            selected_id = int(selected[0])
+            selected_is_lease = (
+                str(selected[1]) == _CONNECTOR_LEASE_STATUS
+                and any(int(row[0]) == selected_id for row in leased_rows)
+            )
+            for leased_row in leased_rows:
+                leased_id = int(leased_row[0])
+                conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET private_state_json = ?
+                    WHERE id = ? AND status = 'leased'
+                    """,
+                    (
+                        _migration_private_state(
+                            leased_row[3],
+                            group=str(group_key),
+                            canonical=selected_is_lease and leased_id == selected_id,
+                            terminal_after_lease=(
+                                not selected_is_lease or leased_id != selected_id
+                            ),
+                        ),
+                        leased_id,
+                    ),
+                )
+            if selected_is_lease:
+                continue
+            transition_key = stable_fingerprint(
+                {
+                    "domain": "tendwire.attention.transition.v1",
+                    "host_id": str(host_id),
+                    "family_key": str(family_key),
+                    "generation": 1,
+                    "event_type": str(event_type),
+                    "stage": str(stage),
+                }
+            )
+            canonical_key = f"attention:{event_type}:{transition_key}"
+            payload = sanitize_public_mapping(
+                _json_object(selected[2]), backend_neutral=True
+            )
+            transition_at = str(selected[5] or "")
+            if not transition_at:
+                transition_at = (
+                    str(lifecycle_row[4])
+                    if lifecycle_row is not None
+                    else "1970-01-01T00:00:00+00:00"
+                )
+            conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, status, payload_json,
+                    private_state_json, created_at, updated_at, next_attempt_at
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, NULL)
+                ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
+                """,
+                (
+                    str(host_id),
+                    ATTENTION_OUTBOX_CONNECTOR,
+                    canonical_key,
+                    _canonical_json(payload),
+                    _migration_private_state(
+                        {},
+                        group=str(group_key),
+                        canonical=True,
+                    ),
+                    transition_at,
+                    transition_at,
+                ),
+            )
+    conn.execute("DROP TABLE temp.attention_v5_jobs")
+
+
+def _migrate_v4_to_v5_conn(conn: sqlite3.Connection) -> None:
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 5:
+        return
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 5:
+            if owns_transaction:
+                conn.commit()
+            return
+        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
+        for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
+            conn.execute(statement)
+        _migrate_v4_attention_rows_conn(conn)
+        _migrate_v4_attention_outbox_conn(conn)
+        conn.execute("PRAGMA user_version = 5")
+        if owns_transaction:
+            conn.commit()
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
+    entered_with_transaction = conn.in_transaction
     conn.execute(CREATE_SNAPSHOTS_TABLE)
     columns = _table_columns(conn)
     if "content_fingerprint" not in columns:
@@ -2860,31 +3897,39 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for statement in CREATE_PR6_TABLES:
         conn.execute(statement)
     _ensure_pr6_columns(conn)
-    _backfill_attention_lifecycle(conn)
+    _backfill_legacy_attention_columns(conn)
     for statement in CREATE_PR6_INDEXES:
         conn.execute(statement)
     _backfill_command_audit(conn)
-    conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
+    if (
+        not entered_with_transaction
+        and conn.in_transaction
+        and int(conn.execute("PRAGMA user_version").fetchone()[0]) < 5
+    ):
+        conn.commit()
+    _migrate_v4_to_v5_conn(conn)
+    conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
+    for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
+        conn.execute(statement)
 
 
 def init_store(db_path: Path) -> None:
     """Initialize or migrate the sqlite store to the current schema."""
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
 
 
 def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
     """Return bounded public-safe host-scoped store and outbox counts."""
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
             "host_id": str(host_id),
             "counts": {},
             "outbox": {"pending": 0, "leased": 0, "terminal": 0, "by_status": {}},
-        }
+        })
     tables = (
         "snapshots",
         "events",
@@ -2939,25 +3984,27 @@ def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
         status = _store_public_label(row[0], allowed=_CONNECTOR_PUBLIC_OUTBOX_STATUSES)
         by_status[status] = by_status.get(status, 0) + int(row[1] or 0)
     pending_statuses = _CONNECTOR_POLLABLE_STATUSES
-    terminal_statuses = {_CONNECTOR_TERMINAL_OUTBOX_STATUS, _CONNECTOR_EXHAUSTED_OUTBOX_STATUS}
+    terminal_statuses = {
+        _CONNECTOR_TERMINAL_OUTBOX_STATUS,
+        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+        _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
+    }
     outbox = {
         "pending": sum(count for status, count in by_status.items() if status in pending_statuses),
         "leased": int(by_status.get(_CONNECTOR_LEASE_STATUS, 0)),
         "terminal": sum(count for status, count in by_status.items() if status in terminal_statuses),
         "by_status": by_status,
     }
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "host_id": str(host_id),
-            "counts": counts,
-            "outbox": outbox,
-            "last_event_at": last_event_row[0] if last_event_row is not None else None,
-            "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "counts": counts,
+        "outbox": outbox,
+        "last_event_at": last_event_row[0] if last_event_row is not None else None,
+        "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
+    })
 
 
 def tail_event_metadata(
@@ -2968,15 +4015,15 @@ def tail_event_metadata(
 ) -> dict[str, Any]:
     """Return bounded event/history metadata without raw payloads."""
     row_limit = max(1, min(int(limit), 100))
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
             "host_id": str(host_id),
             "limit": row_limit,
             "events": [],
-        }
+        })
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
@@ -2999,16 +4046,14 @@ def tail_event_metadata(
         }
         for row in rows
     ]
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "host_id": str(host_id),
-            "limit": row_limit,
-            "events": events,
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "limit": row_limit,
+        "events": events,
+    })
 
 
 def cleanup_event_retention(
@@ -3022,8 +4067,8 @@ def cleanup_event_retention(
     """Delete only host-scoped old rows from the events/history table."""
     days = max(1, int(retention_days))
     cutoff_at = _utc_cutoff(retention_days=days, now=now)
-    if not db_path.exists():
-        return {
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value({
             "schema_version": 1,
             "ok": False,
             "status": "store_unavailable",
@@ -3032,7 +4077,7 @@ def cleanup_event_retention(
             "retention_days": days,
             "cutoff_at": cutoff_at,
             "deleted": 0,
-        }
+        })
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         row = conn.execute(
@@ -3058,18 +4103,16 @@ def cleanup_event_retention(
             except Exception:
                 conn.rollback()
                 raise
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": True,
-            "status": "ok",
-            "host_id": str(host_id),
-            "dry_run": bool(dry_run),
-            "retention_days": days,
-            "cutoff_at": cutoff_at,
-            "deleted": deleted,
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "host_id": str(host_id),
+        "dry_run": bool(dry_run),
+        "retention_days": days,
+        "cutoff_at": cutoff_at,
+        "deleted": deleted,
+    })
 
 
 def run_store_maintenance(
@@ -3097,24 +4140,22 @@ def run_store_maintenance(
         dry_run=dry_run,
     )
     ok = bool(retention.get("ok")) and bool(outbox.get("ok"))
-    return sanitize_forbidden_fields(
-        {
-            "schema_version": 1,
-            "ok": ok,
-            "status": "ok" if ok else "store_unavailable",
-            "host_id": str(host_id),
-            "dry_run": bool(dry_run),
-            "retention": {
-                "retention_days": int(retention.get("retention_days") or retention_days),
-                "cutoff_at": retention.get("cutoff_at"),
-                "deleted": int(retention.get("deleted") or 0),
-            },
-            "outbox": {
-                "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
-                "updated": int(outbox.get("updated") or 0),
-            },
-        }
-    )
+    return sanitize_public_value({
+        "schema_version": 1,
+        "ok": ok,
+        "status": "ok" if ok else "store_unavailable",
+        "host_id": str(host_id),
+        "dry_run": bool(dry_run),
+        "retention": {
+            "retention_days": int(retention.get("retention_days") or retention_days),
+            "cutoff_at": retention.get("cutoff_at"),
+            "deleted": int(retention.get("deleted") or 0),
+        },
+        "outbox": {
+            "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
+            "updated": int(outbox.get("updated") or 0),
+        },
+    })
 
 
 _TURN_CONTENT_FIELDS = frozenset(
@@ -3198,7 +4239,7 @@ def merge_backend_pending(
 ) -> bool:
     """Presence-sync one worker's backend-provided pending prompt (a REAL pane prompt with choices,
     read through the turn adapter). `pending=None` prunes the row (the prompt was answered)."""
-    if not Path(db_path).exists():
+    if not _sqlite_store_exists(db_path):
         return False
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3208,7 +4249,7 @@ def merge_backend_pending(
                 (host_id, worker_id),
             )
             return cur.rowcount > 0
-        payload = stable_json_dumps(dict(pending))
+        payload = _canonical_json(sanitize_public_mapping(pending))
         row = conn.execute(
             "SELECT payload_json FROM backend_pending WHERE host_id = ? AND worker_id = ?",
             (host_id, worker_id),
@@ -3228,7 +4269,7 @@ def merge_backend_pending(
 def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
     """worker_id -> normalized pending dict for every live backend-provided prompt."""
     out: dict[str, dict[str, Any]] = {}
-    if not Path(db_path).exists():
+    if not _sqlite_store_exists(db_path):
         return out
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3240,16 +4281,16 @@ def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[st
                 payload = json.loads(payload_json)
             except (TypeError, ValueError):
                 continue
-            if isinstance(payload, dict):
-                out[str(worker_id)] = payload
-    return out
+            if isinstance(payload, Mapping):
+                out[str(worker_id)] = sanitize_public_mapping(payload)
+    return sanitize_public_mapping(out)
 
 
 def prune_backend_pending(db_path: Path | str, host_id: str, live_worker_ids: Iterable[str]) -> int:
     """Delete backend_pending rows whose worker no longer has a live binding. Presence-sync only
     prunes workers still being polled; this reaps rows orphaned when a worker/pane disappears with
     a prompt still open (otherwise get_pending would surface a phantom prompt for a dead worker)."""
-    if not Path(db_path).exists():
+    if not _sqlite_store_exists(db_path):
         return 0
     live = {str(worker_id) for worker_id in live_worker_ids}
     with _connect(db_path) as conn:
@@ -3279,9 +4320,11 @@ def merge_turn_content(
     observed_at: str | None = None,
 ) -> int:
     """Merge bounded public structured-turn content into host-scoped turn rows."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return 0
-    clean_content = {key: content.get(key) for key in _TURN_CONTENT_FIELDS if key in content}
+    clean_content = sanitize_public_mapping(
+        {key: content.get(key) for key in _TURN_CONTENT_FIELDS if key in content}
+    )
     if not clean_content:
         return 0
     if is_internal_automation_turn_payload(clean_content):
@@ -3303,10 +4346,8 @@ def merge_turn_content(
         decoded_rows: list[tuple[Any, dict[str, Any]]] = []
         for turn_id, payload_json in rows:
             try:
-                payload = json.loads(str(payload_json or "{}"))
+                payload = sanitize_public_mapping(json.loads(str(payload_json or "{}")))
             except json.JSONDecodeError:
-                payload = {}
-            if not isinstance(payload, dict):
                 payload = {}
             decoded_rows.append((turn_id, payload))
         incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
@@ -3346,7 +4387,7 @@ def merge_turn_content(
                     if str(seed.get("source") or "") == "command":
                         seed["source"] = "snapshot"
                 seed.update(clean_content)
-                item = Turn.from_dict(seed).to_dict()
+                item = sanitize_public_mapping(Turn.from_dict(seed).to_dict())
                 conn.execute(
                     """
                     INSERT INTO turns (
@@ -3409,7 +4450,7 @@ def _update_turn_row(
     payload: dict[str, Any],
     current_time: str,
 ) -> None:
-    item = Turn.from_dict(payload).to_dict()
+    item = sanitize_public_mapping(Turn.from_dict(payload).to_dict())
     conn.execute(
         """
         UPDATE turns
@@ -3480,7 +4521,7 @@ def upsert_command_pending_turn(
         worker_id = str(worker.get("id") or "").strip()
     if not worker_id:
         return None
-    item = Turn(
+    item = sanitize_public_mapping(Turn(
         host_id=str(host_id),
         worker_id=worker_id,
         worker_fingerprint=str(getattr(worker, "fingerprint", "") or ""),
@@ -3496,7 +4537,7 @@ def upsert_command_pending_turn(
         started_at=current_time,
         updated_at=current_time,
         origin_command_id=clean_request_id,
-    ).to_dict()
+    ).to_dict())
     turn_id = str(item.get("id") or "")
     if not turn_id:
         return None
@@ -3509,8 +4550,7 @@ def upsert_command_pending_turn(
             "turn_fingerprint": item.get("fingerprint"),
         }
     )
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
         conn.execute(
             """
@@ -3555,7 +4595,7 @@ def upsert_command_pending_turn(
                 _canonical_json(item),
             ),
         )
-    return item
+    return sanitize_public_mapping(item)
 
 
 def turns_payload_from_store(
@@ -3565,17 +4605,17 @@ def turns_payload_from_store(
     snapshot: Snapshot | None = None,
 ) -> dict[str, Any]:
     """Return public turns from the store, preserving structured-turn content."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         if snapshot is not None:
-            return turns_payload_from_snapshot(snapshot)
-        return {
+            return sanitize_public_mapping(turns_payload_from_snapshot(snapshot))
+        return sanitize_public_mapping({
             "schema_version": 1,
             "host_id": str(host_id),
             "updated_at": None,
             "content_fingerprint": stable_fingerprint({"host_id": str(host_id), "turns": []}),
             "turns": [],
             "backend_health": [],
-        }
+        })
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
@@ -3589,7 +4629,7 @@ def turns_payload_from_store(
         ).fetchall()
     if not rows:
         if snapshot is not None:
-            return turns_payload_from_snapshot(snapshot)
+            return sanitize_public_mapping(turns_payload_from_snapshot(snapshot))
         turns: list[dict[str, Any]] = []
         updated_at = None
     else:
@@ -3597,59 +4637,94 @@ def turns_payload_from_store(
         observed_values: list[str] = []
         for payload_json, observed_at in rows:
             try:
-                payload = json.loads(str(payload_json or "{}"))
+                turn_payload = sanitize_public_mapping(json.loads(str(payload_json or "{}")))
             except json.JSONDecodeError:
-                payload = {}
-            if isinstance(payload, dict) and not is_internal_automation_turn_payload(payload):
-                turns.append(Turn.from_dict(payload).to_dict())
+                turn_payload = {}
+            if turn_payload and not is_internal_automation_turn_payload(turn_payload):
+                turns.append(sanitize_public_mapping(Turn.from_dict(turn_payload).to_dict()))
             if observed_at:
                 observed_values.append(str(observed_at))
         updated_at = max(observed_values) if observed_values else None
-    backend_health = [health.to_dict() for health in snapshot.backend_health] if snapshot is not None else []
-    payload = {
+    backend_health = sanitize_public_value(
+        [health.to_dict() for health in snapshot.backend_health]
+        if snapshot is not None
+        else []
+    )
+    if not isinstance(backend_health, list):
+        backend_health = []
+    payload = sanitize_public_mapping({
         "schema_version": 1,
         "host_id": str(host_id),
         "updated_at": updated_at or (snapshot.updated_at if snapshot is not None else None),
         "turns": turns,
         "backend_health": backend_health,
-    }
+    })
     payload["content_fingerprint"] = stable_fingerprint(
         {
             "schema_version": payload["schema_version"],
             "host_id": payload["host_id"],
-            "turns": turns,
-            "backend_health": backend_health,
+            "turns": payload["turns"],
+            "backend_health": payload["backend_health"],
         }
     )
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_mapping(payload)
 
 
-def save_snapshot(db_path: Path, snapshot: Snapshot) -> None:
-    """Persist a canonical snapshot JSON blob in the sqlite store."""
-    data, fingerprint = _snapshot_payload(_snapshot_dict(snapshot))
+def save_snapshot(
+    db_path: Path,
+    snapshot: Snapshot,
+    *,
+    observation: SnapshotObservationContext | None = None,
+) -> None:
+    """Persist a canonical snapshot and its authorized lifecycle transitions."""
+    context = observation or SnapshotObservationContext()
+    private_snapshot_data = _snapshot_dict(snapshot)
+    public_snapshot = Snapshot.from_dict(
+        sanitize_public_mapping(private_snapshot_data)
+    )
+    data, fingerprint = _snapshot_payload(public_snapshot.to_dict())
     payload = _canonical_json(data)
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True, isolation_level=None) as conn:
         _ensure_schema(conn)
-        cursor = conn.execute(
-            """
-            INSERT INTO snapshots (host_id, created_at, content_fingerprint, payload)
-            VALUES (?, ?, ?, ?)
-            """,
-            (snapshot.host_id, snapshot.updated_at, fingerprint, payload),
-        )
-        _upsert_snapshot_projections(
-            conn,
-            snapshot,
-            data,
-            snapshot_id=int(cursor.lastrowid),
-            content_fingerprint=fingerprint,
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO snapshots (
+                    host_id, created_at, content_fingerprint, payload
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    public_snapshot.host_id,
+                    public_snapshot.updated_at,
+                    fingerprint,
+                    payload,
+                ),
+            )
+            _upsert_snapshot_projections(
+                conn,
+                public_snapshot,
+                data,
+                snapshot_id=int(cursor.lastrowid),
+                content_fingerprint=fingerprint,
+                private_snapshot_data=private_snapshot_data,
+            )
+            _apply_attention_observation_conn(
+                conn,
+                snapshot=public_snapshot,
+                payload_data=data,
+                content_fingerprint=fingerprint,
+                observation=context,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | None:
     """Return the latest snapshot globally, or scoped to host_id when provided."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3670,7 +4745,7 @@ def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | Non
             ).fetchone()
     if row is None:
         return None
-    return Snapshot.from_json(row[0])
+    return Snapshot.from_dict(sanitize_public_mapping(_json_object(row[0])))
 
 
 def latest_healthy_backend_snapshot(
@@ -3680,7 +4755,7 @@ def latest_healthy_backend_snapshot(
     backend: str,
 ) -> Snapshot | None:
     """Return the newest snapshot reporting a healthy named backend."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3702,7 +4777,7 @@ def latest_healthy_backend_snapshot(
         ).fetchone()
     if row is None:
         return None
-    return Snapshot.from_json(row[0])
+    return Snapshot.from_dict(sanitize_public_mapping(_json_object(row[0])))
 
 
 def _attention_rows_conn(
@@ -3711,40 +4786,59 @@ def _attention_rows_conn(
     *,
     include_resolved: bool = False,
 ) -> list[Any]:
-    clauses = ["host_id = ?"]
-    params: list[Any] = [str(host_id)]
+    columns = """
+        i.attention_id,
+        i.source,
+        i.kind,
+        i.severity,
+        i.status,
+        i.updated_at,
+        i.fingerprint,
+        i.snapshot_content_fingerprint,
+        i.observed_at,
+        i.payload_json,
+        i.first_seen_at,
+        i.last_seen_at,
+        i.last_changed_at,
+        i.resolved_at,
+        i.lifecycle_status,
+        i.resolved_reason,
+        i.signal_count
+    """
     if not include_resolved:
-        clauses.append("lifecycle_status = ?")
-        params.append(ATTENTION_LIFECYCLE_OPEN)
-    where = " AND ".join(clauses)
+        return conn.execute(
+            f"""
+            SELECT {columns}
+            FROM attention_lifecycles l
+            JOIN attention_items i
+              ON i.host_id = l.host_id
+             AND i.attention_id = l.current_attention_id
+            WHERE l.host_id = ? AND l.lifecycle_status = 'open'
+            ORDER BY i.last_changed_at DESC, i.attention_id
+            """,
+            (str(host_id),),
+        ).fetchall()
     return conn.execute(
         f"""
-        SELECT
-            attention_id,
-            source,
-            kind,
-            severity,
-            status,
-            updated_at,
-            fingerprint,
-            snapshot_content_fingerprint,
-            observed_at,
-            payload_json,
-            first_seen_at,
-            last_seen_at,
-            last_changed_at,
-            resolved_at,
-            lifecycle_status,
-            resolved_reason,
-            signal_count
-        FROM attention_items
-        WHERE {where}
-        ORDER BY
-            CASE lifecycle_status WHEN 'open' THEN 0 ELSE 1 END,
-            last_changed_at DESC,
-            attention_id
+        SELECT {columns}, 0 AS sort_group
+        FROM attention_lifecycles l
+        JOIN attention_items i
+          ON i.host_id = l.host_id
+         AND i.attention_id = l.current_attention_id
+        WHERE l.host_id = ? AND l.lifecycle_status = 'open'
+        UNION ALL
+        SELECT {columns}, 1 AS sort_group
+        FROM attention_items i
+        WHERE i.host_id = ?
+          AND i.lifecycle_status != 'open'
+          AND NOT EXISTS (
+              SELECT 1 FROM attention_lifecycles l
+              WHERE l.host_id = i.host_id
+                AND l.current_attention_id = i.attention_id
+          )
+        ORDER BY sort_group, last_changed_at DESC, attention_id
         """,
-        params,
+        (str(host_id), str(host_id)),
     ).fetchall()
 
 
@@ -3753,7 +4847,7 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
         parsed = json.loads(row[9] or "{}")
     except (TypeError, json.JSONDecodeError):
         parsed = {}
-    payload = _store_sanitize_public_mapping(parsed)
+    payload = sanitize_public_mapping(parsed)
     payload.update(
         {
             "id": str(row[0] or ""),
@@ -3765,7 +4859,11 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
             "fingerprint": str(row[6] or ""),
         }
     )
-    payload["reason"] = _store_public_text(payload.get("reason"), default="")
+    payload["reason"] = _store_public_text(
+        payload.get("reason"),
+        default="",
+        free_text=True,
+    )
     return _attention_lifecycle_payload(
         payload,
         attention_id=str(row[0] or ""),
@@ -3775,7 +4873,11 @@ def _attention_item_from_row(row: Any) -> dict[str, Any]:
         last_changed_at=str(row[12] or row[8] or ""),
         resolved_at=row[13],
         lifecycle_status=str(row[14] or ATTENTION_LIFECYCLE_OPEN),
-        resolved_reason=_store_public_text(row[15], default="") or None,
+        resolved_reason=_store_public_text(
+            row[15],
+            default="",
+            free_text=True,
+        ) or None,
         signal_count=int(row[16] or 1),
     )
 
@@ -3787,7 +4889,7 @@ def list_attention_items(
     include_resolved: bool = False,
 ) -> list[dict[str, Any]]:
     """Return public-safe persisted attention items for a host."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return []
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3796,7 +4898,7 @@ def list_attention_items(
             host_id,
             include_resolved=include_resolved,
         )
-    return [_attention_item_from_row(row) for row in rows]
+    return sanitize_public_value([_attention_item_from_row(row) for row in rows])
 
 
 def attention_payload_from_store(
@@ -3806,7 +4908,7 @@ def attention_payload_from_store(
     include_resolved: bool = False,
 ) -> dict[str, Any] | None:
     """Return a public attention.list payload from lifecycle rows or snapshot fallback."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -3831,6 +4933,12 @@ def attention_payload_from_store(
                 (str(host_id),),
             ).fetchone()[0]
         )
+        lifecycle_row_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM attention_lifecycles WHERE host_id = ?",
+                (str(host_id),),
+            ).fetchone()[0]
+        )
 
     if snapshot_row is None and not rows:
         return None
@@ -3838,14 +4946,22 @@ def attention_payload_from_store(
     snapshot: Snapshot | None = None
     if snapshot_row is not None:
         try:
-            snapshot = Snapshot.from_json(snapshot_row[0])
+            snapshot = Snapshot.from_dict(
+                sanitize_public_mapping(_json_object(snapshot_row[0]))
+            )
         except (TypeError, ValueError, json.JSONDecodeError):
             snapshot = None
 
     attention = [_attention_item_from_row(row) for row in rows]
     backend_health = [health.to_dict() for health in snapshot.backend_health] if snapshot is not None else []
     updated_at = snapshot.updated_at if snapshot is not None else utc_timestamp()
-    if not attention and attention_row_count == 0 and snapshot is not None and snapshot.attention:
+    if (
+        not attention
+        and attention_row_count == 0
+        and lifecycle_row_count == 0
+        and snapshot is not None
+        and snapshot.attention
+    ):
         attention = []
         for signal in snapshot.attention:
             item = signal.to_dict()
@@ -3878,19 +4994,19 @@ def attention_payload_from_store(
             "backend_health": backend_health,
         }
     )
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_value(payload)
 
 
 def list_hosts(db_path: Path) -> list[str]:
     """Return distinct host_ids seen in the store."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return []
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         rows = conn.execute(
             "SELECT DISTINCT host_id FROM snapshots ORDER BY host_id"
         ).fetchall()
-    return [r[0] for r in rows]
+    return sanitize_public_value([row[0] for row in rows])
 
 
 def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> int:
@@ -3906,8 +5022,7 @@ def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> 
     )
     if not binding_list:
         return 0
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
         conn.executemany(
             """
@@ -3969,7 +5084,7 @@ def list_worker_bindings(
     now: str | None = None,
 ) -> list[WorkerBinding]:
     """Return private worker bindings for a host, current/unexpired by default."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return []
     current_time = now or utc_timestamp()
     clauses = ["host_id = ?"]
@@ -4018,7 +5133,7 @@ def resolve_worker_binding(
     now: str | None = None,
 ) -> WorkerBinding | None:
     """Resolve a single current, sendable private binding for a public worker."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return None
     current_time = now or utc_timestamp()
     clauses = ["host_id = ?", "worker_id = ?", "sendable = 1", "expires_at > ?"]
@@ -4086,8 +5201,7 @@ def expire_worker_bindings(
         clauses.append(f"private_fingerprint IN ({placeholders})")
         params.extend(fingerprints)
     where = " AND ".join(clauses)
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
         cursor = conn.execute(
             f"""
@@ -4114,8 +5228,7 @@ def expire_stale_worker_bindings(
     """Expire host/backend bindings absent from a fresh successful observation."""
     current_time = now or utc_timestamp()
     current = {str(value) for value in current_private_fingerprints}
-    _ensure_dir(db_path)
-    with _connect(db_path) as conn:
+    with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
         if current:
             placeholders = ",".join("?" for _ in current)
@@ -4168,7 +5281,7 @@ def get_command_receipt(
     action: str,
 ) -> dict[str, Any] | None:
     """Return the latest command receipt for a host/request/action key, or None."""
-    if not db_path.exists():
+    if not _sqlite_store_exists(db_path):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
@@ -4195,8 +5308,7 @@ def reserve_command_receipt(
     mutation attempt. If another receipt already exists for the same key, the
     existing latest receipt is returned and no new row is inserted.
     """
-    _ensure_dir(db_path)
-    conn = _connect(db_path, isolation_level=None)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
@@ -4272,9 +5384,8 @@ def save_command_receipt(
     pending state of a mutating command so repeated requests can be detected
     and rejected instead of retried blindly.
     """
-    _ensure_dir(db_path)
     now = utc_timestamp()
-    conn = _connect(db_path, isolation_level=None)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
@@ -4360,4 +5471,4 @@ def save_command_receipt(
 
 def envelope_to_receipt_json(envelope: CommandEnvelope) -> str:
     """Serialize a command envelope for storage in a receipt."""
-    return stable_json_dumps(envelope.to_dict())
+    return _canonical_json(envelope.to_dict())

@@ -272,7 +272,7 @@ Tendwire exposes a stdlib-only local daemon:
 
 ```bash
 tendwire daemon --db-path /path/to/tendwire.db
-tendwire daemon --db-path /path/to/tendwire.db --socket-path /tmp/tendwire.sock
+tendwire daemon --db-path /path/to/tendwire.db --socket-path /run/tendwire/tendwire.sock --socket-group tendwire-clients
 ```
 
 On POSIX systems the daemon serves a local Unix domain socket JSON
@@ -282,6 +282,24 @@ resulting snapshot/projections through the existing store APIs, and then serves
 these public methods: `ping`, `health.get`, `snapshot.get`, `attention.list`,
 `turn.list`, `pending.list`, `command.submit`, `connector.poll`,
 `connector.ack`, `connector.fail`, `connector.defer`, and `connector.reclaim`.
+
+POSIX local state is private-only by default. Tendwire enforces mode `0700` on
+its state directory and mode `0600` on its database family and regular private
+files. The default Unix socket is mode `0600`. If an entry owned by the service
+account is broader, Tendwire removes excess bits using the intersection of its
+current and required modes; it never widens a stricter mode. Symlinks, wrong
+owners, and wrong entry types are refused, and private files are created
+securely before publication.
+
+Socket group access is an explicit daemon-only option:
+`--socket-group GROUP` (or `TENDWIRE_SOCKET_GROUP=GROUP`). At runtime Tendwire
+resolves the existing group and verifies that the service account is already a
+member before changing group ownership or permissions. Only the socket changes
+to mode `0660`; database and other state files stay private. Every validated
+group member can invoke the full daemon API, including mutating commands and
+connector operations. Put a shared socket in a dedicated parent owned by the
+service account, assigned to that group, group-traversable, and inaccessible to
+other users (for example, mode `0710`). Never use a shared `/tmp` socket.
 
 Existing CLI commands remain one-shot by default. When `--socket-path` or
 `TENDWIRE_SOCKET_PATH` explicitly points a read-only CLI command at a Tendwire
@@ -518,9 +536,10 @@ optional `title`/`summary`/timestamps, `source`, optional
 `pending_interactions`. Each pending interaction has deterministic `id`,
 `host_id`, `worker_id`, optional `worker_fingerprint`, optional `space_id`,
 bounded `kind`, `question`, finite public-safe `choices`, neutral `status`,
-optional timestamps, optional `fingerprint`, and sanitized `meta`. Choices use
-`choice_id`, `label`, optional `value`, optional `description`, and sanitized
-`params`.
+optional timestamps, optional `fingerprint`, and sanitized `meta`. Each choice
+has exactly a deterministic opaque `choice_id` and a user-facing `label`.
+Backend option, tool, or decision identifiers and any values sent to the
+backend stay private.
 
 Turn and pending IDs/fingerprints are computed from sanitized public content and
 exclude volatile observation timestamps. Pending interactions are derived only

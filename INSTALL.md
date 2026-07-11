@@ -48,6 +48,35 @@ systemctl --user enable --now tendwired.service
 systemctl --user is-active tendwired.service
 ```
 
+## Local-State Permissions and Daemon Socket Access
+
+Production POSIX deployments are private-only by default. Tendwire keeps the
+configured state directory at mode `0700`; the database, its SQLite sidecars,
+and regular private state files are mode `0600`. The default daemon Unix socket
+is also mode `0600`. Keep the service `UMask=0077` line above: it protects every
+process-created file, while Tendwire also enforces the final modes itself.
+
+For existing entries owned by the service account, Tendwire removes broad
+permission bits by intersecting the current mode with the required mode; it
+never widens an already stricter mode. It refuses symlinks, entries owned by
+another account, and entries of the wrong type rather than following, replacing,
+or changing their ownership. New private files are created securely before
+their names are published.
+
+Daemon socket sharing is an explicit opt-in through
+`tendwire daemon --socket-group GROUP` or `TENDWIRE_SOCKET_GROUP=GROUP`. Tendwire
+normalizes the configured name, then resolves the existing group and verifies
+that the service account is a current member before changing the socket group
+or mode. The shared socket is mode `0660`; the database and other local state
+remain private.
+
+Every member of that group can invoke the daemon's full API, including mutating
+commands and connector operations. Use a dedicated socket parent owned by the
+service account, assigned to the selected group, group-traversable, and not
+accessible by other users (for example, mode `0710`). A shared socket cannot
+live under the default mode-`0700` state directory. Never put a Tendwire socket
+in shared `/tmp`.
+
 ## Continuity State, Backup, Upgrade, Loss, and Rotation
 
 Tendwire keeps its optional worker-continuity identity in the configured
@@ -130,7 +159,8 @@ python3 - <<'PY'
 import sqlite3
 from pathlib import Path
 db = Path.home() / ".local/share/tendwire/tendwire.db"
-with sqlite3.connect(db) as conn:
+uri = f"{db.as_uri()}?mode=ro"  # Refuse a missing database instead of creating it.
+with sqlite3.connect(uri, uri=True) as conn:
     print(conn.execute("PRAGMA integrity_check").fetchone()[0])
 PY
 ```
@@ -159,7 +189,8 @@ python3 - <<'PY'
 import sqlite3
 from pathlib import Path
 db = Path.home() / ".local/share/tendwire/tendwire.db"
-with sqlite3.connect(db) as conn:
+uri = f"{db.as_uri()}?mode=ro"  # Refuse a missing database instead of creating it.
+with sqlite3.connect(uri, uri=True) as conn:
     print(conn.execute("PRAGMA integrity_check").fetchone()[0])
 PY
 ```

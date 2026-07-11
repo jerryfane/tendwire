@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +23,10 @@ from .models import (
     _is_forbidden_public_text_phrase,
     _TEXT_FORBIDDEN_FIELD_NAMES,
     normalize_status,
+    public_json_dumps,
+    sanitize_public_mapping,
+    sanitize_public_text,
+    sanitize_public_value,
     sanitize_forbidden_fields,
     stable_fingerprint,
     stable_json_dumps,
@@ -105,13 +108,6 @@ _PENDING_STATUS_ALIASES = {
     "timed-out": "expired",
     "timeout": "expired",
 }
-_PRIVATE_TEXT_LABEL_RE = re.compile(
-    r"(?i)\b("
-    r"pane[_ -]?id|terminal[_ -]?id|backend[_ -]?target|raw[_ -]?target|"
-    r"chat[_ -]?id|topic[_ -]?id|message[_ -]?id|thread[_ -]?id|"
-    r"socket[_ -]?path|argv|env|stdout|stderr|token|secret"
-    r")\b\s*[:=]?\s*\S*"
-)
 _VOLATILE_KEYS = frozenset(
     {
         "updated_at",
@@ -172,7 +168,6 @@ _AUTOMATION_RESULT_FIELDS = frozenset(
         "tests_run",
     }
 )
-_PUBLIC_DROP = object()
 
 
 def _normalize_turn_kind(kind: Any) -> str:
@@ -205,8 +200,7 @@ def _truthy(value: Any) -> bool:
 
 
 def _clean_meta(value: Any) -> dict[str, Any]:
-    clean = _clean_public_value(value if isinstance(value, Mapping) else {})
-    return clean if isinstance(clean, dict) else {}
+    return sanitize_public_mapping(value if isinstance(value, Mapping) else {})
 
 
 def _public_text_tokens(value: str) -> list[str]:
@@ -235,8 +229,8 @@ def _contains_forbidden_public_text(value: str) -> bool:
 
 
 def _public_text(value: Any, *, default: str = "") -> str:
-    text = _string_value(value).strip()
-    if not text or _contains_forbidden_public_text(text):
+    text = sanitize_public_text(_string_value(value).strip())
+    if not text or _contains_forbidden_public_text(text) or _looks_like_raw_command(text):
         return default
     return " ".join(text.split())
 
@@ -248,73 +242,37 @@ def _optional_public_text(value: Any) -> str | None:
     return text or None
 
 
-def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str | None:
+def _optional_public_fingerprint(value: Any) -> str | None:
     if value is None:
         return None
-    text = _string_value(value).replace("\x00", "").strip()
-    if not text:
+    raw = _string_value(value).strip()
+    if not raw or _contains_forbidden_public_text(raw):
         return None
-    text = _PRIVATE_TEXT_LABEL_RE.sub("[redacted]", text)
-    text = "\n".join(" ".join(line.split()) for line in text.splitlines()).strip()
-    if len(text) > max_chars:
-        text = text[: max(0, max_chars - 14)].rstrip() + "\n[truncated]"
+    text = sanitize_public_text(raw)
+    if text != raw or _contains_forbidden_public_text(text):
+        return None
+    return text
+
+
+def _public_turn_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str | None:
+    text = sanitize_public_text(value, max_chars=max_chars)
     return text or None
 
 
-# Bare private patterns (no field-name label) that must never reach public JSON when ingesting
-# free agent-authored prompt text: filesystem/socket paths, pseudo pane/terminal ids, network
-# endpoints, PII, and distinctive secret-token shapes. `_PRIVATE_TEXT_LABEL_RE` only catches
-# "<label>: value" forms; these catch the value on its own. This is a best-effort scrub of the
-# realistic, distinctive cases (same grade as user_text/assistant_final_text turn text): shapeless
-# high-entropy blobs (generic long hex / base64) are NOT matched, because doing so would redact
-# legitimate content (git SHAs, encoded data) — see redact_private_prompt_text docstring.
-_PRIVATE_PROMPT_PATTERNS_RE = re.compile(
-    r"(?<![\w/])/(?:[\w.-]+)(?:/[\w.-]*)+"       # absolute posix path: /home/x/y, /run/.../sock
-    r"|(?<![\w/])/(?:etc|root|home|var|opt|srv|usr|tmp|run|proc|sys|mnt|media|boot|dev|private)\b"  # single-segment sensitive root
-    r"|~/[\w./-]+"                                # home-relative: ~/.ssh/id_rsa
-    r"|\b(?:home|Users|root)/[\w.-]+/[\w./-]+"    # home path w/o leading slash: home/alice/.ssh/id_rsa
-    r"|\b[A-Za-z]:\\[^\s\"']+"                    # windows path: C:\Users\x
-    r"|\\\\[^\s\"']+"                             # UNC path: \\server\share
-    r"|\bw[0-9a-z]+:[a-z][0-9a-z]*\b"           # pseudo pane/terminal/tab id: w4V:p1, w1:t6
-    r"|\bterm_[0-9a-f]+\b"                        # terminal id: term_655ad3e5205705
-    r"|\bsk-[A-Za-z0-9_-]{6,}\b"                # sk- api secret
-    r"|\bgh[oprsu]_[A-Za-z0-9]{6,}\b"           # github tokens (ghp_/gho_/ghr_/ghs_/ghu_)
-    r"|\bxox[baprs]-[A-Za-z0-9-]{6,}\b"          # slack token
-    r"|\bAKIA[0-9A-Z]{12,}\b"                    # aws access key
-    r"|\bAIza[0-9A-Za-z_-]{10,}\b"              # google api key
-    r"|\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"  # JWT (header.payload.sig)
-    r"|\b\d{6,}:[A-Za-z0-9_-]{20,}\b"           # telegram bot token
-    r"|\b[Bb]earer\s+[A-Za-z0-9._-]{10,}"       # bearer token
-    r"|\b[\w.+-]+@[\w-]+\.[\w][\w.-]*\b"        # email / PII
-    r"|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b"  # IPv4(:port)
-    r"|\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b"   # IPv6 full 8-group form
-    r"|\b[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){1,}::[0-9a-f:]*\b",  # IPv6 compressed :: form
-    re.IGNORECASE,
-)
-
-# Zero-width / bidi / format characters used to obfuscate secrets across a match boundary.
-_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 
 
 def redact_private_prompt_text(value: Any, *, max_chars: int = TURN_TEXT_MAX_CHARS) -> str:
-    """Best-effort redaction for free agent-authored prompt text (pending question / choice label),
-    the same content class as turn user_text/assistant_final_text. Normalizes unicode (NFKC +
-    zero-width strip, defeating fullwidth/zero-width obfuscation), then redacts labelled secrets and
-    distinctive bare private patterns (paths, pane/terminal ids, network endpoints, PII, prefixed
-    tokens, JWTs). Returns a cleaned single-spaced string (never None).
+    """Best-effort sanitizer for user-facing pending prompt and choice text.
 
-    NOT a guarantee: shapeless high-entropy secrets (generic long hex, base64 blobs) cannot be
-    scrubbed from arbitrary free text without redacting legitimate content, so — exactly as the
-    contract already treats turn text — they remain the caller's responsibility."""
-    text = _string_value(value).replace("\x00", "").strip()
-    if not text:
-        return ""
-    text = unicodedata.normalize("NFKC", text)
-    text = _ZERO_WIDTH_RE.sub("", text)
-    text = _PRIVATE_TEXT_LABEL_RE.sub("[redacted]", text)
-    text = _PRIVATE_PROMPT_PATTERNS_RE.sub("[redacted]", text)
-    text = " ".join(text.split())
-    return text[:max_chars]
+    Arbitrary shapeless secrets in free-form prose cannot be detected reliably;
+    known private source shapes and provider credentials are still redacted.
+    Non-string backend values are rejected instead of stringified.
+    """
+    return sanitize_public_text(
+        value,
+        max_chars=max_chars,
+        collapse_whitespace=True,
+    )
 
 
 def recompute_pending_content_fingerprint(payload: Mapping[str, Any]) -> str:
@@ -388,12 +346,11 @@ def is_internal_automation_turn_payload(payload: Mapping[str, Any]) -> bool:
 
 
 def _public_identity(value: Any, *, prefix: str, default: str = "unknown") -> str:
-    text = _string_value(value, default).strip()
-    if not text:
-        text = default
-    if not _contains_forbidden_public_text(text):
+    raw = _string_value(value, default).strip() or default
+    text = sanitize_public_text(raw)
+    if text == raw and not _contains_forbidden_public_text(text):
         return " ".join(text.split())
-    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': text})}"
+    return f"{prefix}-{stable_fingerprint({'type': prefix, 'raw_id': raw})}"
 
 
 def _optional_public_identity(value: Any, *, prefix: str) -> str | None:
@@ -403,27 +360,7 @@ def _optional_public_identity(value: Any, *, prefix: str) -> str | None:
 
 
 def _clean_public_value(value: Any) -> Any:
-    clean = sanitize_forbidden_fields(value)
-    if isinstance(clean, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in clean.items():
-            key_text = str(key)
-            if _is_forbidden_public_mapping_key(key_text):
-                continue
-            sanitized = _clean_public_value(item)
-            if sanitized is not _PUBLIC_DROP:
-                result[key_text] = sanitized
-        return result
-    if isinstance(clean, list):
-        result_list: list[Any] = []
-        for item in clean:
-            sanitized = _clean_public_value(item)
-            if sanitized is not _PUBLIC_DROP:
-                result_list.append(sanitized)
-        return result_list
-    if isinstance(clean, str):
-        return _PUBLIC_DROP if _contains_forbidden_public_text(clean) else clean
-    return clean
+    return sanitize_public_value(value)
 
 
 def _normalized_key(value: Any) -> str:
@@ -447,11 +384,18 @@ def _strip_volatile(value: Any) -> Any:
 
 
 def _stable_id(prefix: str, value: Any) -> str:
-    return f"{prefix}-{stable_fingerprint(_strip_volatile(sanitize_forbidden_fields(value)))}"
+    return f"{prefix}-{stable_fingerprint(_strip_volatile(sanitize_public_value(value)))}"
 
 
 def _content_fingerprint(value: Any) -> str:
-    return stable_fingerprint(_strip_volatile(sanitize_forbidden_fields(value)))
+    return stable_fingerprint(_strip_volatile(sanitize_public_value(value)))
+
+
+def _opaque_public_id(prefix: str, raw_value: Any, public_material: Any) -> str:
+    raw = _string_value(raw_value).strip()
+    if re.fullmatch(rf"{re.escape(prefix)}-[0-9a-f]{{24}}", raw):
+        return raw
+    return _stable_id(prefix, {"seed": raw, "public": public_material})
 
 
 def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
@@ -464,13 +408,11 @@ def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
 
 
 def _optional_public_description(value: Any) -> str | None:
-    clean = _clean_public_value(value)
-    if clean is _PUBLIC_DROP:
-        return None
-    if clean in ({}, []):
+    clean = sanitize_public_value(value)
+    if clean in (None, {}, [], ""):
         return None
     if isinstance(clean, Mapping) or isinstance(clean, list):
-        return stable_json_dumps(clean)
+        return public_json_dumps(clean)
     return _optional_string(clean)
 
 
@@ -491,10 +433,8 @@ def _looks_like_raw_command(value: str) -> bool:
 
 
 def _public_choice_value(value: Any) -> Any | None:
-    clean = _clean_public_value(value)
-    if clean is _PUBLIC_DROP:
-        return None
-    if clean in ({}, [], ""):
+    clean = sanitize_public_value(value)
+    if clean in (None, {}, [], ""):
         return None
     if isinstance(clean, str):
         return None if _looks_like_raw_command(clean) else clean
@@ -526,13 +466,12 @@ class InteractionChoice:
         description = _optional_public_description(self.description)
         params = _clean_meta(self.params)
         value = _public_choice_value(self.value)
-        choice_id = _public_text(self.choice_id) or stable_fingerprint(
-            {
-                "label": label,
-                "value": value,
-                "description": description,
-                "params": params,
-            }
+        choice_material = {"label": label}
+        raw_choice_id = _string_value(self.choice_id).strip()
+        choice_id = (
+            _opaque_public_id("choice", raw_choice_id, choice_material)
+            if raw_choice_id
+            else _stable_id("choice", choice_material)
         )
 
         object.__setattr__(self, "choice_id", choice_id)
@@ -542,17 +481,10 @@ class InteractionChoice:
         object.__setattr__(self, "params", params)
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        return {
             "choice_id": self.choice_id,
             "label": self.label,
-            "params": _clean_meta(self.params),
         }
-        public_value = _public_choice_value(self.value)
-        if public_value is not None:
-            payload["value"] = public_value
-        if self.description is not None:
-            payload["description"] = self.description
-        return payload
 
     @classmethod
     def from_dict(cls, data: "InteractionChoice | Mapping[str, Any]") -> "InteractionChoice":
@@ -603,7 +535,7 @@ class Turn:
         status = normalize_status(self.status)
         kind = _normalize_turn_kind(self.kind)
         source = _public_text(self.source, default="snapshot")
-        worker_fingerprint = _optional_public_text(self.worker_fingerprint)
+        worker_fingerprint = _optional_public_fingerprint(self.worker_fingerprint)
         space_id = _optional_public_identity(self.space_id, prefix="space")
         title = _optional_public_text(self.title)
         summary = _optional_public_text(self.summary)
@@ -618,7 +550,16 @@ class Turn:
         updated_at = _optional_timestamp(self.updated_at)
         completed_at = _optional_timestamp(self.completed_at)
         origin_command_id = _optional_public_text(self.origin_command_id)
-        source_turn_id = _optional_public_text(self.source_turn_id)
+        raw_source_turn_id = _optional_public_text(self.source_turn_id)
+        source_turn_id = (
+            _opaque_public_id(
+                "turnsrc",
+                raw_source_turn_id,
+                {"source": source, "kind": kind},
+            )
+            if raw_source_turn_id
+            else None
+        )
         meta = _clean_meta(self.meta)
         identity_payload = {
             "schema_version": TURN_SCHEMA_VERSION,
@@ -676,7 +617,7 @@ class Turn:
         object.__setattr__(self, "meta", meta)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "schema_version": self.schema_version,
             "id": self.id,
             "host_id": self.host_id,
@@ -701,10 +642,10 @@ class Turn:
             "source_turn_id": self.source_turn_id,
             "fingerprint": self.fingerprint,
             "meta": _clean_meta(self.meta),
-        }
+        })
 
     def to_json(self, indent: int | None = None) -> str:
-        return stable_json_dumps(self.to_dict(), indent=indent)
+        return public_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: "Turn | Mapping[str, Any]") -> "Turn":
@@ -765,14 +706,14 @@ class PendingInteraction:
     def __post_init__(self) -> None:
         host_id = _string_value(self.host_id, "unknown")
         worker_id = _public_identity(self.worker_id, prefix="worker")
-        worker_fingerprint = _optional_public_text(self.worker_fingerprint)
+        worker_fingerprint = _optional_public_fingerprint(self.worker_fingerprint)
         space_id = _optional_public_identity(self.space_id, prefix="space")
         kind = _normalize_pending_kind(self.kind)
         question = _public_text(self.question, default="Action requires attention")
-        choices = sorted(
-            (choice if isinstance(choice, InteractionChoice) else InteractionChoice.from_dict(choice) for choice in self.choices),
-            key=lambda choice: (choice.choice_id, choice.label),
-        )
+        choices = [
+            choice if isinstance(choice, InteractionChoice) else InteractionChoice.from_dict(choice)
+            for choice in self.choices
+        ]
         status = _normalize_pending_status(self.status)
         created_at = _optional_timestamp(self.created_at)
         updated_at = _optional_timestamp(self.updated_at)
@@ -815,7 +756,7 @@ class PendingInteraction:
         object.__setattr__(self, "meta", meta)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return sanitize_public_mapping({
             "schema_version": self.schema_version,
             "id": self.id,
             "host_id": self.host_id,
@@ -831,10 +772,10 @@ class PendingInteraction:
             "expires_at": self.expires_at,
             "fingerprint": self.fingerprint,
             "meta": _clean_meta(self.meta),
-        }
+        })
 
     def to_json(self, indent: int | None = None) -> str:
-        return stable_json_dumps(self.to_dict(), indent=indent)
+        return public_json_dumps(self.to_dict(), indent=indent)
 
     @classmethod
     def from_dict(cls, data: "PendingInteraction | Mapping[str, Any]") -> "PendingInteraction":
@@ -1038,7 +979,7 @@ def turns_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
             "backend_health": backend_health,
         }
     )
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_mapping(payload)
 
 
 def pending_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
@@ -1060,9 +1001,9 @@ def pending_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
             "backend_health": backend_health,
         }
     )
-    return sanitize_forbidden_fields(payload)
+    return sanitize_public_mapping(payload)
 
 
 def payload_to_json(payload: Mapping[str, Any], *, indent: int | None = None) -> str:
     """Serialize a turn/pending wrapper using Tendwire stable JSON."""
-    return stable_json_dumps(payload, indent=indent)
+    return public_json_dumps(payload, indent=indent)

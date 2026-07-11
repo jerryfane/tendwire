@@ -392,7 +392,15 @@ def test_herdr_cli_strip_connector_fields_drops_dot_separated_aliases() -> None:
     assert "sentinel-private" not in json.dumps(stripped, sort_keys=True)
     _assert_no_forbidden_fields(stripped)
     assert herdr_cli._safe_text_sample("failed backend.target=sentinel-private-backend") is None
-    assert herdr_cli._safe_text_sample("failed bot.token=sentinel-private-token") is None
+    assert all(
+        herdr_cli._safe_text_sample(sample) is None
+        for sample in (
+            "failed bot.token=sentinel-private-token",
+            "failed bot_token=sentinel-private-token",
+            "failed bot-token=sentinel-private-token",
+            "failed botToken=sentinel-private-token",
+        )
+    )
     assert herdr_cli._safe_text_sample("plain diagnostic text") == "plain diagnostic text"
 
 
@@ -1481,7 +1489,8 @@ def test_no_flag_workspace_and_agent_lists_preferred_without_json_calls(monkeypa
     assert workers[0].backend_target["kind"] == "agent"
     assert workers[0].backend_target["value"] == "Coder"
     assert workers[0].backend_target["sendable"] is True
-    assert workers[0].meta.get("cwd") == "/home/dev"
+    assert "cwd" not in workers[0].meta
+    assert "/home/dev" not in json.dumps(workers[0].to_dict())
     assert "raw_status" not in workers[0].meta
 
 
