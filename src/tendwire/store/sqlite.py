@@ -25,11 +25,10 @@ from ..local_state import (
     PermissionState,
     local_state_error,
     inspect_sqlite_family_at,
-    open_private_file_at,
     open_resolved_parent,
+    private_file_creation_umask,
     prepare_resolved_private_parent,
     prepare_sqlite_family_at,
-    repair_sqlite_family_at,
     validate_owned_directory_stat,
 )
 from ..core.commands import CommandEnvelope
@@ -504,8 +503,10 @@ def _validate_sqlite_family_at(parent_fd: int, leaf: str) -> None:
     for suffix, result in zip(_SQLITE_FAMILY_SUFFIXES, inspected, strict=True):
         if result.state is PermissionState.ABSENT and suffix:
             continue
-        member_fd = open_private_file_at(parent_fd, f"{leaf}{suffix}")
-        os.close(member_fd)
+        if result.state is PermissionState.ABSENT:
+            raise local_state_error(LocalStateErrorCode.MISSING_ENTRY)
+        if result.state is PermissionState.REPAIR_REQUIRED:
+            raise local_state_error(LocalStateErrorCode.INSECURE_MODE)
 
 
 def _sqlite_store_exists(db_path: Path | str) -> bool:
@@ -582,13 +583,14 @@ def _connect(
             raise
         connect_uri = True
     try:
-        conn = sqlite3.connect(
-            connect_target,
-            timeout=30.0,
-            isolation_level=isolation_level,
-            factory=_ClosingConnection,
-            uri=connect_uri,
-        )
+        with private_file_creation_umask():
+            conn = sqlite3.connect(
+                connect_target,
+                timeout=30.0,
+                isolation_level=isolation_level,
+                factory=_ClosingConnection,
+                uri=connect_uri,
+            )
     except Exception:
         if parent_fd is not None:
             os.close(parent_fd)
@@ -619,14 +621,13 @@ def _connect(
         conn._own_parent_fd(parent_fd)
         parent_fd = None
     try:
-        _apply_connection_pragmas(conn, db_path)
-        if leaf is not None:
-            # This harmless read activates the live WAL family before validation.
-            conn.execute("PRAGMA user_version").fetchone()
-            assert conn._parent_fd is not None
-            if prepare:
-                repair_sqlite_family_at(conn._parent_fd, leaf)
-            else:
+        with private_file_creation_umask():
+            _apply_connection_pragmas(conn, db_path)
+            if leaf is not None:
+                # Activate sidecars under the restrictive creation umask, then
+                # inspect metadata without opening another family descriptor.
+                conn.execute("PRAGMA user_version").fetchone()
+                assert conn._parent_fd is not None
                 _validate_sqlite_family_at(conn._parent_fd, leaf)
         return conn
     except Exception:

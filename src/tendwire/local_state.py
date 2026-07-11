@@ -171,7 +171,7 @@ _REMEDIATION = {
     LocalStateErrorCode.OPERATION_FAILED: "check local filesystem permissions and retry",
 }
 
-_BIND_UMASK_LOCK = threading.RLock()
+_PROCESS_UMASK_LOCK = threading.RLock()
 
 
 def local_state_error(code: LocalStateErrorCode) -> LocalStateError:
@@ -1724,13 +1724,28 @@ def socket_bind_umask(socket_group: str | None = None) -> Iterator[SocketGroup |
 
     resolved = resolve_socket_group(socket_group)
     mask = 0o117 if resolved is not None else 0o177
-    with _BIND_UMASK_LOCK:
+    with _PROCESS_UMASK_LOCK:
         try:
             previous = os.umask(mask)
         except OSError:
             _raise(LocalStateErrorCode.OPERATION_FAILED)
         try:
             yield resolved
+        finally:
+            os.umask(previous)
+
+
+@contextmanager
+def private_file_creation_umask() -> Iterator[None]:
+    """Apply a process-wide umask for private files created by external APIs."""
+
+    with _PROCESS_UMASK_LOCK:
+        try:
+            previous = os.umask(0o077)
+        except OSError:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+        try:
+            yield
         finally:
             os.umask(previous)
 

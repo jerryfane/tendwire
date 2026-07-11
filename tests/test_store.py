@@ -138,6 +138,16 @@ def _cross_process_store_writer(
             os.close(fd)
 
 
+def _cross_process_try_immediate(db_path: str, results: Any) -> None:
+    try:
+        with sqlite3.connect(db_path, timeout=0) as conn:
+            conn.execute("PRAGMA busy_timeout=0")
+            conn.execute("BEGIN IMMEDIATE")
+        results.put("acquired")
+    except sqlite3.OperationalError as exc:
+        results.put("locked" if "locked" in str(exc).lower() else type(exc).__name__)
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
 
@@ -236,30 +246,39 @@ def test_store_secure_creation_ignores_permissive_umask_for_live_sqlite_family(
     assert _mode(db_path) == 0o600
 
 
-def test_creation_boundary_repairs_live_sidecars_after_wal_activation(
+def test_creation_boundary_rejects_live_sidecar_change_after_wal_activation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "tendwire.db"
     init_store(db_path)
-    original_repair = store_sqlite.repair_sqlite_family_at
-    repaired_live_family = False
+    original_validate = store_sqlite._validate_sqlite_family_at
+    validated_live_family = False
 
-    def broaden_then_repair(parent_fd: int, leaf: str) -> Any:
-        nonlocal repaired_live_family
-        os.chmod(f"{leaf}-wal", 0o644, dir_fd=parent_fd)
-        os.chmod(f"{leaf}-shm", 0o644, dir_fd=parent_fd)
-        result = original_repair(parent_fd, leaf)
-        repaired_live_family = True
-        return result
+    def broaden_then_validate(parent_fd: int, leaf: str) -> None:
+        nonlocal validated_live_family
+        try:
+            os.stat(f"{leaf}-wal", dir_fd=parent_fd, follow_symlinks=False)
+            os.stat(f"{leaf}-shm", dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            os.chmod(f"{leaf}-wal", 0o644, dir_fd=parent_fd)
+            os.chmod(f"{leaf}-shm", 0o644, dir_fd=parent_fd)
+            validated_live_family = True
+        original_validate(parent_fd, leaf)
 
-    monkeypatch.setattr(store_sqlite, "repair_sqlite_family_at", broaden_then_repair)
+    monkeypatch.setattr(
+        store_sqlite,
+        "_validate_sqlite_family_at",
+        broaden_then_validate,
+    )
 
-    with store_sqlite._connect(db_path, prepare=True):
-        assert _mode(Path(f"{db_path}-wal")) == 0o600
-        assert _mode(Path(f"{db_path}-shm")) == 0o600
+    with pytest.raises(LocalStateError) as caught:
+        store_sqlite._connect(db_path, prepare=True)
 
-    assert repaired_live_family is True
+    assert caught.value.code is LocalStateErrorCode.INSECURE_MODE
+    assert validated_live_family is True
 
 
 def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
@@ -626,6 +645,36 @@ def test_store_wal_is_shared_safely_across_independent_processes(
             == 160
         )
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_store_validation_does_not_release_another_connection_lock(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "same-process-lock" / "tendwire.db"
+    init_store(db_path)
+    holder = store_sqlite._connect(db_path, prepare=True)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        with store_sqlite._connect(db_path) as observer:
+            observer.execute("SELECT COUNT(*) FROM snapshots").fetchone()
+
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        process = context.Process(
+            target=_cross_process_try_immediate,
+            args=(str(db_path), results),
+        )
+        process.start()
+        process.join(timeout=15)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("SQLite lock probe did not terminate")
+        assert process.exitcode == 0
+        assert results.get(timeout=5) == "locked"
+    finally:
+        holder.rollback()
+        holder.close()
 
 
 @pytest.mark.parametrize("prepare", [False, True])
