@@ -43,6 +43,7 @@ from tendwire.core.turns import (
     segment_canonical_text,
     turn_list_cursor,
     turn_since_token,
+    turn_source_id_candidates,
 )
 
 
@@ -252,6 +253,222 @@ def test_turn_roundtrip_sanitizes_fields_and_ignores_volatile_timestamps() -> No
     assert changed_summary.fingerprint != turn.fingerprint
     assert Turn.from_json(turn.to_json()).to_dict() == payload
     _assert_no_forbidden_fields(payload)
+
+
+def test_stable_owner_identity_uses_provenance_tiers_and_ignores_mutable_projection() -> None:
+    stable_key = "wsk1_" + ("1" * 64)
+    split_stable_key = "wsk1_" + ("2" * 64)
+    cross_workspace_stable_key = "wsk1_" + ("3" * 64)
+    raw_source_id = "backend-turn-S"
+    owner_meta = {
+        "stable_key": stable_key,
+        "stable_key_version": 1,
+        "safe": "alpha",
+        "topic_id": "sentinel-private-topic",
+    }
+    base = {
+        "host_id": "stable-host",
+        "worker_id": "worker-A",
+        "worker_fingerprint": "fingerprint-A",
+        "space_id": "space-A",
+        "status": "running",
+        "kind": "message",
+        "source": "worker:worker-A",
+        "meta": owner_meta,
+    }
+    moved_base = {
+        **base,
+        "worker_id": "worker-B",
+        "worker_fingerprint": "fingerprint-B",
+        "space_id": "space-B",
+        "source": "diagnostic:B",
+        "meta": {
+            "stable_key": stable_key,
+            "stable_key_version": 1,
+            "safe": "beta",
+            "backend_target": "sentinel-private-target",
+        },
+    }
+
+    source_a = Turn(
+        **base,
+        source_turn_id=raw_source_id,
+        origin_command_id="command-C",
+    )
+    source_b = Turn(
+        **moved_base,
+        source_turn_id=raw_source_id,
+        origin_command_id="command-C2",
+    )
+    source_without_origin = Turn(**base, source_turn_id=raw_source_id)
+    source_s2 = Turn(**base, source_turn_id="backend-turn-S2")
+    split_source = Turn(
+        **{
+            **base,
+            "meta": {
+                "stable_key": split_stable_key,
+                "stable_key_version": 1,
+                "safe": "alpha",
+            },
+        },
+        source_turn_id=raw_source_id,
+    )
+    cross_workspace_source = Turn(
+        **{
+            **base,
+            "meta": {
+                "stable_key": cross_workspace_stable_key,
+                "stable_key_version": 1,
+                "safe": "alpha",
+            },
+        },
+        source_turn_id=raw_source_id,
+    )
+    command = Turn(**base, origin_command_id="command-C")
+    moved_command = Turn(**moved_base, origin_command_id="command-C")
+    other_command = Turn(**base, origin_command_id="command-C2")
+    placeholder = Turn(**base)
+    moved_placeholder = Turn(**moved_base)
+
+    assert source_a.id == "turn-a92e95ae9752ae53dd9b6ae2"
+    assert source_a.source_turn_id == "turnsrc-609b2f4aef042d2aa571c567"
+    assert source_b.id == source_a.id == source_without_origin.id
+    assert source_b.source_turn_id == source_a.source_turn_id
+    assert source_b.fingerprint != source_a.fingerprint
+    assert source_a.origin_command_id == "command-C"
+    assert source_b.origin_command_id == "command-C2"
+    assert source_without_origin.origin_command_id is None
+
+    assert source_s2.id != source_a.id
+    assert source_s2.source_turn_id != source_a.source_turn_id
+    assert split_source.id == "turn-f90a490bf39c2c0baf397210"
+    assert split_source.source_turn_id == "turnsrc-fa75e4cc3690a659f870f146"
+    assert split_source.id != source_a.id
+    assert cross_workspace_source.id not in {source_a.id, split_source.id}
+    assert cross_workspace_source.source_turn_id not in {
+        source_a.source_turn_id,
+        split_source.source_turn_id,
+    }
+
+    assert command.id == "turn-1bdaacf46fa239939163a472"
+    assert placeholder.id == "turn-b7825dcc9c07c1360de216bc"
+    assert moved_command.id == command.id
+    assert other_command.id not in {command.id, placeholder.id}
+    assert moved_placeholder.id == placeholder.id
+    assert source_a.id not in {command.id, placeholder.id}
+
+    assert turn_source_id_candidates(
+        raw_source_id,
+        meta=owner_meta,
+        source="worker:worker-A",
+        kind="message",
+    ) == (
+        "turnsrc-609b2f4aef042d2aa571c567",
+        "turnsrc-2753f2bdda4829a64ab2d80d",
+    )
+    canonical_source_id = "turnsrc-" + ("c" * 24)
+    assert turn_source_id_candidates(
+        canonical_source_id,
+        meta=owner_meta,
+        source="diagnostic:B",
+        kind="message",
+    ) == (canonical_source_id,)
+
+    payload_a = source_a.to_dict()
+    payload_b = source_b.to_dict()
+    assert Turn.from_json(source_a.to_json()).to_dict() == payload_a
+    assert payload_a["worker_id"] == "worker-A"
+    assert payload_b["worker_id"] == "worker-B"
+    assert payload_a["space_id"] == "space-A"
+    assert payload_b["space_id"] == "space-B"
+    assert payload_a["source"] == "worker:worker-A"
+    assert payload_b["source"] == "diagnostic:B"
+    assert payload_a["meta"]["safe"] == "alpha"
+    assert payload_b["meta"]["safe"] == "beta"
+    encoded_a = json.dumps(payload_a, sort_keys=True)
+    encoded_b = json.dumps(payload_b, sort_keys=True)
+    assert raw_source_id not in encoded_a
+    assert raw_source_id not in encoded_b
+    _assert_no_forbidden_fields(payload_a)
+    _assert_no_forbidden_fields(payload_b)
+    _assert_no_private_sentinels(payload_a)
+    _assert_no_private_sentinels(payload_b)
+
+
+@pytest.mark.parametrize(
+    ("meta", "expected_fingerprint"),
+    (
+        pytest.param({}, "4b88bf0aad64968c86a3ef1b", id="missing"),
+        pytest.param(
+            {"stable_key": "wsk1_BAD", "stable_key_version": 1},
+            "770a8e3eb3c7417bd23cb331",
+            id="malformed",
+        ),
+        pytest.param(
+            {"stable_key": "wsk1_" + ("a" * 64), "stable_key_version": 2},
+            "770ba415e8f97cc5922ce71a",
+            id="wrong-version",
+        ),
+        pytest.param(
+            {"stable_key": "wsk1_" + ("1" * 64), "stable_key_version": True},
+            "e22161b81115a1a9c9625c97",
+            id="boolean-version",
+        ),
+    ),
+)
+def test_missing_or_invalid_owner_keeps_legacy_turn_source_and_fingerprint_golden(
+    meta: dict[str, Any],
+    expected_fingerprint: str,
+) -> None:
+    turn = Turn(
+        host_id="legacy-host",
+        worker_id="worker-A",
+        worker_fingerprint="fp-A",
+        space_id="space-A",
+        status="running",
+        kind="message",
+        source="worker:worker-A",
+        origin_command_id="cmd-7",
+        source_turn_id="backend-turn-S",
+        meta=meta,
+    )
+
+    assert turn.id == "turn-111b13ee5ef47e199949b671"
+    assert turn.source_turn_id == "turnsrc-2753f2bdda4829a64ab2d80d"
+    assert turn.fingerprint == expected_fingerprint
+    assert turn_source_id_candidates(
+        "backend-turn-S",
+        meta=meta,
+        source="worker:worker-A",
+        kind="message",
+    ) == ("turnsrc-2753f2bdda4829a64ab2d80d",)
+    assert "backend-turn-S" not in turn.to_json()
+
+
+def test_legacy_canonical_turn_source_pass_through_keeps_identity_golden() -> None:
+    canonical_source_id = "turnsrc-" + ("c" * 24)
+    turn = Turn(
+        host_id="legacy-host",
+        worker_id="worker-A",
+        worker_fingerprint="fp-A",
+        space_id="space-A",
+        status="running",
+        kind="message",
+        source="worker:worker-A",
+        origin_command_id="cmd-7",
+        source_turn_id=canonical_source_id,
+        meta={},
+    )
+
+    assert turn.id == "turn-6a3630fe91b3668e577fcdf8"
+    assert turn.source_turn_id == canonical_source_id
+    assert turn.fingerprint == "21dfb6041378dc3574054f1c"
+    assert turn_source_id_candidates(
+        canonical_source_id,
+        meta={},
+        source="worker:worker-A",
+        kind="message",
+    ) == (canonical_source_id,)
 
 
 def test_pending_observation_models_explicit_outcomes_and_private_picker_routes() -> None:

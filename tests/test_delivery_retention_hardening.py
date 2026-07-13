@@ -893,3 +893,266 @@ def test_acknowledged_graph_cleanup_deletes_matching_detached_tombstones(
     assert cleanup["deleted"] == 1
     assert cleanup["deleted_rows"]["attempts"] == 2
     assert remaining_attempts == 0
+
+
+def test_same_owner_churn_preserves_detached_ack_tombstone(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "same-owner-detached-ack-tombstone.db"
+    host_id = "detached-owner-churn-host"
+    raw_source = "detached-backend-source-id"
+    private_route = "PRIVATE-HARDENING-ROUTE-SENTINEL"
+    stable_key_k2 = "wsk1_" + ("a" * 64)
+    config = Config(host_id=host_id, db_path=db_path)
+
+    def owner_snapshot(stable_key: str, worker_id: str, space_id: str, second: int) -> Any:
+        return project_from_raw(
+            config,
+            workers=[
+                {
+                    "id": worker_id,
+                    "name": f"Detached Worker {worker_id}",
+                    "status": "active",
+                    "space_id": space_id,
+                    "terminal_id": private_route,
+                    "backend_target": {
+                        "kind": "agent_id",
+                        "value": private_route,
+                        "sendable": True,
+                    },
+                    "meta": {
+                        "stable_key": stable_key,
+                        "stable_key_version": 1,
+                        "chat_id": private_route,
+                        "topic_id": private_route,
+                    },
+                }
+            ],
+            timestamp=datetime(2026, 1, 1, 0, 0, second, tzinfo=timezone.utc),
+        )
+
+    worker_a = owner_snapshot(STABLE_KEY, "worker-1", "space-tombstone-a", 0)
+    init_store(db_path)
+    assert save_snapshot(db_path, worker_a) is True
+    api = ConnectorOutboxAPI(db_path, host_id)
+    original_key = _deliver_final(
+        db_path,
+        host_id,
+        api,
+        source_turn_id=raw_source,
+        text="detached continuity final",
+        observed_at="2026-01-01T00:00:01+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        original = conn.execute(
+            """
+            SELECT outbox.id, outbox.turn_id, outbox.content_revision,
+                   turns.payload_json
+            FROM connector_outbox AS outbox
+            JOIN turns
+              ON turns.host_id = outbox.host_id
+             AND turns.turn_id = outbox.turn_id
+            WHERE outbox.host_id = ?
+              AND outbox.delivery_key = ?
+              AND outbox.delivery_kind = 'final_ready'
+            """,
+            (host_id, original_key),
+        ).fetchone()
+        assert original is not None
+        original_outbox_id = int(original[0])
+        original_turn_id = str(original[1])
+        original_revision = str(original[2])
+        original_source_token = str(
+            json.loads(str(original[3]))["source_turn_id"]
+        )
+        original_attempt = conn.execute(
+            """
+            SELECT id, outbox_id, delivery_key, attempt, status, delivered_at
+            FROM connector_deliveries
+            WHERE outbox_id = ?
+            """,
+            (original_outbox_id,),
+        ).fetchone()
+        assert original_attempt is not None
+        assert original_attempt[4] == "delivered"
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET updated_at = '2000-01-01T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (original_outbox_id,),
+        )
+        conn.execute(
+            """
+            UPDATE connector_deliveries
+            SET delivered_at = '2000-01-01T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (int(original_attempt[0]),),
+        )
+
+    cleanup = cleanup_acknowledged_final_retention(
+        db_path,
+        host_id,
+        acknowledged_final_retention_days=1,
+        acknowledged_final_retention_count=1,
+        batch_size=100,
+        now="2026-07-13T00:00:00+00:00",
+    )
+    assert cleanup["deleted"] == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        detached = conn.execute(
+            """
+            SELECT id, outbox_id, delivery_key, attempt, status, delivered_at
+            FROM connector_deliveries
+            WHERE host_id = ? AND delivery_key = ?
+            """,
+            (host_id, original_key),
+        ).fetchone()
+        assert detached == (
+            int(original_attempt[0]),
+            None,
+            original_key,
+            int(original_attempt[3]),
+            "delivered",
+            "2000-01-01T00:00:00+00:00",
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM connector_outbox WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0] == 0
+
+    worker_b = owner_snapshot(STABLE_KEY, "worker-tombstone-b", "space-tombstone-b", 2)
+    assert worker_b.workers[0].fingerprint != worker_a.workers[0].fingerprint
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-tombstone-b",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": "detached continuity final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 1
+    assert api.poll({"name": FINAL_NAME, "limit": 10})["items"] == []
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert original_source_token.startswith("turnsrc-")
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.source_turn_id') IS NOT NULL
+            """,
+            (host_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM connector_outbox WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            """
+            SELECT id, outbox_id, delivery_key, attempt, status, delivered_at
+            FROM connector_deliveries
+            WHERE host_id = ? AND delivery_key = ?
+            """,
+            (host_id, original_key),
+        ).fetchone() == detached
+
+    init_store(db_path)
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-tombstone-b",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": "detached continuity final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 1
+    restarted = ConnectorOutboxAPI(db_path, host_id)
+    assert restarted.poll({"name": FINAL_NAME, "limit": 10})["items"] == []
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.source_turn_id') IS NOT NULL
+            """,
+            (host_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM connector_outbox WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            """
+            SELECT id, outbox_id, delivery_key, attempt, status, delivered_at
+            FROM connector_deliveries
+            WHERE host_id = ? AND delivery_key = ?
+            """,
+            (host_id, original_key),
+        ).fetchone() == detached
+
+    owner_k2 = owner_snapshot(
+        stable_key_k2,
+        "worker-tombstone-b",
+        "space-tombstone-b",
+        4,
+    )
+    assert save_snapshot(db_path, owner_k2) is True
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-tombstone-b",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": "detached continuity final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:05+00:00",
+    ) == 1
+    k2_poll = restarted.poll({"name": FINAL_NAME, "limit": 10, "lease_seconds": 60})
+    assert len(k2_poll["items"]) == 1
+    k2_item = k2_poll["items"][0]
+    assert k2_item["payload"]["stable_key"] == stable_key_k2
+    assert k2_item["key"] != original_key
+    assert k2_item["payload"]["turn_id"] != original_turn_id
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT id, outbox_id, delivery_key, attempt, status, delivered_at
+            FROM connector_deliveries
+            WHERE host_id = ? AND delivery_key = ?
+            """,
+            (host_id, original_key),
+        ).fetchone() == detached
+        public_payloads = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json FROM turns WHERE host_id = ?
+                UNION ALL
+                SELECT payload_json FROM connector_outbox WHERE host_id = ?
+                """,
+                (host_id, host_id),
+            ).fetchall()
+        ]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    public_surface = json.dumps(
+        {"poll": k2_poll, "payloads": public_payloads},
+        sort_keys=True,
+    )
+    assert private_route not in public_surface
+    assert raw_source not in public_surface

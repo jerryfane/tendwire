@@ -17,12 +17,13 @@ from tendwire.backends.herdr_turns import (
     TurnRefreshResult,
 )
 from tendwire.config import Config
-from tendwire.core.models import WorkerBinding
+from tendwire.core.models import Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
 from tendwire.core.projector import project_from_raw
 from tendwire.store.sqlite import (
     apply_backend_pending_observation,
     init_store,
+    merge_turn_content,
     pending_payload_from_store,
     save_snapshot,
     turns_payload_from_store,
@@ -2165,3 +2166,205 @@ def test_operational_status_has_only_fixed_aggregate_fields(tmp_path: Path) -> N
         "refresh_interval_seconds",
         "adapter_timeout_seconds",
     }
+
+
+def test_structured_refresh_rebinds_same_owner_after_stale_a_rejection_and_current_b_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = Config(
+        host_id="ingestion-owner-host",
+        db_path=tmp_path / "ingestion-owner.db",
+        herdr_timeout_seconds=0.5,
+        turn_refresh_interval_seconds=100.0,
+        turn_refresh_workers=1,
+    )
+    assert config.db_path is not None
+    stable_key = "wsk1_" + ("7" * 64)
+    worker_a = Worker(
+        id="structured-worker-a",
+        name="Structured Worker A",
+        status="active",
+        space_id="structured-space-a",
+        fingerprint="structured-fingerprint-a",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    worker_b = Worker(
+        id="structured-worker-b",
+        name="Structured Worker B",
+        status="waiting",
+        space_id="structured-space-b",
+        fingerprint="structured-fingerprint-b",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    snapshot_a = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-07-13T05:00:00+00:00",
+        workers=[worker_a],
+    )
+    snapshot_b = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-07-13T05:01:00+00:00",
+        workers=[worker_b],
+    )
+    binding_a = _binding(config, worker_a, 70, target="structured-pane-a-private")
+    binding_b = _binding(config, worker_b, 71, target="structured-pane-b-private")
+    raw_source = "019f5590-4444-7444-8444-444444444444"
+
+    init_store(config.db_path)
+    save_snapshot(config.db_path, snapshot_a)
+    upsert_worker_bindings(config.db_path, [binding_a])
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker_a.id,
+        {
+            "source_turn_id": raw_source,
+            "user_text": "stable owner prompt",
+            "assistant_final_text": "initial A final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-13T05:00:01+00:00",
+    ) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        source_before = conn.execute(
+            """
+            SELECT turn_id, list_sequence,
+                   json_extract(payload_json, '$.source_turn_id')
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.source_turn_id') IS NOT NULL
+            """,
+            (config.host_id,),
+        ).fetchone()
+        list_state_before = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+    assert source_before is not None
+
+    old_entered = threading.Event()
+    release_old = threading.Event()
+    current_entered = threading.Event()
+    reads: list[tuple[str, str]] = []
+
+    def read_binding(_config, binding, *, timeout_seconds, cancel_event=None):
+        reads.append((str(binding.worker_id), str(binding.turn_target_value)))
+        if binding.worker_id == worker_a.id:
+            old_entered.set()
+            assert release_old.wait(2)
+            final_text = "stale A final must not commit"
+        else:
+            current_entered.set()
+            final_text = "current B final"
+        return {
+            "source_turn_id": raw_source,
+            "user_text": "stable owner prompt",
+            "assistant_final_text": final_text,
+            "complete": True,
+            "has_open_turn": False,
+        }
+
+    monkeypatch.setattr(herdr_turns, "_read_turn_for_binding", read_binding)
+    scheduler = TurnIngestionScheduler(
+        config,
+        refresh_interval_seconds=100,
+        max_workers=1,
+    )
+    scheduler.start()
+    try:
+        assert old_entered.wait(2)
+        save_snapshot(config.db_path, snapshot_b)
+        upsert_worker_bindings(config.db_path, [binding_b])
+        with sqlite3.connect(str(config.db_path)) as conn:
+            conn.execute(
+                """
+                DELETE FROM worker_bindings
+                WHERE host_id = ? AND private_fingerprint = ?
+                """,
+                (config.host_id, binding_a.private_fingerprint),
+            )
+        scheduler.request_refresh()
+        release_old.set()
+        assert current_entered.wait(2)
+        _wait_until(lambda: scheduler.operational_status()["active"] == 0)
+    finally:
+        release_old.set()
+        scheduler.stop()
+
+    public_payload = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        snapshot=snapshot_b,
+        schema_version=2,
+    )
+    source_turns = [
+        turn for turn in public_payload["turns"] if turn.get("source_turn_id")
+    ]
+    assert len(source_turns) == 1
+    source_turn = source_turns[0]
+    assert source_turn["id"] == source_before[0]
+    assert source_turn["source_turn_id"] == source_before[2]
+    assert source_turn["source_turn_id"] != raw_source
+    assert source_turn["worker_id"] == worker_b.id
+    assert source_turn["worker_fingerprint"] == worker_b.fingerprint
+    assert source_turn["space_id"] == worker_b.space_id
+    assert source_turn["assistant_final_text"] == "current B final"
+    assert source_turn["complete"] is True
+    assert source_turn["has_open_turn"] is False
+    assert reads == [
+        (worker_a.id, "structured-pane-a-private"),
+        (worker_b.id, "structured-pane-b-private"),
+    ]
+    assert scheduler.operational_status()["failed"] == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        persisted_source = conn.execute(
+            """
+            SELECT turn_id, list_sequence,
+                   json_extract(payload_json, '$.source_turn_id')
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.source_turn_id') IS NOT NULL
+            """,
+            (config.host_id,),
+        ).fetchone()
+        list_state_after = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+        current_revisions = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (config.host_id, source_turn["id"]),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert persisted_source == source_before
+    assert persisted_source[1] == source_before[1]
+    assert list_state_after == list_state_before
+    assert current_revisions == 1
+    assert foreign_keys == []
+    encoded = json.dumps(
+        [public_payload, scheduler.operational_status()],
+        sort_keys=True,
+    )
+    for private_value in (
+        raw_source,
+        "structured-pane-a-private",
+        "structured-pane-b-private",
+        binding_a.private_fingerprint,
+        binding_b.private_fingerprint,
+        "stale A final must not commit",
+    ):
+        assert private_value not in encoded

@@ -1481,6 +1481,45 @@ def _opaque_public_id(prefix: str, raw_value: Any, public_material: Any) -> str:
     return _stable_id(prefix, {"seed": raw, "public": public_material})
 
 
+def turn_source_id_candidates(
+    raw_value: Any,
+    *,
+    meta: Mapping[str, Any],
+    source: Any,
+    kind: Any,
+) -> tuple[str, ...]:
+    """Return canonical and compatibility source tokens in match order."""
+
+    raw_source_turn_id = _optional_public_text(raw_value)
+    if not raw_source_turn_id:
+        return ()
+
+    normalized_source = _public_text(source, default="snapshot")
+    normalized_kind = _normalize_turn_kind(kind)
+    legacy_token = _opaque_public_id(
+        "turnsrc",
+        raw_source_turn_id,
+        {"source": normalized_source, "kind": normalized_kind},
+    )
+    owner_identity = _turn_owner_identity(meta)
+    if owner_identity is None:
+        return (legacy_token,)
+
+    owner_token = _opaque_public_id(
+        "turnsrc",
+        raw_source_turn_id,
+        {
+            "identity_domain": "stable-owner-source-v1",
+            "stable_key": owner_identity[0],
+            "stable_key_version": owner_identity[1],
+            "kind": normalized_kind,
+        },
+    )
+    if owner_token == legacy_token:
+        return (owner_token,)
+    return owner_token, legacy_token
+
+
 def _meta_value(meta: Mapping[str, Any], normalized_key: str) -> Any | None:
     normalized_target = _normalized_key(normalized_key)
     compact_target = normalized_target.replace("_", "")
@@ -1730,18 +1769,16 @@ class Turn:
         completed_at = _optional_timestamp(self.completed_at)
         origin_command_id = _optional_public_text(self.origin_command_id)
         raw_source_turn_id = _optional_public_text(self.source_turn_id)
-        source_turn_id = (
-            _opaque_public_id(
-                "turnsrc",
-                raw_source_turn_id,
-                {"source": source, "kind": kind},
-            )
-            if raw_source_turn_id
-            else None
-        )
         meta = _clean_meta(self.meta)
+        source_id_candidates = turn_source_id_candidates(
+            raw_source_turn_id,
+            meta=meta,
+            source=source,
+            kind=kind,
+        )
+        source_turn_id = source_id_candidates[0] if source_id_candidates else None
         owner_identity = _turn_owner_identity(meta)
-        identity_payload = {
+        content_identity_payload = {
             "schema_version": TURN_SCHEMA_VERSION,
             "host_id": host_id,
             "worker_id": worker_id,
@@ -1751,16 +1788,33 @@ class Turn:
             "origin_command_id": origin_command_id,
         }
         if owner_identity is not None:
-            identity_payload["stable_key"] = owner_identity[0]
-            identity_payload["stable_key_version"] = owner_identity[1]
+            content_identity_payload["stable_key"] = owner_identity[0]
+            content_identity_payload["stable_key_version"] = owner_identity[1]
         else:
-            identity_payload["stable_key_status"] = "unavailable"
+            content_identity_payload["stable_key_status"] = "unavailable"
         if source_turn_id:
-            # Distinct backend turns must mint distinct public turn ids;
-            # omitted for legacy rows so their identities stay stable.
-            identity_payload["source_turn_id"] = source_turn_id
+            content_identity_payload["source_turn_id"] = source_turn_id
+
+        if owner_identity is not None:
+            identity_payload = {
+                "identity_domain": "stable-owner-turn-v1",
+                "schema_version": TURN_SCHEMA_VERSION,
+                "host_id": host_id,
+                "stable_key": owner_identity[0],
+                "stable_key_version": owner_identity[1],
+                "kind": kind,
+            }
+            if source_turn_id:
+                identity_payload["source_turn_id"] = source_turn_id
+            elif origin_command_id:
+                identity_payload["origin_command_id"] = origin_command_id
+            else:
+                identity_payload["owner_placeholder"] = True
+        else:
+            identity_payload = content_identity_payload
+
         content_payload = {
-            **identity_payload,
+            **content_identity_payload,
             "worker_fingerprint": worker_fingerprint,
             "status": status,
             "title": title,

@@ -35,9 +35,11 @@ from tendwire.store.sqlite import (
     apply_backend_pending_observation,
     get_command_receipt,
     init_store,
-    save_snapshot,
+    merge_turn_content,
     pending_payload_from_store,
+    save_snapshot,
     turns_payload_from_store,
+    upsert_command_pending_turn,
     upsert_worker_bindings,
 )
 
@@ -1448,3 +1450,449 @@ def test_answer_pending_failed_pre_send_release_is_uncertain(
     )
     assert receipt is not None
     assert receipt["uncertain"] is True
+
+
+def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    stable_key = "wsk1_" + ("6" * 64)
+    request_id = "stable-owner-request"
+    worker_a = Worker(
+        id="owner-worker-a",
+        name="Owner Worker A",
+        status="active",
+        space_id="owner-space-a",
+        fingerprint="owner-fingerprint-a",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    worker_b = Worker(
+        id="owner-worker-b",
+        name="Owner Worker B",
+        status="waiting",
+        space_id="owner-space-b",
+        fingerprint="owner-fingerprint-b",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    binding_a = _binding(
+        worker_a,
+        value="owner-agent-a-private",
+        private_fingerprint="owner-binding-a-private",
+        turn_target_value="owner-pane-a-private",
+    )
+    _seed(config, [worker_a], [binding_a])
+    calls: list[dict[str, Any]] = []
+
+    accepted = submit_command(
+        config,
+        _request(request_id=request_id, worker_id=worker_a.id),
+        socket_client_factory=_factory(calls, pane_id="owner-pane-a-private"),
+    )
+    assert accepted.status == STATUS_ACCEPTED
+    command_before = next(
+        turn
+        for turn in turns_payload_from_store(config.db_path, config.host_id)["turns"]
+        if turn.get("origin_command_id") == request_id
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        command_sequence = conn.execute(
+            """
+            SELECT list_sequence
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (config.host_id, command_before["id"]),
+        ).fetchone()[0]
+
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-13T04:01:00+00:00",
+            workers=[worker_b],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    upsert_worker_bindings(
+        config.db_path,
+        [
+            _binding(
+                worker_b,
+                value="owner-agent-b-private",
+                private_fingerprint="owner-binding-b-private",
+                turn_target_value="owner-pane-b-private",
+            )
+        ],
+    )
+    command_after = upsert_command_pending_turn(
+        config.db_path,
+        config.host_id,
+        worker_b,
+        request_id=request_id,
+        instruction_text="hello",
+        observed_at="2026-07-13T04:01:01+00:00",
+    )
+    assert command_after is not None
+    assert command_after["id"] == command_before["id"]
+    assert command_after["worker_id"] == worker_b.id
+    assert command_after["worker_fingerprint"] == worker_b.fingerprint
+    assert command_after["space_id"] == worker_b.space_id
+    assert command_after["complete"] is False
+    assert command_after["has_open_turn"] is True
+    with sqlite3.connect(str(config.db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT turn_id, list_sequence
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.origin_command_id') = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchall()
+    assert rows == [(command_before["id"], command_sequence)]
+
+    raw_source = "019f5590-3333-7333-8333-333333333333"
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker_b.id,
+        {
+            "source_turn_id": raw_source,
+            "user_text": "hello",
+            "assistant_final_text": "durable owner answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-13T04:01:02+00:00",
+    ) == 1
+    completed_payload = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )
+    completed_source = next(
+        turn
+        for turn in completed_payload["turns"]
+        if turn.get("assistant_final_text") == "durable owner answer"
+    )
+    assert completed_source["id"] != command_before["id"]
+    assert completed_source["origin_command_id"] == request_id
+    assert completed_source["source_turn_id"].startswith("turnsrc-")
+    assert completed_source["source_turn_id"] != raw_source
+    assert completed_source["complete"] is True
+    assert completed_source["has_open_turn"] is False
+    with sqlite3.connect(str(config.db_path)) as conn:
+        source_before_retry = conn.execute(
+            """
+            SELECT turns.turn_id, turns.list_sequence, turns.payload_json,
+                   revisions.content_revision
+            FROM turns
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = ? AND turns.turn_id = ?
+            """,
+            (config.host_id, completed_source["id"]),
+        ).fetchone()
+        list_state_before_retry = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+
+    source_wins = upsert_command_pending_turn(
+        config.db_path,
+        config.host_id,
+        worker_b,
+        request_id=request_id,
+        instruction_text="hello",
+        observed_at="2026-07-13T04:01:03+00:00",
+    )
+    assert source_wins is not None
+    assert source_wins["id"] == completed_source["id"]
+    assert source_wins["source_turn_id"] == completed_source["source_turn_id"]
+    assert source_wins["assistant_final_text"] == "durable owner answer"
+    assert source_wins["complete"] is True
+    assert source_wins["has_open_turn"] is False
+    with sqlite3.connect(str(config.db_path)) as conn:
+        source_after_retry = conn.execute(
+            """
+            SELECT turns.turn_id, turns.list_sequence, turns.payload_json,
+                   revisions.content_revision
+            FROM turns
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = ? AND turns.turn_id = ?
+            """,
+            (config.host_id, completed_source["id"]),
+        ).fetchone()
+        list_state_after_retry = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+        origin_rows = conn.execute(
+            """
+            SELECT turn_id, json_extract(payload_json, '$.source_turn_id')
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.origin_command_id') = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchall()
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert source_after_retry == source_before_retry
+    assert list_state_after_retry == list_state_before_retry
+    assert origin_rows == [
+        (completed_source["id"], completed_source["source_turn_id"])
+    ]
+    assert foreign_keys == []
+    assert calls == _expected_submit_calls(
+        "owner-agent-a-private",
+        pane_id="owner-pane-a-private",
+    )
+
+    receipt = get_command_receipt(
+        config.db_path,
+        config.host_id,
+        request_id,
+        "send_instruction",
+    )
+    assert receipt is not None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        event_payloads = [
+            json.loads(str(row[0]))
+            for row in conn.execute(
+                "SELECT payload_json FROM events WHERE aggregate_id = ? ORDER BY id",
+                (request_id,),
+            ).fetchall()
+        ]
+    public_surfaces = [
+        accepted.to_dict(),
+        command_before,
+        command_after,
+        completed_payload,
+        source_wins,
+        json.loads(receipt["result_json"]),
+        *event_payloads,
+    ]
+    encoded = json.dumps(public_surfaces, sort_keys=True)
+    for private_value in (
+        raw_source,
+        "owner-agent-a-private",
+        "owner-binding-a-private",
+        "owner-pane-a-private",
+        "owner-agent-b-private",
+        "owner-binding-b-private",
+        "owner-pane-b-private",
+    ):
+        assert private_value not in encoded
+    for surface in public_surfaces:
+        _assert_no_private_json(surface)
+
+
+def test_completed_source_command_replay_after_owner_churn_adopts_current_projection_without_reopen(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    stable_key = "wsk1_" + ("8" * 64)
+    request_id = "completed-owner-request"
+    raw_source = "019f5590-5555-7555-8555-555555555555"
+    worker_a = Worker(
+        id="completed-worker-a",
+        name="Completed Worker A",
+        status="active",
+        space_id="completed-space-a",
+        fingerprint="completed-fingerprint-a",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    worker_b = Worker(
+        id="completed-worker-b",
+        name="Completed Worker B",
+        status="waiting",
+        space_id="completed-space-b",
+        fingerprint="completed-fingerprint-b",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    _seed(config, [worker_a])
+    command = upsert_command_pending_turn(
+        config.db_path,
+        config.host_id,
+        worker_a,
+        request_id=request_id,
+        instruction_text="complete this command",
+        observed_at="2026-07-13T06:00:00+00:00",
+    )
+    assert command is not None
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker_a.id,
+        {
+            "source_turn_id": raw_source,
+            "user_text": "complete this command",
+            "assistant_final_text": "terminal answer from A",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-13T06:00:01+00:00",
+    ) == 1
+    before_public = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )
+    source_before = next(
+        turn
+        for turn in before_public["turns"]
+        if turn.get("origin_command_id") == request_id
+        and turn.get("source_turn_id")
+    )
+    assert source_before["worker_id"] == worker_a.id
+    assert source_before["assistant_final_text"] == "terminal answer from A"
+    assert source_before["complete"] is True
+    assert source_before["has_open_turn"] is False
+
+    def durable_identity() -> tuple[Any, ...]:
+        with sqlite3.connect(str(config.db_path)) as conn:
+            row = conn.execute(
+                """
+                SELECT turns.turn_id,
+                       turns.list_sequence,
+                       json_extract(turns.payload_json, '$.source_turn_id'),
+                       revisions.content_revision,
+                       outbox.id,
+                       outbox.delivery_key,
+                       json_extract(outbox.payload_json, '$.final_identity'),
+                       outbox.status
+                FROM turns
+                JOIN turn_content_revisions AS revisions
+                  ON revisions.host_id = turns.host_id
+                 AND revisions.turn_id = turns.turn_id
+                 AND revisions.is_current = 1
+                JOIN connector_outbox AS outbox
+                  ON outbox.host_id = turns.host_id
+                 AND outbox.turn_id = turns.turn_id
+                 AND outbox.content_revision = revisions.content_revision
+                 AND outbox.delivery_kind = 'final_ready'
+                WHERE turns.host_id = ?
+                  AND turns.turn_id = ?
+                """,
+                (config.host_id, source_before["id"]),
+            ).fetchone()
+            assert row is not None
+            return tuple(row)
+
+    durable_before = durable_identity()
+    with sqlite3.connect(str(config.db_path)) as conn:
+        list_state_before = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-07-13T06:01:00+00:00",
+            workers=[worker_b],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    replayed = upsert_command_pending_turn(
+        config.db_path,
+        config.host_id,
+        worker_b,
+        request_id=request_id,
+        instruction_text="complete this command",
+        observed_at="2026-07-13T06:01:01+00:00",
+    )
+    assert replayed is not None
+    assert replayed["id"] == source_before["id"]
+    assert replayed["source_turn_id"] == source_before["source_turn_id"]
+    assert replayed["worker_id"] == worker_b.id
+    assert replayed["worker_fingerprint"] == worker_b.fingerprint
+    assert replayed["space_id"] == worker_b.space_id
+    assert replayed["assistant_final_text"] == "terminal answer from A"
+    assert replayed["complete"] is True
+    assert replayed["has_open_turn"] is False
+
+    after_public = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )
+    source_after = next(
+        turn
+        for turn in after_public["turns"]
+        if turn.get("id") == source_before["id"]
+    )
+    assert source_after["worker_id"] == worker_b.id
+    assert source_after["worker_fingerprint"] == worker_b.fingerprint
+    assert source_after["space_id"] == worker_b.space_id
+    assert source_after["assistant_final_text"] == "terminal answer from A"
+    assert source_after["complete"] is True
+    assert source_after["has_open_turn"] is False
+    assert durable_identity() == durable_before
+    with sqlite3.connect(str(config.db_path)) as conn:
+        list_state_after = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone()
+        origin_rows = conn.execute(
+            """
+            SELECT turn_id,
+                   json_extract(payload_json, '$.source_turn_id'),
+                   json_extract(payload_json, '$.complete')
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.origin_command_id') = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchall()
+        root_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM connector_outbox
+            WHERE host_id = ?
+              AND delivery_kind = 'final_ready'
+              AND turn_id = ?
+            """,
+            (config.host_id, source_before["id"]),
+        ).fetchone()[0]
+        current_revision_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (config.host_id, source_before["id"]),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert list_state_after == list_state_before
+    assert origin_rows == [
+        (source_before["id"], source_before["source_turn_id"], 1)
+    ]
+    assert root_count == 1
+    assert current_revision_count == 1
+    assert foreign_keys == []
+    assert raw_source not in json.dumps(after_public, sort_keys=True)

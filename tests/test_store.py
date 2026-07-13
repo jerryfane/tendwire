@@ -31,8 +31,8 @@ from tendwire.local_state import (
 
 from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
-from tendwire.core.models import WorkerBinding
-from tendwire.core.turns import content_cursor, turn_final_delivery_identity
+from tendwire.core.models import Snapshot, Worker, WorkerBinding
+from tendwire.core.turns import Turn, content_cursor, turn_final_delivery_identity
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
@@ -12328,3 +12328,564 @@ def test_turn_list_interior_deletion_expires_cursor_but_not_since_watermark(
     assert continuation["status"] == "cursor_expired"
     assert insertion_poll.get("ok") is not False
     assert insertion_poll["turns"] == []
+
+
+def test_stable_owner_snapshot_base_preserves_frozen_id_and_sequence_across_worker_churn(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stable-owner-snapshot.db"
+    host_id = "stable-snapshot-host"
+    stable_key = "wsk1_" + ("1" * 64)
+    worker_a = Worker(
+        id="worker-a",
+        name="Worker A",
+        status="active",
+        space_id="space-a",
+        fingerprint="fingerprint-a",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    worker_b = Worker(
+        id="worker-b",
+        name="Worker B",
+        status="waiting",
+        space_id="space-b",
+        fingerprint="fingerprint-b",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    snapshot_a = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-13T00:00:00+00:00",
+        workers=[worker_a],
+    )
+    snapshot_b = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-13T00:01:00+00:00",
+        workers=[worker_b],
+    )
+    frozen_turn_id = "turn-744512196ff4efde645035f9"
+    frozen_fingerprint = "c835738d6fdd5c5ec1d92b1b"
+
+    init_store(db_path)
+    save_snapshot(db_path, snapshot_a)
+    with sqlite3.connect(str(db_path)) as conn:
+        current_id, raw_payload, list_sequence = conn.execute(
+            """
+            SELECT turn_id, payload_json, list_sequence
+            FROM turns
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        assert current_id != frozen_turn_id
+        payload = json.loads(str(raw_payload))
+        payload["id"] = frozen_turn_id
+        payload["fingerprint"] = frozen_fingerprint
+        conn.execute(
+            "DELETE FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
+            (host_id, current_id),
+        )
+        conn.execute(
+            """
+            UPDATE turns
+            SET turn_id = ?, fingerprint = ?, payload_json = ?
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (
+                frozen_turn_id,
+                frozen_fingerprint,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                host_id,
+                current_id,
+            ),
+        )
+        store_sqlite._ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=host_id,
+            turn_id=frozen_turn_id,
+            observed_at=snapshot_a.updated_at,
+        )
+        conn.commit()
+        before_state = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+    assert list_sequence == 1
+    assert before_state == (2, 1)
+
+    save_snapshot(db_path, snapshot_b)
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT turn_id, worker_id, worker_fingerprint, space_id,
+                   list_sequence, payload_json
+            FROM turns
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchall()
+        after_state = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        current_revisions = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (host_id, frozen_turn_id),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert len(rows) == 1
+    turn_id, worker_id, worker_fingerprint, space_id, sequence, raw_payload = rows[0]
+    stored_payload = json.loads(str(raw_payload))
+    assert (turn_id, sequence) == (frozen_turn_id, 1)
+    assert stored_payload["id"] == frozen_turn_id
+    assert (worker_id, worker_fingerprint, space_id) == (
+        worker_b.id,
+        worker_b.fingerprint,
+        worker_b.space_id,
+    )
+    assert stored_payload["worker_id"] == worker_b.id
+    assert stored_payload["worker_fingerprint"] == worker_b.fingerprint
+    assert stored_payload["space_id"] == worker_b.space_id
+    assert stored_payload["title"] == worker_b.name
+    assert stored_payload["meta"]["stable_key"] == stable_key
+    assert after_state == before_state
+    assert current_revisions == 1
+    assert foreign_keys == []
+
+    durable_state = (rows, after_state)
+    save_snapshot(db_path, snapshot_b)
+    with sqlite3.connect(str(db_path)) as conn:
+        replay_rows = conn.execute(
+            """
+            SELECT turn_id, worker_id, worker_fingerprint, space_id,
+                   list_sequence, payload_json
+            FROM turns
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchall()
+        replay_state = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+    assert (replay_rows, replay_state) == durable_state
+    public_payload = turns_payload_from_store(db_path, host_id, schema_version=2)
+    assert [turn["id"] for turn in public_payload["turns"]] == [frozen_turn_id]
+
+
+def test_stable_owner_snapshot_ambiguity_rolls_back_without_allocating_sequence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stable-owner-snapshot-ambiguity.db"
+    host_id = "snapshot-ambiguity-host"
+    stable_key = "wsk1_" + ("2" * 64)
+    worker_a = Worker(
+        id="worker-a",
+        name="Worker A",
+        status="active",
+        fingerprint="snapshot-fingerprint-a",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    worker_b = Worker(
+        id="worker-b",
+        name="Worker B",
+        status="waiting",
+        fingerprint="snapshot-fingerprint-b",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    snapshot_a = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-13T01:00:00+00:00",
+        workers=[worker_a],
+    )
+    snapshot_b = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-13T01:01:00+00:00",
+        workers=[worker_b],
+    )
+    duplicate_id = "turn-222222222222222222222222"
+
+    init_store(db_path)
+    save_snapshot(db_path, snapshot_a)
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT worker_id, worker_fingerprint, space_id, status, kind,
+                   updated_at, fingerprint, snapshot_content_fingerprint,
+                   observed_at, payload_json
+            FROM turns
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        duplicate_payload = json.loads(str(row[9]))
+        duplicate_payload["id"] = duplicate_id
+        duplicate_payload["fingerprint"] = "frozen-duplicate-fingerprint"
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, worker_fingerprint, space_id,
+                status, kind, updated_at, fingerprint,
+                snapshot_content_fingerprint, observed_at, payload_json,
+                list_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)
+            """,
+            (
+                host_id,
+                duplicate_id,
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                "frozen-duplicate-fingerprint",
+                row[7],
+                row[8],
+                json.dumps(duplicate_payload, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        store_sqlite._ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=host_id,
+            turn_id=duplicate_id,
+            observed_at=snapshot_a.updated_at,
+        )
+        conn.execute(
+            """
+            UPDATE turn_list_hosts
+            SET next_sequence = 3
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        )
+        conn.commit()
+
+        before_turns = conn.execute(
+            """
+            SELECT turn_id, worker_id, list_sequence, payload_json
+            FROM turns
+            WHERE host_id = ?
+            ORDER BY list_sequence
+            """,
+            (host_id,),
+        ).fetchall()
+        before_workers = conn.execute(
+            "SELECT worker_id, payload_json FROM workers WHERE host_id = ?",
+            (host_id,),
+        ).fetchall()
+        before_state = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        before_snapshot_count = conn.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+        before_event_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+
+    with pytest.raises(
+        store_sqlite.StoreSchemaError,
+        match="^turn_owner_placeholder_ambiguous$",
+    ):
+        save_snapshot(db_path, snapshot_b)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        after_turns = conn.execute(
+            """
+            SELECT turn_id, worker_id, list_sequence, payload_json
+            FROM turns
+            WHERE host_id = ?
+            ORDER BY list_sequence
+            """,
+            (host_id,),
+        ).fetchall()
+        after_workers = conn.execute(
+            "SELECT worker_id, payload_json FROM workers WHERE host_id = ?",
+            (host_id,),
+        ).fetchall()
+        after_state = conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        after_snapshot_count = conn.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+        after_event_count = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert after_turns == before_turns
+    assert after_workers == before_workers
+    assert after_state == before_state == (3, 1)
+    assert after_snapshot_count == before_snapshot_count
+    assert after_event_count == before_event_count
+    assert foreign_keys == []
+
+
+def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stable-owner-command-provenance.db"
+    host_id = "stable-command-provenance-host"
+    stable_key = "wsk1_" + ("3" * 64)
+    worker = Worker(
+        id="owner-worker",
+        name="Owner Worker",
+        status="active",
+        space_id="owner-space",
+        fingerprint="owner-fingerprint",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    snapshot = Snapshot(
+        host_id=host_id,
+        updated_at="2026-07-13T02:00:00+00:00",
+        workers=[worker],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+
+    command = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        worker,
+        request_id="request-exact",
+        instruction_text="exact prompt",
+        observed_at="2026-07-13T02:00:01+00:00",
+    )
+    assert command is not None
+    raw_matching_source = "019f5590-1111-7111-8111-111111111111"
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        worker.id,
+        {
+            "source_turn_id": raw_matching_source,
+            "user_text": "exact prompt",
+            "assistant_final_text": "exact final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-13T02:00:02+00:00",
+    ) == 1
+    payload = turns_payload_from_store(db_path, host_id, schema_version=2)
+    exact_source = next(
+        turn for turn in payload["turns"]
+        if turn.get("assistant_final_text") == "exact final"
+    )
+    source_with_origin = Turn(
+        host_id=host_id,
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        space_id=worker.space_id,
+        status=worker.status,
+        kind="task",
+        source="command",
+        origin_command_id="request-exact",
+        source_turn_id=raw_matching_source,
+        meta=worker.meta,
+    )
+    source_without_origin = Turn(
+        host_id=host_id,
+        worker_id="changed-worker-diagnostic",
+        worker_fingerprint="changed-fingerprint",
+        space_id="changed-space",
+        status="waiting",
+        kind="task",
+        source="changed-backend-diagnostic",
+        source_turn_id=raw_matching_source,
+        meta=worker.meta,
+    )
+    assert exact_source["id"] == source_with_origin.id == source_without_origin.id
+    assert exact_source["id"] != command["id"]
+    assert exact_source["origin_command_id"] == "request-exact"
+    assert exact_source["source_turn_id"] == source_with_origin.source_turn_id
+    assert raw_matching_source not in json.dumps(payload, sort_keys=True)
+
+    stale_command = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        worker,
+        request_id="request-stale",
+        instruction_text="different command prompt",
+        observed_at="2026-07-13T02:00:03+00:00",
+    )
+    assert stale_command is not None
+    raw_unmatched_source = "019f5590-2222-7222-8222-222222222222"
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        worker.id,
+        {
+            "source_turn_id": raw_unmatched_source,
+            "user_text": "independent backend prompt",
+            "assistant_final_text": "independent final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-13T02:00:04+00:00",
+    ) == 1
+    refreshed = turns_payload_from_store(db_path, host_id, schema_version=2)
+    unmatched_source = next(
+        turn for turn in refreshed["turns"]
+        if turn.get("assistant_final_text") == "independent final"
+    )
+    assert unmatched_source.get("origin_command_id") is None
+    assert unmatched_source["id"] != stale_command["id"]
+    assert any(
+        turn.get("id") == stale_command["id"]
+        and turn.get("origin_command_id") == "request-stale"
+        for turn in refreshed["turns"]
+    )
+    encoded = json.dumps(refreshed, sort_keys=True)
+    assert raw_matching_source not in encoded
+    assert raw_unmatched_source not in encoded
+
+
+def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "owner-source-isolation.db"
+    host_id = "owner-isolation-host"
+    raw_source = "raw-owner-isolation-source"
+    stable_key_1 = "wsk1_" + ("4" * 64)
+    stable_key_2 = "wsk1_" + ("5" * 64)
+
+    def snapshot_for(
+        worker_id: str,
+        stable_key: str | None,
+        observed_at: str,
+    ) -> Snapshot:
+        meta = (
+            {"stable_key": stable_key, "stable_key_version": 1}
+            if stable_key is not None
+            else {}
+        )
+        return Snapshot(
+            host_id=host_id,
+            updated_at=observed_at,
+            workers=[
+                Worker(
+                    id=worker_id,
+                    name="Shared",
+                    status="active",
+                    space_id="shared-space",
+                    fingerprint="shared-fingerprint",
+                    meta=meta,
+                )
+            ],
+        )
+
+    init_store(db_path)
+    cases = (
+        (
+            snapshot_for(
+                "shared-worker",
+                stable_key_1,
+                "2026-07-13T03:00:00+00:00",
+            ),
+            "owner one final",
+            "2026-07-13T03:00:01+00:00",
+        ),
+        (
+            snapshot_for(
+                "shared-worker",
+                stable_key_2,
+                "2026-07-13T03:01:00+00:00",
+            ),
+            "owner two final",
+            "2026-07-13T03:01:01+00:00",
+        ),
+        (
+            snapshot_for(
+                "shared-worker",
+                None,
+                "2026-07-13T03:02:00+00:00",
+            ),
+            "legacy same-worker final",
+            "2026-07-13T03:02:01+00:00",
+        ),
+        (
+            snapshot_for(
+                "legacy-worker-b",
+                None,
+                "2026-07-13T03:03:00+00:00",
+            ),
+            "legacy changed-worker final",
+            "2026-07-13T03:03:01+00:00",
+        ),
+    )
+    for snapshot, final_text, observed_at in cases:
+        save_snapshot(db_path, snapshot)
+        assert merge_turn_content(
+            db_path,
+            host_id,
+            snapshot.workers[0].id,
+            {
+                "source_turn_id": raw_source,
+                "assistant_final_text": final_text,
+                "complete": True,
+                "has_open_turn": False,
+            },
+            observed_at=observed_at,
+        ) == 1
+
+    payload = turns_payload_from_store(db_path, host_id, schema_version=2)
+    source_turns = {
+        str(turn.get("assistant_final_text")): turn
+        for turn in payload["turns"]
+        if turn.get("source_turn_id")
+    }
+    assert set(source_turns) == {
+        "owner one final",
+        "owner two final",
+        "legacy same-worker final",
+        "legacy changed-worker final",
+    }
+    ids = {str(turn["id"]) for turn in source_turns.values()}
+    tokens = {str(turn["source_turn_id"]) for turn in source_turns.values()}
+    assert len(ids) == len(tokens) == 4
+    assert (
+        source_turns["owner one final"]["meta"]["stable_key"],
+        source_turns["owner two final"]["meta"]["stable_key"],
+    ) == (stable_key_1, stable_key_2)
+    assert source_turns["legacy same-worker final"]["meta"].get("stable_key") is None
+    assert source_turns["legacy changed-worker final"]["meta"].get("stable_key") is None
+    assert (
+        source_turns["legacy same-worker final"]["source_turn_id"]
+        == "turnsrc-fdc56cfa0289296df514b264"
+    )
+    assert source_turns["legacy same-worker final"]["worker_id"] == "shared-worker"
+    assert source_turns["legacy changed-worker final"]["worker_id"] == "legacy-worker-b"
+    assert raw_source not in json.dumps(payload, sort_keys=True)
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

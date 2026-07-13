@@ -4,20 +4,31 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from tendwire.config import Config
 from tendwire.connectors import ConnectorOutboxAPI
+from tendwire.core.projector import project_from_raw
 from tendwire.store import sqlite as store_sqlite
-from tendwire.store.sqlite import cleanup_acknowledged_final_retention, init_store
+from tendwire.store.sqlite import (
+    cleanup_acknowledged_final_retention,
+    init_store,
+    merge_turn_content,
+    save_snapshot,
+)
 
 
 HOST_ID = "recovery-host"
 FINAL_NAME = "turn-final"
 CREATED_AT = "2026-01-01T00:00:00+00:00"
 STABLE_KEY = "wsk1_" + ("d" * 64)
+RECOVERY_RAW_SOURCE = "legacy-recovery-backend-source"
+RECOVERY_LEGACY_SOURCE_TOKEN = "turnsrc-422ef48fec1cfb0720da05bd"
+PRIVATE_ROUTE_SENTINEL = "PRIVATE-RECOVERY-ROUTE-SENTINEL"
 
 
 def _insert_revision(
@@ -262,6 +273,143 @@ def _final_span(start: int, end: int) -> dict[str, Any]:
 
 def _user_span(start: int, end: int) -> dict[str, Any]:
     return {"field": "user_text", "start_char": start, "end_char": end}
+
+
+def _owner_snapshot(
+    db_path: Path,
+    *,
+    worker_id: str,
+    worker_name: str,
+    space_id: str,
+    second: int,
+    stable_key: str = STABLE_KEY,
+) -> Any:
+    return project_from_raw(
+        Config(host_id=HOST_ID, db_path=db_path),
+        workers=[
+            {
+                "id": worker_id,
+                "name": worker_name,
+                "status": "active",
+                "space_id": space_id,
+                "terminal_id": PRIVATE_ROUTE_SENTINEL,
+                "backend_target": {
+                    "kind": "agent_id",
+                    "value": PRIVATE_ROUTE_SENTINEL,
+                    "sendable": True,
+                },
+                "meta": {
+                    "stable_key": stable_key,
+                    "stable_key_version": 1,
+                    "chat_id": PRIVATE_ROUTE_SENTINEL,
+                    "topic_id": PRIVATE_ROUTE_SENTINEL,
+                },
+            }
+        ],
+        timestamp=datetime(2026, 1, 1, 0, 0, second, tzinfo=timezone.utc),
+    )
+
+
+def _turn_graph_snapshot(db_path: Path, turn_id: str) -> dict[str, Any]:
+    with sqlite3.connect(str(db_path)) as conn:
+        turn_row = conn.execute(
+            """
+            SELECT payload_json, list_sequence
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (HOST_ID, turn_id),
+        ).fetchone()
+        assert turn_row is not None
+        payload = json.loads(str(turn_row[0]))
+        return {
+            "turn_identity": (
+                turn_id,
+                payload.get("id"),
+                payload.get("source_turn_id"),
+                int(turn_row[1]),
+            ),
+            "revisions": conn.execute(
+                """
+                SELECT content_revision, user_state, final_state, is_current,
+                       created_at, superseded_at
+                FROM turn_content_revisions
+                WHERE host_id = ? AND turn_id = ?
+                ORDER BY content_revision
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "boundaries": conn.execute(
+                """
+                SELECT content_revision, field, page_index, start_char, start_byte
+                FROM turn_content_page_boundaries
+                WHERE host_id = ? AND turn_id = ?
+                ORDER BY content_revision, field, page_index
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "plans": conn.execute(
+                """
+                SELECT id, plan_token, content_revision, presentation_version,
+                       generation, part_count, state, replaces_plan_token,
+                       recovers_plan_token, source_outbox_id
+                FROM turn_presentation_plans
+                WHERE host_id = ? AND turn_id = ?
+                ORDER BY id
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "jobs": conn.execute(
+                """
+                SELECT jobs.id, jobs.plan_id, jobs.sequence_index, jobs.operation,
+                       jobs.part_ordinal, jobs.spans_json, jobs.outbox_id
+                FROM turn_presentation_jobs AS jobs
+                JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+                WHERE plans.host_id = ? AND plans.turn_id = ?
+                ORDER BY jobs.id
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "recoveries": conn.execute(
+                """
+                SELECT audit.id, audit.request_id, audit.failed_plan_id,
+                       audit.recovered_plan_id, audit.failed_plan_token,
+                       audit.recovered_plan_token, audit.generation,
+                       audit.source_job_count, audit.delivered_prefix_count,
+                       audit.fresh_job_count, audit.retained_failed_job_count,
+                       audit.prior_attempt_count, audit.outcome
+                FROM turn_presentation_recoveries AS audit
+                JOIN turn_presentation_plans AS failed
+                  ON failed.id = audit.failed_plan_id
+                WHERE audit.host_id = ? AND failed.turn_id = ?
+                ORDER BY audit.id
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "outbox": conn.execute(
+                """
+                SELECT id, delivery_key, delivery_kind, turn_id,
+                       content_revision, status, next_attempt_at
+                FROM connector_outbox
+                WHERE host_id = ? AND turn_id = ?
+                ORDER BY id
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+            "attempts": conn.execute(
+                """
+                SELECT deliveries.id, deliveries.outbox_id,
+                       deliveries.delivery_key, deliveries.attempt,
+                       deliveries.status, deliveries.created_at,
+                       deliveries.delivered_at
+                FROM connector_deliveries AS deliveries
+                JOIN connector_outbox AS outbox ON outbox.id = deliveries.outbox_id
+                WHERE outbox.host_id = ? AND outbox.turn_id = ?
+                ORDER BY deliveries.id
+                """,
+                (HOST_ID, turn_id),
+            ).fetchall(),
+        }
 
 
 @pytest.mark.parametrize(
@@ -639,6 +787,43 @@ def _seed_v10_recovered_lineage(db_path: Path) -> tuple[str, str, str]:
     }
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            """
+            UPDATE turns
+            SET worker_id = 'worker-recovery-a',
+                worker_fingerprint = 'fingerprint-recovery-a',
+                space_id = 'space-recovery-a',
+                payload_json = ?
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "id": turn_id,
+                        "host_id": HOST_ID,
+                        "worker_id": "worker-recovery-a",
+                        "worker_fingerprint": "fingerprint-recovery-a",
+                        "space_id": "space-recovery-a",
+                        "status": "complete",
+                        "kind": "turn",
+                        "source": "herdr-a",
+                        "source_turn_id": RECOVERY_LEGACY_SOURCE_TOKEN,
+                        "complete": True,
+                        "has_open_turn": False,
+                        "updated_at": CREATED_AT,
+                        "meta": {
+                            "stable_key": STABLE_KEY,
+                            "stable_key_version": 1,
+                        },
+                        "chat_id": PRIVATE_ROUTE_SENTINEL,
+                    },
+                    sort_keys=True,
+                ),
+                HOST_ID,
+                turn_id,
+            ),
+        )
         failed_cursor = conn.execute(
             """
             INSERT INTO turn_presentation_plans (
@@ -823,6 +1008,114 @@ def test_v11_migration_uses_effective_recovery_lineage_without_repost_or_hold(
         now="2099-01-01T00:00:00+00:00",
     )
     assert cleanup["deleted"] == 1
+
+
+def test_v11_migrated_recovery_lineage_survives_same_owner_worker_churn(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v11-recovered-lineage-owner-churn.db"
+    turn_id, revision, failed_token = _seed_v10_recovered_lineage(db_path)
+    init_store(db_path)
+
+    original_key = _final_key(turn_id, revision)
+    before = _turn_graph_snapshot(db_path, turn_id)
+    assert before["turn_identity"] == (
+        turn_id,
+        turn_id,
+        RECOVERY_LEGACY_SOURCE_TOKEN,
+        1,
+    )
+    assert len(before["attempts"]) == 3
+    assert [row[4] for row in before["attempts"]] == [
+        "delivered",
+        "delivered",
+        "delivered",
+    ]
+    recovered_plan = next(row for row in before["plans"] if row[6] == "completed")
+    root = next(row for row in before["outbox"] if row[1] == original_key)
+    assert recovered_plan[9] == root[0]
+    assert before["recoveries"][0][4:6] == (
+        failed_token,
+        recovered_plan[1],
+    )
+
+    worker_b = _owner_snapshot(
+        db_path,
+        worker_id="worker-recovery-b",
+        worker_name="Recovery Worker B",
+        space_id="space-recovery-b",
+        second=2,
+    )
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        "worker-recovery-b",
+        {
+            "source_turn_id": RECOVERY_RAW_SOURCE,
+            "assistant_final_text": "abcdefghijkl",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 1
+
+    after_churn = _turn_graph_snapshot(db_path, turn_id)
+    assert after_churn == before
+    api = ConnectorOutboxAPI(db_path, HOST_ID)
+    assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
+    with sqlite3.connect(str(db_path)) as conn:
+        current = conn.execute(
+            """
+            SELECT worker_id, worker_fingerprint, space_id, payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (HOST_ID, turn_id),
+        ).fetchone()
+        assert current is not None
+        current_payload = json.loads(str(current[3]))
+        assert current[:3] == (
+            "worker-recovery-b",
+            worker_b.workers[0].fingerprint,
+            "space-recovery-b",
+        )
+        assert current_payload["id"] == turn_id
+        assert current_payload["source_turn_id"] == RECOVERY_LEGACY_SOURCE_TOKEN
+        public_payloads = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json FROM turns WHERE host_id = ?
+                UNION ALL
+                SELECT payload_json FROM connector_outbox WHERE host_id = ?
+                """,
+                (HOST_ID, HOST_ID),
+            ).fetchall()
+        ]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    encoded_public = "\n".join(public_payloads)
+    assert PRIVATE_ROUTE_SENTINEL not in encoded_public
+    assert RECOVERY_RAW_SOURCE not in encoded_public
+
+    init_store(db_path)
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        "worker-recovery-b",
+        {
+            "source_turn_id": RECOVERY_RAW_SOURCE,
+            "assistant_final_text": "abcdefghijkl",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 0
+    assert ConnectorOutboxAPI(db_path, HOST_ID).poll(
+        {"name": FINAL_NAME, "limit": 100}
+    )["items"] == []
+    assert _turn_graph_snapshot(db_path, turn_id) == before
 
 
 def test_known_incomplete_final_is_hold_then_complete_revision_drains(
@@ -1447,6 +1740,221 @@ def test_source_less_failed_plan_is_rediscoverable_and_retryable_by_inspected_ke
     assert recovered["status"] == "recovered"
     _ack(restarted, _poll_one(restarted))
     assert restarted.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
+
+
+def test_source_less_recovery_ids_survive_same_owner_worker_churn_and_ack_loss(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "source-less-owner-churn-ack-loss.db"
+    raw_source = "source-less-backend-id"
+    final_text = "source-less continuity final"
+    worker_a = _owner_snapshot(
+        db_path,
+        worker_id="worker-source-less-a",
+        worker_name="Source-less Worker A",
+        space_id="space-source-less-a",
+        second=0,
+    )
+    init_store(db_path)
+    assert save_snapshot(db_path, worker_a) is True
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        "worker-source-less-a",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": final_text,
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:01+00:00",
+    ) == 1
+
+    api = ConnectorOutboxAPI(db_path, HOST_ID, max_attempts=1)
+    source = _poll_one(api)
+    turn_id = str(source["payload"]["turn_id"])
+    revision = str(source["payload"]["content_revision"])
+    original_key = str(source["key"])
+    original_plan, _original_job_key = _deliver_one_part_source(
+        api,
+        source=source,
+        turn_id=turn_id,
+        revision=revision,
+        final_length=len(final_text),
+        version="source-less-churn-original-v1",
+    )
+    failed_plan = _prepare_plan(
+        api,
+        turn_id=turn_id,
+        revision=revision,
+        parts=[[_final_span(0, len(final_text))]],
+        version="source-less-churn-replacement-v2",
+        source_ref=None,
+    )
+    failed_job = _poll_one(api)
+    assert api.fail(
+        {
+            "name": FINAL_NAME,
+            "ref": failed_job["ref"],
+            "delay_seconds": 0,
+        }
+    )["status"] == "attempts_exhausted"
+
+    before_churn = _turn_graph_snapshot(db_path, turn_id)
+    root = next(row for row in before_churn["outbox"] if row[1] == original_key)
+    plan_links = {row[1]: row[9] for row in before_churn["plans"]}
+    assert plan_links == {
+        original_plan["plan_token"]: root[0],
+        failed_plan["plan_token"]: None,
+    }
+    assert [row[4] for row in before_churn["attempts"]] == [
+        "delivered",
+        "delivered",
+        "failed",
+    ]
+
+    worker_b = _owner_snapshot(
+        db_path,
+        worker_id="worker-source-less-b",
+        worker_name="Source-less Worker B",
+        space_id="space-source-less-b",
+        second=2,
+    )
+    assert worker_b.workers[0].fingerprint != worker_a.workers[0].fingerprint
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        "worker-source-less-b",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": final_text,
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 1
+    assert _turn_graph_snapshot(db_path, turn_id) == before_churn
+
+    churned = ConnectorOutboxAPI(db_path, HOST_ID, max_attempts=1)
+    inspected = churned.inspect(
+        {
+            "schema_version": 1,
+            "name": FINAL_NAME,
+            "status": "dead_letter",
+            "limit": 10,
+        }
+    )
+    assert inspected["total"] == 1
+    failed_item = inspected["items"][0]
+    assert failed_item["plan_token"] == failed_plan["plan_token"]
+    assert failed_item["key"] == original_key
+    recovery_request = {
+        "schema_version": 1,
+        "action": "recover",
+        "name": FINAL_NAME,
+        "failed_plan_token": failed_plan["plan_token"],
+        "request_id": "source-less-owner-churn-recovery",
+    }
+    recovered = churned.prepare(recovery_request)
+    assert recovered["ok"] is True
+    assert recovered["status"] == "recovered"
+    assert recovered["failed_plan_token"] == failed_plan["plan_token"]
+    assert recovered["idempotent_replay"] is False
+    recovered_job = _poll_one(churned)
+    acknowledged = churned.ack(
+        {
+            "name": FINAL_NAME,
+            "ref": recovered_job["ref"],
+            "response": {"accepted": True},
+        }
+    )
+    assert acknowledged["ok"] is True
+    assert acknowledged["status"] == "acknowledged"
+
+    completed_graph = _turn_graph_snapshot(db_path, turn_id)
+    completed_links = {row[1]: row[9] for row in completed_graph["plans"]}
+    assert completed_links == {
+        original_plan["plan_token"]: root[0],
+        failed_plan["plan_token"]: None,
+        recovered["plan_token"]: None,
+    }
+    recovery_row = completed_graph["recoveries"][0]
+    failed_row = next(
+        row for row in completed_graph["plans"] if row[1] == failed_plan["plan_token"]
+    )
+    recovered_row = next(
+        row for row in completed_graph["plans"] if row[1] == recovered["plan_token"]
+    )
+    assert recovery_row[2:6] == (
+        failed_row[0],
+        recovered_row[0],
+        failed_plan["plan_token"],
+        recovered["plan_token"],
+    )
+    before_attempt_ids = [row[0] for row in before_churn["attempts"]]
+    completed_attempt_ids = [row[0] for row in completed_graph["attempts"]]
+    assert [row[4] for row in completed_graph["attempts"]] == [
+        "delivered",
+        "delivered",
+        "delivered",
+    ]
+    assert completed_attempt_ids[:2] == before_attempt_ids[:2]
+    assert before_attempt_ids[2] not in completed_attempt_ids
+    assert len(set(completed_attempt_ids)) == 3
+    assert len(
+        [row for row in completed_graph["outbox"] if row[1] == original_key]
+    ) == 1
+
+    init_store(db_path)
+    restarted = ConnectorOutboxAPI(db_path, HOST_ID, max_attempts=1)
+    assert restarted.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
+    replayed_recovery = restarted.prepare(recovery_request)
+    assert replayed_recovery["ok"] is True
+    assert replayed_recovery["idempotent_replay"] is True
+    assert replayed_recovery["failed_plan_token"] == failed_plan["plan_token"]
+    assert replayed_recovery["plan_token"] == recovered["plan_token"]
+    assert save_snapshot(db_path, worker_b) is True
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        "worker-source-less-b",
+        {
+            "source_turn_id": raw_source,
+            "assistant_final_text": final_text,
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:00:03+00:00",
+    ) == 0
+    assert restarted.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
+    assert _turn_graph_snapshot(db_path, turn_id) == completed_graph
+
+    with sqlite3.connect(str(db_path)) as conn:
+        public_payloads = [
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json FROM turns WHERE host_id = ?
+                UNION ALL
+                SELECT payload_json FROM connector_outbox WHERE host_id = ?
+                """,
+                (HOST_ID, HOST_ID),
+            ).fetchall()
+        ]
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    public_surface = json.dumps(
+        {
+            "inspect": inspected,
+            "recovered": recovered,
+            "acknowledged": acknowledged,
+            "replayed_recovery": replayed_recovery,
+            "payloads": public_payloads,
+        },
+        sort_keys=True,
+    )
+    assert PRIVATE_ROUTE_SENTINEL not in public_surface
+    assert raw_source not in public_surface
 
 
 def test_failed_plan_inspection_reserves_space_when_holds_fill_limit(
