@@ -34,10 +34,12 @@ from ..worker_identity import (
 from ..core.projector import project_from_observations
 from ..store.sqlite import (
     SnapshotObservationContext,
+    SnapshotRetentionPolicy,
     expire_stale_worker_bindings,
     expire_worker_bindings,
     latest_snapshot,
     list_worker_bindings,
+    maybe_run_automatic_store_maintenance,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -95,6 +97,18 @@ _SPACE_EVENT_NAMES = frozenset(
 )
 _WORKTREE_EVENT_NAMES = frozenset({"worktree.created", "worktree.opened", "worktree.removed"})
 _PANE_WORKER_EVENT_NAMES = frozenset({"pane.created", "pane.focused"})
+_TURN_REFRESH_EVENT_NAMES = frozenset(
+    {
+        "pane.created",
+        "pane.focused",
+        "pane.moved",
+        "pane.closed",
+        "pane.exited",
+        "pane.agent_detected",
+        "pane.agent_status_changed",
+        "pane.output_matched",
+    }
+)
 
 
 class HerdrEventBackendError(Exception):
@@ -577,6 +591,8 @@ class HerdrEventBackend:
         self.reconnect_delay_seconds = max(0.0, float(reconnect_delay_seconds))
         self.stop_event = stop_event or threading.Event()
         self._lock = threading.RLock()
+        self._turn_refresh_callback_lock = threading.Lock()
+        self._turn_refresh_callback: Callable[[], None] | None = None
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._producer_dedupe: OrderedDict[HerdrProducerIdentity, None] = OrderedDict()
@@ -597,6 +613,7 @@ class HerdrEventBackend:
         self._last_reconcile_at: str | None = None
         self._last_snapshot_at: str | None = None
         self._last_cap_status_at: str | None = None
+        self._automatic_maintenance_status: dict[str, Any] | None = None
         self._next_reconcile_monotonic: float | None = None
         self._subscription_pane_ids: list[str] = []
         self._load_existing_state()
@@ -629,6 +646,11 @@ class HerdrEventBackend:
                 "last_snapshot_at": self._last_snapshot_at,
                 "last_cap_status_at": self._last_cap_status_at,
                 "reconcile_enabled": self.reconcile_interval_seconds > 0,
+                "automatic_maintenance": (
+                    dict(self._automatic_maintenance_status)
+                    if self._automatic_maintenance_status is not None
+                    else None
+                ),
             }
 
     @property
@@ -640,6 +662,24 @@ class HerdrEventBackend:
         thread = self._thread
         return thread is not None and thread.is_alive()
 
+    def set_turn_refresh_callback(self, callback: Callable[[], None] | None) -> None:
+        """Set the post-persistence turn refresh signal."""
+        if callback is not None and not callable(callback):
+            raise TypeError("turn refresh callback must be callable or None")
+        with self._turn_refresh_callback_lock:
+            self._turn_refresh_callback = callback
+
+    def _notify_turn_refresh(self) -> None:
+        with self._turn_refresh_callback_lock:
+            callback = self._turn_refresh_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            # Scheduling is best-effort after the durable backend commit.
+            pass
+
     def _health_for(self, outcome: str) -> HerdrEventBackendHealth:
         health = herdr_backend_health(outcome)
         return HerdrEventBackendHealth(
@@ -648,6 +688,46 @@ class HerdrEventBackend:
             observed_at=health.observed_at or utc_timestamp(),
             message=health.message,
         )
+
+    def _save_snapshot(
+        self,
+        snapshot: Snapshot,
+        *,
+        observation: SnapshotObservationContext,
+    ) -> None:
+        save_snapshot(self.db_path, snapshot, observation=observation)
+        policy = SnapshotRetentionPolicy(
+            retention_days=self.config.snapshot_retention_days,
+            retention_count=self.config.snapshot_retention_count,
+            batch_size=self.config.snapshot_maintenance_batch_size,
+        )
+        try:
+            result = maybe_run_automatic_store_maintenance(
+                self.db_path,
+                policy=policy,
+                cadence_seconds=self.config.store_maintenance_cadence_seconds,
+            )
+            snapshot_result = result.get("snapshot")
+            snapshot_counts = snapshot_result if isinstance(snapshot_result, Mapping) else {}
+            maintenance_status = {
+                "ok": bool(result.get("ok")),
+                "status": str(result.get("status") or "unknown"),
+                "due": bool(result.get("due")),
+                "examined": int(snapshot_counts.get("examined") or 0),
+                "deleted": int(snapshot_counts.get("deleted") or 0),
+                "remaining_candidates": bool(snapshot_counts.get("remaining_candidates")),
+            }
+        except Exception:
+            self._automatic_maintenance_status = {
+                "ok": False,
+                "status": "failed",
+                "due": False,
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+            }
+        else:
+            self._automatic_maintenance_status = maintenance_status
 
     def _load_existing_state(self) -> None:
         try:
@@ -863,8 +943,7 @@ class HerdrEventBackend:
                     workers=snapshot_workers,
                     backend_health=[health],
                 )
-                save_snapshot(
-                    self.db_path,
+                self._save_snapshot(
                     snapshot,
                     observation=SnapshotObservationContext(
                         authority="complete",
@@ -894,7 +973,8 @@ class HerdrEventBackend:
                     observed_at=health.observed_at or snapshot.updated_at,
                     message=health.message,
                 )
-                return snapshot
+            self._notify_turn_refresh()
+            return snapshot
         except (HerdrContinuityUnavailableError, InstallationKeyError):
             snapshot = self._mark_unhealthy("continuity_unavailable")
             with self._lock:
@@ -1019,6 +1099,7 @@ class HerdrEventBackend:
     def flush(self) -> None:
         # Draining, application, persistence, and producer-ID commitment share
         # one lock scope so later batches cannot overtake an earlier flush.
+        notify_turn_refresh = False
         with self._lock:
             if not self._pending_events:
                 return
@@ -1026,6 +1107,9 @@ class HerdrEventBackend:
             accepted_at = utc_timestamp()
             self._pending_events.clear()
             has_producer_identity = any(event.producer_identity is not None for event in events)
+            has_turn_refresh_event = any(
+                event.name in _TURN_REFRESH_EVENT_NAMES for event in events
+            )
             try:
                 self._event_continuity_revalidated = False
                 changed = False
@@ -1037,10 +1121,13 @@ class HerdrEventBackend:
                 if changed or has_producer_identity:
                     self._persist_current_state(observed_at=accepted_at)
                 self._commit_producer_identities(events)
+                notify_turn_refresh = has_turn_refresh_event
             except (HerdrContinuityUnavailableError, InstallationKeyError):
                 self._mark_unhealthy("continuity_unavailable")
             finally:
                 self._event_continuity_revalidated = False
+        if notify_turn_refresh:
+            self._notify_turn_refresh()
 
     def _apply_event(self, event: NormalizedHerdrEvent) -> bool:
         if event.name in _SPACE_EVENT_NAMES:
@@ -2083,14 +2170,7 @@ class HerdrEventBackend:
             workers=workers,
             backend_health=[health],
         )
-        previous = latest_snapshot(self.db_path, self.config.host_id)
-        if (
-            previous is not None
-            and previous.content_fingerprint == snapshot.content_fingerprint
-        ):
-            return previous
-        save_snapshot(
-            self.db_path,
+        self._save_snapshot(
             snapshot,
             observation=SnapshotObservationContext(
                 authority="positive" if health.status == "healthy" else "none",
@@ -2138,8 +2218,7 @@ class HerdrEventBackend:
             workers=workers,
             backend_health=[health],
         )
-        save_snapshot(
-            self.db_path,
+        self._save_snapshot(
             snapshot,
             observation=SnapshotObservationContext(
                 authority="none",
@@ -2185,8 +2264,7 @@ class HerdrEventBackend:
                 workers=workers,
                 backend_health=[health],
             )
-            save_snapshot(
-                self.db_path,
+            self._save_snapshot(
                 snapshot,
                 observation=SnapshotObservationContext(
                     authority="none",

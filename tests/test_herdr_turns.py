@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import sqlite3
 import subprocess
+import threading
 import pytest
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,110 @@ from tendwire.store.sqlite import (
     turns_payload_from_store,
     upsert_worker_bindings,
 )
+
+
+def _read_test_ipc_request(channel):
+    return json.loads(
+        herdr_turns._blocking_recv_frame(
+            channel,
+            herdr_turns._CODEX_STATE_IPC_MAX_BYTES,
+        ).decode("utf-8")
+    )
+
+
+def _send_test_ipc_response(channel, response) -> None:
+    herdr_turns._blocking_send_frame(
+        channel,
+        json.dumps(response, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def _failed_isolated_turn_child(channel) -> None:
+    try:
+        request = _read_test_ipc_request(channel)
+        _send_test_ipc_response(
+            channel,
+            {
+                "protocol": 1,
+                "nonce": request["nonce"],
+                "disposition": "failed",
+                "content": None,
+                "parser_state": None,
+                "bytes_read": 0,
+            },
+        )
+    finally:
+        channel.close()
+
+
+def _invalid_isolated_turn_child(channel) -> None:
+    try:
+        _read_test_ipc_request(channel)
+        _send_test_ipc_response(
+            channel,
+            {
+                "protocol": 1,
+                "nonce": "not-the-request-nonce",
+                "disposition": "ok",
+                "content": None,
+                "parser_state": None,
+                "bytes_read": 0,
+            },
+        )
+    finally:
+        channel.close()
+
+
+def _blocked_isolated_turn_child(channel) -> None:
+    _read_test_ipc_request(channel)
+    threading.Event().wait(30)
+
+
+def _growing_isolated_turn_child(channel) -> None:
+    try:
+        request = _read_test_ipc_request(channel)
+        large_final = "grew-during-read-" + ("g" * (2 * 1024 * 1024))
+        with open(request["target_value"], "a", encoding="utf-8") as handle:
+            handle.write(
+                "\n"
+                + json.dumps(
+                    {
+                        "type": "message",
+                        "id": "grown-final",
+                        "message": {
+                            "role": "assistant",
+                            "stopReason": "stop",
+                            "content": [{"type": "text", "text": large_final}],
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        parser_state = request["parser_state"]
+        assert parser_state["source"] == "omp"
+        parsed = herdr_turns._read_omp_session_turn_with_state(
+            request["target_value"],
+            herdr_turns._deserialize_omp_state(parser_state["state"]),
+        )
+        content, checkpoint, bytes_read = parsed
+        response = {
+            "protocol": 1,
+            "nonce": request["nonce"],
+            "disposition": "ok",
+            "content": content,
+            "parser_state": {
+                "source": "omp",
+                "state": herdr_turns._serialize_omp_state(checkpoint),
+            },
+            "bytes_read": bytes_read,
+        }
+        herdr_turns._blocking_send_streamed_omp_response(
+            channel,
+            json.dumps(response, separators=(",", ":")).encode("utf-8"),
+            request["nonce"],
+        )
+    finally:
+        channel.close()
 
 
 def test_refresh_structured_turn_content_uses_private_binding_without_public_leak(
@@ -170,7 +276,10 @@ def test_refresh_structured_turn_content_reads_codex_session_jsonl(
             },
         },
     ]
-    session_file.write_text("\n".join(json.dumps(item) for item in lines), encoding="utf-8")
+    session_file.write_text(
+        "\n".join(json.dumps(item) for item in lines) + "\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.setattr(
         herdr_turns.subprocess,
@@ -269,7 +378,10 @@ def test_refresh_structured_turn_content_skips_codex_automation_protocol_turn(
             },
         },
     ]
-    session_file.write_text("\n".join(json.dumps(item) for item in lines), encoding="utf-8")
+    session_file.write_text(
+        "\n".join(json.dumps(item) for item in lines) + "\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
     config = Config(host_id="turn-host", db_path=db_path)
@@ -337,6 +449,7 @@ def test_turns_payload_from_store_quarantines_existing_automation_protocol_rows(
                         "assistant_final_text": '{"acme_result":{"decision":"approved","summary":"internal"}}',
                     }
                 ),
+                1,
             ),
             (
                 host_id,
@@ -358,14 +471,15 @@ def test_turns_payload_from_store_quarantines_existing_automation_protocol_rows(
                         "assistant_final_text": "Normal answer.",
                     }
                 ),
+                2,
             ),
         ]
         conn.executemany(
             """
             INSERT INTO turns (
                 host_id, turn_id, worker_id, status, kind, updated_at, fingerprint,
-                snapshot_content_fingerprint, observed_at, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                snapshot_content_fingerprint, observed_at, payload_json, list_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -610,6 +724,8 @@ def test_omp_agent_session_id_also_maps_to_omp_turn_target() -> None:
 def _write_omp_session(tmp_path, lines):
     with herdr_turns._OMP_SESSION_CACHE_LOCK:
         herdr_turns._OMP_SESSION_CACHE.clear()
+        herdr_turns._OMP_SESSION_CACHE_LIVE_KEYS = None
+        herdr_turns._OMP_SESSION_CACHE_BINDING_GENERATIONS.clear()
     root = tmp_path / "omp-sessions"
     session_dir = root / "-demoapp"
     session_dir.mkdir(parents=True)
@@ -813,6 +929,681 @@ def test_omp_incremental_cache_keeps_turn_state_when_prompt_leaves_tail(tmp_path
     assert second["complete"] is False
     assert "Still working" in second["assistant_stream_text"]
     assert "step 1 · git status" in second["assistant_stream_text"]
+
+
+def test_isolated_omp_response_bound_tracks_valid_growth_during_child_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [_omp_msg("growing-user", "user", "wait for large final", attribution="user")],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    monkeypatch.setattr(herdr_turns, "_file_turn_child", _growing_isolated_turn_child)
+
+    content = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=5,
+    )
+
+    assert content["source_turn_id"] == "growing-user"
+    assert content["assistant_final_text"].startswith("grew-during-read-")
+    assert len(content["assistant_final_text"]) > 2 * 1024 * 1024
+    assert content["complete"] is True
+
+
+def test_isolated_omp_authoritative_final_over_64mib_streams_losslessly(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    large_final = "lossless-omp-" + (
+        "z" * (herdr_turns._CODEX_POLL_MAX_BYTES + 257)
+    )
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("over-limit-user", "user", "retain exact OMP final", attribution="user"),
+            _omp_msg("over-limit-final", "assistant", large_final, stop="stop"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    before_children = {child.pid for child in multiprocessing.active_children()}
+    before_threads = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("tendwire-turn")
+    }
+
+    content = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=60,
+    )
+
+    assert content["assistant_final_text"] == large_final
+    assert content["complete"] is True
+    assert {child.pid for child in multiprocessing.active_children()} == before_children
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("tendwire-turn")
+    } == before_threads
+
+
+def test_isolated_omp_large_final_unchanged_fast_path_and_appended_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    large_final = "canonical-" + ("x" * (6 * 1024 * 1024))
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("six-mib-user", "user", "first private prompt", attribution="user"),
+            _omp_msg("six-mib-final", "assistant", large_final, stop="stop"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    byte_reads: list[int] = []
+    monkeypatch.setattr(herdr_turns, "_OMP_ISOLATED_READ_OBSERVER", byte_reads.append)
+
+    first = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=10,
+    )
+    assert first["assistant_final_text"] == large_final
+    cache_key = herdr_turns._omp_cache_key(str(path))
+    assert cache_key is not None
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        checkpoint = herdr_turns._serialize_omp_state(
+            herdr_turns._OMP_SESSION_CACHE[cache_key]
+        )
+    checkpoint_json = json.dumps(checkpoint, separators=(",", ":"))
+    assert len(checkpoint_json.encode("utf-8")) < 1024
+    assert "canonical-" not in checkpoint_json
+    assert set(checkpoint) == {
+        "offset",
+        "observed_size",
+        "file_id",
+        "mtime_ns",
+        "ctime_ns",
+        "replay_offset",
+        "turn_open",
+        "project_root",
+    }
+    assert checkpoint["turn_open"] is False
+
+    original_get_context = herdr_turns.multiprocessing.get_context
+
+    def fail_if_spawned(*_args, **_kwargs):
+        raise AssertionError("unchanged OMP poll spawned a child")
+
+    monkeypatch.setattr(herdr_turns.multiprocessing, "get_context", fail_if_spawned)
+    second = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=1,
+    )
+    monkeypatch.setattr(herdr_turns.multiprocessing, "get_context", original_get_context)
+    assert second is herdr_turns._UNCHANGED_TURN
+    assert byte_reads[-1] == 0
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert (
+            herdr_turns._serialize_omp_state(herdr_turns._OMP_SESSION_CACHE[cache_key])
+            == checkpoint
+        )
+
+    appended = "\n".join(
+        [
+            "",
+            json.dumps(
+                _omp_msg("next-user", "user", "new appended prompt", attribution="user"),
+                separators=(",", ":"),
+            ),
+            json.dumps(
+                _omp_msg("next-final", "assistant", "new answer", stop="stop"),
+                separators=(",", ":"),
+            ),
+        ]
+    )
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(appended)
+    third = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=5,
+    )
+    assert third["source_turn_id"] == "next-user"
+    assert third["user_text"] == "new appended prompt"
+    assert third["assistant_final_text"] == "new answer"
+    assert large_final not in json.dumps(third)
+    assert byte_reads[-1] == len(appended.encode("utf-8"))
+
+
+def test_isolated_omp_cache_validates_identity_and_retains_good_state_on_failures(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [_omp_msg("original-user", "user", "original prompt", attribution="user")],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    original_child = herdr_turns._file_turn_child
+
+    first = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    cache_key = herdr_turns._omp_cache_key(str(path))
+    assert cache_key is not None
+
+    def cached_state():
+        with herdr_turns._OMP_SESSION_CACHE_LOCK:
+            return herdr_turns._serialize_omp_state(herdr_turns._OMP_SESSION_CACHE[cache_key])
+
+    first_state = cached_state()
+    assert first["source_turn_id"] == "original-user"
+
+    for child, expected_error, timeout_seconds in (
+        (_blocked_isolated_turn_child, herdr_turns._TurnReadTimeout, 0.1),
+        (_failed_isolated_turn_child, herdr_turns._TurnReadFailed, 5),
+        (_invalid_isolated_turn_child, herdr_turns._TurnReadFailed, 5),
+    ):
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "\n"
+                + json.dumps(
+                    {"type": "ignored", "failure_attempt": child.__name__},
+                    separators=(",", ":"),
+                )
+            )
+        monkeypatch.setattr(herdr_turns, "_file_turn_child", child)
+        with pytest.raises(expected_error):
+            herdr_turns._read_file_turn_isolated(
+                "omp_session_path",
+                str(path),
+                timeout_seconds=timeout_seconds,
+            )
+        assert cached_state() == first_state
+    monkeypatch.setattr(herdr_turns, "_file_turn_child", original_child)
+
+    replacement = path.with_name("replacement.jsonl")
+    replacement.write_text(
+        json.dumps(_omp_msg("replacement-user", "user", "replacement prompt", attribution="user")),
+        encoding="utf-8",
+    )
+    replacement.replace(path)
+    replaced = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    replaced_state = cached_state()
+    assert replaced["source_turn_id"] == "replacement-user"
+    assert replaced_state["file_id"] != first_state["file_id"]
+
+    replaced_inode = path.stat().st_ino
+    path.write_text(
+        json.dumps(_omp_msg("truncated-user", "user", "short", attribution="user")),
+        encoding="utf-8",
+    )
+    assert path.stat().st_ino == replaced_inode
+    truncated = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    assert truncated["source_turn_id"] == "truncated-user"
+
+    final_line = json.dumps(_omp_msg("final-answer", "assistant", "published", stop="stop"))
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("\n" + final_line)
+    final = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    final_state = cached_state()
+    assert final["source_turn_id"] == "truncated-user"
+    assert final["assistant_final_text"] == "published"
+    assert final_state["offset"] == path.stat().st_size
+
+
+def test_omp_same_inode_same_size_rewrite_forces_cold_rescan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("user-old", "user", "prompt-old", attribution="user"),
+            _omp_msg("final-old", "assistant", "answer-old", stop="stop"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    first = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    original_stat = path.stat()
+    original_size = original_stat.st_size
+    assert first["assistant_final_text"] == "answer-old"
+
+    rewritten = "\n".join(
+        json.dumps(line)
+        for line in (
+            _omp_msg("user-new", "user", "prompt-new", attribution="user"),
+            _omp_msg("final-new", "assistant", "answer-new", stop="stop"),
+        )
+    )
+    assert len(rewritten.encode("utf-8")) == original_size
+    path.write_text(rewritten, encoding="utf-8")
+    rewritten_stat = path.stat()
+    assert rewritten_stat.st_ino == original_stat.st_ino
+    assert rewritten_stat.st_size == original_size
+    assert (
+        rewritten_stat.st_mtime_ns != original_stat.st_mtime_ns
+        or rewritten_stat.st_ctime_ns != original_stat.st_ctime_ns
+    )
+
+    second = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+
+    assert second["source_turn_id"] == "user-new"
+    assert second["user_text"] == "prompt-new"
+    assert second["assistant_final_text"] == "answer-new"
+
+
+def test_omp_every_assistant_after_final_is_ignored_until_next_user(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    irrelevant = {
+        "type": "message",
+        "id": "metadata-only",
+        "message": {
+            "role": "assistant",
+            "stopReason": "toolUse",
+            "content": [{"type": "metadata", "value": "private bookkeeping"}],
+        },
+    }
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("stable-user", "user", "stable prompt", attribution="user"),
+            _omp_msg("stable-final", "assistant", "stable answer", stop="stop"),
+            irrelevant,
+            _omp_msg(
+                "renderable-progress",
+                "assistant",
+                "must not reopen the completed turn",
+                stop="toolUse",
+            ),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+
+    content = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+
+    assert content["assistant_final_text"] == "stable answer"
+    assert content["complete"] is True
+    assert content["assistant_stream_text"] is None
+    cache_key = herdr_turns._omp_cache_key(str(path))
+    assert cache_key is not None
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        checkpoint = herdr_turns._OMP_SESSION_CACHE[cache_key]
+        assert checkpoint.turn_open is False
+        assert checkpoint.replay_offset == checkpoint.offset
+
+
+def test_omp_appended_assistant_after_committed_final_advances_idle_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("done-user", "user", "finish once", attribution="user"),
+            _omp_msg("done-final", "assistant", "finished once", stop="stop"),
+        ],
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    first = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+    assert first["assistant_final_text"] == "finished once"
+
+    appended = "\n" + json.dumps(
+        _omp_msg(
+            "late-progress",
+            "assistant",
+            "late renderable progress",
+            stop="toolUse",
+        ),
+        separators=(",", ":"),
+    )
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(appended)
+    second = herdr_turns._read_file_turn_isolated(
+        "omp_session_path",
+        str(path),
+        timeout_seconds=2,
+    )
+
+    assert second is None
+    cache_key = herdr_turns._omp_cache_key(str(path))
+    assert cache_key is not None
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        checkpoint = herdr_turns._OMP_SESSION_CACHE[cache_key]
+        assert checkpoint.turn_open is False
+        assert checkpoint.offset == path.stat().st_size
+        assert checkpoint.replay_offset == checkpoint.offset
+    assert (
+        herdr_turns._read_file_turn_isolated(
+            "omp_session_path",
+            str(path),
+            timeout_seconds=1,
+        )
+        is herdr_turns._UNCHANGED_TURN
+    )
+
+
+def test_omp_retries_atomic_replacement_that_occurs_during_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, path = _write_omp_session(
+        tmp_path,
+        [
+            _omp_msg("old-user", "user", "old prompt", attribution="user"),
+            _omp_msg("old-final", "assistant", "stale answer", stop="stop"),
+        ],
+    )
+    replacement = path.with_name("during-read-replacement.jsonl")
+    replacement.write_text(
+        "\n".join(
+            json.dumps(line, separators=(",", ":"))
+            for line in (
+                _omp_msg("new-user", "user", "new prompt", attribution="user"),
+                _omp_msg("new-final", "assistant", "current answer", stop="stop"),
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    original_open = open
+    replaced = False
+
+    class ReplacingReader:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def fileno(self):
+            return self.handle.fileno()
+
+        def seek(self, *args):
+            return self.handle.seek(*args)
+
+        def read(self, *args):
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                replacement.replace(path)
+            return self.handle.read(*args)
+
+    def racing_open(file, mode="r", *args, **kwargs):
+        handle = original_open(file, mode, *args, **kwargs)
+        if Path(file) == path and mode == "rb" and not replaced:
+            return ReplacingReader(handle)
+        return handle
+
+    monkeypatch.setattr("builtins.open", racing_open)
+    content = herdr_turns._read_omp_session_turn(str(path))
+
+    assert replaced is True
+    assert content["source_turn_id"] == "new-user"
+    assert content["assistant_final_text"] == "current answer"
+    assert "stale answer" not in json.dumps(content)
+
+
+def test_omp_concurrent_cache_loser_cannot_overwrite_accepted_checkpoint() -> None:
+    cache_key = "concurrent-publication"
+    prior = herdr_turns._OmpSessionState(
+        offset=100,
+        observed_size=100,
+        file_id=(7, 11),
+    )
+    accepted = herdr_turns._OmpSessionState(
+        offset=300,
+        observed_size=300,
+        file_id=(7, 11),
+    )
+    losing = herdr_turns._OmpSessionState(
+        offset=300,
+        observed_size=300,
+        file_id=(7, 11),
+        turn_open=True,
+    )
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._OMP_SESSION_CACHE_LIVE_KEYS = None
+        herdr_turns._OMP_SESSION_CACHE[cache_key] = accepted
+
+    returned = herdr_turns._publish_omp_cache_state(
+        cache_key,
+        herdr_turns._serialize_omp_state(prior),
+        losing,
+        {"assistant_final_text": "losing duplicate"},
+    )
+
+    assert returned is None
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert herdr_turns._OMP_SESSION_CACHE[cache_key] is accepted
+
+
+def test_omp_cache_lru_capacity_moves_hits_and_evicts_oldest(monkeypatch) -> None:
+    monkeypatch.setattr(herdr_turns, "_OMP_SESSION_CACHE_CAPACITY", 3)
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._OMP_SESSION_CACHE.clear()
+        herdr_turns._OMP_SESSION_CACHE_LIVE_KEYS = None
+    for index in range(3):
+        state = herdr_turns._OmpSessionState(
+            offset=index + 1,
+            observed_size=index + 1,
+            file_id=(1, index + 1),
+        )
+        herdr_turns._publish_omp_cache_state(
+            f"key-{index}",
+            None,
+            state,
+            None,
+        )
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert herdr_turns._omp_cache_get_locked("key-0") is not None
+
+    newest = herdr_turns._OmpSessionState(
+        offset=4,
+        observed_size=4,
+        file_id=(1, 4),
+    )
+    herdr_turns._publish_omp_cache_state(
+        "key-3",
+        None,
+        newest,
+        None,
+    )
+
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert list(herdr_turns._OMP_SESSION_CACHE) == ["key-2", "key-0", "key-3"]
+        assert len(herdr_turns._OMP_SESSION_CACHE) == 3
+
+
+def test_omp_sixty_four_large_completed_sessions_keep_only_bounded_coordinates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "omp-sessions"
+    session_dir = root / "-many"
+    session_dir.mkdir(parents=True)
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._OMP_SESSION_CACHE.clear()
+        herdr_turns._OMP_SESSION_CACHE_LIVE_KEYS = None
+
+    for index in range(64):
+        large_final = f"large-final-{index}-" + ("z" * (128 * 1024))
+        path = session_dir / f"{index:02d}.jsonl"
+        path.write_text(
+            "\n".join(
+                json.dumps(line, separators=(",", ":"))
+                for line in (
+                    _omp_msg(f"user-{index}", "user", f"prompt-{index}", attribution="user"),
+                    _omp_msg(f"final-{index}", "assistant", large_final, stop="stop"),
+                )
+            ),
+            encoding="utf-8",
+        )
+        content = herdr_turns._read_omp_session_turn(str(path))
+        assert content["assistant_final_text"] == large_final
+
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        serialized = json.dumps(
+            {
+                key: herdr_turns._serialize_omp_state(state)
+                for key, state in herdr_turns._OMP_SESSION_CACHE.items()
+            },
+            separators=(",", ":"),
+        )
+        assert len(herdr_turns._OMP_SESSION_CACHE) == 64
+        assert herdr_turns._omp_cache_weight_locked() <= herdr_turns._OMP_SESSION_CACHE_MAX_BYTES
+        assert all(not state.turn_open for state in herdr_turns._OMP_SESSION_CACHE.values())
+    assert "large-final-" not in serialized
+    assert "z" * 1024 not in serialized
+
+
+def test_omp_cache_enforces_serialized_byte_bound(monkeypatch) -> None:
+    monkeypatch.setattr(herdr_turns, "_OMP_SESSION_CACHE_CAPACITY", 64)
+    monkeypatch.setattr(herdr_turns, "_OMP_SESSION_CACHE_MAX_BYTES", 600)
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._OMP_SESSION_CACHE.clear()
+        herdr_turns._OMP_SESSION_CACHE_LIVE_KEYS = None
+        for index in range(20):
+            herdr_turns._omp_cache_store_locked(
+                f"long-cache-key-{index}-" + ("k" * 40),
+                herdr_turns._OmpSessionState(
+                    offset=index,
+                    observed_size=index,
+                    file_id=(1, index),
+                ),
+            )
+        assert len(herdr_turns._OMP_SESSION_CACHE) < 20
+        assert herdr_turns._omp_cache_weight_locked() <= 600
+
+
+def test_omp_cache_prunes_disappeared_bindings_and_keeps_live_binding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, live_path = _write_omp_session(
+        tmp_path,
+        [_omp_msg("live", "user", "live", attribution="user")],
+    )
+    stale_path = live_path.with_name("stale.jsonl")
+    stale_path.write_text(
+        json.dumps(_omp_msg("stale", "user", "stale", attribution="user")),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMP_SESSIONS_DIR", str(root))
+    live_key = herdr_turns._omp_cache_key(str(live_path))
+    stale_key = herdr_turns._omp_cache_key(str(stale_path))
+    assert live_key is not None
+    assert stale_key is not None
+    live_state = herdr_turns._OmpSessionState(
+        offset=1,
+        observed_size=1,
+        file_id=(1, 1),
+    )
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        herdr_turns._omp_cache_store_locked(live_key, live_state)
+        herdr_turns._omp_cache_store_locked(
+            stale_key,
+            herdr_turns._OmpSessionState(offset=1, file_id=(1, 2)),
+        )
+    live_binding = WorkerBinding(
+        host_id="host",
+        worker_id="worker",
+        worker_fingerprint="worker-fingerprint",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="agent",
+        turn_target_kind="omp_session_path",
+        turn_target_value=str(live_path),
+        sendable=True,
+        observed_at="2026-07-12T00:00:00+00:00",
+        expires_at="9999-12-31T23:59:59+00:00",
+        private_fingerprint="private",
+    )
+
+    herdr_turns._prune_omp_cache_for_bindings([live_binding])
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert list(herdr_turns._OMP_SESSION_CACHE) == [live_key]
+        retained_prior = herdr_turns._serialize_omp_state(
+            herdr_turns._OMP_SESSION_CACHE[live_key]
+        )
+        retained_generation = herdr_turns._omp_cache_binding_generation_locked(live_key)
+
+    live_path.unlink()
+    herdr_turns._prune_omp_cache_for_bindings([live_binding])
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert list(herdr_turns._OMP_SESSION_CACHE) == [live_key]
+        assert herdr_turns._omp_cache_binding_generation_locked(live_key) == retained_generation
+
+    herdr_turns._prune_omp_cache_for_bindings([])
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert not herdr_turns._OMP_SESSION_CACHE
+
+    herdr_turns._prune_omp_cache_for_bindings([live_binding])
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert (
+            herdr_turns._omp_cache_binding_generation_locked(live_key)
+            != retained_generation
+        )
+
+    resurrected = herdr_turns._OmpSessionState(
+        offset=2,
+        observed_size=2,
+        file_id=(1, 1),
+    )
+    returned = herdr_turns._publish_omp_cache_state(
+        live_key,
+        retained_prior,
+        resurrected,
+        None,
+        retained_generation,
+    )
+    assert returned is None
+    with herdr_turns._OMP_SESSION_CACHE_LOCK:
+        assert live_key not in herdr_turns._OMP_SESSION_CACHE
 
 
 def test_omp_tool_progress_uses_only_allowlisted_structured_summaries(tmp_path, monkeypatch) -> None:

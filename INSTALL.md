@@ -32,6 +32,8 @@ Type=simple
 UMask=0077
 Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
+Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
+Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
 Restart=always
 RestartSec=5s
@@ -47,6 +49,114 @@ systemctl --user daemon-reload
 systemctl --user enable --now tendwired.service
 systemctl --user is-active tendwired.service
 ```
+
+## Background Turn Ingestion Operations
+
+The daemon, not each read request, owns turn refresh. It performs an immediate
+scan on startup, repeats it every
+`TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` (default `2.0`), and accepts coalesced
+signals from relevant persisted pane-event batches and completed full
+reconciles. `TENDWIRE_TURN_REFRESH_WORKERS` defaults to `4`, must be from 1
+through 32, and cannot exceed `TENDWIRE_MAX_WORKERS`. Every adapter uses
+`TENDWIRE_HERDR_TIMEOUT_SECONDS`; the queue is fixed at 64. One private target
+is serialized with itself while distinct targets can use the worker pool.
+
+OMP JSONL cache/IPC state is coordinate-only: parse/EOF and replay offsets,
+observed file identity/size/timestamps, an open-turn flag, and validated project
+root. It never contains or transports prompt IDs or user/final/stream bodies.
+An unchanged stable stat returns unchanged without a child spawn, file read, or
+IPC frame. A changed open turn reconstructs from its replay coordinate; after a
+completed final the checkpoint becomes idle at EOF, and only a new eligible
+user message opens another turn. Its LRU is capped at 64 entries and 64 KiB of
+serialized key-plus-checkpoint weight.
+
+A Codex binding must be an exact canonical lowercase, non-nil UUID. Its only
+eligible rollout path is
+`sessions/YYYY/MM/DD/rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl`, with a valid
+date/time matching the hierarchy; no identifier is interpolated into a glob.
+The resolver accepts exactly one canonical regular in-root file after symlink
+and device/inode checks. A missing, unsafe, over-limit, or duplicate exact
+identity is unavailable.
+Every cache hit validates the current sessions-root device/inode; a found result
+also validates the rollout inode. A root identity change immediately clears
+that root's cached path results and complete index.
+
+The complete Codex index is capped at 100,000 visited entries, 32,768 session
+identities, and 8 MiB; its path-result LRU is capped at 256 entries and 256 KiB.
+Negative results expire after 2 seconds. A lookup rebuilds the complete index
+once its snapshot is 60 seconds old. Consequently, a newly created duplicate
+may remain undiscovered for up to one 60-second snapshot interval before the
+refreshed index makes that identity ambiguous and unavailable.
+
+Codex parser state is private and held in a 64-entry, 16 MiB LRU. Only valid
+newline-terminated records advance its committed offset; a partial final record
+waits for its newline. The bounds are 8 MiB per record, a 64 KiB initial and
+16 MiB maximum/65,536-record recovery scan, and 64 MiB of source data per poll.
+Warm append-only polls read only appended bytes; an unchanged poll reads zero
+source bytes. Truncation, rotation, replacement, or missing state uses this
+bounded recovery, while malformed/oversized input or no recoverable boundary
+fails without advancing the prior checkpoint.
+No Codex session ID, rollout path, file identity/coordinate, parser/cache state,
+or raw record enters public JSON.
+
+OMP reader requests remain capped at 16 KiB. A canonical OMP response has no
+total-size ceiling: its exact ordered payload is streamed in frames of at most
+1 MiB under the same deadline, with manifest, nonce, end-marker, and EOF
+validation, so canonical finals are not truncated by IPC. Codex parser-state
+requests are capped at 12 MiB, and each Codex response remains one frame capped
+at 64 MiB. Nonblocking framed-socket send/receive, parsing, and child join share
+the single adapter deadline without a helper IPC thread. Timeout teardown spends
+at most 250 ms on terminate/kill/join attempts and reaps the child under normal
+POSIX scheduling; it does not wait beyond that grace for an OS-uninterruptible
+child.
+
+A file-reader checkpoint remains a candidate until Tendwire revalidates the
+exact binding and durably applies any content; a no-content candidate still
+requires binding validation. Cancellation, apply failure, stale/replaced
+binding, or a same-path fingerprint-generation change leaves the prior cache
+untouched.
+
+`health.get`'s `result.turn_ingestion` reports only aggregate status,
+queue/active counts, outcome counters, last-success/duration/staleness values,
+and configured bounds. `stale` means no sufficiently recent successful
+refresh. A failed binding scan or consecutive adapter failure/timeout produces
+`degraded`; a later successful scan/refresh recovers current health even though
+the lifetime `failed` and `timed_out` counters remain cumulative.
+`stale_binding` churn contributes to the aggregate failed counter without
+keeping health degraded. Worker IDs, target kinds/values, session paths, and
+private fingerprints are never included. Cached `turn.list`, `health.get`,
+`snapshot.get`, `attention.list`, and `pending.list` requests remain
+independent of blocked adapters.
+
+Daemon and CLI pending reads share one store projection that atomically reads
+the latest stored public snapshot with durable `backend_pending` rows. A
+malformed snapshot returns `store_unavailable`. On definite daemon
+unavailability before transmission, the CLI reads only this store view and
+never observes Herdr. A timeout after transmission returns `daemon_timeout`;
+other ambiguous or invalid exchanges return `daemon_protocol_error`, with no
+fallback source read.
+
+Turn ingestion is also the sole owner of backend-pending transitions. An open
+prompt is upserted, a successful no-prompt read stores a non-answerable
+tombstone, and authoritative binding removal reaps the row. A transient read
+retains the last prompt as stale for one fixed, non-sliding
+`TENDWIRE_PENDING_STALE_GRACE_SECONDS` window (30 seconds by default); repeated
+failures do not extend the deadline, and degraded freshness remains visible
+after prompt expiry until recovery. A malformed prompt exposes snapshot
+fallback immediately while reporting degraded freshness. `answer_pending`
+commands bind the public pending ID, fingerprint, and choice ID to the current
+durable revision, binding fingerprint, and exact private pane target before any
+pane mutation.
+
+On `SIGINT` or `SIGTERM`, the daemon stops accepting socket work, flushes and
+detaches event refresh signaling, cancels and boundedly drains ingestion, then
+stops the backend. Stop Tendwire only after its consumers for a coordinated
+maintenance window. A stopped process cannot be restarted in place; a service
+manager restart creates a fresh daemon, whose immediate scan reuses durable
+bindings. After restart, confirm fresh health and cached reads are available
+without losing final-turn or connector state; `turn_ingestion` may initially be
+`stale` until a refresh succeeds and reports `degraded` if adapters fail. There
+is no `SIGHUP` reload/restart contract.
 
 ## Local-State Permissions and Daemon Socket Access
 
@@ -170,16 +280,204 @@ ordinary load, upgrade, or recovery shortcut:
 Restore the coherent recovery set instead whenever continuity is meant to
 survive.
 
+## SQLite Family Validation, Preparation, and Repair
+
+Treat `TENDWIRE_DB_PATH` as the main member of a four-name SQLite family:
+the main database, `-wal`, `-shm`, and `-journal`. The three sidecars are
+optional. Their absence, including transient disappearance during one bounded
+inspection, is valid. After the main database has been selected, it is
+mandatory; disappearance or replacement is a fail-closed `entry_changed`
+condition. Every present member must be an owned regular file. Wrong type,
+symlink, wrong owner, insecure validation-time permissions, or identity
+replacement fails closed without following or mutating the offending entry.
+
+Authority is deliberately narrow:
+
+- Ordinary reads, `tendwire doctor --json`, daemon health, and
+  `tendwire store status` are validation-only and non-creating. They do not
+  initialize a missing main database, synthesize an absent sidecar, or repair
+  permissions.
+- Store startup and creation-capable writes explicitly prepare the family.
+  Prepare may create the missing main database and may intersect a validated
+  present member's mode with `0600`; it never creates an optional sidecar and
+  never widens a stricter mode.
+- The explicit repair path only intersects modes on validated existing
+  members. It performs whole-family prevalidation before changing any mode and
+  never replaces an entry or changes ownership.
+- Private-mode preparation and repair cannot disturb active Tendwire SQLite
+  transactions, and a no-op private prepare preserves them. Any main creation or
+  permission narrowing first requires bounded, nonblocking exclusive authority over
+  the store parent directory. Current-schema filesystem reads stay cheap and
+  nonmutating after their schema-version read: they take no exclusive parent
+  authority and perform no persistent WAL negotiation or schema DDL. An
+  uninitialized or migrating filesystem store takes that exclusive authority before
+  persistent WAL negotiation or schema DDL, performs that work under private
+  creation mode, then revalidates and narrows the resulting main database, `-wal`,
+  and `-shm` members before restoring retained shared authority. A live Tendwire
+  connection retains shared parent-directory authority, so a conflicting repair
+  fails with a typed, path-free error before mutation; that shared authority also
+  rejects the schema branch before WAL, DDL, or sidecar mutation. A connection
+  obtains shared authority before preparation, promotes the same authority only for
+  a necessary mutation, and restores shared authority for the remainder of its lifetime.
+
+The family algorithm performs finite capture, preflight, and final validation
+rather than recursively retrying churn. An optional sidecar that vanishes is
+accepted as absent; a newly observed valid optional may be captured once; a
+replacement, hostile appearance, or selected-main change aborts. Private code
+receives typed, path-free `LocalStateError` failures. Public doctor/status
+surfaces return fixed aggregate records such as `database_permissions:
+unsafe` or `store_unavailable`, with no path, SQLite suffix, UID/GID, inode, raw
+exception, or private bytes.
+
+Automatic retention remains bounded to its configured batch and cadence and
+has no authority to compact or replace the database. Only explicit offline
+`store compact --execute --acknowledge-offline` has compaction authority, and
+it must still revalidate the selected source identity before publishing its
+verified replacement.
+
+## Store Retention and Offline Compaction
+
+Snapshot history stores changes, not polling volume. An observation whose
+content fingerprint is identical to the immediately preceding snapshot for the
+same host refreshes that row; a non-adjacent return to earlier content appends a
+new row. The defaults retain a 14-day window and the newest 4096 changed rows
+per host, including the latest. Fourteen days at one observation every five
+minutes is $14 \times 288 = 4032$, so the count default leaves 64 rows of
+headroom. A historical row must remain inside both the age and count windows to
+be retained; falling outside either makes it eligible. The newest row for each
+host is exempt from both limits.
+
+The daemon checks a persisted database-wide maintenance cadence after a stored
+snapshot. By default, no more than 100 eligible snapshot rows are removed once
+per 3600 seconds. A backlog is resumed in later batches. This automatic path is
+coarse, bounded, and never runs `VACUUM`; it does not promise immediate
+enforcement, exactly-once maintenance, or offline completion. Override the
+defaults with `TENDWIRE_SNAPSHOT_RETENTION_DAYS`,
+`TENDWIRE_SNAPSHOT_RETENTION_COUNT`,
+`TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE`, and
+`TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS`.
+
+Use the JSON-only online hooks for aggregate inspection and bounded cleanup:
+
+```bash
+tendwire store status --db-path /path/to/tendwire.db
+tendwire store cleanup --dry-run --db-path /path/to/tendwire.db
+tendwire store cleanup --retention-days 14 --max-outbox-attempts 10 \
+  --snapshot-retention-days 14 --snapshot-retention-count 4096 \
+  --snapshot-batch-size 100 --db-path /path/to/tendwire.db
+```
+
+`store status`'s `maintenance` object reports the last completed automatic
+batch and status,
+database-wide snapshot count, reported age/count/batch/cadence values, and a
+backlog boolean. `cleanup` reports aggregate event `retention`, database-wide
+`snapshots`, `outbox`, and `turn_content` results. Its flags are per-invocation
+policy overrides; they do not rewrite configuration. A cleanup dry-run rolls
+back every maintenance transaction and changes no rows or maintenance markers.
+
+Page reclamation is a separate, explicit `store compact` CLI operation. It is
+not exposed through the daemon API and must be run only in a controlled offline
+window with all Tendwire, connector, and other SQLite writers stopped. The
+dry-run mode is strictly read-only: it does not initialize or migrate a store,
+repair permissions, checkpoint WAL, create a backup, prune rows, build a
+replacement, update a marker or timestamp, or change the database family. It
+requires current schema v10 and rejects both `--acknowledge-offline` and
+`--backup-path`.
+
+Follow this order exactly:
+
+1. **Stop consumers.** Stop Herdres and every other Tendwire consumer first.
+   Confirm they cannot reconnect or submit connector work.
+2. **Stop Tendwire.** Stop `tendwired.service` and every one-shot or alternate
+   writer. Confirm all database writers are stopped.
+3. **Dry-run.** From the same installed release or source checkout that owns
+   the v9 store, run:
+
+   ```bash
+   tendwire store compact --dry-run \
+     --snapshot-retention-days 14 --snapshot-retention-count 4096 \
+     --batch-size 100 --db-path /path/to/tendwire.db
+   ```
+
+   Continue only when the JSON result has `ok: true`, status `dry_run`,
+   `integrity.before: ok`, compliant permissions, and `space.headroom_ok:
+   true`. The estimate reserves space for the current SQLite family, verified
+   backup, and replacement; when the backup is on another filesystem, that
+   destination also needs sufficient space.
+4. **Execute.** Choose an access-restricted backup directory owned by the
+   service account. The backup file itself must not already exist. Then run:
+
+   ```bash
+   tendwire store compact --execute --acknowledge-offline \
+     --backup-path /secure/backup/tendwire.pre-compact.db \
+     --snapshot-retention-days 14 --snapshot-retention-count 4096 \
+     --batch-size 100 --db-path /path/to/tendwire.db
+   ```
+
+   Execute rechecks current schema, permissions, `PRAGMA quick_check`,
+   headroom, and an exclusive writer lock. It creates a mode-restricted backup
+   through the SQLite backup API and verifies that backup, drains eligible
+   snapshot history in bounded batches, performs a truncating WAL checkpoint,
+   builds an adjacent private `VACUUM INTO` replacement, checks the replacement
+   with `quick_check` and `foreign_key_check`, and atomically publishes it only
+   if the source identity is unchanged. It then restores normal WAL
+   configuration and verifies integrity and private permissions after
+   publication.
+5. **Verify.** Require status `completed`, `integrity.backup: ok`,
+   `integrity.replacement: ok`, `integrity.after: ok`,
+   `checkpoint.status: completed`, `replacement.status: published`, and
+   `rollback.status: not_needed`. While writers remain stopped, run the
+   read-only verification below and confirm store status is `ok` with expected
+   aggregate counts:
+
+   ```bash
+   tendwire store status --db-path /path/to/tendwire.db
+   python3 - <<'PY'
+   import sqlite3
+   from pathlib import Path
+   db = Path("/path/to/tendwire.db")
+   with sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True) as conn:
+       print(conn.execute("PRAGMA quick_check").fetchone()[0])
+       print(conn.execute("PRAGMA foreign_key_check").fetchone())
+   PY
+   ```
+
+   Expected lines are `ok` and `None`. Keep the verified compaction backup:
+   Tendwire never deletes or rotates it. Retain it through the full
+   verification and rollback window, then remove it only under the site's
+   access-controlled backup-retention policy.
+6. **Restart.** Restart Tendwire first and verify `health.get`/`store status`;
+   only then restart Herdres and other consumers. Verify one authoritative
+   reconcile and normal connector flow before closing the maintenance window.
+
+Compaction reports only aggregate counts, byte estimates, check outcomes, and
+fixed statuses. Besides `dry_run` and `completed`, defined statuses are
+`invalid_request`, `store_unavailable`, `schema_not_current`,
+`permissions_failed`, `offline_required`, `integrity_failed`,
+`insufficient_space`, `backup_failed`, `maintenance_failed`,
+`checkpoint_failed`, `replacement_failed`, `rollback_completed`, and
+`rollback_failed`. A failure before publication leaves the source in place. A
+failure after publication attempts restoration from the verified backup and
+returns `rollback_completed` only after the restored store passes its checks.
+For `rollback_failed`, or for an operator-directed state rollback, keep every
+writer and consumer stopped, preserve the failed database family for diagnosis,
+and restore the complete coherent pre-maintenance checkpoint described above.
+Never restore or replace the database while any writer is running, mix
+checkpoints, or treat an acknowledgement flag as proof that the store was
+offline.
+
 ## Compatible Tendwire/Herdres Pair and Copy-First Dry Check
 
 Goal 05B is a paired producer/consumer contract. Install or upgrade Tendwire
 with a Herdres revision that explicitly supports all of the following together:
 
-- Tendwire SQLite store schema v7;
-- `turn.list` schema v2 with per-turn content descriptor schema v1 and bounded
-  1,000-character previews;
-- schema-v1 `turn.content.get` with linear opaque-cursor traversal and a
-  49,152-byte UTF-8 page ceiling;
+- Tendwire SQLite store schema v10, including automatic transactional migration
+  of v8 turns to immutable per-host `list_sequence` values and v9 pending rows
+  to explicit freshness/revision state;
+- `turn.list` schema v2 with per-turn content descriptor schema v1, bounded
+  1,000-character previews, and insertion-stable cursor/since paging;
+- schema-v1 `turn.content.get` with linear opaque-cursor traversal and the
+  unchanged 49,152-byte (48 KiB) UTF-8 page ceiling;
 - range-only schema-v1 `connector.prepare` actions `begin`, `part`, `commit`,
   and explicit `recover`, plus the existing lease/ACK boundary; and
 - failed-plan generation, retained contiguous ACKed prefix, fresh-suffix
@@ -222,6 +520,90 @@ pair compatibility and rollback readiness only; they do not deploy, restart,
 or migrate live state.
 
 ## Verification
+
+From a source checkout, the focused Goal 06 verification and synthetic
+benchmark commands are:
+
+```bash
+PYTHONPATH=src python3 -m tendwire.cli store cleanup --help
+PYTHONPATH=src python3 -m tendwire.cli store compact --help
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_config.py tests/test_cli.py tests/test_daemon.py \
+  tests/test_store.py tests/test_release_readiness.py \
+  -k 'snapshot_maintenance or adjacent_identical or snapshot_retention or maintenance_paths_never_issue_vacuum or store_status_require_current_schema or store_compact or compact_store or migration_registry_transition or maintenance_release_surfaces'
+PYTHONPATH=src python3 scripts/store_benchmark.py --snapshot-rows 50000 --json
+```
+
+The benchmark is source-checkout-only, uses the Python standard library and
+generated synthetic fixtures, and must never be pointed at or populated from a
+live database. Record only its aggregate public-safe output. Its timings are
+release evidence for bounded behavior, not CI thresholds or pass/fail gates.
+
+The focused Goal 07 ingestion, transport, paging, and privacy verification is:
+
+```bash
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_turn_ingestion.py tests/test_herdr_events.py tests/test_daemon.py \
+  tests/test_cli.py tests/test_cli_command.py tests/test_store.py \
+  tests/test_herdr_turns.py tests/test_turns.py tests/test_config.py \
+  tests/test_public_content_safety.py
+```
+
+Run the complete suite separately:
+
+```bash
+PYTHONPATH=src python3 -m pytest -q
+```
+
+Run the frozen Goal 07 benchmark command exactly:
+
+```bash
+PYTHONPATH=src python3 scripts/turn_ingestion_benchmark.py \
+  --workers 8 --blocked-workers 2 --blocked-seconds 5 \
+  --warmups 3 --samples 21 --json
+```
+
+The benchmark uses generated private fixtures, real Unix-socket requests, and
+deterministically blocked adapters; never point it at live state. Record its
+aggregate public-safe host result in
+`docs/evidence/goal07-turn-ingestion-benchmark.md`. The evidence budgets are
+cached `turn.list` and `health.get` p95 no greater than 350 ms and immediate
+synthetic `command.submit` p95 no greater than 250 ms. They are recorded-host
+release evidence, not flaky unit-test or ordinary-CI timing thresholds and not
+a generic SLA, scaling guarantee, or statistical service-level claim. Do not
+claim observed timings unless the completed evidence records them.
+
+The focused Goal 08 Codex reader, ingestion, and public-privacy verification is:
+
+```bash
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_codex_session_reader.py tests/test_herdr_turns.py \
+  tests/test_turn_ingestion.py tests/test_public_content_safety.py
+```
+
+After it passes, run the complete-suite command above. Then run the exact
+synthetic Goal 08 benchmark:
+
+```bash
+PYTHONPATH=src python3 scripts/codex_session_reader_benchmark.py --json
+```
+
+The benchmark must use only its generated private fixture, never live Codex
+state. Its stable gates are exact rejection before filesystem work; one
+complete 20,000-file index build visiting no more than 100,000 entries and
+retaining no more than 8 MiB; no extra build for the warm lookup; no more than
+64 KiB read for the benchmark's cold resynchronization; exactly append-sized
+incremental work; and zero source bytes for an unchanged poll. Its recursive
+privacy gate must reject generated paths, session/turn identities, content,
+filenames, and UUID-shaped strings from the success report. Record only the
+compact aggregate output in
+`docs/evidence/goal08-codex-session-reader-benchmark.md`.
+
+The 60-second complete-index refresh interval is a deliberate bounded-work
+tradeoff: a duplicate added after a successful lookup can remain undiscovered
+until that refresh, after which the identity is ambiguous and unavailable.
+Documented-host timing ceilings are release evidence, not ordinary-CI gates or
+a generic service-level claim.
 
 ```bash
 tendwire doctor --json

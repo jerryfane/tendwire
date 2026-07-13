@@ -83,7 +83,295 @@ Herdres state, bindings, and topics require explicit migration and review;
 stale bindings are quarantined and old topics are not silently rebound or
 automatically reused.
 
-## 5. Local hygiene (optional, before building from a dirty tree)
+## 5. Goal 07/09 ingestion and pending verification
+
+The release contract uses store schema v10. Its transactional v8-to-v9
+migration backfills immutable positive `list_sequence` values independently per
+host and creates the uniqueness/paging state used by stable `turn.list`
+traversal. The v9-to-v10 migration preserves public pending rows while adding
+explicit freshness, binding-scoped revision routing, and durable two-phase
+answer claims; migrated rows remain unanswerable until refreshed from an
+authoritative binding.
+Validate a migration only on the access-restricted scratch copy from section 4;
+do not initialize or migrate the sole recovery copy.
+
+The daemon owns short-cadence and event-signaled refresh, with coalescing,
+per-target serialization, a fixed worker/queue bound, adapter deadlines, and
+aggregate degraded/stale health. Public read handlers remain cache-only.
+
+OMP cache/IPC state must remain a coordinate-only checkpoint and must never
+carry prompt, user, final, or stream bodies. An unchanged stable stat must
+return unchanged without spawn/read/transport; changed open turns reconstruct
+from a replay coordinate; completed finals compact to idle EOF until a new
+eligible user message opens a turn. The private cache remains bounded by 64
+entries and 64 KiB serialized key-plus-checkpoint weight, with disappeared
+bindings pruned and same-path private-fingerprint changes advancing its
+generation.
+
+The OMP spawned-reader request remains capped at 16 KiB. A canonical OMP
+response has no total-size ceiling: its exact ordered payload is streamed in
+frames of at most 1 MiB under the same deadline, with manifest, nonce,
+end-marker, and EOF validation, so canonical finals are not truncated by IPC.
+Nonblocking framed socket send/receive, parsing, and join share that adapter
+deadline without a helper IPC thread.
+Timeout teardown spends at most 250 ms on terminate/kill/join attempts and
+reaps the child under normal POSIX scheduling; it does not wait beyond that
+grace for an OS-uninterruptible child. A
+content-bearing file-reader candidate publishes only after exact binding
+revalidation and successful durable apply; a no-content candidate still
+requires binding validation. Cancellation, failure, stale binding, or a changed
+same-path generation cannot advance the cache. Ingestion health must recover
+after a later success while preserving cumulative failed/timeout counters;
+`stale_binding` churn must not by itself keep health degraded.
+
+Daemon and CLI pending surfaces must share the atomic latest-snapshot plus
+durable-`backend_pending` store projection. A malformed snapshot fails as
+`store_unavailable`. Definite pre-transmission daemon unavailability permits
+only a store read and no Herdr observation. A post-transmission timeout returns
+`daemon_timeout`; protocol ambiguity returns `daemon_protocol_error`, and
+neither path falls back.
+
+`tendwire turns` direct refresh fallback is limited to one initial-page attempt
+when daemon unavailability is definite before request transmission; a timeout
+after transmission returns `daemon_timeout` without a second refresh.
+Pagination remains bounded to limit 100 by default and 250 maximum, uses stable
+watermark-bound cursor/since traversal with a fixed 900-second cursor TTL, and
+retains the 1 MiB transport-frame and 48 KiB content-page limits. The API keeps
+eight request workers and 32 admitted connections, returning retryable
+`server_busy` beyond that bound. Release-visible ingestion metrics must remain
+aggregate and must not expose a worker, target, session path, or private
+fingerprint.
+
+From the source checkout, run the focused Goal 07 suite:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_turn_ingestion.py tests/test_herdr_events.py tests/test_daemon.py \
+  tests/test_cli.py tests/test_cli_command.py tests/test_store.py \
+  tests/test_herdr_turns.py tests/test_turns.py tests/test_config.py \
+  tests/test_public_content_safety.py
+```
+
+Then run the complete suite:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q
+```
+
+Run the frozen benchmark command exactly:
+
+```sh
+PYTHONPATH=src python3 scripts/turn_ingestion_benchmark.py \
+  --workers 8 --blocked-workers 2 --blocked-seconds 5 \
+  --warmups 3 --samples 21 --json
+```
+
+The benchmark must use generated private fixtures and real Unix-socket requests
+with two deterministically blocked adapters, never live state. Record only its
+aggregate public-safe output in
+`docs/evidence/goal07-turn-ingestion-benchmark.md`. The recorded-host evidence
+budgets are cached `turn.list` and `health.get` p95 no greater than 350 ms and
+immediate synthetic `command.submit` p95 no greater than 250 ms. These are
+recorded-host release evidence rather than ordinary-CI or unit-test timing
+gates, and not a generic SLA, scaling guarantee, or statistical service-level
+claim. Do not state observed timing or deployment success until the completed
+evidence supports it.
+
+## 6. Goal 08 Codex session-reader verification
+
+A Codex binding must be an exact canonical lowercase, non-nil UUID. The only
+eligible rollout grammar is
+`sessions/YYYY/MM/DD/rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl`, with a valid
+date/time matching the hierarchy and no identifier interpolation into a glob.
+Resolution must yield exactly one canonical regular file beneath the canonical
+sessions root after symlink and device/inode checks. Missing, unsafe,
+over-limit, or multiple exact matches are unavailable.
+Every cache hit validates the current sessions-root device/inode; a found result
+also validates the rollout inode. A root identity change immediately clears
+that root's cached path results and complete index.
+
+The complete index is bounded to 100,000 filesystem visits, 32,768 session
+identities, and 8 MiB retained; its path-result LRU is bounded to 256 entries
+and 256 KiB. Negative results expire after 2 seconds. A lookup rebuilds the
+complete index once its snapshot is 60 seconds old. That interval is the
+documented bounded-work tradeoff: a duplicate created after a successful lookup
+may remain undiscovered for up to one 60-second snapshot interval, after which
+the refreshed index makes the identity ambiguous and unavailable.
+
+The private parser LRU is bounded to 64 entries and 16 MiB. Only valid
+newline-terminated records advance the committed offset; a partial final record
+waits for its newline. The limits are 8 MiB per record, a 64 KiB initial and
+16 MiB maximum/65,536-record recovery scan, and 64 MiB of source data per poll.
+Warm append-only reads consume only appended bytes and an unchanged poll reads
+zero source bytes. Truncation, rotation, replacement, or missing state uses the
+same bounded recovery rather than a whole-file fallback; malformed/oversized
+input or no recoverable boundary fails without advancing the prior checkpoint.
+
+Codex parser-state requests are capped at 12 MiB, and each Codex response
+remains one frame capped at 64 MiB. A response is only a candidate: content
+publishes only after exact binding revalidation and durable apply, and
+no-content state still requires binding revalidation. Cancellation, failure,
+or a stale/replaced binding cannot advance the cache.
+Public JSON must contain no session ID, rollout path,
+device/inode, offset, parser/cache state, raw record, or private fingerprint.
+
+Run the focused Goal 08 suite from the source checkout:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_codex_session_reader.py tests/test_herdr_turns.py \
+  tests/test_turn_ingestion.py tests/test_public_content_safety.py
+```
+
+Then run the complete suite:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q
+```
+
+Run the exact synthetic benchmark command:
+
+```sh
+PYTHONPATH=src python3 scripts/codex_session_reader_benchmark.py --json
+```
+
+The benchmark must use only generated private fixtures, never live Codex state.
+Its portable bounded-work gates are: invalid wildcard rejection before any
+index build; one complete 20,000-file index build with no more than 100,000
+filesystem visits and 8 MiB retained; no extra warm-lookup index build; no more
+than 64 KiB read for the benchmark cold resynchronization; exactly append-sized
+incremental work; and zero source bytes for an unchanged poll. Its recursive
+privacy gate must reject generated paths, session/turn identities, content,
+filenames, and UUID-shaped strings from the success report.
+
+Record the exact command and compact aggregate result in
+`docs/evidence/goal08-codex-session-reader-benchmark.md`. Documented-host timing
+ceilings are release evidence, not ordinary-CI gates, a generic SLA, or a
+scaling guarantee.
+
+## 7. Goal 08B SQLite sidecar race/recovery verification
+
+A file-backed store release must treat the main database, `-wal`, `-shm`, and
+`-journal` as one identity-validated family. Absent optional sidecars and
+optional sidecars that transiently disappear are valid. Once selected, the main
+database is mandatory. A wrong type, wrong owner, insecure validation-time
+mode, hostile appearance, or identity replacement must fail closed without
+following or mutating the entry.
+
+Creation and repair authority must remain explicit and narrow. Prepare may
+create only a missing main database and may intersect modes of validated
+present family members with `0600`; repair only intersects modes of validated
+existing members. Neither creates an optional sidecar, widens a stricter mode,
+replaces an entry, or changes ownership. Ordinary reads, diagnostics, health,
+and `store status` are validation-only and non-creating. The capture/preflight/
+final-validation sequence is bounded and does not recursively retry churn.
+Private-mode preparation and repair cannot disturb active Tendwire SQLite
+transactions, and a no-op private prepare preserves them. Any main creation or
+permission narrowing first requires bounded, nonblocking exclusive authority over
+the store parent directory. Current-schema filesystem reads stay cheap and
+nonmutating after their schema-version read: they take no exclusive parent
+authority and perform no persistent WAL negotiation or schema DDL. An
+uninitialized or migrating filesystem store takes that exclusive authority before
+persistent WAL negotiation or schema DDL, performs that work under private
+creation mode, then revalidates and narrows the resulting main database, `-wal`,
+and `-shm` members before restoring retained shared authority. A live Tendwire
+connection retains shared parent-directory authority, so a conflicting repair
+fails with a typed, path-free error before mutation; that shared authority also
+rejects the schema branch before WAL, DDL, or sidecar mutation. A connection
+obtains shared authority before preparation, promotes the same authority only for
+a necessary mutation, and restores shared authority for the remainder of its lifetime.
+
+Private failures remain typed, path-free `LocalStateError` values; public
+surfaces emit fixed aggregate records such as `database_permissions: unsafe`
+and `store_unavailable`, without private paths, suffixes, ownership, inode, raw
+exception, or content.
+
+Automatic maintenance retains only bounded batch/cadence authority and never
+compacts. Dry-run compaction remains validation-only. Execute compaction alone
+has explicit offline replacement authority after `--acknowledge-offline`, and
+must revalidate the selected source identity before publishing a verified
+replacement.
+
+Run these Goal 08B release commands from the isolated candidate source checkout,
+never against live configuration, a live database, a live daemon socket, or a
+running Tendwire/Herdres service. These are verification commands, not
+deployment, migration, or restart instructions.
+
+Focused:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_local_state_permissions.py tests/test_store.py \
+  tests/test_diagnostics.py tests/test_cli.py tests/test_daemon.py \
+  tests/test_release_readiness.py \
+  tests/test_sqlite_sidecar_race_benchmark.py
+```
+
+Full:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q
+```
+
+Compile:
+
+```sh
+PYTHONPATH=src python3 -m py_compile $(git ls-files '*.py')
+```
+
+Diff hygiene:
+
+```sh
+git diff --check
+```
+
+Synthetic installed-candidate evidence:
+
+```sh
+python3 scripts/sqlite_sidecar_race_benchmark.py \
+  --iterations 128 \
+  --daemon-wal-cycles 64 \
+  --requests-per-method 64 \
+  --herdres-sync-passes 3 \
+  --phase-timeout-seconds 120 \
+  --json
+```
+
+The driver is `scripts/sqlite_sidecar_race_benchmark.py`, its focused harness
+test is `tests/test_sqlite_sidecar_race_benchmark.py`, and the frozen compact
+aggregate JSON plus exact execution record is
+`docs/evidence/goal08b-sqlite-sidecar-race-recovery.md`. Its captured aggregate
+records a private temporary directory, installed-candidate import/origin checks,
+production callback and Herdres source-sync markers, and exact file-descriptor,
+thread, direct-child, and socket accounting. It records one settling sync
+followed by exactly two no-op syncs, zero direct Herdr calls, and zero outbound
+network attempts. The aggregate does not establish the absence of every possible
+access to operator live configuration, database, socket, or service lifecycle;
+run the command only under the isolated-candidate directions above.
+
+The driver removes `PYTHONPATH`, deterministically builds a versioned wheel from
+this isolated source checkout, installs it with `pip --no-index --no-deps` into
+a private temporary virtual environment, and re-executes the candidate with
+isolated Python. It verifies that the imported package originates in that
+private installation and not the mutable `/home/smith/tendwire` checkout.
+Provenance binds base revision
+`c0ebff7cfba401f6c13da1b58a00abf8ff0b5f36` to packaged-source SHA-256
+`15b1ca262f6051b191d1587d353c465cc74fd6c6a9d0676eb9348eafef35ff87`;
+the installed `0.1.0` wheel SHA-256 is
+`7be0f975b0241aaf092a9bba38ace2e3e2efd2f91996f02b2cbcb24b93fac02d`.
+
+The frozen run exited `0` with 256 bounded family preparations, 384 scheduled
+optional disappearances, 64 daemon WAL cycles, 64 successful requests for each
+of `snapshot.get`, schema-v2 `turn.list`, and `health.get`, three Herdres source
+passes, exactly two subsequent no-op passes, nine real candidate CLI
+subprocesses, zero direct Herdr calls, and zero outbound network attempts.
+Candidate resources were file descriptors `3/10/3`, threads `1/11/1`, and
+direct children `0/1/0` (before/peak/after); the socket was absent after
+shutdown and every frozen Boolean check passed. The evidence document is the
+authority for the compact JSON and recorded-host timings; those timings are
+observations, not portable CI gates or service-level claims.
+
+## 8. Local hygiene (optional, before building from a dirty tree)
 
 ```sh
 find . -type d -name __pycache__ -not -path './.git/*' -exec rm -rf {} +

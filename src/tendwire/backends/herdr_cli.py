@@ -18,6 +18,7 @@ import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..config import Config
@@ -34,6 +35,7 @@ from ..core.models import (
     worker_binding_private_fingerprint,
 )
 from ..local_state import (
+    ConfigStateReport,
     LocalStateErrorCode,
     LocalStateKind,
     PermissionState,
@@ -560,13 +562,13 @@ def _local_state_check(
     }
 
 
-def _local_state_checks(config: Config) -> tuple[list[dict[str, Any]], bool]:
-    """Inspect configured state once and return fixed, path-free doctor records."""
+def _inspect_local_state(config: Config) -> ConfigStateReport | None:
+    """Inspect configured local state once without creating or repairing it."""
     try:
         if config.db_path is None:
             raise ValueError
         socket_path = config.socket_path or config.data_dir / "tendwire.sock"
-        report = inspect_config_state(
+        return inspect_config_state(
             config.data_dir,
             config.db_path,
             socket_path=socket_path,
@@ -578,6 +580,15 @@ def _local_state_checks(config: Config) -> tuple[list[dict[str, Any]], bool]:
             socket_group=config.socket_group,
         )
     except Exception:
+        return None
+
+
+def _local_state_checks(
+    report: ConfigStateReport | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fold a path-free inspection report into the fixed local-state checks."""
+    inspected = report
+    if inspected is None:
         checks = [
             {
                 "name": name,
@@ -595,12 +606,12 @@ def _local_state_checks(config: Config) -> tuple[list[dict[str, Any]], bool]:
             kinds,
             neutral_outcome,
             neutral_remediation,
-            entries=report.entries,
-            issues=report.issues,
+            entries=inspected.entries,
+            issues=inspected.issues,
         )
         for name, kinds, neutral_outcome, neutral_remediation in _LOCAL_STATE_CHECK_GROUPS
     ]
-    return checks, report.ok
+    return checks, inspected.ok
 
 
 def _public_herdr_bin(value: str) -> str:
@@ -613,10 +624,202 @@ def _public_herdr_bin(value: str) -> str:
     return sanitized or "[redacted]"
 
 
+_STORE_MAINTENANCE_REMEDIATION = {
+    "ok": "No action required.",
+    "overdue": "Keep Tendwire running to resume automatic store maintenance.",
+    "backlog": "Keep Tendwire running to drain the maintenance backlog.",
+    "not_initialized": "No action required while the store is uninitialized.",
+    "unsafe": "Move unsafe local state aside and restore from a trusted backup.",
+    "unavailable": "Check store availability before retrying diagnostics.",
+}
+_STORE_KINDS = frozenset(
+    {
+        LocalStateKind.STATE_DIRECTORY,
+        LocalStateKind.DATABASE,
+        LocalStateKind.DATABASE_WAL,
+        LocalStateKind.DATABASE_SHM,
+        LocalStateKind.DATABASE_JOURNAL,
+    }
+)
+
+
+def _store_maintenance_record(
+    config: Config,
+    outcome: str,
+    *,
+    snapshot_count: int = 0,
+    last_completed_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the fixed public-safe maintenance doctor record."""
+    return {
+        "name": "store_maintenance",
+        "ok": outcome in {"ok", "not_initialized"},
+        "outcome": outcome,
+        "remediation": _STORE_MAINTENANCE_REMEDIATION[outcome],
+        "snapshot_retention_days": config.snapshot_retention_days,
+        "snapshot_retention_count": config.snapshot_retention_count,
+        "maintenance_batch_size": config.snapshot_maintenance_batch_size,
+        "maintenance_cadence_seconds": config.store_maintenance_cadence_seconds,
+        "snapshot_count": snapshot_count,
+        "last_completed_at": last_completed_at,
+    }
+
+
+def _public_utc_timestamp(value: Any) -> tuple[str | None, datetime | None]:
+    """Return a normalized public UTC timestamp, rejecting malformed/private text."""
+    if not isinstance(value, str) or not value.strip():
+        return None, None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None, None
+    if parsed.tzinfo is None:
+        return None, None
+    normalized = parsed.astimezone(timezone.utc)
+    return normalized.isoformat(), normalized
+
+
+
+
+def _store_maintenance_check(
+    config: Config,
+    report: ConfigStateReport | None,
+) -> dict[str, Any]:
+    """Return one fixed, path-free, non-mutating store-maintenance check."""
+    if report is None:
+        return _store_maintenance_record(config, "unsafe")
+    relevant_issues = [issue for issue in report.issues if issue.kind in _STORE_KINDS]
+    relevant_entries = [entry for entry in report.entries if entry.kind in _STORE_KINDS]
+    if relevant_issues or any(
+        entry.state is PermissionState.REPAIR_REQUIRED for entry in relevant_entries
+    ):
+        return _store_maintenance_record(config, "unsafe")
+    database = next(
+        (entry for entry in relevant_entries if entry.kind is LocalStateKind.DATABASE),
+        None,
+    )
+    if database is None or database.state is PermissionState.ABSENT:
+        return _store_maintenance_record(config, "not_initialized")
+
+    try:
+        from ..store.sqlite import store_status
+
+        status = store_status(
+            config.db_path,
+            config.host_id,
+            snapshot_retention_days=config.snapshot_retention_days,
+            snapshot_retention_count=config.snapshot_retention_count,
+            maintenance_batch_size=config.snapshot_maintenance_batch_size,
+            maintenance_cadence_seconds=config.store_maintenance_cadence_seconds,
+            require_current_schema=True,
+        )
+        maintenance = status.get("maintenance")
+        if (
+            status.get("ok") is not True
+            or not isinstance(maintenance, Mapping)
+            or isinstance(maintenance.get("snapshot_count"), bool)
+            or not isinstance(maintenance.get("snapshot_count"), int)
+            or int(maintenance["snapshot_count"]) < 0
+            or not isinstance(maintenance.get("backlog"), bool)
+            or maintenance.get("status") not in {"never", "ok", "failed"}
+        ):
+            return _store_maintenance_record(config, "unavailable")
+        snapshot_count = int(maintenance["snapshot_count"])
+        maintenance_status = str(maintenance["status"])
+        last_value = maintenance.get("last_completed_at")
+        if maintenance_status == "failed" or (
+            maintenance_status == "never" and last_value is not None
+        ):
+            return _store_maintenance_record(config, "unavailable")
+        if last_value is None:
+            last_completed_at = None
+            completed = None
+        else:
+            last_completed_at, completed = _public_utc_timestamp(last_value)
+            if completed is None:
+                return _store_maintenance_record(config, "unavailable")
+        if maintenance["backlog"]:
+            outcome = "backlog"
+        elif completed is None:
+            outcome = "overdue"
+        else:
+            _now_value, now = _public_utc_timestamp(utc_timestamp())
+            if now is None:
+                return _store_maintenance_record(config, "unavailable")
+            due_at = completed + timedelta(
+                seconds=config.store_maintenance_cadence_seconds
+            )
+            outcome = "overdue" if now >= due_at else "ok"
+        return _store_maintenance_record(
+            config,
+            outcome,
+            snapshot_count=snapshot_count,
+            last_completed_at=last_completed_at,
+        )
+    except Exception:
+        return _store_maintenance_record(config, "unavailable")
+
+
+def _pending_ingestion_check(config: Config) -> dict[str, Any]:
+    """Return one fixed non-mutating check from durable pending state only."""
+    unavailable = {
+        "status": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+    try:
+        from ..store.sqlite import backend_pending_health
+
+        value = backend_pending_health(config.db_path, config.host_id)
+    except Exception:
+        value = unavailable
+    raw = value if isinstance(value, Mapping) else unavailable
+    raw_counts = raw.get("counts")
+    status = raw.get("status")
+    count_values = (
+        tuple(raw_counts.get(key) for key in ("fresh", "stale", "total"))
+        if isinstance(raw_counts, Mapping)
+        else ()
+    )
+    valid_counts = len(count_values) == 3 and all(
+        isinstance(item, int) and not isinstance(item, bool) and item >= 0
+        for item in count_values
+    )
+    if (
+        status not in {"healthy", "degraded", "store_unavailable"}
+        or not valid_counts
+        or count_values[2] != count_values[0] + count_values[1]
+        or (status == "healthy" and count_values[1] != 0)
+        or (status == "degraded" and count_values[1] == 0)
+        or (status == "store_unavailable" and count_values != (0, 0, 0))
+    ):
+        status = "store_unavailable"
+        counts = dict(unavailable["counts"])
+    else:
+        counts = dict(zip(("fresh", "stale", "total"), count_values, strict=True))
+    return {
+        "name": "pending_ingestion",
+        "ok": status == "healthy",
+        "outcome": status,
+        "counts": counts,
+        "stale_grace_seconds": config.pending_stale_grace_seconds,
+    }
+
+
 def _finish_diagnostics(result: dict[str, Any], config: Config) -> dict[str, Any]:
-    local_checks, local_ok = _local_state_checks(config)
+    report = _inspect_local_state(config)
+    local_checks, local_ok = _local_state_checks(report)
+    maintenance = _store_maintenance_check(config, report)
+    pending_ingestion = _pending_ingestion_check(config)
     result["checks"].extend(local_checks)
-    if not local_ok and result["status"] == "ok":
+    result["checks"].append(maintenance)
+    result["checks"].append(pending_ingestion)
+    if (
+        (not local_ok or not maintenance["ok"] or not pending_ingestion["ok"])
+        and result["status"] == "ok"
+    ):
         result["status"] = "degraded"
     return result
 

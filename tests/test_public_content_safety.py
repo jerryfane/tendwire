@@ -511,6 +511,10 @@ def test_snapshot_turn_and_pending_keep_public_structural_opaque_values() -> Non
     assert turns_wrapper["turns"][0]["worker_fingerprint"] == worker.fingerprint
     assert pending_wrapper["host_id"] == snapshot.host_id
     assert pending_wrapper["content_fingerprint"]
+    assert pending_wrapper["pending_health"] == {
+        "status": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
     assert pending_wrapper["pending_interactions"][0]["id"]
     assert pending_wrapper["pending_interactions"][0]["fingerprint"]
     assert pending_wrapper["pending_interactions"][0]["worker_id"] == worker.id

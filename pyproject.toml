@@ -46,6 +46,7 @@ include = [
     "/.env.example",
     "/README.md",
     "/pyproject.toml",
+    "/scripts/sqlite_sidecar_race_benchmark.py",
 ]
 
 [tool.pytest.ini_options]

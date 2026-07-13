@@ -778,8 +778,12 @@ def _canonical_turn(
             INSERT OR IGNORE INTO turns (
                 host_id, turn_id, worker_id, worker_fingerprint, space_id,
                 status, kind, updated_at, fingerprint,
-                snapshot_content_fingerprint, observed_at, payload_json
-            ) VALUES (?, ?, ?, NULL, NULL, 'complete', 'turn', ?, ?, ?, ?, ?)
+                snapshot_content_fingerprint, observed_at, payload_json,
+                list_sequence
+            ) VALUES (
+                ?, ?, ?, NULL, NULL, 'complete', 'turn', ?, ?, ?, ?, ?,
+                (SELECT COALESCE(MAX(list_sequence), 0) + 1 FROM turns WHERE host_id = ?)
+            )
             """,
             (
                 host_id,
@@ -790,6 +794,7 @@ def _canonical_turn(
                 f"snapshot-{worker_id}",
                 created_at,
                 json.dumps({"source_turn_id": source_turn_id, "complete": True}),
+                host_id,
             ),
         )
         conn.execute(
@@ -1017,7 +1022,7 @@ def _downgrade_presentation_schema_to_v6(db_path: Path) -> None:
         )
 
 
-def test_v6_to_v7_plan_migration_is_bounded_atomic_and_preserves_jobs(
+def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1055,7 +1060,7 @@ def test_v6_to_v7_plan_migration_is_bounded_atomic_and_preserves_jobs(
             ).fetchall()
         }
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 7
+    assert version == store_sqlite.STORE_SCHEMA_VERSION == 10
     assert plan_row == (plan["plan_token"], 1, None, "active")
     assert job_count == outbox_count == 2
     assert {

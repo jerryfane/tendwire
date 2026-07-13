@@ -7,14 +7,15 @@ sharing the race-resistant path handling and validation rules.
 
 from __future__ import annotations
 
+import fcntl
 import errno
 import os
 import secrets
 import stat
 import threading
 import sys
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field as dataclass_field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Iterator, NoReturn
@@ -785,6 +786,41 @@ def repair_private_directory(path: str | os.PathLike[str]) -> PermissionResult:
     finally:
         os.close(parent_fd)
 
+def repair_private_directory_at(dir_fd: int) -> PermissionResult:
+    """Narrow one caller-pinned owned directory without resolving its pathname."""
+
+    try:
+        current = os.fstat(dir_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(current)
+    identity = entry_identity(current)
+    mode = stat.S_IMODE(current.st_mode)
+    desired = mode & PRIVATE_DIRECTORY_MODE
+    if desired == mode:
+        return PermissionResult(
+            LocalStateKind.STATE_DIRECTORY,
+            PermissionState.PRIVATE,
+            mode,
+        )
+    try:
+        os.fchmod(dir_fd, desired)
+        current = os.fstat(dir_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(current)
+    if (
+        not identity_matches(identity, current)
+        or stat.S_IMODE(current.st_mode) != desired
+    ):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _sync_directory(dir_fd)
+    return PermissionResult(
+        LocalStateKind.STATE_DIRECTORY,
+        PermissionState.REPAIRED,
+        desired,
+    )
+
 
 def prepare_and_open_private_directory(
     path: str | os.PathLike[str],
@@ -1402,12 +1438,408 @@ def atomic_replace_private_file(
         os.close(parent_fd)
 
 
+class _SqliteReplacementPhase(str, Enum):
+    RESERVED = "reserved"
+    RELEASED = "released"
+    CREATED = "created"
+
+
+@dataclass(frozen=True)
+class SqliteReplacementHandle:
+    """Opaque capability for one identity-checked SQLite replacement."""
+
+    parent_fd: int = dataclass_field(repr=False)
+    parent_identity: EntryIdentity = dataclass_field(repr=False)
+    retained_mode: int
+    _source_name: str = dataclass_field(repr=False)
+    _source_identity: EntryIdentity = dataclass_field(repr=False)
+    _source_mode: int = dataclass_field(repr=False)
+    _replacement_name: str = dataclass_field(repr=False)
+    _replacement_identity: EntryIdentity | None = dataclass_field(repr=False)
+    _phase: _SqliteReplacementPhase = dataclass_field(repr=False)
+
+
+def _validate_single_link(value: os.stat_result) -> None:
+    try:
+        single_link = value.st_nlink == 1
+    except AttributeError:
+        _raise(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+    if not single_link:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+
+
+def _verify_sqlite_replacement_parent(handle: SqliteReplacementHandle) -> None:
+    try:
+        current = os.fstat(handle.parent_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(current)
+    if not identity_matches(handle.parent_identity, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    if stat.S_IMODE(current.st_mode) & ~PRIVATE_DIRECTORY_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+
+
+def _verify_sqlite_replacement_source(
+    handle: SqliteReplacementHandle,
+) -> os.stat_result:
+    current = verify_entry_identity(
+        handle.parent_fd,
+        handle._source_name,
+        handle._source_identity,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+    _validate_single_link(current)
+    mode = stat.S_IMODE(current.st_mode)
+    if mode != handle._source_mode:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    if mode & ~PRIVATE_FILE_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    return current
+
+
+def _verify_sqlite_replacement_artifact(
+    handle: SqliteReplacementHandle,
+) -> os.stat_result:
+    expected = handle._replacement_identity
+    if expected is None:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    current = verify_entry_identity(
+        handle.parent_fd,
+        handle._replacement_name,
+        expected,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+    _validate_single_link(current)
+    if identity_matches(handle._source_identity, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    return current
+
+
+def prepare_private_sqlite_replacement_at(
+    parent_fd: int,
+    *,
+    basename: str,
+    retained_mode: int,
+) -> SqliteReplacementHandle:
+    """Reserve an opaque, private output name beside a verified SQLite source."""
+
+    require_posix_support()
+    source_name = _leaf_name(basename)
+    if isinstance(retained_mode, bool) or not isinstance(retained_mode, int):
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    if retained_mode < 0 or retained_mode & ~0o777:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    try:
+        parent = os.fstat(parent_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(parent)
+    if stat.S_IMODE(parent.st_mode) & ~PRIVATE_DIRECTORY_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+
+    source = lstat_at(parent_fd, source_name)
+    if source is None:
+        _raise(LocalStateErrorCode.MISSING_ENTRY)
+    validate_owned_regular_stat(source)
+    _validate_single_link(source)
+    source_mode = stat.S_IMODE(source.st_mode)
+    if source_mode & ~PRIVATE_FILE_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    desired_mode = source_mode & retained_mode & PRIVATE_FILE_MODE
+
+    replacement_name = f".tendwire-sqlite-{secrets.token_hex(16)}.vacuum"
+    fd = create_private_file_at(parent_fd, replacement_name)
+    replacement_identity: EntryIdentity | None = None
+    try:
+        reserved = os.fstat(fd)
+        validate_owned_regular_stat(reserved)
+        _validate_single_link(reserved)
+        replacement_identity = entry_identity(reserved)
+        if same_inode(source, reserved):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        try:
+            os.fsync(fd)
+        except OSError:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+        _sync_directory(parent_fd)
+        return SqliteReplacementHandle(
+            parent_fd=parent_fd,
+            parent_identity=entry_identity(parent),
+            retained_mode=desired_mode,
+            _source_name=source_name,
+            _source_identity=entry_identity(source),
+            _source_mode=source_mode,
+            _replacement_name=replacement_name,
+            _replacement_identity=replacement_identity,
+            _phase=_SqliteReplacementPhase.RESERVED,
+        )
+    except Exception:
+        if replacement_identity is not None:
+            try:
+                current = lstat_at(parent_fd, replacement_name)
+                if current is not None and identity_matches(replacement_identity, current):
+                    os.unlink(replacement_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            except (LocalStateError, OSError):
+                pass
+        raise
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def release_private_sqlite_replacement_at(
+    handle: SqliteReplacementHandle,
+) -> Iterator[tuple[SqliteReplacementHandle, str]]:
+    """Release the verified reservation while holding a restrictive umask."""
+
+    if handle._phase is not _SqliteReplacementPhase.RESERVED:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _verify_sqlite_replacement_parent(handle)
+    _verify_sqlite_replacement_source(handle)
+    _verify_sqlite_replacement_artifact(handle)
+    assert handle._replacement_identity is not None
+    unlink_verified_entry(
+        handle.parent_fd,
+        handle._replacement_name,
+        handle._replacement_identity,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+    released = replace(
+        handle,
+        _replacement_identity=None,
+        _phase=_SqliteReplacementPhase.RELEASED,
+    )
+    with private_file_creation_umask():
+        yield released, proc_fd_path(handle.parent_fd, handle._replacement_name)
+
+
+def verify_created_private_sqlite_replacement_at(
+    handle: SqliteReplacementHandle,
+) -> SqliteReplacementHandle:
+    """Pin, narrow, and fsync the SQLite-created replacement output."""
+
+    if handle._phase is not _SqliteReplacementPhase.RELEASED:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _verify_sqlite_replacement_parent(handle)
+    _verify_sqlite_replacement_source(handle)
+    created = lstat_at(handle.parent_fd, handle._replacement_name)
+    if created is None:
+        _raise(LocalStateErrorCode.MISSING_ENTRY)
+    validate_owned_regular_stat(created)
+    _validate_single_link(created)
+    if identity_matches(handle._source_identity, created):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    if stat.S_IMODE(created.st_mode) & ~PRIVATE_FILE_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    created_identity = entry_identity(created)
+
+    fd = -1
+    try:
+        fd, opened = _open_verified_at(
+            handle.parent_fd,
+            handle._replacement_name,
+            flags=os.O_RDWR,
+            expected_type=EntryType.REGULAR_FILE,
+        )
+        _validate_single_link(opened)
+        if not identity_matches(created_identity, opened):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        try:
+            os.fchmod(fd, handle.retained_mode)
+            os.fsync(fd)
+            opened = os.fstat(fd)
+        except OSError:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+        validate_owned_regular_stat(opened)
+        _validate_single_link(opened)
+        if not identity_matches(created_identity, opened):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        if stat.S_IMODE(opened.st_mode) != handle.retained_mode:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    verified = replace(
+        handle,
+        _replacement_identity=created_identity,
+        _phase=_SqliteReplacementPhase.CREATED,
+    )
+    _verify_sqlite_replacement_artifact(verified)
+    _sync_directory(handle.parent_fd)
+    return verified
+
+
+def publish_private_sqlite_replacement_at(
+    handle: SqliteReplacementHandle,
+    *,
+    expected_source: EntryIdentity,
+) -> EntryIdentity:
+    """Atomically publish one verified SQLite replacement over its source."""
+
+    if handle._phase is not _SqliteReplacementPhase.CREATED:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    if expected_source != handle._source_identity:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _verify_sqlite_replacement_parent(handle)
+    _verify_sqlite_replacement_source(handle)
+    replacement = _verify_sqlite_replacement_artifact(handle)
+    if stat.S_IMODE(replacement.st_mode) != handle.retained_mode:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+
+    fd = -1
+    try:
+        fd, opened = _open_verified_at(
+            handle.parent_fd,
+            handle._replacement_name,
+            flags=os.O_RDONLY,
+            expected_type=EntryType.REGULAR_FILE,
+        )
+        _validate_single_link(opened)
+        if not identity_matches(handle._replacement_identity, opened):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        try:
+            os.fsync(fd)
+        except OSError:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    _verify_sqlite_replacement_source(handle)
+    _verify_sqlite_replacement_artifact(handle)
+    try:
+        os.replace(
+            handle._replacement_name,
+            handle._source_name,
+            src_dir_fd=handle.parent_fd,
+            dst_dir_fd=handle.parent_fd,
+        )
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    published = verify_entry_identity(
+        handle.parent_fd,
+        handle._source_name,
+        handle._replacement_identity,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+    _validate_single_link(published)
+    if stat.S_IMODE(published.st_mode) != handle.retained_mode:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _sync_directory(handle.parent_fd)
+    return entry_identity(published)
+
+
+def cleanup_private_sqlite_replacement_at(handle: SqliteReplacementHandle) -> None:
+    """Remove only the exact prepublication artifact pinned by ``handle``."""
+
+    if handle._phase is _SqliteReplacementPhase.RELEASED:
+        return
+    expected = handle._replacement_identity
+    if expected is None:
+        return
+    _verify_sqlite_replacement_parent(handle)
+    current = lstat_at(handle.parent_fd, handle._replacement_name)
+    if current is None:
+        return
+    validate_owned_regular_stat(current)
+    if not identity_matches(expected, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    _validate_single_link(current)
+    if identity_matches(handle._source_identity, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    unlink_verified_entry(
+        handle.parent_fd,
+        handle._replacement_name,
+        expected,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+
+
+def sqlite_parent_available_bytes_at(parent_fd: int) -> int:
+    """Return bytes available to the current process on a pinned parent."""
+
+    require_posix_support()
+    try:
+        parent = os.fstat(parent_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(parent)
+    if stat.S_IMODE(parent.st_mode) & ~PRIVATE_DIRECTORY_MODE:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    try:
+        values = os.fstatvfs(parent_fd)
+        block_size = values.f_frsize or values.f_bsize
+        available = values.f_bavail * block_size
+    except (AttributeError, OSError, TypeError, ValueError):
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    if available < 0:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    return int(available)
+
+
 _SQLITE_SUFFIXES = (
     (LocalStateKind.DATABASE, ""),
     (LocalStateKind.DATABASE_WAL, "-wal"),
     (LocalStateKind.DATABASE_SHM, "-shm"),
     (LocalStateKind.DATABASE_JOURNAL, "-journal"),
 )
+
+
+class _SQLiteTerminalState(str, Enum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    INVALID = "invalid"
+
+
+@dataclass
+class _SQLiteMemberStage:
+    kind: LocalStateKind
+    leaf: str
+    optional: bool
+    repair_capable: bool
+    initially_present: bool
+    selected_identity: EntryIdentity | None
+    selected_mode: int | None
+    fd: int | None
+    error: LocalStateError | None = None
+
+
+@dataclass
+class _SQLiteMemberTerminal:
+    kind: LocalStateKind
+    leaf: str
+    optional: bool
+    repair_capable: bool
+    state: _SQLiteTerminalState
+    result: PermissionResult | None
+    identity: EntryIdentity | None
+    mode: int | None
+    size: int | None
+    link_count: int | None
+    fd: int | None
+    error: LocalStateError | None = None
+
+
+@dataclass
+class _SQLiteFamilyStage:
+    parent_fd: int
+    members: tuple[_SQLiteMemberStage, ...]
+
+
+@dataclass(frozen=True)
+class _SQLiteFamilyMemberSnapshot:
+    kind: LocalStateKind
+    state: PermissionState
+    mode: int | None
+    identity: EntryIdentity | None
+    size: int | None
+    link_count: int | None
+
+
+def _sqlite_family_test_phase(phase: str, kind: LocalStateKind) -> None:
+    """No-op deterministic phase seam for filesystem-race tests."""
 
 
 def _sqlite_leaf_names(name: str) -> tuple[tuple[LocalStateKind, str], ...]:
@@ -1422,14 +1854,718 @@ def _sqlite_names(
     return parent, _sqlite_leaf_names(name)
 
 
+
+
+def _open_sqlite_member_stage_at(
+    parent_fd: int,
+    stage: _SQLiteMemberStage,
+    observed: os.stat_result,
+) -> _SQLiteMemberStage:
+    try:
+        validate_owned_regular_stat(observed)
+    except LocalStateError as exc:
+        stage.error = exc
+        return stage
+    selected = entry_identity(observed)
+    stage.initially_present = True
+    stage.selected_identity = selected
+    stage.selected_mode = stat.S_IMODE(observed.st_mode)
+    path_flag = getattr(os, "O_PATH", None)
+    if path_flag is None:
+        stage.error = local_state_error(LocalStateErrorCode.UNSUPPORTED_PLATFORM)
+        return stage
+    access_flags = path_flag
+    flags = access_flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(stage.leaf, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            if stage.optional:
+                return stage
+            stage.error = local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
+            return stage
+        try:
+            current = lstat_at(parent_fd, stage.leaf)
+            if current is None:
+                code = (
+                    LocalStateErrorCode.ENTRY_CHANGED
+                    if not stage.optional
+                    else LocalStateErrorCode.OPERATION_FAILED
+                )
+                stage.error = local_state_error(code)
+            else:
+                validate_owned_regular_stat(current)
+                stage.error = local_state_error(
+                    LocalStateErrorCode.ENTRY_CHANGED
+                    if not identity_matches(selected, current)
+                    else LocalStateErrorCode.OPERATION_FAILED
+                )
+        except LocalStateError as current_error:
+            stage.error = current_error
+        return stage
+    try:
+        current = os.fstat(fd)
+        validate_owned_regular_stat(current)
+        if not identity_matches(selected, current):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    except OSError:
+        os.close(fd)
+        stage.error = local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+        return stage
+    except LocalStateError as exc:
+        os.close(fd)
+        stage.error = exc
+        return stage
+    stage.fd = fd
+    stage.selected_mode = stat.S_IMODE(current.st_mode)
+    try:
+        _sqlite_family_test_phase("captured", stage.kind)
+    except BaseException:
+        os.close(fd)
+        stage.fd = None
+        raise
+    return stage
+
+
+def _capture_sqlite_member_at(
+    parent_fd: int,
+    leaf: str,
+    kind: LocalStateKind,
+    *,
+    optional: bool,
+    repair_capable: bool,
+) -> _SQLiteMemberStage:
+    stage = _SQLiteMemberStage(
+        kind=kind,
+        leaf=leaf,
+        optional=optional,
+        repair_capable=repair_capable,
+        initially_present=False,
+        selected_identity=None,
+        selected_mode=None,
+        fd=None,
+    )
+    try:
+        observed = lstat_at(parent_fd, leaf)
+    except LocalStateError as exc:
+        stage.error = exc
+        return stage
+    if observed is None:
+        return stage
+    return _open_sqlite_member_stage_at(parent_fd, stage, observed)
+
+
+def _close_sqlite_stages(stages: Iterable[_SQLiteMemberStage]) -> None:
+    for stage in stages:
+        if stage.fd is not None:
+            os.close(stage.fd)
+            stage.fd = None
+
+
+def _stage_sqlite_family_at(
+    parent_fd: int,
+    name: str,
+    *,
+    repair_capable: bool,
+) -> _SQLiteFamilyStage:
+    members: list[_SQLiteMemberStage] = []
+    try:
+        for index, (kind, leaf) in enumerate(_sqlite_leaf_names(name)):
+            members.append(
+                _capture_sqlite_member_at(
+                    parent_fd,
+                    leaf,
+                    kind,
+                    optional=index != 0,
+                    repair_capable=repair_capable,
+                )
+            )
+        return _SQLiteFamilyStage(parent_fd=parent_fd, members=tuple(members))
+    except BaseException:
+        _close_sqlite_stages(members)
+        raise
+
+
+def _sqlite_absent_terminal(stage: _SQLiteMemberStage) -> _SQLiteMemberTerminal:
+    if stage.fd is not None:
+        os.close(stage.fd)
+        stage.fd = None
+    return _SQLiteMemberTerminal(
+        kind=stage.kind,
+        leaf=stage.leaf,
+        optional=stage.optional,
+        repair_capable=stage.repair_capable,
+        state=_SQLiteTerminalState.ABSENT,
+        result=PermissionResult(stage.kind, PermissionState.ABSENT, None),
+        identity=None,
+        mode=None,
+        size=None,
+        link_count=None,
+        fd=None,
+    )
+
+
+def _sqlite_invalid_terminal(
+    stage: _SQLiteMemberStage,
+    error: LocalStateError,
+) -> _SQLiteMemberTerminal:
+    terminal = _SQLiteMemberTerminal(
+        kind=stage.kind,
+        leaf=stage.leaf,
+        optional=stage.optional,
+        state=_SQLiteTerminalState.INVALID,
+        result=None,
+        identity=stage.selected_identity,
+        mode=stage.selected_mode,
+        size=None,
+        repair_capable=stage.repair_capable,
+        link_count=None,
+        fd=stage.fd,
+        error=error,
+    )
+    stage.fd = None
+    return terminal
+
+
+def _terminalize_sqlite_member_at(
+    parent_fd: int,
+    stage: _SQLiteMemberStage,
+    *,
+    require_main: bool,
+) -> _SQLiteMemberTerminal:
+    if stage.error is not None:
+        return _sqlite_invalid_terminal(stage, stage.error)
+    if not stage.initially_present:
+        _sqlite_family_test_phase("appearance_check", stage.kind)
+        try:
+            appeared = lstat_at(parent_fd, stage.leaf)
+        except LocalStateError as exc:
+            return _sqlite_invalid_terminal(stage, exc)
+        if appeared is None:
+            if require_main and not stage.optional:
+                return _sqlite_invalid_terminal(
+                    stage,
+                    local_state_error(LocalStateErrorCode.MISSING_ENTRY),
+                )
+            return _sqlite_absent_terminal(stage)
+        _open_sqlite_member_stage_at(parent_fd, stage, appeared)
+        if stage.error is not None:
+            return _sqlite_invalid_terminal(stage, stage.error)
+    if stage.selected_identity is None:
+        return _sqlite_invalid_terminal(
+            stage,
+            local_state_error(LocalStateErrorCode.ENTRY_CHANGED),
+        )
+    if stage.fd is None:
+        try:
+            current = lstat_at(parent_fd, stage.leaf)
+            if current is None and stage.optional:
+                return _sqlite_absent_terminal(stage)
+            if current is not None:
+                validate_owned_regular_stat(current)
+        except LocalStateError as exc:
+            return _sqlite_invalid_terminal(stage, exc)
+        return _sqlite_invalid_terminal(
+            stage,
+            local_state_error(LocalStateErrorCode.ENTRY_CHANGED),
+        )
+
+    _sqlite_family_test_phase("preflight", stage.kind)
+    try:
+        linked = lstat_at(parent_fd, stage.leaf)
+        if linked is None:
+            if stage.optional:
+                return _sqlite_absent_terminal(stage)
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        validate_owned_regular_stat(linked)
+        if not identity_matches(stage.selected_identity, linked):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        current = os.fstat(stage.fd)
+        validate_owned_regular_stat(current)
+        if not identity_matches(stage.selected_identity, current):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    except OSError:
+        return _sqlite_invalid_terminal(
+            stage,
+            local_state_error(LocalStateErrorCode.OPERATION_FAILED),
+        )
+    except LocalStateError as exc:
+        return _sqlite_invalid_terminal(stage, exc)
+    mode = stat.S_IMODE(current.st_mode)
+    terminal = _SQLiteMemberTerminal(
+        kind=stage.kind,
+        leaf=stage.leaf,
+        optional=stage.optional,
+        repair_capable=stage.repair_capable,
+        state=_SQLiteTerminalState.PRESENT,
+        result=PermissionResult(
+            stage.kind,
+            _mode_state(mode, PRIVATE_FILE_MODE),
+            mode,
+        ),
+        identity=entry_identity(current),
+        mode=mode,
+        size=int(current.st_size),
+        link_count=int(current.st_nlink),
+        fd=stage.fd,
+    )
+    stage.fd = None
+    return terminal
+
+
+def _terminalize_sqlite_family_at(
+    stage: _SQLiteFamilyStage,
+    *,
+    require_main: bool,
+) -> tuple[_SQLiteMemberTerminal, ...]:
+    terminals: list[_SQLiteMemberTerminal] = []
+    try:
+        for member in stage.members:
+            terminals.append(
+                _terminalize_sqlite_member_at(
+                    stage.parent_fd,
+                    member,
+                    require_main=require_main,
+                )
+            )
+        return tuple(terminals)
+    except BaseException:
+        _close_sqlite_terminals(terminals)
+        raise
+
+
+def _raise_invalid_sqlite_terminals(
+    terminals: Iterable[_SQLiteMemberTerminal],
+) -> None:
+    for terminal in terminals:
+        if terminal.state is _SQLiteTerminalState.INVALID:
+            assert terminal.error is not None
+            raise terminal.error
+
+
+def _preflight_sqlite_terminals_at(
+    parent_fd: int,
+    terminals: tuple[_SQLiteMemberTerminal, ...],
+    *,
+    require_main: bool,
+) -> None:
+    _raise_invalid_sqlite_terminals(terminals)
+    if require_main and terminals[0].state is _SQLiteTerminalState.ABSENT:
+        _raise(LocalStateErrorCode.MISSING_ENTRY)
+    for terminal in terminals:
+        _refresh_sqlite_terminal_at(parent_fd, terminal)
+    if require_main and terminals[0].state is _SQLiteTerminalState.ABSENT:
+        _raise(LocalStateErrorCode.MISSING_ENTRY)
+
+
+def _require_expected_sqlite_main_identity(
+    terminals: tuple[_SQLiteMemberTerminal, ...],
+    expected_main_identity: EntryIdentity | None,
+) -> None:
+    """Reject absence or substitution when a caller has pinned the main."""
+
+    if expected_main_identity is None:
+        return
+    main = terminals[0]
+    if (
+        main.state is not _SQLiteTerminalState.PRESENT
+        or main.identity != expected_main_identity
+    ):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+
+
+
+def _set_sqlite_terminal_absent(terminal: _SQLiteMemberTerminal) -> None:
+    if terminal.fd is not None:
+        os.close(terminal.fd)
+        terminal.fd = None
+    terminal.state = _SQLiteTerminalState.ABSENT
+    terminal.result = PermissionResult(terminal.kind, PermissionState.ABSENT, None)
+    terminal.identity = None
+    terminal.mode = None
+    terminal.size = None
+    terminal.link_count = None
+    terminal.error = None
+
+
+def _refresh_sqlite_terminal_at(
+    parent_fd: int,
+    terminal: _SQLiteMemberTerminal,
+) -> os.stat_result | None:
+    if terminal.state is not _SQLiteTerminalState.PRESENT:
+        return None
+    assert terminal.identity is not None
+    assert terminal.fd is not None
+    linked = lstat_at(parent_fd, terminal.leaf)
+    if linked is None:
+        if terminal.optional:
+            _set_sqlite_terminal_absent(terminal)
+            return None
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    validate_owned_regular_stat(linked)
+    if not identity_matches(terminal.identity, linked):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    try:
+        current = os.fstat(terminal.fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_regular_stat(current)
+    if not identity_matches(terminal.identity, current):
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    terminal.mode = stat.S_IMODE(current.st_mode)
+    terminal.size = int(current.st_size)
+    terminal.link_count = int(current.st_nlink)
+    if (
+        terminal.result is not None
+        and terminal.result.state
+        in {PermissionState.PRIVATE, PermissionState.REPAIR_REQUIRED}
+    ):
+        terminal.result = PermissionResult(
+            terminal.kind,
+            _mode_state(terminal.mode, PRIVATE_FILE_MODE),
+            terminal.mode,
+        )
+    return current
+
+
+@contextmanager
+def _sqlite_mutation_authority(
+    parent_fd: int,
+    *,
+    retain_parent_shared_lock: bool,
+) -> Iterator[None]:
+    """Serialize SQLite member mutation against retained store parent locks."""
+
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(
+                parent_fd,
+                (
+                    fcntl.LOCK_SH | fcntl.LOCK_NB
+                    if retain_parent_shared_lock
+                    else fcntl.LOCK_UN
+                ),
+            )
+        except (BlockingIOError, OSError):
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+
+def _validate_existing_sqlite_parent_fd(parent_fd: int) -> os.stat_result:
+    """Validate an existing SQLite parent before permission repair."""
+
+    try:
+        current = os.fstat(parent_fd)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    validate_owned_directory_stat(current)
+    if stat.S_IMODE(current.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    return current
+
+
+def prepare_resolved_private_sqlite_parent(
+    path: str | os.PathLike[str],
+    *,
+    retain_parent_shared_lock: bool = False,
+) -> tuple[int, str, PermissionResult]:
+    """Retain a private SQLite parent, serializing only an existing repair."""
+
+    require_posix_support()
+    parent, _leaf = _path_parts(path)
+    if os.fspath(parent) in {".", os.sep}:
+        _raise(LocalStateErrorCode.INVALID_ENTRY_NAME)
+    try:
+        parent_fd, leaf = open_resolved_parent(path)
+    except LocalStateError as exc:
+        if exc.code is not LocalStateErrorCode.MISSING_ENTRY:
+            raise
+        parent_fd, leaf, result = prepare_resolved_private_parent(path)
+        try:
+            if retain_parent_shared_lock:
+                try:
+                    fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    _raise(LocalStateErrorCode.OPERATION_FAILED)
+            return parent_fd, leaf, result
+        except Exception:
+            os.close(parent_fd)
+            raise
+
+    try:
+        current = _validate_existing_sqlite_parent_fd(parent_fd)
+        mode = stat.S_IMODE(current.st_mode)
+        result = PermissionResult(
+            LocalStateKind.STATE_DIRECTORY,
+            PermissionState.PRIVATE,
+            mode,
+        )
+        shared_lock_held = False
+        if mode & ~PRIVATE_DIRECTORY_MODE:
+            with _sqlite_mutation_authority(
+                parent_fd,
+                retain_parent_shared_lock=retain_parent_shared_lock,
+            ):
+                result = repair_private_directory_at(parent_fd)
+            shared_lock_held = retain_parent_shared_lock
+
+        current = _validate_existing_sqlite_parent_fd(parent_fd)
+        if stat.S_IMODE(current.st_mode) & ~PRIVATE_DIRECTORY_MODE:
+            _raise(LocalStateErrorCode.INSECURE_MODE)
+        if retain_parent_shared_lock and not shared_lock_held:
+            try:
+                fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                _raise(LocalStateErrorCode.OPERATION_FAILED)
+        return parent_fd, leaf, result
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _sqlite_terminal_requires_narrowing(terminal: _SQLiteMemberTerminal) -> bool:
+    return (
+        terminal.state is _SQLiteTerminalState.PRESENT
+        and terminal.result is not None
+        and terminal.result.state is PermissionState.REPAIR_REQUIRED
+    )
+
+def _accept_optional_sqlite_terminal_retirement_at(
+    parent_fd: int,
+    terminal: _SQLiteMemberTerminal,
+) -> bool:
+    """Terminalize an optional member only after its pathname is absent."""
+
+    if not terminal.optional or lstat_at(parent_fd, terminal.leaf) is not None:
+        return False
+    _set_sqlite_terminal_absent(terminal)
+    return True
+
+
+
+
+def _narrow_sqlite_terminal_at(
+    parent_fd: int,
+    terminal: _SQLiteMemberTerminal,
+) -> None:
+    """Narrow one staged member through a short-lived ordinary descriptor."""
+
+    assert terminal.identity is not None
+    assert terminal.mode is not None
+    expected_mode = terminal.mode
+    current = _refresh_sqlite_terminal_at(parent_fd, terminal)
+    if current is None:
+        return
+    if terminal.mode != expected_mode:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    desired = expected_mode & PRIVATE_FILE_MODE
+    _sqlite_family_test_phase("narrow_before_open", terminal.kind)
+    fd = -1
+    try:
+        try:
+            fd = os.open(
+                terminal.leaf,
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            if _accept_optional_sqlite_terminal_retirement_at(parent_fd, terminal):
+                return
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        except OSError:
+            _raise(LocalStateErrorCode.OPERATION_FAILED)
+        opened = os.fstat(fd)
+        validate_owned_regular_stat(opened)
+        if (
+            not identity_matches(terminal.identity, opened)
+            or stat.S_IMODE(opened.st_mode) != expected_mode
+        ):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        _sqlite_family_test_phase("narrow_before_pre_fchmod_verify", terminal.kind)
+        try:
+            linked = verify_entry_identity(
+                parent_fd,
+                terminal.leaf,
+                terminal.identity,
+                expected_type=EntryType.REGULAR_FILE,
+            )
+        except LocalStateError:
+            if _accept_optional_sqlite_terminal_retirement_at(parent_fd, terminal):
+                return
+            raise
+        if stat.S_IMODE(linked.st_mode) != expected_mode:
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        os.fchmod(fd, desired)
+        opened = os.fstat(fd)
+        validate_owned_regular_stat(opened)
+        if (
+            not identity_matches(terminal.identity, opened)
+            or stat.S_IMODE(opened.st_mode) != desired
+        ):
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        _sqlite_family_test_phase("narrow_before_post_fchmod_verify", terminal.kind)
+        try:
+            linked = verify_entry_identity(
+                parent_fd,
+                terminal.leaf,
+                terminal.identity,
+                expected_type=EntryType.REGULAR_FILE,
+            )
+        except LocalStateError:
+            if _accept_optional_sqlite_terminal_retirement_at(parent_fd, terminal):
+                return
+            raise
+        if stat.S_IMODE(linked.st_mode) != desired:
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+    except OSError:
+        _raise(LocalStateErrorCode.OPERATION_FAILED)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _repair_sqlite_terminals_at(
+    parent_fd: int,
+    terminals: tuple[_SQLiteMemberTerminal, ...],
+) -> tuple[PermissionResult, ...]:
+    _raise_invalid_sqlite_terminals(terminals)
+    changed = False
+    for terminal in terminals:
+        assert terminal.result is not None
+        assert terminal.mode is not None or terminal.state is not _SQLiteTerminalState.PRESENT
+        expected_mode = terminal.mode
+        repaired = _sqlite_terminal_requires_narrowing(terminal)
+        current = _refresh_sqlite_terminal_at(parent_fd, terminal)
+        if current is None:
+            continue
+        assert expected_mode is not None
+        if terminal.mode != expected_mode:
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        if repaired:
+            _narrow_sqlite_terminal_at(parent_fd, terminal)
+            changed = True
+        current = _refresh_sqlite_terminal_at(parent_fd, terminal)
+        if current is None:
+            continue
+        final_mode = stat.S_IMODE(current.st_mode)
+        expected_final_mode = (
+            expected_mode & PRIVATE_FILE_MODE if repaired else expected_mode
+        )
+        if final_mode != expected_final_mode:
+            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+        terminal.result = PermissionResult(
+            terminal.kind,
+            PermissionState.REPAIRED if repaired else PermissionState.PRIVATE,
+            final_mode,
+        )
+    if changed:
+        _sync_directory(parent_fd)
+    return tuple(
+        terminal.result
+        for terminal in terminals
+        if terminal.result is not None
+    )
+
+
+def _repair_sqlite_terminals_with_authority_at(
+    parent_fd: int,
+    terminals: tuple[_SQLiteMemberTerminal, ...],
+    *,
+    retain_parent_shared_lock: bool = False,
+) -> tuple[PermissionResult, ...]:
+    """Acquire exclusive authority only when a terminal requires fchmod."""
+
+    _raise_invalid_sqlite_terminals(terminals)
+    if not any(_sqlite_terminal_requires_narrowing(terminal) for terminal in terminals):
+        return _repair_sqlite_terminals_at(parent_fd, terminals)
+    with _sqlite_mutation_authority(
+        parent_fd,
+        retain_parent_shared_lock=retain_parent_shared_lock,
+    ):
+        _preflight_sqlite_terminals_at(
+            parent_fd,
+            terminals,
+            require_main=False,
+        )
+        return _repair_sqlite_terminals_at(parent_fd, terminals)
+
+
+def _snapshot_sqlite_terminals(
+    terminals: tuple[_SQLiteMemberTerminal, ...],
+) -> tuple[_SQLiteFamilyMemberSnapshot, ...]:
+    _raise_invalid_sqlite_terminals(terminals)
+    snapshots: list[_SQLiteFamilyMemberSnapshot] = []
+    for terminal in terminals:
+        assert terminal.result is not None
+        snapshots.append(
+            _SQLiteFamilyMemberSnapshot(
+                kind=terminal.kind,
+                state=terminal.result.state,
+                mode=terminal.mode,
+                identity=terminal.identity,
+                size=terminal.size,
+                link_count=terminal.link_count,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _close_sqlite_terminals(
+    terminals: Iterable[_SQLiteMemberTerminal],
+) -> None:
+    for terminal in terminals:
+        if terminal.fd is not None:
+            os.close(terminal.fd)
+            terminal.fd = None
+
+
+def _snapshot_sqlite_family_at(
+    parent_fd: int,
+    name: str,
+    *,
+    require_main: bool,
+) -> tuple[_SQLiteFamilyMemberSnapshot, ...]:
+    stage = _stage_sqlite_family_at(
+        parent_fd,
+        name,
+        repair_capable=False,
+    )
+    terminals: tuple[_SQLiteMemberTerminal, ...] = ()
+    try:
+        terminals = _terminalize_sqlite_family_at(
+            stage,
+            require_main=require_main,
+        )
+        _preflight_sqlite_terminals_at(
+            parent_fd,
+            terminals,
+            require_main=require_main,
+        )
+        return _snapshot_sqlite_terminals(terminals)
+    finally:
+        _close_sqlite_terminals(terminals)
+        _close_sqlite_stages(stage.members)
+
+
 def inspect_sqlite_family_at(
     parent_fd: int, name: str
 ) -> tuple[PermissionResult, ...]:
     """Inspect a SQLite family relative to a caller-owned resolved parent."""
 
     return tuple(
-        inspect_private_file_at(parent_fd, member, kind=kind)
-        for kind, member in _sqlite_leaf_names(name)
+        PermissionResult(member.kind, member.state, member.mode)
+        for member in _snapshot_sqlite_family_at(
+            parent_fd,
+            name,
+            require_main=False,
+        )
     )
 
 
@@ -1456,23 +2592,23 @@ def repair_sqlite_family_at(
 ) -> tuple[PermissionResult, ...]:
     """Validate then narrow a SQLite family below a resolved parent fd."""
 
-    names = _sqlite_leaf_names(name)
-    inspected = tuple(
-        inspect_private_file_at(parent_fd, member, kind=kind)
-        for kind, member in names
+    stage = _stage_sqlite_family_at(
+        parent_fd,
+        name,
+        repair_capable=True,
     )
-    results: list[PermissionResult] = []
-    repaired = False
-    for (kind, member), result in zip(names, inspected):
-        if result.state is PermissionState.ABSENT:
-            results.append(result)
-            continue
-        changed = repair_private_file_at(parent_fd, member, kind=kind)
-        repaired = repaired or changed.state is PermissionState.REPAIRED
-        results.append(changed)
-    if repaired:
-        _sync_directory(parent_fd)
-    return tuple(results)
+    terminals: tuple[_SQLiteMemberTerminal, ...] = ()
+    try:
+        terminals = _terminalize_sqlite_family_at(stage, require_main=False)
+        _preflight_sqlite_terminals_at(
+            parent_fd,
+            terminals,
+            require_main=False,
+        )
+        return _repair_sqlite_terminals_with_authority_at(parent_fd, terminals)
+    finally:
+        _close_sqlite_terminals(terminals)
+        _close_sqlite_stages(stage.members)
 
 
 def repair_sqlite_family(
@@ -1489,46 +2625,196 @@ def repair_sqlite_family(
         os.close(parent_fd)
 
 
-def prepare_sqlite_family_at(
-    parent_fd: int, name: str
-) -> tuple[PermissionResult, ...]:
-    """Create and repair a SQLite family below a resolved private parent fd."""
+def _cleanup_created_sqlite_main_at(
+    parent_fd: int,
+    leaf: str,
+    created_identity: EntryIdentity,
+) -> None:
+    """Remove a failed newly-created main only while its original link remains."""
 
-    names = _sqlite_leaf_names(name)
-    fd = -1
     try:
-        inspected = tuple(
-            inspect_private_file_at(parent_fd, member, kind=kind)
-            for kind, member in names
+        current = lstat_at(parent_fd, leaf)
+        if current is None or not identity_matches(created_identity, current):
+            return
+        unlink_verified_entry(
+            parent_fd,
+            leaf,
+            created_identity,
+            expected_type=EntryType.REGULAR_FILE,
         )
-        results: list[PermissionResult] = []
-        main_kind, main_name = names[0]
-        if inspected[0].state is PermissionState.ABSENT:
-            try:
-                fd = create_private_file_at(parent_fd, main_name)
-            except LocalStateError as exc:
-                if exc.code is not LocalStateErrorCode.ENTRY_EXISTS:
-                    raise
-            else:
-                os.fsync(fd)
-                results.append(
-                    PermissionResult(main_kind, PermissionState.CREATED, PRIVATE_FILE_MODE)
-                )
-        if not results:
-            results.append(repair_private_file_at(parent_fd, main_name, kind=main_kind))
-        elif fd < 0:
-            results[0] = repair_private_file_at(parent_fd, main_name, kind=main_kind)
+    except (LocalStateError, OSError):
+        pass
 
-        for (kind, member), result in zip(names[1:], inspected[1:]):
-            if result.state is PermissionState.ABSENT:
-                results.append(result)
-            else:
-                results.append(repair_private_file_at(parent_fd, member, kind=kind))
-        _sync_directory(parent_fd)
-        return tuple(results)
+
+def prepare_sqlite_family_at(
+    parent_fd: int,
+    name: str,
+    *,
+    retain_parent_shared_lock: bool = False,
+    _parent_exclusive_lock_held: bool = False,
+    _expected_main_identity: EntryIdentity | None = None,
+) -> tuple[PermissionResult, ...]:
+    """Create or narrow a SQLite family under one bounded mutation phase."""
+
+    stage = _stage_sqlite_family_at(
+        parent_fd,
+        name,
+        repair_capable=True,
+    )
+    terminals: tuple[_SQLiteMemberTerminal, ...] = ()
+    created_main_identity: EntryIdentity | None = None
+    try:
+        terminals = _terminalize_sqlite_family_at(stage, require_main=False)
+        _preflight_sqlite_terminals_at(
+            parent_fd,
+            terminals,
+            require_main=False,
+        )
+        _require_expected_sqlite_main_identity(
+            terminals,
+            _expected_main_identity,
+        )
+        needs_mutation = (
+            terminals[0].state is _SQLiteTerminalState.ABSENT
+            or any(
+                _sqlite_terminal_requires_narrowing(terminal)
+                for terminal in terminals
+            )
+        )
+        if not needs_mutation:
+            _preflight_sqlite_terminals_at(
+                parent_fd,
+                terminals,
+                require_main=True,
+            )
+            return _repair_sqlite_terminals_at(parent_fd, terminals)
+
+        authority = (
+            nullcontext()
+            if _parent_exclusive_lock_held
+            else _sqlite_mutation_authority(
+                parent_fd,
+                retain_parent_shared_lock=retain_parent_shared_lock,
+            )
+        )
+        with authority:
+            _preflight_sqlite_terminals_at(
+                parent_fd,
+                terminals,
+                require_main=False,
+            )
+            _require_expected_sqlite_main_identity(
+                terminals,
+                _expected_main_identity,
+            )
+            if terminals[0].state is _SQLiteTerminalState.ABSENT:
+                main = stage.members[0]
+                fd = -1
+                try:
+                    try:
+                        fd = create_private_file_at(parent_fd, main.leaf)
+                    except LocalStateError as exc:
+                        if exc.code is not LocalStateErrorCode.ENTRY_EXISTS:
+                            raise
+                        selected_main = _capture_sqlite_member_at(
+                            parent_fd,
+                            main.leaf,
+                            main.kind,
+                            optional=False,
+                            repair_capable=True,
+                        )
+                        if (
+                            not selected_main.initially_present
+                            and selected_main.error is None
+                        ):
+                            selected_main.error = local_state_error(
+                                LocalStateErrorCode.ENTRY_CHANGED
+                            )
+                    else:
+                        try:
+                            current = os.fstat(fd)
+                        except OSError:
+                            _raise(LocalStateErrorCode.OPERATION_FAILED)
+                        created_main_identity = entry_identity(current)
+                        validate_owned_regular_stat(current)
+                        try:
+                            os.fsync(fd)
+                        except OSError:
+                            _raise(LocalStateErrorCode.OPERATION_FAILED)
+                        _sqlite_family_test_phase("created", main.kind)
+                        selected_main = _capture_sqlite_member_at(
+                            parent_fd,
+                            main.leaf,
+                            main.kind,
+                            optional=False,
+                            repair_capable=True,
+                        )
+                        if (
+                            selected_main.error is not None
+                            or selected_main.selected_identity != created_main_identity
+                        ):
+                            _close_sqlite_stages((selected_main,))
+                            _raise(LocalStateErrorCode.ENTRY_CHANGED)
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+
+                stage.members = (selected_main, *stage.members[1:])
+                selected_terminal = _terminalize_sqlite_member_at(
+                    parent_fd,
+                    stage.members[0],
+                    require_main=True,
+                )
+                if (
+                    created_main_identity is not None
+                    and selected_terminal.identity != created_main_identity
+                ):
+                    _raise(LocalStateErrorCode.ENTRY_CHANGED)
+                terminals = (selected_terminal, *terminals[1:])
+
+            _preflight_sqlite_terminals_at(
+                parent_fd,
+                terminals,
+                require_main=True,
+            )
+            results = list(_repair_sqlite_terminals_at(parent_fd, terminals))
+            if created_main_identity is not None:
+                if (
+                    terminals[0].state is not _SQLiteTerminalState.PRESENT
+                    or terminals[0].identity != created_main_identity
+                    or terminals[0].mode is None
+                ):
+                    _raise(LocalStateErrorCode.ENTRY_CHANGED)
+                _sync_directory(parent_fd)
+                _sqlite_family_test_phase(
+                    "before_created_result",
+                    LocalStateKind.DATABASE,
+                )
+                final_main = verify_entry_identity(
+                    parent_fd,
+                    terminals[0].leaf,
+                    created_main_identity,
+                    expected_type=EntryType.REGULAR_FILE,
+                )
+                if stat.S_IMODE(final_main.st_mode) != terminals[0].mode:
+                    _raise(LocalStateErrorCode.ENTRY_CHANGED)
+                results[0] = PermissionResult(
+                    LocalStateKind.DATABASE,
+                    PermissionState.CREATED,
+                    terminals[0].mode,
+                )
+            return tuple(results)
+    except BaseException:
+        if created_main_identity is not None:
+            _cleanup_created_sqlite_main_at(
+                parent_fd,
+                stage.members[0].leaf,
+                created_main_identity,
+            )
+        raise
     finally:
-        if fd >= 0:
-            os.close(fd)
+        _close_sqlite_terminals(terminals)
+        _close_sqlite_stages(stage.members)
 
 
 def prepare_sqlite_family(
@@ -1536,7 +2822,9 @@ def prepare_sqlite_family(
 ) -> tuple[PermissionResult, ...]:
     """Securely create the main database and repair every present sidecar."""
 
-    parent_fd, name, _parent_result = prepare_resolved_private_parent(db_path)
+    parent_fd, name, _parent_result = prepare_resolved_private_sqlite_parent(
+        db_path
+    )
     try:
         return prepare_sqlite_family_at(parent_fd, name)
     finally:
@@ -2132,6 +3420,77 @@ def repair_owned_socket(
         os.close(parent_fd)
 
 
+def _audit_permission_result(
+    entries: list[PermissionResult],
+    issues: list[LocalStateIssue],
+    result: PermissionResult,
+) -> None:
+    entries.append(result)
+    if result.state is PermissionState.REPAIR_REQUIRED:
+        issues.append(
+            LocalStateIssue(
+                kind=result.kind,
+                code=LocalStateErrorCode.INSECURE_MODE,
+                remediation=_REMEDIATION[LocalStateErrorCode.INSECURE_MODE],
+            )
+        )
+
+
+def _audit_sqlite_family(
+    entries: list[PermissionResult],
+    issues: list[LocalStateIssue],
+    db_path: str | os.PathLike[str],
+) -> None:
+    names = _sqlite_names(db_path)[1]
+    try:
+        opened = _open_parent(db_path, missing_ok=True)
+    except LocalStateError as exc:
+        issues.append(
+            LocalStateIssue(
+                kind=LocalStateKind.DATABASE,
+                code=exc.code,
+                remediation=_REMEDIATION[exc.code],
+            )
+        )
+        return
+    if opened is None:
+        for kind, _leaf in names:
+            _audit_permission_result(
+                entries,
+                issues,
+                PermissionResult(kind, PermissionState.ABSENT, None),
+            )
+        return
+    parent_fd, name = opened
+    stage: _SQLiteFamilyStage | None = None
+    terminals: tuple[_SQLiteMemberTerminal, ...] = ()
+    try:
+        stage = _stage_sqlite_family_at(
+            parent_fd,
+            name,
+            repair_capable=False,
+        )
+        terminals = _terminalize_sqlite_family_at(stage, require_main=False)
+        for terminal in terminals:
+            if terminal.state is _SQLiteTerminalState.INVALID:
+                assert terminal.error is not None
+                issues.append(
+                    LocalStateIssue(
+                        kind=terminal.kind,
+                        code=terminal.error.code,
+                        remediation=_REMEDIATION[terminal.error.code],
+                    )
+                )
+                continue
+            assert terminal.result is not None
+            _audit_permission_result(entries, issues, terminal.result)
+    finally:
+        _close_sqlite_terminals(terminals)
+        if stage is not None:
+            _close_sqlite_stages(stage.members)
+        os.close(parent_fd)
+
+
 def _audit_one(
     entries: list[PermissionResult],
     issues: list[LocalStateIssue],
@@ -2145,15 +3504,7 @@ def _audit_one(
             LocalStateIssue(kind=kind, code=exc.code, remediation=_REMEDIATION[exc.code])
         )
         return
-    entries.append(result)
-    if result.state is PermissionState.REPAIR_REQUIRED:
-        issues.append(
-            LocalStateIssue(
-                kind=kind,
-                code=LocalStateErrorCode.INSECURE_MODE,
-                remediation=_REMEDIATION[LocalStateErrorCode.INSECURE_MODE],
-            )
-        )
+    _audit_permission_result(entries, issues, result)
 
 
 def inspect_config_state(
@@ -2174,15 +3525,7 @@ def inspect_config_state(
         LocalStateKind.STATE_DIRECTORY,
         lambda: inspect_private_directory(data_dir),
     )
-    for kind, suffix in _SQLITE_SUFFIXES:
-        _audit_one(
-            entries,
-            issues,
-            kind,
-            lambda kind=kind, suffix=suffix: inspect_private_file(
-                Path(f"{os.fspath(db_path)}{suffix}"), kind=kind
-            ),
-        )
+    _audit_sqlite_family(entries, issues, db_path)
     for private_path in private_files:
         _audit_one(
             entries,
@@ -2315,6 +3658,8 @@ def _repair_config_entry(entry: _ConfigRepairEntry) -> PermissionResult:
         expected_type=entry.expected_type,
     )
     mode = stat.S_IMODE(current.st_mode)
+    if mode != entry.inspected.mode:
+        _raise(LocalStateErrorCode.ENTRY_CHANGED)
     desired = mode & entry.maximum_mode
     if desired == mode:
         return PermissionResult(entry.kind, PermissionState.PRIVATE, mode)
@@ -2333,6 +3678,36 @@ def _repair_config_entry(entry: _ConfigRepairEntry) -> PermissionResult:
     )
 
 
+def _finalize_config_repair_entry(
+    entry: _ConfigRepairEntry,
+    previous: PermissionResult,
+) -> PermissionResult:
+    if entry.expected is None:
+        return previous
+    assert entry.parent_fd is not None
+    current = verify_entry_identity(
+        entry.parent_fd,
+        entry.name,
+        entry.expected,
+        expected_type=entry.expected_type,
+    )
+    mode = stat.S_IMODE(current.st_mode)
+    if _mode_state(
+        mode,
+        entry.maximum_mode,
+    ) is PermissionState.REPAIR_REQUIRED:
+        _raise(LocalStateErrorCode.INSECURE_MODE)
+    return PermissionResult(
+        entry.kind,
+        (
+            PermissionState.REPAIRED
+            if previous.state is PermissionState.REPAIRED
+            else PermissionState.PRIVATE
+        ),
+        mode,
+    )
+
+
 def repair_config_state(
     data_dir: str | os.PathLike[str],
     db_path: str | os.PathLike[str] | None,
@@ -2345,9 +3720,13 @@ def repair_config_state(
     must do so separately through the explicit ``prepare_*`` operations.
     """
 
-    entries: list[_ConfigRepairEntry] = []
+    ordinary_entries: list[_ConfigRepairEntry] = []
+    sqlite_parent_fd: int | None = None
+    sqlite_stage: _SQLiteFamilyStage | None = None
+    sqlite_terminals: tuple[_SQLiteMemberTerminal, ...] = ()
+    sqlite_absent: tuple[PermissionResult, ...] = ()
     try:
-        entries.append(
+        ordinary_entries.append(
             _inspect_config_repair_entry(
                 data_dir,
                 kind=LocalStateKind.STATE_DIRECTORY,
@@ -2356,18 +3735,22 @@ def repair_config_state(
             )
         )
         if db_path is not None:
-            sqlite_parent, sqlite_names = _sqlite_names(db_path)
-            for kind, name in sqlite_names:
-                entries.append(
-                    _inspect_config_repair_entry(
-                        sqlite_parent / name,
-                        kind=kind,
-                        expected_type=EntryType.REGULAR_FILE,
-                        maximum_mode=PRIVATE_FILE_MODE,
-                    )
+            sqlite_names = _sqlite_names(db_path)[1]
+            opened = _open_parent(db_path, missing_ok=True)
+            if opened is None:
+                sqlite_absent = tuple(
+                    PermissionResult(kind, PermissionState.ABSENT, None)
+                    for kind, _leaf in sqlite_names
+                )
+            else:
+                sqlite_parent_fd, sqlite_name = opened
+                sqlite_stage = _stage_sqlite_family_at(
+                    sqlite_parent_fd,
+                    sqlite_name,
+                    repair_capable=True,
                 )
         for path in private_files:
-            entries.append(
+            ordinary_entries.append(
                 _inspect_config_repair_entry(
                     path,
                     kind=LocalStateKind.PRIVATE_FILE,
@@ -2376,13 +3759,109 @@ def repair_config_state(
                 )
             )
 
-        for entry in entries:
+        for entry in ordinary_entries:
             _verify_config_repair_entry(entry)
-        repaired = tuple(_repair_config_entry(entry) for entry in entries)
-        for entry in entries:
+        if sqlite_stage is not None:
+            sqlite_terminals = _terminalize_sqlite_family_at(
+                sqlite_stage,
+                require_main=False,
+            )
+        for entry in ordinary_entries:
             _verify_config_repair_entry(entry)
-        return ConfigStateReport(ok=True, entries=repaired, issues=())
+        if sqlite_parent_fd is not None:
+            _preflight_sqlite_terminals_at(
+                sqlite_parent_fd,
+                sqlite_terminals,
+                require_main=False,
+            )
+
+        mutation_required = any(
+            entry.inspected.state is PermissionState.REPAIR_REQUIRED
+            for entry in ordinary_entries
+        ) or any(
+            _sqlite_terminal_requires_narrowing(terminal)
+            for terminal in sqlite_terminals
+        )
+        if sqlite_parent_fd is not None and mutation_required:
+            with _sqlite_mutation_authority(
+                sqlite_parent_fd,
+                retain_parent_shared_lock=False,
+            ):
+                for entry in ordinary_entries:
+                    _verify_config_repair_entry(entry)
+                _preflight_sqlite_terminals_at(
+                    sqlite_parent_fd,
+                    sqlite_terminals,
+                    require_main=False,
+                )
+                sqlite_results = _repair_sqlite_terminals_at(
+                    sqlite_parent_fd,
+                    sqlite_terminals,
+                )
+                ordinary_results = [
+                    _repair_config_entry(entry) for entry in ordinary_entries
+                ]
+        else:
+            if sqlite_parent_fd is not None:
+                sqlite_results = _repair_sqlite_terminals_at(
+                    sqlite_parent_fd,
+                    sqlite_terminals,
+                )
+            else:
+                sqlite_results = sqlite_absent
+            ordinary_results = [
+                _repair_config_entry(entry) for entry in ordinary_entries
+            ]
+
+        for entry in ordinary_entries:
+            _verify_config_repair_entry(entry)
+        ordinary_results = [
+            _finalize_config_repair_entry(entry, previous)
+            for entry, previous in zip(ordinary_entries, ordinary_results)
+        ]
+        if sqlite_parent_fd is not None:
+            for terminal in sqlite_terminals:
+                previous = terminal.result
+                current = _refresh_sqlite_terminal_at(
+                    sqlite_parent_fd,
+                    terminal,
+                )
+                if current is None:
+                    continue
+                assert previous is not None
+                assert terminal.mode is not None
+                if _mode_state(
+                    terminal.mode,
+                    PRIVATE_FILE_MODE,
+                ) is PermissionState.REPAIR_REQUIRED:
+                    _raise(LocalStateErrorCode.INSECURE_MODE)
+                terminal.result = PermissionResult(
+                    terminal.kind,
+                    (
+                        PermissionState.REPAIRED
+                        if previous.state is PermissionState.REPAIRED
+                        else PermissionState.PRIVATE
+                    ),
+                    terminal.mode,
+                )
+            sqlite_results = tuple(
+                terminal.result
+                for terminal in sqlite_terminals
+                if terminal.result is not None
+            )
+
+        repaired = (
+            ordinary_results[0],
+            *sqlite_results,
+            *ordinary_results[1:],
+        )
+        return ConfigStateReport(ok=True, entries=tuple(repaired), issues=())
     finally:
-        for entry in entries:
+        _close_sqlite_terminals(sqlite_terminals)
+        if sqlite_stage is not None:
+            _close_sqlite_stages(sqlite_stage.members)
+        if sqlite_parent_fd is not None:
+            os.close(sqlite_parent_fd)
+        for entry in ordinary_entries:
             if entry.parent_fd is not None:
                 os.close(entry.parent_fd)

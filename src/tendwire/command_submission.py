@@ -38,18 +38,24 @@ from .core.commands import (
 from .core.models import BackendHealth, Snapshot, Worker, WorkerBinding, stable_json_dumps
 from .core.projector import project_from_observations
 from .store.sqlite import (
+    abandon_backend_pending_choice_claim,
     append_event,
+    claim_backend_pending_choice,
     envelope_to_receipt_json,
     find_recent_matching_command_submission,
+    finish_backend_pending_choice_send,
     latest_snapshot,
     list_worker_bindings,
     reserve_command_receipt,
     save_command_receipt,
+    start_backend_pending_choice_send,
     upsert_command_pending_turn,
 )
 
 
 HERDR_BACKEND = "herdr"
+_MUTATING_ACTIONS = frozenset({"send_instruction", "answer_pending"})
+_PENDING_CHANGED_MESSAGE = "pending interaction changed or is no longer answerable"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 _SUBMIT_ENTER_DELAY_SECONDS = 0.2
@@ -577,6 +583,249 @@ def _socket_send_envelope(
     )
 
 
+def _pending_changed_envelope(request: CommandRequest) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_STALE_TARGET,
+        error=error_value(STATUS_STALE_TARGET, _PENDING_CHANGED_MESSAGE),
+    )
+
+
+def _pending_public_result(
+    request: CommandRequest,
+    claim: Any,
+    *,
+    delivery_state: str,
+) -> dict[str, Any]:
+    params = request.params or {}
+    result: dict[str, Any] = {
+        "target": {"worker_id": claim.worker_id},
+        "pending": {
+            "id": params.get("pending_id"),
+            "fingerprint": params.get("pending_fingerprint"),
+        },
+        "choice": {"choice_id": params.get("choice_id")},
+        "delivery_state": delivery_state,
+    }
+    if delivery_state == "submitted":
+        result.update(
+            {
+                "transport_state": "submitted",
+                "observed_pending_state": "pending_observation",
+            }
+        )
+    return result
+
+
+def _pending_claim_has_exact_route(claim: Any) -> bool:
+    return (
+        isinstance(claim.worker_id, str)
+        and bool(claim.worker_id)
+        and isinstance(claim.worker_fingerprint, str)
+        and bool(claim.worker_fingerprint)
+        and isinstance(claim.binding_private_fingerprint, str)
+        and bool(claim.binding_private_fingerprint)
+        and isinstance(claim.turn_target_value, str)
+        and bool(claim.turn_target_value.strip())
+        and not isinstance(claim.picker_ordinal, bool)
+        and isinstance(claim.picker_ordinal, int)
+        and claim.picker_ordinal >= 1
+    )
+
+
+def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
+    if not claim_token:
+        return True
+    if config.db_path is None:
+        return False
+    try:
+        return abandon_backend_pending_choice_claim(
+            config.db_path,
+            config.host_id,
+            claim_token,
+        )
+    except Exception:
+        return False
+
+
+def _pending_claim_release_error(
+    config: Config,
+    request: CommandRequest,
+    claim_token: str | None,
+) -> CommandEnvelope | None:
+    if _abandon_pending_claim(config, claim_token):
+        return None
+    return _backend_uncertain(
+        request,
+        "pending answer claim could not be safely released",
+    )
+
+
+def _close_socket_client(client: Any | None) -> None:
+    if client is None or not hasattr(client, "close"):
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
+def _answer_pending_envelope(
+    config: Config,
+    request: CommandRequest,
+    *,
+    socket_client_factory: SocketClientFactory | None = None,
+) -> CommandEnvelope:
+    if config.db_path is None:
+        return _backend_unavailable(request, "pending state store is unavailable")
+    params = request.params or {}
+    try:
+        claim = claim_backend_pending_choice(
+            config.db_path,
+            config.host_id,
+            str(params.get("pending_id") or ""),
+            str(params.get("pending_fingerprint") or ""),
+            str(params.get("choice_id") or ""),
+            claim=not request.dry_run,
+        )
+    except Exception:
+        if request.dry_run:
+            return _backend_unavailable(request, "pending state store is unavailable")
+        return _backend_uncertain(request, "pending answer claim state is uncertain")
+    expected_claim_status = "validated" if request.dry_run else "claimed"
+    if claim.status != expected_claim_status:
+        return _pending_changed_envelope(request)
+
+    claim_token = claim.claim_token if isinstance(claim.claim_token, str) else None
+    if not request.dry_run and not claim_token:
+        return _pending_changed_envelope(request)
+    if not _pending_claim_has_exact_route(claim):
+        release_error = _pending_claim_release_error(config, request, claim_token)
+        if release_error is not None:
+            return release_error
+        return _pending_changed_envelope(request)
+
+    if request.dry_run:
+        return CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status="dry_run",
+            result=_pending_public_result(request, claim, delivery_state="not_submitted"),
+        )
+
+
+    factory = socket_client_factory or _default_socket_client_factory
+    client: Any | None = None
+    try:
+        client = factory(config)
+        if not hasattr(client, "request"):
+            raise TypeError("socket client does not expose generic request")
+        if hasattr(client, "connect"):
+            client.connect()
+    except Exception:
+        _close_socket_client(client)
+        release_error = _pending_claim_release_error(config, request, claim_token)
+        if release_error is not None:
+            return release_error
+        return _backend_unavailable(request, "Herdr socket could not be reached")
+
+    try:
+        started = start_backend_pending_choice_send(
+            config.db_path,
+            config.host_id,
+            claim_token,
+        )
+    except Exception:
+        _close_socket_client(client)
+        _abandon_pending_claim(config, claim_token)
+        return _backend_uncertain(request, "pending answer start state is uncertain")
+    if (
+        started.status != "started"
+        or started.worker_id != claim.worker_id
+        or started.worker_fingerprint != claim.worker_fingerprint
+        or started.binding_private_fingerprint != claim.binding_private_fingerprint
+        or started.turn_target_value != claim.turn_target_value
+        or started.picker_ordinal != claim.picker_ordinal
+    ):
+        _close_socket_client(client)
+        release_error = _pending_claim_release_error(config, request, claim_token)
+        if release_error is not None:
+            return release_error
+        return _pending_changed_envelope(request)
+
+    pane_id = started.turn_target_value.strip()
+    picker_ordinal = started.picker_ordinal
+    if isinstance(picker_ordinal, bool) or not isinstance(picker_ordinal, int) or picker_ordinal < 1:
+        try:
+            finish_backend_pending_choice_send(
+                config.db_path,
+                config.host_id,
+                claim_token,
+                accepted=False,
+            )
+        except Exception:
+            pass
+        _close_socket_client(client)
+        return _backend_uncertain(
+            request,
+            "pending answer state is uncertain after send start",
+        )
+
+    try:
+        _append_command_event(
+            config,
+            "command.send_started",
+            request,
+            status=STATUS_PENDING,
+            target_worker_id=started.worker_id,
+        )
+        _submit_private_pane_input(
+            client,
+            pane_id,
+            str(picker_ordinal),
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            finish_backend_pending_choice_send(
+                config.db_path,
+                config.host_id,
+                claim_token,
+                accepted=False,
+            )
+        except Exception:
+            pass
+        return _backend_uncertain(
+            request,
+            "Herdr socket pane input state is uncertain after send start",
+        )
+    finally:
+        _close_socket_client(client)
+
+    try:
+        finished = finish_backend_pending_choice_send(
+            config.db_path,
+            config.host_id,
+            claim_token,
+            accepted=True,
+        )
+    except Exception:
+        finished = False
+    if not finished:
+        return _backend_uncertain(
+            request,
+            "pending answer state is uncertain after send completion",
+        )
+
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result=_pending_public_result(request, started, delivery_state="submitted"),
+    )
+
+
 def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) -> CommandEnvelope:
     if receipt.get("payload_fingerprint") != request.payload_fingerprint():
         return CommandEnvelope.error(
@@ -616,7 +865,11 @@ def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) 
 
 
 def _reserve_mutating_request(config: Config, request: CommandRequest) -> CommandEnvelope | None:
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
+    if (
+        request.action not in _MUTATING_ACTIONS
+        or request.dry_run
+        or not has_nonblank_request_id(request.request_id)
+    ):
         return None
     if config.db_path is None:
         return _backend_unavailable(request, "command receipt store is unavailable")
@@ -639,7 +892,10 @@ def _reserve_mutating_request(config: Config, request: CommandRequest) -> Comman
         request_json=_request_json(request),
     )
     if reservation["reserved"]:
-        _append_command_event(config, "command.reserved", request, status=STATUS_PENDING)
+        try:
+            _append_command_event(config, "command.reserved", request, status=STATUS_PENDING)
+        except Exception:
+            pass
         return None
 
     envelope = _envelope_from_receipt(request, reservation["receipt"])
@@ -648,7 +904,10 @@ def _reserve_mutating_request(config: Config, request: CommandRequest) -> Comman
         event_type = "command.duplicate"
     elif envelope.status == STATUS_REQUEST_STATE_UNCERTAIN:
         event_type = "command.uncertain"
-    _append_command_event(config, event_type, request, status=envelope.status, envelope=envelope)
+    try:
+        _append_command_event(config, event_type, request, status=envelope.status, envelope=envelope)
+    except Exception:
+        pass
     return envelope
 
 
@@ -659,7 +918,11 @@ def _save_mutating_result(
     *,
     worker: Worker | None = None,
 ) -> None:
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
+    if (
+        request.action not in _MUTATING_ACTIONS
+        or request.dry_run
+        or not has_nonblank_request_id(request.request_id)
+    ):
         return
     if config.db_path is None:
         return
@@ -673,7 +936,7 @@ def _save_mutating_result(
         result_json=envelope_to_receipt_json(envelope),
         uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
     )
-    if envelope.status == STATUS_ACCEPTED and worker is not None:
+    if request.action == "send_instruction" and envelope.status == STATUS_ACCEPTED and worker is not None:
         upsert_command_pending_turn(
             config.db_path,
             config.host_id,
@@ -725,8 +988,20 @@ def submit_command(
     if validation_error is not None:
         return CommandEnvelope.error(request, validation_error)
 
-    if request.action != "send_instruction" or request.dry_run:
+    if request.action not in _MUTATING_ACTIONS:
         return _execute_non_mutating(config, request)
+    if request.dry_run:
+        if request.action == "send_instruction":
+            return _execute_non_mutating(config, request)
+        snapshot = _current_snapshot(config)
+        envelope = _backend_health_error(config, request, snapshot)
+        if envelope is not None:
+            return envelope
+        return _answer_pending_envelope(
+            config,
+            request,
+            socket_client_factory=socket_client_factory,
+        )
 
     receipt_envelope = _reserve_mutating_request(config, request)
     if receipt_envelope is not None:
@@ -735,7 +1010,13 @@ def submit_command(
     snapshot = _current_snapshot(config)
     envelope = _backend_health_error(config, request, snapshot)
     resolved_worker: Worker | None = None
-    if envelope is None:
+    if envelope is None and request.action == "answer_pending":
+        envelope = _answer_pending_envelope(
+            config,
+            request,
+            socket_client_factory=socket_client_factory,
+        )
+    elif envelope is None:
         bindings = []
         if config.db_path is not None:
             bindings = list_worker_bindings(config.db_path, config.host_id, backend=HERDR_BACKEND)

@@ -30,6 +30,8 @@ from tendwire.store.sqlite import (
     init_store,
     latest_snapshot,
     list_worker_bindings,
+    merge_backend_pending,
+    pending_payload_from_store,
     merge_turn_content,
     save_snapshot,
     turns_payload_from_store,
@@ -173,7 +175,7 @@ def test_cli_socket_group_option_is_daemon_only_and_normalized(monkeypatch) -> N
     assert captured[0].socket_group == "daemon-clients"
 
 
-def test_cli_turns_json_no_herdr_prints_public_empty_collection(capsys) -> None:
+def test_cli_turns_json_without_cached_store_is_publicly_unavailable(capsys) -> None:
     code = main(
         [
             "--host-id",
@@ -187,15 +189,14 @@ def test_cli_turns_json_no_herdr_prints_public_empty_collection(capsys) -> None:
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
+    assert code == 1
     assert captured.err == ""
-    assert payload["schema_version"] == 1
-    assert payload["host_id"] == "turns-host"
-    assert payload["turns"] == []
-    assert len(payload["content_fingerprint"]) == 24
-    assert payload["backend_health"][0]["name"] == "herdr"
-    assert payload["backend_health"][0]["status"] == "unavailable"
-    assert payload["backend_health"][0]["outcome"] == "missing_binary"
+    assert payload == {
+        "schema_version": 1,
+        "host_id": "turns-host",
+        "ok": False,
+        "status": "store_unavailable",
+    }
 
 
 def test_cli_turns_schema_v2_daemon_request_requires_no_content_fetch(
@@ -259,7 +260,17 @@ def test_cli_turns_schema_v2_daemon_request_requires_no_content_fetch(
     assert payload["schema_version"] == 2
     assert payload["turns"][0]["assistant_final_text"] == "short final"
     assert payload["turns"][0]["content"]["fields"]["assistant_final_text"]["inline"] is True
-    assert calls == [("turn.list", {"schema_version": 2})]
+    assert calls == [
+        (
+            "turn.list",
+            {
+                "schema_version": 2,
+                "limit": 100,
+                "cursor": None,
+                "since": None,
+            },
+        )
+    ]
 
 
 def test_cli_turns_v1_upgrade_required_is_json_and_nonzero(
@@ -273,7 +284,12 @@ def test_cli_turns_v1_upgrade_required_is_json_and_nonzero(
 
         def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
             assert method == "turn.list"
-            assert params == {"schema_version": 1}
+            assert params == {
+                "schema_version": 1,
+                "limit": 100,
+                "cursor": None,
+                "since": None,
+            }
             return {
                 "ok": True,
                 "result": {
@@ -307,6 +323,507 @@ def test_cli_turns_v1_upgrade_required_is_json_and_nonzero(
     assert payload["status"] == "upgrade_required"
     assert payload["required_turn_schema_version"] == 2
     assert payload["error"]["code"] == "upgrade_required"
+
+
+def test_cli_turns_parser_defaults_bounds_and_exclusive_positions() -> None:
+    parser = _build_parser()
+
+    defaults = parser.parse_args(["turns"])
+    assert defaults.limit == 100
+    assert defaults.cursor is None
+    assert defaults.since is None
+
+    bounded = parser.parse_args(["turns", "--limit", "250", "--cursor", "twlist1.page"])
+    assert bounded.limit == 250
+    assert bounded.cursor == "twlist1.page"
+    assert bounded.since is None
+
+    for invalid_limit in ("0", "251", "1.5"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["turns", "--limit", invalid_limit])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["turns", "--cursor", "twlist1.page", "--since", "twsince1.new"]
+        )
+
+
+def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    daemon_calls: list[tuple[str, dict[str, Any]]] = []
+    refresh_calls: list[dict[str, Any]] = []
+    store_calls: list[tuple[Any, ...]] = []
+
+    class UnavailableClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            daemon_calls.append((method, dict(params or {})))
+            raise DaemonUnavailable("not listening", request_started=False)
+
+    def refresh(_config: Config, **kwargs: Any) -> dict[str, Any]:
+        refresh_calls.append(kwargs)
+        return {"ok": True, "status": "ok", "updated": 1, "attempted": 1}
+
+    def read_page(db_path: Path, host_id: str, **kwargs: Any) -> dict[str, Any]:
+        store_calls.append((db_path, host_id, kwargs))
+        return {
+            "schema_version": 2,
+            "host_id": host_id,
+            "ok": True,
+            "status": "ok",
+            "turns": [{"id": "cached-turn"}],
+            "next_cursor": "twlist1.next",
+            "since": "twsince1.done",
+        }
+
+    def forbidden_snapshot(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("turn fallback must not observe a snapshot")
+
+    db_path = tmp_path / "fallback.db"
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", refresh)
+    monkeypatch.setattr("tendwire.cli.turns_payload_from_store", read_page)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_snapshot)
+
+    code = main(
+        [
+            "--host-id",
+            "fallback-host",
+            "--herdr-timeout",
+            "0.75",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--schema-version",
+            "2",
+            "--limit",
+            "7",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["turns"] == [{"id": "cached-turn"}]
+    assert daemon_calls == [
+        (
+            "turn.list",
+            {"schema_version": 2, "limit": 7, "cursor": None, "since": None},
+        )
+    ]
+    assert refresh_calls == [
+        {
+            "adapter_timeout_seconds": 0.75,
+            "max_workers": 4,
+            "total_timeout_seconds": 1.75,
+        }
+    ]
+    assert store_calls == [
+        (
+            db_path,
+            "fallback-host",
+            {
+                "schema_version": 2,
+                "limit": 7,
+                "cursor": None,
+                "since": None,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("position_flag", "position_value"),
+    [
+        ("--cursor", "twlist1.page"),
+        ("--since", "twsince1.done"),
+    ],
+)
+def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    position_flag: str,
+    position_value: str,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    store_calls: list[dict[str, Any]] = []
+
+    class UnavailableClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, _method: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+            raise DaemonUnavailable("not listening", request_started=False)
+
+    def forbidden_refresh(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("continuation must never refresh")
+
+    def read_page(_db_path: Path, host_id: str, **kwargs: Any) -> dict[str, Any]:
+        store_calls.append(kwargs)
+        return {
+            "schema_version": 2,
+            "host_id": host_id,
+            "ok": True,
+            "status": "ok",
+            "turns": [],
+            "next_cursor": None,
+            "since": "twsince1.next",
+        }
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_refresh)
+    monkeypatch.setattr("tendwire.cli.turns_payload_from_store", read_page)
+
+    code = main(
+        [
+            "--host-id",
+            "continuation-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--schema-version",
+            "2",
+            "--limit",
+            "9",
+            position_flag,
+            position_value,
+            "--db-path",
+            str(tmp_path / "cache.db"),
+        ]
+    )
+    json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert store_calls == [
+        {
+            "schema_version": 2,
+            "limit": 9,
+            "cursor": position_value if position_flag == "--cursor" else None,
+            "since": position_value if position_flag == "--since" else None,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "timeout",
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "daemon_timeout",
+                "error": {
+                    "code": "daemon_timeout",
+                    "message": "Tendwire daemon request timed out",
+                },
+            },
+        ),
+        (
+            "protocol",
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "daemon_protocol_error",
+                "error": {
+                    "code": "daemon_protocol_error",
+                    "message": "Tendwire daemon returned an invalid response",
+                },
+            },
+        ),
+        (
+            "malformed",
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "daemon_protocol_error",
+                "error": {
+                    "code": "daemon_protocol_error",
+                    "message": "Tendwire daemon returned an invalid response",
+                },
+            },
+        ),
+        (
+            "daemon_error",
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "code": "invalid_params",
+                    "message": "invalid parameters",
+                },
+            },
+        ),
+    ],
+)
+def test_cli_turns_reachable_or_ambiguous_failure_never_reads_sources(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    mode: str,
+    expected: dict[str, Any],
+) -> None:
+    from tendwire.daemon_api import DaemonProtocolError, DaemonUnavailable
+
+    calls = 0
+
+    class FailingClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert method == "turn.list"
+            assert params == {
+                "schema_version": 1,
+                "limit": 100,
+                "cursor": None,
+                "since": None,
+            }
+            if mode == "timeout":
+                raise DaemonUnavailable(
+                    "timed out",
+                    timed_out=True,
+                    request_started=True,
+                )
+            if mode == "protocol":
+                raise DaemonProtocolError("invalid frame", request_started=True)
+            if mode == "malformed":
+                return {"ok": True, "result": ["not", "a", "mapping"]}
+            return expected
+
+    def forbidden_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("ambiguous/reachable failures must not read any source")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FailingClient)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_read)
+    monkeypatch.setattr("tendwire.cli.turns_payload_from_store", forbidden_read)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_read)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden_read)
+
+    code = main(
+        [
+            "--host-id",
+            "failure-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--db-path",
+            str(tmp_path / "cache.db"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.err == ""
+    assert json.loads(captured.out) == expected
+    assert calls == 1
+
+
+@pytest.mark.parametrize("status", ["invalid_cursor", "cursor_expired", "since_expired"])
+def test_cli_turns_reachable_invalid_or_expired_page_is_authoritative(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    status: str,
+) -> None:
+    result = {
+        "schema_version": 2,
+        "ok": False,
+        "status": status,
+    }
+
+    class AuthoritativeClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            assert method == "turn.list"
+            assert params == {
+                "schema_version": 2,
+                "limit": 11,
+                "cursor": "twlist1.requested",
+                "since": None,
+            }
+            return {"ok": True, "result": result}
+
+    def forbidden_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("reachable page result must be authoritative")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", AuthoritativeClient)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden_read)
+    monkeypatch.setattr("tendwire.cli.turns_payload_from_store", forbidden_read)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden_read)
+
+    code = main(
+        [
+            "--host-id",
+            "authoritative-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "turns",
+            "--schema-version",
+            "2",
+            "--limit",
+            "11",
+            "--cursor",
+            "twlist1.requested",
+            "--db-path",
+            str(tmp_path / "cache.db"),
+        ]
+    )
+
+    assert code == 1
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_cli_turns_traverses_over_one_mib_across_bounded_daemon_pages(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    socket_path = tmp_path / "paged-turns.sock"
+    snapshot = Snapshot(host_id="paged-host", updated_at="2026-01-01T00:00:00+00:00")
+    canonical_text = {
+        f"turn-{index:03d}": (
+            f"\n# Turn {index:03d}\n"
+            + (f"exact-{index:03d}-αβγ\n" * 650)
+            + "終\n"
+        )
+        for index in range(110)
+    }
+    ordered_ids = list(canonical_text)
+    seen_requests: list[dict[str, Any]] = []
+
+    def get_turns(
+        *,
+        schema_version: int,
+        limit: int,
+        cursor: str | None,
+        since: str | None,
+    ) -> dict[str, Any]:
+        seen_requests.append(
+            {
+                "schema_version": schema_version,
+                "limit": limit,
+                "cursor": cursor,
+                "since": since,
+            }
+        )
+        start = 0 if cursor is None else 55
+        page_ids = ordered_ids[start : start + 55]
+        return {
+            "schema_version": 2,
+            "host_id": "paged-host",
+            "ok": True,
+            "status": "ok",
+            "turns": [
+                {
+                    "id": turn_id,
+                    "assistant_final_text": canonical_text[turn_id],
+                    "content": {
+                        "schema_version": 1,
+                        "content_revision": f"twrev1.{turn_id}",
+                        "known_incomplete": False,
+                        "fields": {
+                            "assistant_final_text": {
+                                "availability": "complete",
+                                "inline": True,
+                                "char_length": len(canonical_text[turn_id]),
+                                "byte_length": len(canonical_text[turn_id].encode("utf-8")),
+                                "page_count": 1,
+                                "first_cursor": None,
+                            }
+                        },
+                    },
+                }
+                for turn_id in page_ids
+            ],
+            "next_cursor": "twlist1.second" if start == 0 else None,
+            "since": "twsince1.complete" if start else None,
+        }
+
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {},
+        get_turns=get_turns,
+    )
+    server = UnixSocketJSONServer(
+        socket_path,
+        api.dispatch,
+        accept_timeout_seconds=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    pages: list[dict[str, Any]] = []
+    encoded_sizes: list[int] = []
+    cursor: str | None = None
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while True:
+            argv = [
+                "--host-id",
+                "paged-host",
+                "--socket-path",
+                str(socket_path),
+                "turns",
+                "--schema-version",
+                "2",
+                "--limit",
+                "55",
+            ]
+            if cursor is not None:
+                argv += ["--cursor", cursor]
+            assert main(argv) == 0
+            captured = capsys.readouterr()
+            assert captured.err == ""
+            encoded = captured.out.encode("utf-8")
+            assert len(encoded) < 1024 * 1024
+            encoded_sizes.append(len(encoded))
+            page = json.loads(captured.out)
+            pages.append(page)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+    finally:
+        server.close()
+        thread.join(timeout=2)
+
+    listed = [turn for page in pages for turn in page["turns"]]
+    assert sum(encoded_sizes) > 1024 * 1024
+    assert [turn["id"] for turn in listed] == ordered_ids
+    assert {
+        turn["id"]: turn["assistant_final_text"] for turn in listed
+    } == canonical_text
+    assert seen_requests == [
+        {
+            "schema_version": 2,
+            "limit": 55,
+            "cursor": None,
+            "since": None,
+        },
+        {
+            "schema_version": 2,
+            "limit": 55,
+            "cursor": "twlist1.second",
+            "since": None,
+        },
+    ]
+    assert not thread.is_alive()
 
 
 def test_cli_turn_content_get_preserves_exact_page_and_params(
@@ -499,7 +1016,10 @@ def test_cli_long_content_pages_match_direct_store_and_daemon(
     turn = listed["turns"][0]
     revision = turn["content"]["content_revision"]
     descriptor = turn["content"]["fields"]["assistant_final_text"]
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", lambda _config: 0)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content",
+        lambda _config, **_kwargs: {"ok": True},
+    )
 
     v1_code = main(
         [
@@ -683,7 +1203,10 @@ def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
             "complete": True,
         },
     ) == 1
-    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", lambda _config: 0)
+    monkeypatch.setattr(
+        "tendwire.cli.refresh_structured_turn_content",
+        lambda _config, **_kwargs: {"ok": True},
+    )
     common = [
         "--host-id",
         "compat-host",
@@ -766,29 +1289,198 @@ def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
     assert content_error["status"] == "content_known_incomplete"
 
 
-def test_cli_pending_json_no_herdr_prints_public_empty_collection(capsys) -> None:
+def test_cli_pending_missing_store_is_fixed_and_never_observes_sources(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("pending fallback must not observe Herdr or source state")
+
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+
     code = main(
         [
             "--host-id",
             "pending-host",
-            "--herdr-bin",
-            "definitely-not-a-real-herdr-binary",
             "pending",
             "--json",
+            "--db-path",
+            str(tmp_path / "missing.db"),
         ]
     )
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
+    assert code == 1
     assert captured.err == ""
-    assert payload["schema_version"] == 1
-    assert payload["host_id"] == "pending-host"
-    assert payload["pending_interactions"] == []
-    assert len(payload["content_fingerprint"]) == 24
-    assert payload["backend_health"][0]["name"] == "herdr"
-    assert payload["backend_health"][0]["status"] == "unavailable"
-    assert payload["backend_health"][0]["outcome"] == "missing_binary"
+    assert payload == {
+        "schema_version": 1,
+        "host_id": "pending-host",
+        "ok": False,
+        "status": "store_unavailable",
+        "pending_interactions": [],
+        "backend_health": [],
+        "pending_health": {
+            "status": "store_unavailable",
+            "counts": {"fresh": 0, "stale": 0, "total": 0},
+        },
+    }
+    _assert_no_public_json_forbidden(payload)
+
+
+@pytest.mark.parametrize("mode", ["success", "error"])
+def test_cli_pending_structured_daemon_result_or_error_is_authoritative(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    mode: str,
+) -> None:
+    success = {
+        "schema_version": 1,
+        "host_id": "authoritative-pending",
+        "pending_interactions": [],
+        "backend_health": [],
+        "pending_health": {
+            "status": "healthy",
+            "counts": {"fresh": 0, "stale": 0, "total": 0},
+        },
+        "content_fingerprint": "a" * 24,
+    }
+    error = {
+        "schema_version": 1,
+        "ok": False,
+        "status": "error",
+        "result": None,
+        "error": {
+            "code": "invalid_params",
+            "message": "invalid pending request",
+        },
+    }
+    calls = 0
+
+    class AuthoritativeClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert method == "pending.list"
+            assert params == {}
+            if mode == "success":
+                return {"ok": True, "result": success}
+            return error
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("authoritative daemon response must not read fallback state")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", AuthoritativeClient)
+    monkeypatch.setattr("tendwire.cli.pending_payload_from_store", forbidden)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+
+    code = main(
+        [
+            "--host-id",
+            "authoritative-pending",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "pending",
+            "--json",
+            "--db-path",
+            str(tmp_path / "cache.db"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert calls == 1
+    assert payload == (success if mode == "success" else error)
+    assert code == (0 if mode == "success" else 1)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [
+        ("timeout", "daemon_timeout"),
+        ("protocol", "daemon_protocol_error"),
+        ("malformed", "daemon_protocol_error"),
+        ("post_send_unavailable", "daemon_protocol_error"),
+    ],
+)
+def test_cli_pending_post_send_failure_never_reads_or_retries(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    mode: str,
+    expected_status: str,
+) -> None:
+    from tendwire.daemon_api import DaemonProtocolError, DaemonUnavailable
+
+    calls = 0
+
+    class FailingClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert method == "pending.list"
+            assert params == {}
+            if mode == "timeout":
+                raise DaemonUnavailable(
+                    "timed out",
+                    timed_out=True,
+                    request_started=True,
+                )
+            if mode == "protocol":
+                raise DaemonProtocolError("invalid frame", request_started=True)
+            if mode == "post_send_unavailable":
+                raise DaemonUnavailable("connection lost", request_started=True)
+            return {"ok": True, "result": ["not", "a", "mapping"]}
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("post-send failure must not read fallback state")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FailingClient)
+    monkeypatch.setattr("tendwire.cli.pending_payload_from_store", forbidden)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+
+    code = main(
+        [
+            "--host-id",
+            "failed-pending",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "pending",
+            "--json",
+            "--db-path",
+            str(tmp_path / "cache.db"),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert calls == 1
+    assert payload == {
+        "schema_version": 1,
+        "ok": False,
+        "status": expected_status,
+        "error": {
+            "code": expected_status,
+            "message": (
+                "Tendwire daemon request timed out"
+                if expected_status == "daemon_timeout"
+                else "Tendwire daemon returned an invalid response"
+            ),
+        },
+    }
 
 
 def test_cli_store_hooks_print_json_only_and_support_dry_run(tmp_path: Path, capsys) -> None:
@@ -871,15 +1563,25 @@ def test_cli_store_hooks_print_json_only_and_support_dry_run(tmp_path: Path, cap
     assert "payload_json" not in json.dumps(tail_payload)
     assert cleanup_payload["dry_run"] is True
     assert cleanup_payload["retention"]["deleted"] == 1
+    assert "last_examined_id" not in json.dumps(cleanup_payload)
     assert event_count == 2
     assert missing_payload["status"] == "store_unavailable"
 
 
-def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeypatch) -> None:
-    def _fake_herdr_state(config):
-        return [
-            Space(id="space-1", name="Space One", status="active"),
-        ], [
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_cli_pending_pre_send_unavailable_uses_durable_overlay_only(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    timed_out: bool,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    db_path = tmp_path / "pending-fallback.db"
+    snapshot = Snapshot(
+        host_id="projection-cli",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[
             Worker(
                 id="worker-1",
                 name="Worker One",
@@ -888,137 +1590,172 @@ def test_cli_turns_and_pending_project_from_snapshot_observation(capsys, monkeyp
                 summary="human approval required before continuing",
                 meta={
                     "needs_human": True,
-                    "safe": "kept",
-                    "pane_id": "pane-private",
-                    "tty": "sentinel-cli-tty",
-                    "pty": "sentinel-cli-pty",
-                    "pid": "sentinel-cli-pid",
-                    "processId": "sentinel-cli-process",
-                    "tmux-session": "sentinel-cli-tmux",
-                    "screenSession": "sentinel-cli-screen",
-                    "window_id": "sentinel-cli-window",
-                    "tabId": "sentinel-cli-tab",
-                    "terminalid": "sentinel-cli-terminal",
-                    "backendTarget": "sentinel-cli-backend",
-                    "session-id": "sentinel-cli-session",
-                    "messageIds": "sentinel-cli-message-ids",
-                    "terminalIds": "sentinel-cli-terminal-ids",
-                    "terminal": "sentinel-cli-terminal-object",
-                    "telegramMessageId": "sentinel-cli-telegram-message",
-                    "routeId": "sentinel-cli-route-id",
-                    "connectorId": "sentinel-cli-connector-id",
-                    "tmuxPaneId": "sentinel-cli-tmux-pane-id",
-                    "screenWindowId": "sentinel-cli-screen-window-id",
-                    "agentSessionId": "sentinel-cli-agent-session-id",
-                    "session": "sentinel-cli-session-object",
-                    "privateFingerprints": "sentinel-cli-private-fingerprints",
-                    "passwords": "sentinel-cli-passwords",
-                    "privateBinding": "sentinel-cli-private-binding",
-                    "authToken": "sentinel-cli-auth",
+                    "pane_id": "sentinel-cli-pane",
                 },
-                backend_target={"kind": "agent_id", "value": "agent-private", "sendable": True},
+                backend_target={
+                    "kind": "agent_id",
+                    "value": "sentinel-cli-target",
+                    "sendable": True,
+                },
             )
-        ]
-
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
-
-    turns_code = main(["--host-id", "projection-cli", "--herdr-bin", "herdr", "turns", "--json"])
-    turns_captured = capsys.readouterr()
-    turns_payload = json.loads(turns_captured.out)
-    pending_code = main(["--host-id", "projection-cli", "--herdr-bin", "herdr", "pending", "--json"])
-    pending_captured = capsys.readouterr()
-    pending_payload = json.loads(pending_captured.out)
-
-    encoded_turns = json.dumps(turns_payload)
-    encoded_pending = json.dumps(pending_payload)
-    assert turns_code == 0
-    assert pending_code == 0
-    assert turns_captured.err == ""
-    assert pending_captured.err == ""
-    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
-    assert turns_payload["turns"][0]["status"] == "waiting"
-    assert turns_payload["turns"][0]["kind"] == "task"
-    assert pending_payload["pending_interactions"][0]["worker_id"] == "worker-1"
-    assert pending_payload["pending_interactions"][0]["kind"] == "approval"
-    assert pending_payload["pending_interactions"][0]["status"] == "open"
-    assert "agent-private" not in encoded_turns
-    assert "pane-private" not in encoded_turns
-    assert "agent-private" not in encoded_pending
-    assert "pane-private" not in encoded_pending
-    assert "sentinel-cli-" not in encoded_turns
-    assert "sentinel-cli-" not in encoded_pending
-    _assert_no_public_json_forbidden(turns_payload)
-    _assert_no_public_json_forbidden(pending_payload)
-
-
-def test_cli_turns_and_pending_json_strip_raw_command_action_material(capsys, monkeypatch) -> None:
-    def _fake_snapshot(config):
-        return Snapshot(
-            host_id=config.host_id,
-            updated_at="2026-01-01T00:00:00+00:00",
-            workers=[
-                Worker(
-                    id="worker-1",
-                    name="Worker One",
-                    status="waiting",
-                    space_id="space-1",
-                    summary="waiting for action",
-                )
-            ],
-            attention=[
-                AttentionSignal(
-                    kind="worker_status",
-                    severity="warning",
-                    status="waiting",
-                    reason="Choose next action",
-                    source="worker:worker-1",
-                    updated_at="2026-01-01T00:00:00+00:00",
-                    suggested_actions=[
-                        SuggestedAction(
-                            command="sentinel-cli-safe-looking-command-alias",
-                            params={
-                                "safe_choice": "kept",
-                                "commandLine": "sentinel-cli-command-line",
-                                "terminal_id": "sentinel-cli-terminal",
-                                "backendTarget": "sentinel-cli-backend",
-                                "session-id": "sentinel-cli-session",
-                                "token": "sentinel-cli-token",
-                                "secret": "sentinel-cli-secret",
-                            },
-                        )
-                    ],
-                    meta={"worker_id": "worker-1", "space_id": "space-1", "needs_human": True},
-                    host_id=config.host_id,
-                )
-            ],
-        )
-
-    monkeypatch.setattr("tendwire.cli._current_public_snapshot", _fake_snapshot)
-
-    turns_code = main(["--host-id", "raw-command-cli", "turns", "--json"])
-    turns_captured = capsys.readouterr()
-    pending_code = main(["--host-id", "raw-command-cli", "pending", "--json"])
-    pending_captured = capsys.readouterr()
-    turns_payload = json.loads(turns_captured.out)
-    pending_payload = json.loads(pending_captured.out)
-    encoded_turns = json.dumps(turns_payload, sort_keys=True)
-    encoded_pending = json.dumps(pending_payload, sort_keys=True)
-
-    assert turns_code == 0
-    assert pending_code == 0
-    assert turns_captured.err == ""
-    assert pending_captured.err == ""
-    assert turns_payload["turns"][0]["worker_id"] == "worker-1"
-    assert pending_payload["pending_interactions"][0]["choices"] == [
+        ],
+        backend_health=[
+            {
+                "name": "herdr",
+                "status": "healthy",
+                "outcome": "healthy_non_empty",
+                "observed_at": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    merge_backend_pending(
+        db_path,
+        snapshot.host_id,
+        "worker-1",
         {
-            "choice_id": pending_payload["pending_interactions"][0]["choices"][0]["choice_id"],
+            "question": "Which durable option?",
+            "kind": "choice",
+            "choices": [
+                {"choice_id": "safe", "label": "Safe"},
+                {
+                    "choice_id": "private",
+                    "label": "sentinel-cli-private",
+                    "value": "sentinel-cli-command",
+                },
+            ],
+            "meta": {"source": "backend", "pane_id": "sentinel-cli-pane"},
+        },
+    )
+    expected = pending_payload_from_store(db_path, snapshot.host_id)
+    calls = 0
+
+    class UnavailableClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert method == "pending.list"
+            assert params == {}
+            raise DaemonUnavailable(
+                "not listening",
+                timed_out=timed_out,
+                request_started=False,
+            )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("durable pending fallback must not observe Herdr")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", UnavailableClient)
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
+    monkeypatch.setattr("tendwire.cli.refresh_structured_turn_content", forbidden)
+
+    code = main(
+        [
+            "--host-id",
+            snapshot.host_id,
+            "--socket-path",
+            str(tmp_path / "missing.sock"),
+            "pending",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert calls == 1
+    assert payload == expected
+    assert payload["pending_interactions"][0]["question"] == "Which durable option?"
+    assert "sentinel-cli" not in json.dumps(payload, sort_keys=True)
+    _assert_no_public_json_forbidden(payload)
+
+
+def test_cli_pending_durable_snapshot_strips_raw_command_action_material(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "raw-command-pending.db"
+    snapshot = Snapshot(
+        host_id="raw-command-cli",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[
+            Worker(
+                id="worker-1",
+                name="Worker One",
+                status="waiting",
+                space_id="space-1",
+                summary="waiting for action",
+            )
+        ],
+        attention=[
+            AttentionSignal(
+                kind="worker_status",
+                severity="warning",
+                status="waiting",
+                reason="Choose next action",
+                source="worker:worker-1",
+                updated_at="2026-01-01T00:00:00+00:00",
+                suggested_actions=[
+                    SuggestedAction(
+                        command="sentinel-cli-safe-looking-command-alias",
+                        params={
+                            "safe_choice": "kept",
+                            "commandLine": "sentinel-cli-command-line",
+                            "terminal_id": "sentinel-cli-terminal",
+                            "backendTarget": "sentinel-cli-backend",
+                            "session-id": "sentinel-cli-session",
+                            "token": "sentinel-cli-token",
+                            "secret": "sentinel-cli-secret",
+                        },
+                    )
+                ],
+                meta={
+                    "worker_id": "worker-1",
+                    "space_id": "space-1",
+                    "needs_human": True,
+                },
+                host_id="raw-command-cli",
+            )
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("pending projection must not observe current state")
+
+    monkeypatch.setattr("tendwire.cli._current_public_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", forbidden)
+
+    code = main(
+        [
+            "--host-id",
+            snapshot.host_id,
+            "pending",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert code == 0
+    assert payload["pending_interactions"][0]["choices"] == [
+        {
+            "choice_id": payload["pending_interactions"][0]["choices"][0]["choice_id"],
             "label": "Action",
         }
     ]
-    assert "sentinel-cli-" not in encoded_turns
-    assert "sentinel-cli-" not in encoded_pending
-    _assert_no_public_json_forbidden(turns_payload)
-    _assert_no_public_json_forbidden(pending_payload)
+    assert "sentinel-cli-" not in encoded
+    _assert_no_public_json_forbidden(payload)
 
 
 def test_cli_snapshot_json_reports_healthy_empty_herdr(capsys, monkeypatch) -> None:
@@ -1378,6 +2115,8 @@ def test_cli_public_json_does_not_emit_connector_private_store_rows(
             "definitely-not-a-real-herdr-binary",
             "pending",
             "--json",
+            "--db-path",
+            str(db_path),
         ]
     )
     pending_captured = capsys.readouterr()
@@ -1423,7 +2162,7 @@ def test_cli_public_json_does_not_emit_connector_private_store_rows(
 
     encoded = json.dumps(payloads, sort_keys=True)
     assert snapshot_code == 0
-    assert turns_code == 0
+    assert turns_code == 1
     assert pending_code == 0
     assert doctor_code == 1
     assert command_code == 0
@@ -1629,3 +2368,415 @@ def test_cli_snapshot_with_live_shaped_herdr_fixtures(capsys, monkeypatch) -> No
     assert payload["backend_health"][0]["counts"] == {"spaces": 1, "workers": 1}
     assert "agent_session" not in json.dumps(payload)
     assert "sess-cli" not in json.dumps(payload)
+
+
+def test_cli_store_compact_parser_requires_exactly_one_mode() -> None:
+    parser = _build_parser()
+    parsed = parser.parse_args(
+        [
+            "store",
+            "compact",
+            "--db-path",
+            "private.db",
+            "--dry-run",
+            "--snapshot-retention-days",
+            "9",
+            "--snapshot-retention-count",
+            "17",
+            "--batch-size",
+            "3",
+        ]
+    )
+
+    assert parsed.store_action == "compact"
+    assert parsed.compact_dry_run is True
+    assert parsed.compact_execute is False
+    assert parsed.snapshot_retention_days == 9
+    assert parsed.snapshot_retention_count == 17
+    assert parsed.snapshot_batch_size == 3
+    with pytest.raises(SystemExit):
+        parser.parse_args(["store", "compact"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["store", "compact", "--dry-run", "--execute"]
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--execute"],
+        ["--execute", "--acknowledge-offline"],
+        ["--execute", "--backup-path", "private-backup.db"],
+        ["--dry-run", "--acknowledge-offline"],
+        ["--dry-run", "--backup-path", "private-backup.db"],
+        ["--dry-run", "--batch-size", "0"],
+    ],
+)
+def test_cli_store_compact_rejects_invalid_authority_as_one_json_object(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+) -> None:
+    db_path = tmp_path / "must-not-be-opened.db"
+
+    code = main(
+        [
+            "store",
+            "compact",
+            "--db-path",
+            str(db_path),
+            *extra,
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["status"] == "invalid_request"
+    assert payload["command"] == "store.compact"
+    assert not db_path.exists()
+
+
+def test_cli_store_compact_dry_run_is_read_only_json_and_skips_generic_repair(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "compact-dry-run.db"
+    init_store(db_path)
+    before = tuple(
+        sorted(
+            (
+                path.name,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in tmp_path.iterdir()
+        )
+    )
+
+    def forbidden_repair(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("compact must not run generic permission repair")
+
+    monkeypatch.setattr("tendwire.cli.repair_config_state", forbidden_repair)
+    code = main(
+        [
+            "store",
+            "compact",
+            "--db-path",
+            str(db_path),
+            "--dry-run",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    after = tuple(
+        sorted(
+            (
+                path.name,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in tmp_path.iterdir()
+        )
+    )
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["status"] == "dry_run"
+    assert payload["ok"] is True
+    assert payload["backup"]["created"] is False
+    assert after == before
+
+
+def test_cli_store_compact_execute_success_is_public_safe_and_retains_backup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db_path = tmp_path / "sentinel-private-store-name.db"
+    backup_path = tmp_path / "sentinel-private-backup-name.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("CREATE TABLE compact_private (value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO compact_private (value) VALUES (?)",
+            ("sentinel-private-payload",),
+        )
+
+    code = main(
+        [
+            "store",
+            "compact",
+            "--db-path",
+            str(db_path),
+            "--execute",
+            "--acknowledge-offline",
+            "--backup-path",
+            str(backup_path),
+            "--snapshot-retention-days",
+            "7",
+            "--snapshot-retention-count",
+            "2",
+            "--batch-size",
+            "1",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert code == 0
+    assert captured.err == ""
+    assert payload["status"] == "completed"
+    assert payload["command"] == "store.compact"
+    assert payload["backup"] == {
+        "required": True,
+        "created": True,
+        "verified": True,
+    }
+    assert backup_path.is_file()
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT value FROM compact_private"
+        ).fetchone()[0] == "sentinel-private-payload"
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    for private_value in (
+        str(db_path),
+        db_path.name,
+        str(backup_path),
+        backup_path.name,
+        "sentinel-private-payload",
+    ):
+        assert private_value not in encoded
+
+
+def test_cli_store_cleanup_passes_snapshot_policy_overrides(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "cleanup-policy.db"
+    init_store(db_path)
+    captured_options: dict[str, Any] = {}
+
+    def capture_maintenance(
+        _db_path: Path,
+        _host_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        captured_options.update(kwargs)
+        return {"schema_version": 1, "ok": True, "status": "ok"}
+
+    monkeypatch.setattr(
+        "tendwire.cli.run_store_maintenance",
+        capture_maintenance,
+    )
+    code = main(
+        [
+            "store",
+            "cleanup",
+            "--db-path",
+            str(db_path),
+            "--dry-run",
+            "--snapshot-retention-days",
+            "11",
+            "--snapshot-retention-count",
+            "23",
+            "--snapshot-batch-size",
+            "5",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out)["ok"] is True
+    assert captured_options["dry_run"] is True
+    assert captured_options["snapshot_retention_days"] == 11
+    assert captured_options["snapshot_retention_count"] == 23
+    assert captured_options["snapshot_batch_size"] == 5
+
+
+def test_cli_store_status_passes_configured_maintenance_policy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "status-policy.db"
+    init_store(db_path)
+    monkeypatch.setenv("TENDWIRE_SNAPSHOT_RETENTION_DAYS", "19")
+    monkeypatch.setenv("TENDWIRE_SNAPSHOT_RETENTION_COUNT", "211")
+    monkeypatch.setenv("TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE", "37")
+    monkeypatch.setenv("TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS", "7200")
+    received: dict[str, Any] = {}
+
+    def capture_status(
+        _db_path: Path,
+        _host_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        received.update(kwargs)
+        return {"schema_version": 1, "ok": True, "status": "ok"}
+
+    monkeypatch.setattr("tendwire.cli.store_status", capture_status)
+    code = main(
+        [
+            "store",
+            "status",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out)["ok"] is True
+    assert received == {
+        "snapshot_retention_days": 19,
+        "snapshot_retention_count": 211,
+        "maintenance_batch_size": 37,
+        "maintenance_cadence_seconds": 7200,
+    }
+
+
+def test_cli_doctor_with_absent_sqlite_sidecars_is_noncreating(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "private-cli-doctor-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "private-cli-doctor-database"
+    init_store(db_path)
+    sidecars = tuple(
+        Path(f"{db_path}{suffix}") for suffix in ("-wal", "-shm", "-journal")
+    )
+    assert all(not os.path.lexists(path) for path in sidecars)
+    before = (
+        tuple(sorted(path.name for path in state_dir.iterdir())),
+        db_path.stat().st_ino,
+        db_path.stat().st_size,
+        db_path.stat().st_mtime_ns,
+    )
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(state_dir))
+    monkeypatch.setenv("TENDWIRE_DB_PATH", str(db_path))
+
+    def forbidden_repair(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("doctor must remain validation-only")
+
+    monkeypatch.setattr("tendwire.cli.repair_config_state", forbidden_repair)
+    code = main(
+        [
+            "--host-id",
+            "doctor-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "doctor",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    database_check = next(
+        check for check in payload["checks"] if check["name"] == "database_permissions"
+    )
+    after = (
+        tuple(sorted(path.name for path in state_dir.iterdir())),
+        db_path.stat().st_ino,
+        db_path.stat().st_size,
+        db_path.stat().st_mtime_ns,
+    )
+
+    assert code == 1
+    assert captured.err == ""
+    assert database_check == {
+        "name": "database_permissions",
+        "ok": True,
+        "outcome": "compliant",
+        "remediation": "No action required.",
+    }
+    assert after == before
+    assert all(not os.path.lexists(path) for path in sidecars)
+
+
+@pytest.mark.parametrize("hostile_member", ["main", "wal"])
+def test_cli_doctor_sqlite_failures_are_one_fixed_path_free_record(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_member: str,
+) -> None:
+    state_dir = tmp_path / "private-cli-hostile-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "private-cli-hostile-database"
+    target = state_dir / "private-cli-hostile-target"
+    private_contents = b"raw-OSError-private-cli-target"
+    target.write_bytes(private_contents)
+    os.chmod(target, 0o600)
+    if hostile_member == "main":
+        hostile_path = db_path
+    else:
+        init_store(db_path)
+        hostile_path = Path(f"{db_path}-wal")
+    hostile_path.symlink_to(target)
+    hostile_inode = str(os.lstat(hostile_path).st_ino)
+    target_before = target.read_bytes()
+    monkeypatch.setenv("TENDWIRE_DATA_DIR", str(state_dir))
+    monkeypatch.setenv("TENDWIRE_DB_PATH", str(db_path))
+
+    def forbidden_repair(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("doctor must not repair hostile SQLite entries")
+
+    monkeypatch.setattr("tendwire.cli.repair_config_state", forbidden_repair)
+    code = main(
+        [
+            "--host-id",
+            "doctor-host",
+            "--herdr-bin",
+            "definitely-not-a-real-herdr-binary",
+            "doctor",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    database_check = [
+        check for check in payload["checks"] if check["name"] == "database_permissions"
+    ]
+
+    assert code == 1
+    assert captured.err == ""
+    assert database_check == [
+        {
+            "name": "database_permissions",
+            "ok": False,
+            "outcome": "unsafe",
+            "remediation": "Move unsafe local state aside and restore from a trusted backup.",
+        }
+    ]
+    assert hostile_path.is_symlink()
+    assert target.read_bytes() == target_before
+    serialized = json.dumps(payload, sort_keys=True)
+    for forbidden in (
+        str(state_dir),
+        str(db_path),
+        db_path.name,
+        str(hostile_path),
+        hostile_path.name,
+        str(target),
+        target.name,
+        private_contents.decode(),
+        hostile_inode,
+        "-wal",
+        "-shm",
+        "-journal",
+        "OSError",
+        "[Errno",
+        '"uid"',
+        '"gid"',
+        '"inode"',
+    ):
+        assert forbidden not in serialized

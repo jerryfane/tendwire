@@ -19,14 +19,21 @@ from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import (
     InteractionChoice,
     PendingInteraction,
+    PendingObservation,
+    PendingObservedChoice,
     Turn,
     TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
+    TURN_LIST_CURSOR_TTL_SECONDS,
+    TURN_LIST_DEFAULT_LIMIT,
+    TURN_LIST_MAX_LIMIT,
     build_turn_content_descriptor,
     build_turn_content_page,
     content_cursor,
     content_revision,
     content_segment_id,
     decode_content_cursor,
+    decode_turn_list_cursor,
+    decode_turn_since_token,
     payload_to_json,
     pending_from_snapshot,
     pending_payload_from_snapshot,
@@ -34,6 +41,8 @@ from tendwire.core.turns import (
     turns_payload_from_snapshot,
     project_turn_content,
     segment_canonical_text,
+    turn_list_cursor,
+    turn_since_token,
 )
 
 
@@ -243,6 +252,74 @@ def test_turn_roundtrip_sanitizes_fields_and_ignores_volatile_timestamps() -> No
     assert changed_summary.fingerprint != turn.fingerprint
     assert Turn.from_json(turn.to_json()).to_dict() == payload
     _assert_no_forbidden_fields(payload)
+
+
+def test_pending_observation_models_explicit_outcomes_and_private_picker_routes() -> None:
+    choice = PendingObservedChoice(
+        choice_id="choice-" + ("a" * 24),
+        label="Approve",
+        picker_ordinal=1,
+    )
+    observation = PendingObservation(
+        kind="open_prompt",
+        question="Continue?",
+        pending_kind="choice",
+        choices=(choice,),
+        revision_digest="private-revision-digest",
+    )
+
+    assert observation.kind == "open_prompt"
+    assert observation.choices == (choice,)
+    assert not hasattr(observation, "to_dict")
+    for kind in (
+        "read_succeeded_no_prompt",
+        "read_succeeded_invalid_prompt",
+        "read_failed",
+        "worker_authoritatively_absent",
+    ):
+        assert PendingObservation(kind=kind).kind == kind
+
+    with pytest.raises(ValueError, match="cannot carry prompt data"):
+        PendingObservation(kind="read_failed", question="must not survive")
+    with pytest.raises(ValueError, match="must be unique"):
+        PendingObservation(
+            kind="open_prompt",
+            question="Continue?",
+            choices=(choice, choice),
+            revision_digest="private-revision-digest",
+        )
+    with pytest.raises(ValueError, match="picker ordinal"):
+        PendingObservedChoice(
+            choice_id="choice-" + ("b" * 24),
+            label="Reject",
+            picker_ordinal=0,
+        )
+
+
+def test_pending_interaction_preserves_only_valid_supplied_revision_bound_id() -> None:
+    supplied_id = "pending-" + ("c" * 24)
+    authoritative = PendingInteraction(
+        id=supplied_id,
+        host_id="pending-id-host",
+        worker_id="worker-1",
+        question="Continue?",
+    )
+    canonical = PendingInteraction(
+        host_id="pending-id-host",
+        worker_id="worker-1",
+        question="Continue?",
+    )
+    invalid = PendingInteraction(
+        id="sentinel-private-tool-decision",
+        host_id="pending-id-host",
+        worker_id="worker-1",
+        question="Continue?",
+    )
+
+    assert authoritative.id == supplied_id
+    assert authoritative.fingerprint == canonical.fingerprint
+    assert invalid.id == canonical.id
+    assert "sentinel-private" not in json.dumps(invalid.to_dict(), sort_keys=True)
 
 
 def test_pending_interaction_roundtrip_sanitizes_choices_and_ignores_timestamps() -> None:
@@ -1593,3 +1670,127 @@ def test_turn_list_v2_adds_content_descriptors_without_changing_v1_default() -> 
     }
     with pytest.raises(ValueError, match="unsupported_turn_schema_version"):
         turns_payload_from_snapshot(snapshot, schema_version=3)
+
+
+def test_turn_list_cursor_round_trip_binds_complete_request_and_expiry() -> None:
+    cursor = turn_list_cursor(
+        "host-public",
+        schema_version=2,
+        limit=37,
+        since_sequence=4,
+        watermark=91,
+        floor_sequence=1,
+        traversal_generation=7,
+        worker_id="worker-public",
+        list_sequence=77,
+        turn_id="turn-public",
+        store_epoch="epoch-public",
+        expires_at=1_900,
+    )
+
+    position = decode_turn_list_cursor(
+        cursor,
+        host_id="host-public",
+        schema_version=2,
+        limit=37,
+        now=1_000,
+    )
+
+    assert cursor.startswith("twlist1.")
+    assert position.schema_version == 2
+    assert position.limit == 37
+    assert position.since_sequence == 4
+    assert position.watermark == 91
+    assert position.floor_sequence == 1
+    assert position.traversal_generation == 7
+    assert position.worker_id == "worker-public"
+    assert position.list_sequence == 77
+    assert position.turn_id == "turn-public"
+    assert position.store_epoch == "epoch-public"
+    assert position.expires_at == 1_900
+    assert TURN_LIST_DEFAULT_LIMIT == 100
+    assert TURN_LIST_MAX_LIMIT == 250
+    assert TURN_LIST_CURSOR_TTL_SECONDS == 900
+
+
+def test_turn_list_cursor_rejects_tamper_cross_binding_and_expiry_distinctly() -> None:
+    cursor = turn_list_cursor(
+        "host-a",
+        schema_version=1,
+        limit=1,
+        since_sequence=0,
+        watermark=2,
+        floor_sequence=1,
+        traversal_generation=1,
+        worker_id="worker-a",
+        list_sequence=2,
+        turn_id="turn-a",
+        store_epoch="epoch-a",
+        expires_at=2_000,
+    )
+    tampered = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
+
+    for candidate, host, schema, limit in (
+        (tampered, "host-a", 1, 1),
+        (cursor, "host-b", 1, 1),
+        (cursor, "host-a", 2, 1),
+        (cursor, "host-a", 1, 2),
+        ("twlist1.!!!!", "host-a", 1, 1),
+        ("twsince1.e30", "host-a", 1, 1),
+    ):
+        with pytest.raises(ValueError, match="invalid_cursor"):
+            decode_turn_list_cursor(
+                candidate,
+                host_id=host,
+                schema_version=schema,
+                limit=limit,
+                now=1_000,
+            )
+    with pytest.raises(ValueError, match="cursor_expired"):
+        decode_turn_list_cursor(
+            cursor,
+            host_id="host-a",
+            schema_version=1,
+            limit=1,
+            now=2_000,
+        )
+
+
+def test_turn_since_token_is_deterministic_strict_and_store_epoch_bound() -> None:
+    token = turn_since_token(
+        "host-a",
+        schema_version=2,
+        watermark=123,
+        store_epoch="epoch-a",
+    )
+    same = turn_since_token(
+        "host-a",
+        schema_version=2,
+        watermark=123,
+        store_epoch="epoch-a",
+    )
+
+    position = decode_turn_since_token(
+        token,
+        host_id="host-a",
+        schema_version=2,
+    )
+
+    assert token == same
+    assert token.startswith("twsince1.")
+    assert position.schema_version == 2
+    assert position.watermark == 123
+    assert position.store_epoch == "epoch-a"
+    for candidate, host, schema in (
+        (token[:-1] + ("A" if token[-1] != "A" else "B"), "host-a", 2),
+        (token, "host-b", 2),
+        (token, "host-a", 1),
+        ("twsince1.!!!!", "host-a", 2),
+        ("twlist1.e30", "host-a", 2),
+    ):
+        with pytest.raises(ValueError, match="invalid_cursor"):
+            decode_turn_since_token(
+                candidate,
+                host_id=host,
+                schema_version=schema,
+            )

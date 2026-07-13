@@ -31,7 +31,9 @@ from .models import (
 
 COMMAND_SCHEMA_VERSION = 1
 
-ALLOWED_ACTIONS = frozenset({"noop", "read_snapshot", "resolve_target", "send_instruction"})
+ALLOWED_ACTIONS = frozenset(
+    {"noop", "read_snapshot", "resolve_target", "send_instruction", "answer_pending"}
+)
 REQUEST_ALLOWED_FIELDS = frozenset(
     {"schema_version", "action", "request_id", "dry_run", "target", "instruction", "params"}
 )
@@ -82,6 +84,9 @@ VALID_STATUSES = frozenset(
 # Neutral target fields permitted in command requests.
 TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
+ANSWER_PENDING_PARAM_FIELDS = frozenset(
+    {"pending_id", "pending_fingerprint", "choice_id"}
+)
 
 # Connector, low-level terminal, routing, and private fields rejected anywhere in a request.
 FORBIDDEN_REQUEST_FIELDS = FORBIDDEN_FIELD_NAMES
@@ -372,6 +377,52 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             return error_value(
                 STATUS_INVALID_REQUEST,
                 "non-dry-run send_instruction requires request_id",
+                details={"field": "request_id"},
+            )
+
+    if request.action == "answer_pending":
+        if request.target is not None:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_pending does not accept a target",
+                details={"field": "target"},
+            )
+        if request.instruction is not None:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_pending does not accept an instruction",
+                details={"field": "instruction"},
+            )
+        if not isinstance(request.params, dict):
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_pending requires params",
+                details={"field": "params"},
+            )
+        actual_fields = set(request.params)
+        if actual_fields != ANSWER_PENDING_PARAM_FIELDS:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_pending params must contain exactly pending_id, pending_fingerprint, and choice_id",
+                details={
+                    "field": "params",
+                    "required": sorted(ANSWER_PENDING_PARAM_FIELDS),
+                    "missing": sorted(ANSWER_PENDING_PARAM_FIELDS - actual_fields),
+                    "disallowed": sorted(actual_fields - ANSWER_PENDING_PARAM_FIELDS),
+                },
+            )
+        for field in sorted(ANSWER_PENDING_PARAM_FIELDS):
+            value = request.params.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return error_value(
+                    STATUS_INVALID_REQUEST,
+                    f"answer_pending requires nonblank params.{field}",
+                    details={"field": f"params.{field}"},
+                )
+        if not request.dry_run and not has_nonblank_request_id(request.request_id):
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "non-dry-run answer_pending requires request_id",
                 details={"field": "request_id"},
             )
 

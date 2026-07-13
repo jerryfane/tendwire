@@ -162,7 +162,13 @@ def _assert_no_forbidden_fields(value: Any, path: str = "$") -> None:
 
 
 def test_allowed_actions_frozen() -> None:
-    assert ALLOWED_ACTIONS == {"noop", "read_snapshot", "resolve_target", "send_instruction"}
+    assert ALLOWED_ACTIONS == {
+        "noop",
+        "read_snapshot",
+        "resolve_target",
+        "send_instruction",
+        "answer_pending",
+    }
 
 
 def test_command_request_defaults_are_dry_run() -> None:
@@ -474,6 +480,129 @@ def test_validate_send_instruction_non_dry_run_requires_nonblank_request_id(requ
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
     assert "request_id" in error["message"]
+
+
+def _answer_pending_request(
+    *,
+    request_id: str | None = "answer-1",
+    dry_run: bool = False,
+    params: Any = None,
+) -> CommandRequest:
+    return CommandRequest(
+        action="answer_pending",
+        request_id=request_id,
+        dry_run=dry_run,
+        params=params
+        if params is not None
+        else {
+            "pending_id": "pending-public",
+            "pending_fingerprint": "pending-revision",
+            "choice_id": "choice-public",
+        },
+    )
+
+
+def test_parse_answer_pending_accepts_exact_opaque_params() -> None:
+    payload = {
+        "schema_version": 1,
+        "action": "answer_pending",
+        "request_id": "answer-1",
+        "dry_run": False,
+        "params": {
+            "pending_id": " opaque pending ",
+            "pending_fingerprint": " opaque revision ",
+            "choice_id": " opaque choice ",
+        },
+    }
+
+    request, parse_error = parse_command_request(json.dumps(payload))
+
+    assert parse_error is None
+    assert request is not None
+    assert validate_request(request) is None
+    assert request.params == payload["params"]
+
+
+@pytest.mark.parametrize(
+    "changes,field",
+    [
+        ({"target": {"worker_id": "w-1"}}, "target"),
+        ({"instruction": {"text": "private"}}, "instruction"),
+        ({"params": None}, "params"),
+        ({"params": {}}, "params"),
+        (
+            {
+                "params": {
+                    "pending_id": "pending-public",
+                    "pending_fingerprint": "pending-revision",
+                    "choice_id": "choice-public",
+                    "extra": "no",
+                }
+            },
+            "params",
+        ),
+        (
+            {
+                "params": {
+                    "pending_id": "",
+                    "pending_fingerprint": "pending-revision",
+                    "choice_id": "choice-public",
+                }
+            },
+            "params.pending_id",
+        ),
+        (
+            {
+                "params": {
+                    "pending_id": "pending-public",
+                    "pending_fingerprint": " \t",
+                    "choice_id": "choice-public",
+                }
+            },
+            "params.pending_fingerprint",
+        ),
+        (
+            {
+                "params": {
+                    "pending_id": "pending-public",
+                    "pending_fingerprint": "pending-revision",
+                    "choice_id": 1,
+                }
+            },
+            "params.choice_id",
+        ),
+    ],
+)
+def test_validate_answer_pending_rejects_non_exact_shape(
+    changes: dict[str, Any],
+    field: str,
+) -> None:
+    request = _answer_pending_request()
+    data = request.to_dict()
+    data.update(changes)
+
+    error = validate_request(CommandRequest.from_dict(data))
+
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert field in str(error)
+
+
+@pytest.mark.parametrize("request_id", [None, "", "   \t"])
+def test_validate_answer_pending_non_dry_run_requires_request_id(
+    request_id: str | None,
+) -> None:
+    error = validate_request(_answer_pending_request(request_id=request_id))
+
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert "request_id" in error["message"]
+
+
+def test_validate_answer_pending_dry_run_does_not_require_request_id() -> None:
+    assert validate_request(
+        _answer_pending_request(request_id=None, dry_run=True)
+    ) is None
 
 
 @pytest.mark.parametrize(

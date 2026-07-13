@@ -288,12 +288,24 @@ tendwire daemon --db-path /path/to/tendwire.db --socket-path /run/tendwire/tendw
 ```
 
 On POSIX systems the daemon serves a local Unix domain socket JSON
-request/response API. Startup loads the normal Tendwire config, initializes the
-SQLite store, performs one authoritative initial reconcile, persists the
-resulting snapshot/projections through the existing store APIs, and then serves
-these public methods: `ping`, `health.get`, `snapshot.get`, `attention.list`,
-`turn.list`, `pending.list`, `command.submit`, `connector.poll`,
-`connector.ack`, `connector.fail`, `connector.defer`, and `connector.reclaim`.
+request/response API. Startup loads the normal Tendwire config,
+initializes/migrates the SQLite store, performs one authoritative initial
+reconcile, persists the resulting snapshot and projections, starts the
+background turn-ingestion scheduler, and requests its initial refresh before
+publishing the socket. The public methods are `ping`, `health.get`,
+`snapshot.get`, `attention.list`, `turn.list`, `turn.content.get`,
+`pending.list`, `command.submit`, `connector.poll`, `connector.ack`,
+`connector.fail`, `connector.defer`, and `connector.reclaim`. Read handlers
+including `health.get`, `snapshot.get`, `attention.list`, `turn.list`, and
+`pending.list` serve persisted/cached projections only; they never wait for a
+private turn adapter.
+
+The socket server has eight request workers and admits at most 32 in-flight
+connections. Excess admissions receive public error `server_busy` with
+`details.retryable=true`; capacity becomes available again as requests finish.
+Request and response frames remain limited to 1 MiB (1,048,576 bytes). An
+oversized request is rejected, and an oversized response is replaced by
+`response_too_large` without making the server unavailable.
 
 POSIX local state is private-only by default. Tendwire enforces mode `0700` on
 its state directory and mode `0600` on its database family and regular private
@@ -314,11 +326,16 @@ service account, assigned to that group, group-traversable, and inaccessible to
 other users (for example, mode `0710`). Never use a shared `/tmp` socket.
 
 Existing CLI commands remain one-shot by default. When `--socket-path` or
-`TENDWIRE_SOCKET_PATH` explicitly points a read-only CLI command at a Tendwire
-daemon, unreachable, stale, or timed-out daemon sockets still fall back to the
-existing one-shot path. The CLI uses short daemon client timeouts for read-only
-methods and a longer timeout for `command.submit`, because a mutating command
-may have to wait for Herdr delivery and receipt handling.
+`TENDWIRE_SOCKET_PATH` selects a daemon, any received daemon result or domain
+error is authoritative. `tendwire turns` performs its single direct-source
+fallback only when the daemon is definitely unavailable before request bytes
+were sent: for an initial page it runs one refresh with the configured turn
+worker bound, per-adapter `TENDWIRE_HERDR_TIMEOUT_SECONDS`, and total bound of
+that timeout plus one second, then reads one store page. `--cursor` and
+`--since` continuations read the store without refreshing. A timeout after
+transmission may mean the daemon started the request, so the CLI returns
+`daemon_timeout` and does not run a second refresh.
+Other invalid daemon exchanges return `daemon_protocol_error`.
 
 Mutating `command --json` requests (`send_instruction` with `dry_run: false`) do
 **not** fall back in explicit daemon/socket mode. A missing/refused daemon
@@ -376,9 +393,101 @@ authoritative; event updates are incremental hints applied on top of that
 snapshot. Idle event-read timeouts are normal and do not mark Herdr failed.
 Disconnects and protocol failures degrade backend health but do not prune
 private worker bindings or pretend Herdr is authoritatively empty. Reconnects
-resubscribe to the same official event set. Daemon start/stop are idempotent and
-bounded: stopping closes the event backend and local Tendwire socket without
-adding connector, UI, source-mode, or raw terminal integration.
+resubscribe to the same official event set.
+
+The daemon owns ongoing turn ingestion. It scans eligible durable Codex, OMP,
+and pane bindings immediately at startup and every two seconds by default.
+Persisted
+`pane.created`, `pane.focused`, `pane.moved`, `pane.closed`, `pane.exited`,
+`pane.agent_detected`, `pane.agent_status_changed`, and
+`pane.output_matched` batches, plus a completed full reconcile, request an
+earlier scan. Bursts coalesce into one pending scan; duplicate queued work
+coalesces, and a signal for a running target requests at most one follow-up
+refresh.
+
+Refreshes are serialized by private binding fingerprint, so one target is
+never read concurrently with itself while distinct targets can use the fixed
+four-worker pool. The scheduler queue is bounded at 64; a full queue records
+aggregate `queue_full` evidence and rotates later scans rather than growing
+without bound. Every adapter read uses `TENDWIRE_HERDR_TIMEOUT_SECONDS`;
+filesystem adapters receive bounded timeout/cancellation cleanup, and each
+result is revalidated against the current binding before commit.
+Adapter failures and timeouts make current ingestion health `degraded` until a
+later successful refresh clears the consecutive-failure state; the aggregate
+`failed` and `timed_out` counters remain cumulative. Binding churn reported as
+`stale_binding` increments `failed` for evidence but does not poison current
+health. Absence of a recent successful refresh becomes `stale`. Cached daemon
+reads remain available while an adapter is blocked or ingestion is degraded.
+
+OMP caching and IPC use a coordinate-only checkpoint: EOF/parse offset,
+observed device/inode/size/mtime/ctime, replay offset, open-turn flag, and
+validated project root. The checkpoint never contains or transports prompt
+IDs, user text, assistant final/stream text, or other turn bodies. An unchanged
+stable stat returns `unchanged` without spawning a child, reading the session,
+or transporting a frame. When the file changes, an open turn is reconstructed
+from its replay coordinate; a completed final compacts to an idle EOF
+checkpoint, and only a later eligible user message opens another turn. Its
+private checkpoint LRU is bounded by both 64 entries and 64 KiB of serialized
+cache-key-plus-checkpoint weight.
+
+Codex bindings accept only exact canonical lowercase, non-nil UUIDs. A rollout
+must have the exact path
+`sessions/YYYY/MM/DD/rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl`, with a valid
+date/time matching its hierarchy; the identifier is never interpolated into a
+glob. Resolution succeeds only for one canonical regular file beneath the
+canonical sessions root after symlink and device/inode checks. Missing, unsafe,
+over-limit, or multiple exact matches are unavailable.
+Every cache hit validates the current sessions-root device/inode; a found result
+also validates the rollout inode. A root identity change immediately clears
+that root's cached path results and complete index.
+
+The complete Codex index is bounded to 100,000 visited filesystem entries,
+32,768 session identities, and 8 MiB retained; its path-result LRU is bounded
+to 256 entries and 256 KiB. Negative results live for 2 seconds. A lookup
+rebuilds the complete index once its snapshot is 60 seconds old. This
+deliberately avoids a 20,000-file walk on each poll, so a duplicate created
+after a successful lookup may remain undiscovered for up to one 60-second
+snapshot interval; the refreshed index makes that identity ambiguous and
+therefore unavailable.
+
+The private Codex parser LRU is bounded to 64 entries and 16 MiB. State commits
+only through valid newline-terminated records, retaining a partial final record
+until its newline arrives. A record is limited to 8 MiB, cold recovery starts
+with 64 KiB and never scans more than 16 MiB or 65,536 records, and one poll
+reads at most 64 MiB. Warm append-only polls read only newly appended bytes and
+an unchanged poll reads zero source bytes. Truncation, rotation, replacement,
+or lost state triggers the same bounded recovery rather than a whole-file
+fallback; malformed/oversized input or failure to find a boundary fails the
+read without advancing the prior checkpoint.
+No Codex session ID, rollout path, file identity/coordinate, parser/cache state,
+or raw record enters public JSON.
+
+OMP reader requests remain capped at 16 KiB. A canonical OMP response has no
+total-size ceiling: its exact ordered payload is streamed in frames of at most
+1 MiB under the same deadline, with manifest, nonce, end-marker, and EOF
+validation, so canonical finals are not truncated by IPC. A Codex parser-state
+request is capped at 12 MiB, and each Codex response remains one frame capped
+at 64 MiB. The parent performs nonblocking framed socket send and receive,
+parsing, and child join
+under one adapter deadline without a helper IPC thread. Timeout cleanup spends
+at most 250 ms on terminate/kill/join attempts and reaps the child under normal
+POSIX scheduling; it does not wait beyond that grace for an OS-uninterruptible
+child.
+Binding scans prune disappeared cache entries and advance a generation when the
+same resolved target's private-fingerprint set changes.
+
+A valid file-reader response yields only a candidate checkpoint. A
+content-bearing candidate is published only after the parent revalidates the
+exact binding and durably applies the turn; a no-content candidate still
+requires exact binding validation. Cancellation, failed apply, stale binding,
+disappeared path, or a changed same-path fingerprint generation cannot advance
+the cache.
+
+Shutdown first stops socket admission, then flushes/detaches event signaling,
+cancels and boundedly drains turn work, and finally stops the event backend.
+Repeated stop requests are safe. A stopped daemon or scheduler is not restarted
+in place: service restart constructs a new instance, whose immediate scan
+reuses durable bindings and preserves already-final turns and connector state.
 
 PR16 adds conservative daemon/runtime tuning knobs for 24/7 and Raspberry Pi
 use. They are available as `Config` constructor arguments and environment
@@ -393,6 +502,12 @@ variables:
 | `max_workers` | `TENDWIRE_MAX_WORKERS` | `512` | integer >= 1 |
 | `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
 | `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
+| `snapshot_retention_days` | `TENDWIRE_SNAPSHOT_RETENTION_DAYS` | `14` | positive integer |
+| `snapshot_retention_count` | `TENDWIRE_SNAPSHOT_RETENTION_COUNT` | `4096` | positive integer; includes each host's latest row |
+| `snapshot_maintenance_batch_size` | `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE` | `100` | integer from 1 through 1000 |
+| `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
+| `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
+| `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set
@@ -405,6 +520,15 @@ snapshot/projections instead of publishing a truncated authoritative snapshot.
 Incremental events that would add workers over the cap are ignored with the
 same public-safe degraded evidence.
 
+Snapshot history defaults are sized for a five-minute observation rhythm:
+$14 \times 24 \times 12 = 4032$ observations, while the 4096-row count
+ceiling (including the latest row) leaves 64 rows of headroom. This is a
+changed-history bound rather than a promise to write on every observation:
+when a new snapshot has the same content fingerprint as the immediately
+preceding snapshot for that host, Tendwire refreshes that row's timestamp and
+canonical payload instead of appending another history row. If the content
+later changes back, it is a new non-adjacent history row.
+
 An active `agent.list` row must resolve to one authoritative `pane.list` owner
 before a healthy source snapshot can replace authenticated worker continuity.
 If both probes succeed but that match is missing, Tendwire reports
@@ -412,15 +536,20 @@ If both probes succeed but that match is missing, Tendwire reports
 bindings. This treats cross-probe lifecycle skew as non-authoritative without
 turning it into a permanent connector quarantine.
 
-`health.get` remains schema-version 1 and now includes public-safe operational
+`health.get` remains schema-version 1 and includes public-safe operational
 fields: daemon status and `started_at`; store status/counts and outbox counts;
 snapshot and last event/snapshot/reconcile timestamps when available; backend
 runtime readiness when the socket backend is active; backend health; and numeric
-`limits` for debounce, reconcile, retention, output excerpt, worker cap, outbox
-attempt cap, and outbox claim TTL. It does not expose daemon socket paths,
-database paths, Herdr binary paths, backend targets, raw Herdr payloads,
-private bindings, private fingerprints, connector private state, tokens,
-argv/env/stdout/stderr, or low-level terminal identifiers.
+`limits` for debounce, reconcile, event retention, output excerpt, worker cap,
+outbox attempt/claim TTL, and snapshot retention age/count/batch/cadence. Its
+`turn_ingestion` object is aggregate-only:
+`status`, `queue`, `active`, `refreshed`, `failed`, `timed_out`, `coalesced`,
+`queue_full`, `last_success`, `last_duration_ms`, `stale_age`, and
+`bounds.{refresh_interval_seconds,max_workers,queue_capacity,adapter_timeout_seconds}`.
+It never identifies which worker or binding failed. Health output does not
+expose daemon socket paths, database paths, Herdr binary paths, backend targets,
+raw Herdr payloads, private bindings or fingerprints, connector private state,
+tokens, argv/env/stdout/stderr, or low-level terminal identifiers.
 
 Optional local persistence uses the stdlib SQLite store and does not change
 stdout:
@@ -536,7 +665,35 @@ targets, socket paths, raw target values, private bindings, session IDs, private
 fingerprints, raw command payloads, argv/env/stdout/stderr, raw terminal
 controls, tokens, or secrets.
 
-### Turn-list schema negotiation and content paging
+### Turn-list paging, stability, and schema negotiation
+
+`turn.list` accepts only `schema_version`, `limit`, `cursor`, and `since`.
+Schema version defaults to 1 and may be 1 or 2. The limit defaults to 100 and
+must be an integer from 1 through 250. `cursor` and `since` are opaque,
+nonempty tokens and are mutually exclusive.
+
+A successful page contains exactly the wrapper fields `schema_version`,
+`host_id`, `updated_at`, `turns`, `backend_health`, `next_cursor`, `has_more`,
+`as_of`, `since`, and `content_fingerprint`. `as_of` and `since` carry the same
+watermark token. Pages are ordered by public worker ID, then immutable
+per-host insertion sequence newest-first, then turn ID. A continuation is
+bound to the original host, schema, limit, optional since position, watermark,
+store generation, and last row. Inserts after that watermark cannot enter the
+traversal, so a first-page result set remains stable while it is paged; use the
+first page's `since` token in a later new request to discover newly inserted
+turns.
+
+Continuation cursors have a fixed 900-second TTL measured from the first page;
+following a cursor does not extend it. Malformed, tampered, or cross-bound
+cursors return `invalid_cursor`; elapsed cursors, removed anchors, retention
+that advances the floor beyond the traversal's original floor, or a changed
+store generation return `cursor_expired`. Since
+tokens have no wall-clock TTL, but a changed store generation or impossible
+watermark returns `since_expired`. These are domain results inside a valid
+daemon success envelope. Unsupported schema and malformed parameters are API
+errors (`unsupported_schema` or `invalid_params`); an unavailable store returns
+`store_unavailable`. Every list page remains below the unchanged 1 MiB response
+frame bound, even when fewer than the requested number of turns fit.
 
 `turns --json --schema-version 2` and daemon `turn.list` with
 `{"schema_version":2}` return the schema-v2 turn-list wrapper. Each turn keeps
@@ -621,21 +778,69 @@ has exactly a deterministic opaque `choice_id` and a user-facing `label`.
 Backend option, tool, or decision identifiers and any values sent to the
 backend stay private.
 
-Turn and pending IDs/fingerprints are computed from sanitized public content and
-exclude volatile observation timestamps. Pending interactions are derived only
-from explicit human-actionable public attention signals or public suggested
-actions; generic waiting or pending worker status alone does not create a
-pending interaction.
+Daemon `pending.list` and the CLI's store fallback use the same durable
+projection. One read transaction captures the latest stored public snapshot
+and the corresponding `backend_pending` rows, so pending derivation never
+mixes snapshots from different moments. Turn ingestion updates each worker's
+backend-provided pending state durably with its refresh. A missing, malformed,
+wrong-host, or otherwise invalid stored snapshot returns `store_unavailable`
+rather than projecting partial state.
+
+Successful reads with an open prompt upsert that prompt; successful reads with
+no prompt retain a fresh non-answerable tombstone so snapshot fallback clears
+for that worker. Authoritative binding removal deletes the worker's row.
+Transient reads retain the last open prompt as `stale` for one fixed,
+non-sliding `TENDWIRE_PENDING_STALE_GRACE_SECONDS` window (30 seconds by
+default); repeated failures do not extend the deadline. At expiry the prompt
+leaves the public overlay, but freshness health remains degraded until a
+successful read or authoritative removal. A successfully read malformed prompt
+leaves the backend overlay immediately, preserving any valid snapshot-derived
+fallback while reporting degraded freshness.
+
+`command.submit` action `answer_pending` accepts exactly the public
+`pending_id`, `pending_fingerprint`, and `choice_id` in `params`; a non-dry-run
+request also requires `request_id`. The store atomically validates the observed
+revision, binding fingerprint, and exact private pane target before returning
+only the private picker ordinal to the send path. A changed, stale,
+disappeared, or already claimed decision fails before pane mutation.
+Once sending starts, an indeterminate failure is reported as request-state
+uncertainty and is never automatically retried. After confirmed submission,
+the exact answered revision and claim atomically become a fresh non-answerable
+tombstone before the accepted result is returned, so an older snapshot fallback
+cannot reappear. A concurrently observed newer revision is never overwritten.
+
+Any daemon response is authoritative. Only definite unavailability before
+request transmission permits the CLI fallback, which reads that durable store
+view without observing Herdr. A timeout after transmission returns the fixed
+`daemon_timeout` error; other ambiguous/invalid exchanges return
+`daemon_protocol_error`. Neither case starts a second request or source read.
+
+Turn IDs/fingerprints are computed from sanitized public content and exclude
+volatile observation timestamps. Backend pending and choice handles also bind
+to a one-way digest of the exact private source binding and pane target, so
+byte-identical prompts observed on a replacement source mint different public
+handles without exposing either private value. Pending interactions are derived
+only from explicit human-actionable public attention signals or public
+suggested actions; generic waiting or pending worker status alone does not
+create a pending interaction.
 
 ## SQLite store
 
-The current store schema is version 7 (`PRAGMA user_version=7`). Migration is
-idempotent and transactional: schema v6 introduced immutable canonical turn
-content revisions and backfilled legacy rows, marking a legacy
-`[truncated]` value `known_incomplete` rather than claiming recovery; schema v7
-adds presentation-plan generations, failed-plan lineage, and an immutable
-recovery audit. It does not reconstruct bytes that were absent from the legacy
-store.
+The current store schema is version 10 (`PRAGMA user_version=10`). Migration is
+idempotent and transactional. Schema v6 introduced immutable canonical turn
+content revisions and backfilled legacy rows, marking a legacy `[truncated]`
+value `known_incomplete` rather than claiming recovery. Schema v7 added
+presentation-plan generations, failed-plan lineage, and an immutable recovery
+audit. Schema v8 added persisted maintenance state and bounded
+snapshot-retention indexes. Schema v9 added an immutable positive
+`list_sequence` for each host/turn, a per-host uniqueness constraint and paging
+index, and a store-generation row used to bind list cursors and since tokens.
+Schema v10 adds explicit pending observation/freshness state, private
+revision-bound choice routing, and durable two-phase answer claims. The
+v9-to-v10 migration preserves legacy public pending rows but leaves them
+unrouted until a fresh binding-scoped observation supplies authoritative
+revision and route data. Migrations do not reconstruct bytes absent from a
+legacy store or rewrite existing canonical turn history.
 
 The optional SQLite store keeps canonical snapshot JSON blobs in the `snapshots`
 table and maintains Tendwire-local operational tables for attention lifecycle,
@@ -654,12 +859,65 @@ for local history and debugging but ignored by command routing.
 
 Every store connection applies a 30-second SQLite `busy_timeout`; file-backed
 databases use WAL journaling, foreign keys are enabled, and synchronous mode is
-`NORMAL`. The current safety stance is a single local Tendwire writer: the
-daemon/socket backend writes projections through the existing store APIs, and
-one-shot CLI persistence writes only when explicitly requested. The store is not
-a multi-service event bus and does not persist raw Herdr event payloads, socket
-paths, terminal streams, argv/env/stdout/stderr, or connector-specific routing
+`NORMAL`. The current safety stance is one local Tendwire service process: its
+bounded turn-ingestion workers can persist distinct targets concurrently
+through the store's transaction APIs, while external Tendwire writers are not a
+supported multi-service event bus. One-shot CLI persistence writes only when
+explicitly requested. The store does not persist raw Herdr event payloads,
+socket paths, terminal streams, argv/env/stdout/stderr, or connector-specific
 state.
+
+### SQLite family lifecycle and race boundary
+
+A file-backed store is one validated family: the main database plus the
+optional `-wal`, `-shm`, and `-journal` members. An absent optional sidecar is
+normal, and a transient optional that disappears while the family is being
+captured is also accepted as absent. Once the main database has been selected,
+however, it is mandatory: disappearance or identity replacement fails closed.
+Every present member must remain an owned regular file at the selected identity.
+A symlink, wrong type, wrong owner, insecure mode on a validation-only path, or
+replacement race is rejected without following, changing, or deleting the
+hostile entry.
+
+Creation, repair, and inspection are separate authorities. Explicit store
+startup/creation uses the SQLite-family prepare operation, which may create only
+the missing main database and may narrow permissions on validated present
+members. Explicit repair narrows validated existing members only. Neither
+operation creates an absent optional sidecar or widens a stricter mode.
+Private-mode preparation and repair cannot disturb active Tendwire SQLite
+transactions, and a no-op private prepare preserves them. Any main creation or
+permission narrowing first requires bounded, nonblocking exclusive authority over
+the store parent directory. Current-schema filesystem reads stay cheap and
+nonmutating after their schema-version read: they take no exclusive parent
+authority and perform no persistent WAL negotiation or schema DDL. An
+uninitialized or migrating filesystem store takes that exclusive authority before
+persistent WAL negotiation or schema DDL, performs that work under private
+creation mode, then revalidates and narrows the resulting main database, `-wal`,
+and `-shm` members before restoring retained shared authority. A live Tendwire
+connection retains shared parent-directory authority, so a conflicting repair
+fails with a typed, path-free error before mutation; that shared authority also
+rejects the schema branch before WAL, DDL, or sidecar mutation. A connection
+obtains shared authority before preparation, promotes the same authority only for
+a necessary mutation, and restores shared authority for the remainder of its lifetime.
+Ordinary reads, `store status`, health collection, and `doctor` are
+validation-only and non-creating: they do not initialize a missing database or
+repair a family. Their finite capture, preflight, and final validation passes do
+not recursively retry sidecar churn; stable transient absence succeeds and an
+unstable identity fails closed.
+
+Private filesystem failures are typed, path-free `LocalStateError` values.
+Public diagnostics and store surfaces map them to fixed aggregate records such
+as the `database_permissions` `unsafe` outcome or `store_unavailable`; they do
+not expose a path, suffix, owner, inode, raw exception, or private content.
+Automatic retention stays batch-bounded and has no compaction authority.
+Compaction remains the separately acknowledged offline operation described
+below, with the selected source identity revalidated before publication.
+
+The synthetic Goal 08B race/recovery evidence is recorded in
+`docs/evidence/goal08b-sqlite-sidecar-race-recovery.md`; its driver and focused
+audit are `scripts/sqlite_sidecar_race_benchmark.py` and
+`tests/test_sqlite_sidecar_race_benchmark.py`. The evidence uses only generated
+private state and an isolated candidate from this source checkout.
 
 Bounded operational store hooks are JSON-only:
 
@@ -667,18 +925,58 @@ Bounded operational store hooks are JSON-only:
 tendwire store status --db-path /path/to/tendwire.db
 tendwire store events-tail --limit 20 --db-path /path/to/tendwire.db
 tendwire store cleanup --dry-run --db-path /path/to/tendwire.db
-tendwire store cleanup --retention-days 14 --max-outbox-attempts 5 --db-path /path/to/tendwire.db
+tendwire store cleanup --retention-days 14 --max-outbox-attempts 5 \
+  --snapshot-retention-days 14 --snapshot-retention-count 4096 \
+  --snapshot-batch-size 100 --db-path /path/to/tendwire.db
+tendwire store compact --dry-run --db-path /path/to/tendwire.db
+tendwire store compact --execute --acknowledge-offline \
+  --backup-path /path/to/tendwire.pre-compact.db \
+  --db-path /path/to/tendwire.db
 ```
 
-`store status` returns host-scoped counts, last event/snapshot timestamps, and
-outbox counts by neutral status. `store events-tail` returns only bounded event
-metadata such as row id, event type, aggregate type, timestamp, and content
-fingerprint; it never returns `payload_json` or raw event payloads. `store
-cleanup` is idempotent and host scoped. Event retention deletes only old rows
-from the `events` history table. It does not delete snapshots, projections,
-command receipts, private worker bindings, active outbox rows, active leases,
-deliveries, or private state. `--dry-run` reports the same counts without
-deleting or updating rows.
+`store status` returns host-scoped table counts, last event/snapshot timestamps,
+and aggregate outbox `pending`, `leased`, `terminal`, and `by_status` counts.
+Its database-wide `maintenance` object reports `last_completed_at`, status,
+snapshot count, the snapshot age/count/batch/cadence policy, and whether a
+retention backlog remains. `store events-tail` returns only bounded event
+metadata such as row ID, event type, aggregate type, timestamp, and content
+fingerprint; it never returns `payload_json` or raw event payloads.
+
+`store cleanup` performs one bounded online batch and reports aggregate
+`retention`, database-wide `snapshots`, `outbox`, and `turn_content` objects.
+The event/outbox/turn-content policy defaults come from the normal configuration.
+The flags shown above override event age, retry count, snapshot age, snapshot
+count, and snapshot batch size for that invocation. Snapshot retention keeps
+the intersection of the configured age window and newest-per-host count window:
+a changed-history row is eligible when it falls outside either window. The
+newest row for every host is always exempt, even when it is old or the count is
+one. Cleanup does not remove current projections, command receipts, private
+worker bindings, live outbox work or leases, or current referenced turn content.
+With `--dry-run`, every maintenance transaction is rolled back; the aggregate
+candidate/action counts are predictions and no store row or maintenance marker
+is changed.
+
+Automatic maintenance is deliberately coarse and bounded. After a stored
+snapshot, the daemon consults one persisted database-wide cadence marker
+(3600 seconds by default); when due, it removes at most one snapshot batch
+(100 rows by default) and reports whether backlog remains. It does not loop
+until the backlog is empty, compact pages, or invoke `VACUUM`. Page reclamation
+is never automatic or part of a request path.
+
+`store compact` is an explicit CLI-only database operation, not a daemon API.
+Dry-run accepts optional `--snapshot-retention-days`,
+`--snapshot-retention-count`, and `--batch-size` overrides, but rejects
+`--acknowledge-offline` and `--backup-path`; it opens the current v9 store
+read-only, runs `PRAGMA quick_check`, estimates eligible snapshots and disk
+headroom, and is strictly non-mutating. Execute requires all writers stopped,
+the literal `--acknowledge-offline` flag, and a new nonexistent private backup
+path. Its result status is one of `completed`, `invalid_request`,
+`store_unavailable`, `schema_not_current`, `permissions_failed`,
+`offline_required`, `integrity_failed`, `insufficient_space`, `backup_failed`,
+`maintenance_failed`, `checkpoint_failed`, `replacement_failed`,
+`rollback_completed`, or `rollback_failed`; dry-run success is `dry_run`.
+These statuses describe verified local outcomes, not exactly-once execution.
+See `INSTALL.md` for the required maintenance and rollback order.
 
 ## Neutral connector outbox boundary
 

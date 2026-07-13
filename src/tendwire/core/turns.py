@@ -11,10 +11,11 @@ import hashlib
 import hmac
 import json
 import re
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from .models import (
     AttentionSignal,
@@ -49,6 +50,9 @@ TURN_TEXT_MAX_CHARS = 12000
 TURN_STREAM_TEXT_MAX_CHARS = 4000
 TURN_CONTENT_PREVIEW_MAX_CHARS = 1000
 TURN_CONTENT_PAGE_MAX_UTF8_BYTES = 48 * 1024
+TURN_LIST_DEFAULT_LIMIT = 100
+TURN_LIST_MAX_LIMIT = 250
+TURN_LIST_CURSOR_TTL_SECONDS = 900
 
 TURN_CONTENT_FIELDS = ("user_text", "assistant_final_text")
 TURN_CONTENT_AVAILABILITIES = frozenset({"absent", "complete", "known_incomplete"})
@@ -488,6 +492,333 @@ def decode_content_cursor(
     if not hmac.compare_digest(integrity, expected):
         raise ValueError("invalid_cursor")
     return ContentCursorPosition(index, segment_id, start_char, start_byte)
+
+
+@dataclass(frozen=True)
+class TurnListCursorPosition:
+    """Validated continuation coordinates for one stable turn-list traversal."""
+
+    schema_version: int
+    limit: int
+    since_sequence: int
+    watermark: int
+    floor_sequence: int
+    traversal_generation: int
+    worker_id: str
+    list_sequence: int
+    turn_id: str
+    store_epoch: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class TurnSincePosition:
+    """Validated durable insertion watermark for a turn-list poll."""
+
+    schema_version: int
+    watermark: int
+    store_epoch: str
+
+
+def _decode_turn_list_token(token: str, prefix: str, status: str) -> dict[str, Any]:
+    if not isinstance(token, str) or not token.startswith(prefix):
+        raise ValueError(status)
+    encoded = token.removeprefix(prefix)
+    if (
+        not encoded
+        or len(encoded) > 2048
+        or any(
+            character
+            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in encoded
+        )
+    ):
+        raise ValueError(status)
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if _base64url(raw) != encoded:
+            raise ValueError("noncanonical token encoding")
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        raise ValueError(status) from None
+    if not isinstance(body, dict):
+        raise ValueError(status)
+    return body
+
+
+def _turn_list_nonnegative_integer(value: Any, status: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(status)
+    return value
+
+
+def turn_list_cursor(
+    host_id: str,
+    *,
+    schema_version: int,
+    limit: int,
+    since_sequence: int,
+    watermark: int,
+    floor_sequence: int,
+    traversal_generation: int,
+    worker_id: str,
+    list_sequence: int,
+    turn_id: str,
+    store_epoch: str,
+    expires_at: int,
+) -> str:
+    """Encode an opaque cursor bound to the complete original list request."""
+    status = "invalid_cursor"
+    host = str(host_id)
+    worker = str(worker_id)
+    turn = str(turn_id)
+    epoch = str(store_epoch)
+    if (
+        not host
+        or not worker
+        or not turn
+        or not epoch
+        or max(map(len, (host, worker, turn, epoch))) > 512
+    ):
+        raise ValueError(status)
+    schema = _turn_list_nonnegative_integer(schema_version, status)
+    page_limit = _turn_list_nonnegative_integer(limit, status)
+    since_value = _turn_list_nonnegative_integer(since_sequence, status)
+    high = _turn_list_nonnegative_integer(watermark, status)
+    floor = _turn_list_nonnegative_integer(floor_sequence, status)
+    generation = _turn_list_nonnegative_integer(traversal_generation, status)
+    sequence = _turn_list_nonnegative_integer(list_sequence, status)
+    expiry = _turn_list_nonnegative_integer(expires_at, status)
+    if (
+        schema not in {1, TURN_LIST_SCHEMA_VERSION}
+        or not 1 <= page_limit <= TURN_LIST_MAX_LIMIT
+        or since_value > high
+        or sequence <= since_value
+        or sequence > high
+        or (high and not 1 <= floor <= high)
+        or generation < 1
+        or not high
+        or not expiry
+    ):
+        raise ValueError(status)
+    material = {
+        "expires_at": expiry,
+        "floor_sequence": floor,
+        "traversal_generation": generation,
+        "host_id": host,
+        "limit": page_limit,
+        "list_sequence": sequence,
+        "schema_version": schema,
+        "since_sequence": since_value,
+        "store_epoch": epoch,
+        "turn_id": turn,
+        "watermark": high,
+        "worker_id": worker,
+    }
+    body = stable_json_dumps(
+        {
+            "e": expiry,
+            "f": floor,
+            "g": generation,
+            "h": _domain_digest(
+                "tendwire.turn-list-cursor-integrity.v1",
+                material,
+            ),
+            "l": page_limit,
+            "p": [worker, sequence, turn],
+            "q": epoch,
+            "s": since_value,
+            "v": 1,
+            "w": high,
+            "x": schema,
+            "z": host,
+        }
+    ).encode("utf-8")
+    return f"twlist1.{_base64url(body)}"
+
+
+def decode_turn_list_cursor(
+    cursor: str,
+    *,
+    host_id: str,
+    schema_version: int,
+    limit: int,
+    now: float | int | None = None,
+) -> TurnListCursorPosition:
+    """Strictly validate a list cursor and its request binding."""
+    status = "invalid_cursor"
+    body = _decode_turn_list_token(cursor, "twlist1.", status)
+    if set(body) != {"e", "f", "g", "h", "l", "p", "q", "s", "v", "w", "x", "z"}:
+        raise ValueError(status)
+    if body.get("v") != 1:
+        raise ValueError(status)
+    position = body.get("p")
+    if (
+        not isinstance(position, list)
+        or len(position) != 3
+        or not isinstance(position[0], str)
+        or not position[0]
+        or not isinstance(position[2], str)
+        or not position[2]
+        or not isinstance(body.get("h"), str)
+        or not isinstance(body.get("q"), str)
+        or not body.get("q")
+        or not isinstance(body.get("z"), str)
+        or not body.get("z")
+    ):
+        raise ValueError(status)
+    try:
+        expiry = _turn_list_nonnegative_integer(body.get("e"), status)
+        floor = _turn_list_nonnegative_integer(body.get("f"), status)
+        generation = _turn_list_nonnegative_integer(body.get("g"), status)
+        page_limit = _turn_list_nonnegative_integer(body.get("l"), status)
+        sequence = _turn_list_nonnegative_integer(position[1], status)
+        since_value = _turn_list_nonnegative_integer(body.get("s"), status)
+        high = _turn_list_nonnegative_integer(body.get("w"), status)
+        schema = _turn_list_nonnegative_integer(body.get("x"), status)
+    except ValueError:
+        raise ValueError(status) from None
+    host = str(body["z"])
+    worker = str(position[0])
+    turn = str(position[2])
+    epoch = str(body["q"])
+    if (
+        host != str(host_id)
+        or schema != schema_version
+        or page_limit != limit
+        or schema not in {1, TURN_LIST_SCHEMA_VERSION}
+        or not 1 <= page_limit <= TURN_LIST_MAX_LIMIT
+        or since_value > high
+        or not high
+        or sequence <= since_value
+        or sequence > high
+        or not 1 <= floor <= high
+        or generation < 1
+        or max(map(len, (host, worker, turn, epoch))) > 512
+    ):
+        raise ValueError(status)
+    expected = _domain_digest(
+        "tendwire.turn-list-cursor-integrity.v1",
+        {
+            "expires_at": expiry,
+            "floor_sequence": floor,
+            "traversal_generation": generation,
+            "host_id": host,
+            "limit": page_limit,
+            "list_sequence": sequence,
+            "schema_version": schema,
+            "since_sequence": since_value,
+            "store_epoch": epoch,
+            "turn_id": turn,
+            "watermark": high,
+            "worker_id": worker,
+        },
+    )
+    if not hmac.compare_digest(str(body["h"]), expected):
+        raise ValueError(status)
+    current = time.time() if now is None else float(now)
+    if not current < expiry:
+        raise ValueError("cursor_expired")
+    return TurnListCursorPosition(
+        schema,
+        page_limit,
+        since_value,
+        high,
+        floor,
+        generation,
+        worker,
+        sequence,
+        turn,
+        epoch,
+        expiry,
+    )
+
+
+def turn_since_token(
+    host_id: str,
+    *,
+    schema_version: int,
+    watermark: int,
+    store_epoch: str,
+) -> str:
+    """Encode a durable opaque watermark for later insertion discovery."""
+    status = "invalid_cursor"
+    host = str(host_id)
+    epoch = str(store_epoch)
+    schema = _turn_list_nonnegative_integer(schema_version, status)
+    high = _turn_list_nonnegative_integer(watermark, status)
+    if (
+        not host
+        or not epoch
+        or max(len(host), len(epoch)) > 512
+        or schema not in {1, TURN_LIST_SCHEMA_VERSION}
+    ):
+        raise ValueError(status)
+    material = {
+        "host_id": host,
+        "schema_version": schema,
+        "store_epoch": epoch,
+        "watermark": high,
+    }
+    body = stable_json_dumps(
+        {
+            "h": _domain_digest(
+                "tendwire.turn-list-since-integrity.v1",
+                material,
+            ),
+            "q": epoch,
+            "v": 1,
+            "w": high,
+            "x": schema,
+            "z": host,
+        }
+    ).encode("utf-8")
+    return f"twsince1.{_base64url(body)}"
+
+
+def decode_turn_since_token(
+    token: str,
+    *,
+    host_id: str,
+    schema_version: int,
+) -> TurnSincePosition:
+    """Strictly validate a durable list watermark token."""
+    status = "invalid_cursor"
+    body = _decode_turn_list_token(token, "twsince1.", status)
+    if set(body) != {"h", "q", "v", "w", "x", "z"} or body.get("v") != 1:
+        raise ValueError(status)
+    if (
+        not isinstance(body.get("h"), str)
+        or not isinstance(body.get("q"), str)
+        or not body.get("q")
+        or not isinstance(body.get("z"), str)
+        or not body.get("z")
+    ):
+        raise ValueError(status)
+    high = _turn_list_nonnegative_integer(body.get("w"), status)
+    schema = _turn_list_nonnegative_integer(body.get("x"), status)
+    host = str(body["z"])
+    epoch = str(body["q"])
+    if (
+        host != str(host_id)
+        or schema != schema_version
+        or schema not in {1, TURN_LIST_SCHEMA_VERSION}
+        or max(len(host), len(epoch)) > 512
+    ):
+        raise ValueError(status)
+    expected = _domain_digest(
+        "tendwire.turn-list-since-integrity.v1",
+        {
+            "host_id": host,
+            "schema_version": schema,
+            "store_epoch": epoch,
+            "watermark": high,
+        },
+    )
+    if not hmac.compare_digest(str(body["h"]), expected):
+        raise ValueError(status)
+    return TurnSincePosition(schema, high, epoch)
 
 
 def _utf8_code_point_width(character: str) -> int:
@@ -981,6 +1312,22 @@ def build_turn_content_page(
     }
 
 
+def _healthy_empty_pending_health() -> dict[str, Any]:
+    """Return the fixed health projection for snapshot-only pending wrappers."""
+    return {
+        "status": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+
+
+def _unavailable_pending_health() -> dict[str, Any]:
+    """Return the fixed fail-closed health projection when durability is unknown."""
+    return {
+        "status": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+
+
 def recompute_pending_content_fingerprint(payload: Mapping[str, Any]) -> str:
     """Recompute a pending payload's content_fingerprint after its pending_interactions list
     is rewritten (e.g. the daemon backend overlay), matching pending_payload_from_snapshot."""
@@ -990,6 +1337,10 @@ def recompute_pending_content_fingerprint(payload: Mapping[str, Any]) -> str:
             "host_id": payload.get("host_id"),
             "pending_interactions": payload.get("pending_interactions", []),
             "backend_health": payload.get("backend_health", []),
+            "pending_health": payload.get(
+                "pending_health",
+                _unavailable_pending_health(),
+            ),
         }
     )
 
@@ -1155,6 +1506,90 @@ def _public_suggested_action_value(action: Any) -> Any | None:
 
 def _is_pending_routing_meta_key(key: Any) -> bool:
     return _compact_key(key) in {"workerid", "spaceid"}
+
+
+PendingObservationKind = Literal[
+    "open_prompt",
+    "read_succeeded_no_prompt",
+    "read_succeeded_invalid_prompt",
+    "read_failed",
+    "worker_authoritatively_absent",
+]
+
+
+@dataclass(frozen=True)
+class PendingObservedChoice:
+    """One safe public choice plus its private 1-based picker route."""
+
+    choice_id: str
+    label: str
+    picker_ordinal: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.choice_id, str)
+            or re.fullmatch(r"choice-[0-9a-f]{24}", self.choice_id) is None
+        ):
+            raise ValueError("invalid pending observation choice id")
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("invalid pending observation choice label")
+        if (
+            not isinstance(self.picker_ordinal, int)
+            or isinstance(self.picker_ordinal, bool)
+            or self.picker_ordinal < 1
+        ):
+            raise ValueError("invalid pending observation picker ordinal")
+
+
+@dataclass(frozen=True)
+class PendingObservation:
+    """One explicit source-read outcome with no public serializer."""
+
+    kind: PendingObservationKind
+    question: str | None = None
+    pending_kind: str | None = None
+    choices: tuple[PendingObservedChoice, ...] = ()
+    revision_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            "open_prompt",
+            "read_succeeded_no_prompt",
+            "read_succeeded_invalid_prompt",
+            "read_failed",
+            "worker_authoritatively_absent",
+        }:
+            raise ValueError("invalid pending observation kind")
+        if self.kind == "open_prompt":
+            if not isinstance(self.question, str) or not self.question.strip():
+                raise ValueError("open pending observation requires a question")
+            if (
+                not isinstance(self.revision_digest, str)
+                or not self.revision_digest
+            ):
+                raise ValueError("open pending observation requires a revision digest")
+            if not isinstance(self.choices, tuple) or not all(
+                isinstance(choice, PendingObservedChoice) for choice in self.choices
+            ):
+                raise ValueError("invalid pending observation choices")
+            choice_ids = [choice.choice_id for choice in self.choices]
+            ordinals = [choice.picker_ordinal for choice in self.choices]
+            if len(choice_ids) != len(set(choice_ids)) or len(ordinals) != len(
+                set(ordinals)
+            ):
+                raise ValueError("pending observation choices must be unique")
+            if self.pending_kind is not None and (
+                not isinstance(self.pending_kind, str)
+                or not self.pending_kind.strip()
+            ):
+                raise ValueError("invalid pending observation prompt kind")
+        elif (
+            self.question is not None
+            or self.pending_kind is not None
+            or self.choices
+            or self.revision_digest is not None
+        ):
+            raise ValueError("non-open pending observation cannot carry prompt data")
 
 
 @dataclass(frozen=True)
@@ -1442,7 +1877,12 @@ class PendingInteraction:
             "status": status,
             "meta": meta,
         }
-        interaction_id = _stable_id("pending", identity_payload)
+        raw_interaction_id = _string_value(self.id).strip()
+        interaction_id = (
+            raw_interaction_id
+            if re.fullmatch(r"pending-[0-9a-f]{24}", raw_interaction_id)
+            else _stable_id("pending", identity_payload)
+        )
         fingerprint = _content_fingerprint(content_payload)
 
         object.__setattr__(self, "schema_version", TURN_SCHEMA_VERSION)
@@ -1718,12 +2158,14 @@ def pending_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
     """Return the public JSON wrapper for projected pending interactions."""
     pending = [interaction.to_dict() for interaction in pending_from_snapshot(snapshot)]
     backend_health = _backend_health_payload(snapshot.backend_health)
+    pending_health = _healthy_empty_pending_health()
     payload = {
         "schema_version": TURN_SCHEMA_VERSION,
         "host_id": snapshot.host_id,
         "updated_at": snapshot.updated_at,
         "pending_interactions": pending,
         "backend_health": backend_health,
+        "pending_health": pending_health,
     }
     payload["content_fingerprint"] = _content_fingerprint(
         {
@@ -1731,6 +2173,7 @@ def pending_payload_from_snapshot(snapshot: Snapshot) -> dict[str, Any]:
             "host_id": payload["host_id"],
             "pending_interactions": pending,
             "backend_health": backend_health,
+            "pending_health": pending_health,
         }
     )
     return sanitize_public_mapping(payload)

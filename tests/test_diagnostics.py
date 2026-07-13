@@ -6,10 +6,13 @@ import json
 import os
 import subprocess
 import socket
+import sqlite3
 import stat
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from tendwire.backends import herdr_cli
 from tendwire.backends.herdr_cli import diagnose_herdr, fetch_herdr_state
@@ -23,6 +26,7 @@ from tendwire.local_state import (
     PermissionResult,
     PermissionState,
 )
+from tendwire.store.sqlite import init_store
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "herdr"
@@ -90,6 +94,26 @@ def _local_state_checks(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for check in payload["checks"]
         if str(check["name"]) in _LOCAL_STATE_CHECK_NAMES
     }
+
+
+def _maintenance_check(payload: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        check
+        for check in payload["checks"]
+        if check.get("name") == "store_maintenance"
+    ]
+    assert len(matches) == 1
+    return matches[0]
+def _pending_check(payload: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        check
+        for check in payload["checks"]
+        if check.get("name") == "pending_ingestion"
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 
 
 def _patch_healthy_herdr(monkeypatch, calls: list[tuple[str, ...]] | None = None) -> None:
@@ -235,12 +259,13 @@ def test_cli_herdr_timeout_knob_is_used_by_doctor(capsys, monkeypatch, tmp_path:
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
-    assert code == 0
+    assert code == 1
     assert captured.err == ""
     assert timeouts == [0.75, 0.75, 0.75]
     assert payload["timeout_seconds"] == 0.75
     assert payload["aggregate_deadline_seconds"] == 4.5
     assert all("aggregate_deadline_seconds" in check for check in _herdr_checks(payload))
+    assert _pending_check(payload)["outcome"] == "store_unavailable"
 
 
 def test_doctor_appends_fixed_compliant_local_state_checks(
@@ -258,7 +283,7 @@ def test_doctor_appends_fixed_compliant_local_state_checks(
         socket_path=state_dir / "tendwire.sock",
     )
     assert config.db_path is not None
-    _write_mode(config.db_path, 0o600)
+    init_store(config.db_path)
     for identity_path in (
         config.installation_key_path,
         config.installation_key_marker_path,
@@ -288,7 +313,7 @@ def test_doctor_appends_fixed_compliant_local_state_checks(
     }
     assert payload["schema_version"] == 1
     assert payload["command"] == "doctor"
-    assert payload["status"] == "ok"
+    assert payload["status"] == "degraded"
     assert calls == [
         ("workspace", "list"),
         ("agent", "list"),
@@ -306,6 +331,7 @@ def test_doctor_appends_fixed_compliant_local_state_checks(
         }
         for name, check in local_checks.items()
     )
+    assert _maintenance_check(payload)["outcome"] == "overdue"
 
 
 def test_doctor_treats_uninitialized_state_and_stopped_socket_as_neutral(
@@ -325,7 +351,7 @@ def test_doctor_treats_uninitialized_state_and_stopped_socket_as_neutral(
 
     payload = diagnose_herdr(config)
 
-    assert payload["status"] == "ok"
+    assert payload["status"] == "degraded"
     assert not state_dir.exists()
     assert calls == [
         ("workspace", "list"),
@@ -357,6 +383,25 @@ def test_doctor_treats_uninitialized_state_and_stopped_socket_as_neutral(
             "not_running",
             "No action required while the daemon is stopped.",
         ),
+    }
+    assert _maintenance_check(payload) == {
+        "name": "store_maintenance",
+        "ok": True,
+        "outcome": "not_initialized",
+        "remediation": "No action required while the store is uninitialized.",
+        "snapshot_retention_days": 14,
+        "snapshot_retention_count": 4096,
+        "maintenance_batch_size": 100,
+        "maintenance_cadence_seconds": 3600,
+        "snapshot_count": 0,
+        "last_completed_at": None,
+    }
+    assert _pending_check(payload) == {
+        "name": "pending_ingestion",
+        "ok": False,
+        "outcome": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+        "stale_grace_seconds": 30.0,
     }
 
 
@@ -564,6 +609,8 @@ def test_doctor_reports_broad_modes_without_mutating_and_cli_exits_degraded(
         }
         for name, check in _local_state_checks(payload).items()
     )
+    assert _maintenance_check(payload)["outcome"] == "unsafe"
+    assert _maintenance_check(payload)["ok"] is False
 
 
 def test_doctor_degrades_for_symlinks_and_wrong_entry_types_without_following(
@@ -601,6 +648,8 @@ def test_doctor_degrades_for_symlinks_and_wrong_entry_types_without_following(
     assert local_checks["daemon_socket_permissions"]["outcome"] == "unsafe"
     assert db_path.is_symlink()
     assert target.read_bytes() == b"local-state"
+    assert _maintenance_check(payload)["outcome"] == "unsafe"
+    assert _maintenance_check(payload)["ok"] is False
     serialized = json.dumps(payload)
     for forbidden in (
         str(state_dir),
@@ -611,6 +660,354 @@ def test_doctor_degrades_for_symlinks_and_wrong_entry_types_without_following(
         "wrong socket type",
     ):
         assert forbidden not in serialized
+
+
+def test_store_maintenance_rejects_wrong_database_type_without_mutation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "wrong-type-private-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "wrong-type-private-database"
+    db_path.mkdir(mode=0o700)
+    sentinel = db_path / "private-sentinel"
+    sentinel.write_text("wrong-type-private-content", encoding="utf-8")
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=db_path,
+    )
+    before = (stat.S_IMODE(db_path.stat().st_mode), sentinel.read_bytes())
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    assert payload["status"] == "degraded"
+    assert _maintenance_check(payload)["outcome"] == "unsafe"
+    assert (stat.S_IMODE(db_path.stat().st_mode), sentinel.read_bytes()) == before
+    serialized = json.dumps(payload)
+    for private in (
+        str(state_dir),
+        str(db_path),
+        str(sentinel),
+        "wrong-type-private-content",
+    ):
+        assert private not in serialized
+
+
+def test_store_maintenance_refuses_outdated_schema_without_migration(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "outdated-private-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "outdated-private-store.db"
+    private_table = "private_schema_sentinel"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(f"CREATE TABLE {private_table} (private_value TEXT)")
+        conn.execute(
+            f"INSERT INTO {private_table} (private_value) VALUES (?)",
+            ("outdated-private-content",),
+        )
+        conn.execute("PRAGMA user_version = 1")
+    os.chmod(db_path, 0o600)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=db_path,
+    )
+    before = db_path.read_bytes()
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    assert payload["status"] == "degraded"
+    assert _maintenance_check(payload)["outcome"] == "unavailable"
+    assert db_path.read_bytes() == before
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute(
+            f"SELECT private_value FROM {private_table}"
+        ).fetchone()[0] == "outdated-private-content"
+    serialized = json.dumps(payload)
+    for private in (
+        str(state_dir),
+        str(db_path),
+        private_table,
+        "outdated-private-content",
+    ):
+        assert private not in serialized
+
+
+def _seed_maintenance_store(
+    config: Config,
+    *,
+    last_completed_at: str,
+    snapshot_count: int,
+) -> tuple[bytes, str]:
+    assert config.db_path is not None
+    init_store(config.db_path)
+    private = "maintenance-private-payload-sentinel"
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE store_maintenance_state
+            SET last_started_at = ?,
+                last_completed_at = ?,
+                last_status = 'ok'
+            WHERE scope = 'automatic'
+            """,
+            (last_completed_at, last_completed_at),
+        )
+        for index in range(snapshot_count):
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    host_id, created_at, content_fingerprint, payload
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    config.host_id,
+                    f"2026-01-01T00:00:0{index}+00:00",
+                    f"private-fingerprint-{index}",
+                    json.dumps({"private": private, "index": index}),
+                ),
+            )
+    return config.db_path.read_bytes(), private
+
+
+def test_store_maintenance_reports_current_fixed_aggregate_without_mutation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "current-private-state"
+    state_dir.mkdir(mode=0o700)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=state_dir / "current-private-store.db",
+        snapshot_retention_days=21,
+        snapshot_retention_count=10,
+        snapshot_maintenance_batch_size=7,
+        store_maintenance_cadence_seconds=3600,
+    )
+    before, private = _seed_maintenance_store(
+        config,
+        last_completed_at="2026-01-01T00:00:00+00:00",
+        snapshot_count=1,
+    )
+    monkeypatch.setattr(
+        herdr_cli,
+        "utc_timestamp",
+        lambda *_args, **_kwargs: "2026-01-01T00:30:00+00:00",
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    assert payload["status"] == "ok"
+    assert _maintenance_check(payload) == {
+        "name": "store_maintenance",
+        "ok": True,
+        "outcome": "ok",
+        "remediation": "No action required.",
+        "snapshot_retention_days": 21,
+        "snapshot_retention_count": 10,
+        "maintenance_batch_size": 7,
+        "maintenance_cadence_seconds": 3600,
+        "snapshot_count": 1,
+        "last_completed_at": "2026-01-01T00:00:00+00:00",
+    }
+    assert _pending_check(payload) == {
+        "name": "pending_ingestion",
+        "ok": True,
+        "outcome": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+        "stale_grace_seconds": 30.0,
+    }
+    assert config.db_path is not None
+    assert config.db_path.read_bytes() == before
+    assert private not in json.dumps(payload)
+
+
+def test_doctor_pending_ingestion_is_fixed_nonmutating_and_public_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    state_dir = tmp_path / "pending-health-private-state"
+    state_dir.mkdir(mode=0o700)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=state_dir / "pending-health-private.db",
+        pending_stale_grace_seconds=17,
+    )
+    before, private = _seed_maintenance_store(
+        config,
+        last_completed_at="2026-01-01T00:00:00+00:00",
+        snapshot_count=1,
+    )
+    herdr_calls: list[tuple[str, ...]] = []
+    _patch_healthy_herdr(monkeypatch, herdr_calls)
+    monkeypatch.setattr(
+        herdr_cli,
+        "utc_timestamp",
+        lambda *_args, **_kwargs: "2026-01-01T00:30:00+00:00",
+    )
+    durable_calls: list[tuple[Path, str]] = []
+
+    def durable_health(db_path: Path, host_id: str) -> dict[str, Any]:
+        durable_calls.append((db_path, host_id))
+        return {
+            "status": "degraded",
+            "counts": {"fresh": 2, "stale": 1, "total": 3},
+            "pane_id": "sentinel-private-pane",
+            "source_path": str(tmp_path / "sentinel-private-source"),
+            "tool_id": "sentinel-private-tool",
+            "error": "sentinel-private-error",
+        }
+
+    monkeypatch.setattr(store_sqlite, "backend_pending_health", durable_health)
+
+    payload = diagnose_herdr(config)
+
+    assert payload["status"] == "degraded"
+    assert durable_calls == [(config.db_path, config.host_id)]
+    assert herdr_calls == [
+        ("workspace", "list"),
+        ("agent", "list"),
+        ("pane", "list"),
+    ]
+    assert _pending_check(payload) == {
+        "name": "pending_ingestion",
+        "ok": False,
+        "outcome": "degraded",
+        "counts": {"fresh": 2, "stale": 1, "total": 3},
+        "stale_grace_seconds": 17.0,
+    }
+    assert config.db_path.read_bytes() == before
+    serialized = json.dumps(payload, sort_keys=True)
+    assert private not in serialized
+    assert "sentinel-private" not in serialized
+    monkeypatch.setattr(
+        store_sqlite,
+        "backend_pending_health",
+        lambda *_args: {
+            "status": "healthy",
+            "counts": {"fresh": 1, "stale": 1, "total": 2},
+        },
+    )
+    fail_closed = diagnose_herdr(config)
+    assert _pending_check(fail_closed) == {
+        "name": "pending_ingestion",
+        "ok": False,
+        "outcome": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+        "stale_grace_seconds": 17.0,
+    }
+    monkeypatch.setattr(
+        store_sqlite,
+        "backend_pending_health",
+        lambda *_args: {
+            "status": "healthy",
+            "counts": {"fresh": 3, "stale": 0, "total": 3},
+        },
+    )
+    recovered = diagnose_herdr(config)
+    assert recovered["status"] == "ok"
+    assert _pending_check(recovered) == {
+        "name": "pending_ingestion",
+        "ok": True,
+        "outcome": "healthy",
+        "counts": {"fresh": 3, "stale": 0, "total": 3},
+        "stale_grace_seconds": 17.0,
+    }
+
+
+def test_store_maintenance_reports_overdue_without_mutation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "overdue-private-state"
+    state_dir.mkdir(mode=0o700)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=state_dir / "overdue-private-store.db",
+        snapshot_retention_count=10,
+        store_maintenance_cadence_seconds=3600,
+    )
+    before, private = _seed_maintenance_store(
+        config,
+        last_completed_at="2026-01-01T00:00:00+00:00",
+        snapshot_count=1,
+    )
+    monkeypatch.setattr(
+        herdr_cli,
+        "utc_timestamp",
+        lambda *_args, **_kwargs: "2026-01-01T02:00:00+00:00",
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    check = _maintenance_check(payload)
+    assert payload["status"] == "degraded"
+    assert check["outcome"] == "overdue"
+    assert check["ok"] is False
+    assert check["snapshot_count"] == 1
+    assert check["last_completed_at"] == "2026-01-01T00:00:00+00:00"
+    assert config.db_path is not None
+    assert config.db_path.read_bytes() == before
+    assert private not in json.dumps(payload)
+
+
+def test_store_maintenance_reports_backlog_before_cadence_without_mutation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "backlog-private-state"
+    state_dir.mkdir(mode=0o700)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=state_dir / "backlog-private-store.db",
+        snapshot_retention_days=36500,
+        snapshot_retention_count=1,
+        snapshot_maintenance_batch_size=1,
+        store_maintenance_cadence_seconds=3600,
+    )
+    before, private = _seed_maintenance_store(
+        config,
+        last_completed_at="2026-01-01T00:00:00+00:00",
+        snapshot_count=2,
+    )
+    monkeypatch.setattr(
+        herdr_cli,
+        "utc_timestamp",
+        lambda *_args, **_kwargs: "2026-01-01T00:30:00+00:00",
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    check = _maintenance_check(payload)
+    assert payload["status"] == "degraded"
+    assert check["outcome"] == "backlog"
+    assert check["ok"] is False
+    assert check["snapshot_count"] == 2
+    assert check["last_completed_at"] == "2026-01-01T00:00:00+00:00"
+    assert config.db_path is not None
+    assert config.db_path.read_bytes() == before
+    assert private not in json.dumps(payload)
 
 
 def test_doctor_maps_owner_and_group_failures_to_fixed_unsafe_records(
@@ -799,3 +1196,199 @@ def test_fixture_outputs_parse_through_snapshot_fail_soft_path(monkeypatch) -> N
     assert spaces[0].id == "ws-fixture"
     assert len(workers) == 1
     assert workers[0].id == "Fixture Agent"
+
+
+def test_doctor_initialized_store_with_absent_sqlite_sidecars_is_validation_only(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "private-doctor-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "private-doctor-database"
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=db_path,
+    )
+    init_store(db_path)
+    sidecars = tuple(
+        Path(f"{db_path}{suffix}") for suffix in ("-wal", "-shm", "-journal")
+    )
+    assert all(not os.path.lexists(path) for path in sidecars)
+    before = (
+        tuple(sorted(path.name for path in state_dir.iterdir())),
+        db_path.stat().st_ino,
+        db_path.stat().st_size,
+        db_path.stat().st_mtime_ns,
+        stat.S_IMODE(db_path.stat().st_mode),
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    after = (
+        tuple(sorted(path.name for path in state_dir.iterdir())),
+        db_path.stat().st_ino,
+        db_path.stat().st_size,
+        db_path.stat().st_mtime_ns,
+        stat.S_IMODE(db_path.stat().st_mode),
+    )
+    assert _local_state_checks(payload)["database_permissions"] == {
+        "name": "database_permissions",
+        "ok": True,
+        "outcome": "compliant",
+        "remediation": "No action required.",
+    }
+    assert after == before
+    assert all(not os.path.lexists(path) for path in sidecars)
+
+
+@pytest.mark.parametrize("hostile_member", ["main", "wal"])
+def test_doctor_sqlite_failures_are_fixed_typed_and_path_free(
+    monkeypatch: Any,
+    tmp_path: Path,
+    hostile_member: str,
+) -> None:
+    state_dir = tmp_path / "private-doctor-hostile-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "private-doctor-hostile-database"
+    target = state_dir / "private-doctor-hostile-target"
+    private_contents = b"raw-OSError-private-sidecar-target"
+    target.write_bytes(private_contents)
+    os.chmod(target, 0o600)
+    if hostile_member == "main":
+        hostile_path = db_path
+    else:
+        init_store(db_path)
+        hostile_path = Path(f"{db_path}-wal")
+    hostile_path.symlink_to(target)
+    target_before = (
+        target.read_bytes(),
+        target.stat().st_ino,
+        stat.S_IMODE(target.stat().st_mode),
+    )
+    hostile_inode = str(os.lstat(hostile_path).st_ino)
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=db_path,
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    database_check = _local_state_checks(payload)["database_permissions"]
+    assert database_check == {
+        "name": "database_permissions",
+        "ok": False,
+        "outcome": "unsafe",
+        "remediation": "Move unsafe local state aside and restore from a trusted backup.",
+    }
+    assert _maintenance_check(payload)["outcome"] == "unsafe"
+    assert hostile_path.is_symlink()
+    assert (
+        target.read_bytes(),
+        target.stat().st_ino,
+        stat.S_IMODE(target.stat().st_mode),
+    ) == target_before
+    serialized = json.dumps(payload, sort_keys=True)
+    for forbidden in (
+        str(state_dir),
+        str(db_path),
+        db_path.name,
+        str(hostile_path),
+        hostile_path.name,
+        str(target),
+        target.name,
+        private_contents.decode(),
+        hostile_inode,
+        "-wal",
+        "-shm",
+        "-journal",
+        "OSError",
+        "[Errno",
+        '"uid"',
+        '"gid"',
+        '"inode"',
+    ):
+        assert forbidden not in serialized
+
+
+def test_doctor_selected_main_disappearance_is_typed_and_publicly_fixed(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    from tendwire import local_state as local_state_module
+
+    state_dir = tmp_path / "private-doctor-main-race-state"
+    state_dir.mkdir(mode=0o700)
+    db_path = state_dir / "private-doctor-main-race-database"
+    config = Config(
+        host_id="doctor-host",
+        herdr_bin="herdr",
+        data_dir=state_dir,
+        db_path=db_path,
+    )
+    init_store(db_path)
+    selected_inode = str(db_path.stat().st_ino)
+    removed = False
+    observed_codes: list[LocalStateErrorCode] = []
+    original_inspect = herdr_cli.inspect_config_state
+
+    def remove_selected_main(phase: str, kind: LocalStateKind) -> None:
+        nonlocal removed
+        if phase == "captured" and kind is LocalStateKind.DATABASE and not removed:
+            removed = True
+            db_path.unlink()
+
+    def capture_typed_failure(*args: Any, **kwargs: Any) -> ConfigStateReport:
+        report = original_inspect(*args, **kwargs)
+        observed_codes.extend(
+            issue.code
+            for issue in report.issues
+            if issue.kind is LocalStateKind.DATABASE
+        )
+        return report
+
+    monkeypatch.setattr(
+        local_state_module,
+        "_sqlite_family_test_phase",
+        remove_selected_main,
+    )
+    monkeypatch.setattr(
+        herdr_cli,
+        "inspect_config_state",
+        capture_typed_failure,
+    )
+    _patch_healthy_herdr(monkeypatch)
+
+    payload = diagnose_herdr(config)
+
+    assert removed
+    assert observed_codes == [LocalStateErrorCode.ENTRY_CHANGED]
+    assert not os.path.lexists(db_path)
+    assert _local_state_checks(payload)["database_permissions"] == {
+        "name": "database_permissions",
+        "ok": False,
+        "outcome": "unsafe",
+        "remediation": "Move unsafe local state aside and restore from a trusted backup.",
+    }
+    assert _maintenance_check(payload)["outcome"] == "unsafe"
+    serialized = json.dumps(payload, sort_keys=True)
+    for forbidden in (
+        str(state_dir),
+        str(db_path),
+        db_path.name,
+        selected_inode,
+        "-wal",
+        "-shm",
+        "-journal",
+        "OSError",
+        "[Errno",
+        '"uid"',
+        '"gid"',
+        '"inode"',
+    ):
+        assert forbidden not in serialized

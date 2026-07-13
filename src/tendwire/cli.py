@@ -51,17 +51,20 @@ from .core.models import (
     utc_timestamp,
 )
 from .core.turns import (
-    payload_to_json,
-    pending_payload_from_snapshot,
+    TURN_LIST_DEFAULT_LIMIT,
+    TURN_LIST_MAX_LIMIT,
     turns_payload_from_snapshot,
 )
 from .local_state import repair_config_state
 from .store.sqlite import (
+    CompactionOptions,
+    compact_store,
     attention_payload_from_store,
     envelope_to_receipt_json,
     expire_stale_worker_bindings,
     latest_healthy_backend_snapshot,
     latest_snapshot,
+    pending_payload_from_store,
     list_worker_bindings,
     reserve_command_receipt,
     run_store_maintenance,
@@ -86,6 +89,7 @@ class _DaemonAttempt:
     result: dict[str, Any] | None = None
     response_error: dict[str, Any] | None = None
     error_kind: str | None = None
+    request_started: bool | None = None
 
 
 def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
@@ -94,9 +98,21 @@ def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
             _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS,
             float(config.herdr_timeout_seconds) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS,
         )
-    if method == "turn.content.get":
+    if method in {"turn.list", "turn.content.get"}:
         return _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS
     return _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS
+
+
+def _turn_list_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= limit <= TURN_LIST_MAX_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"limit must be between 1 and {TURN_LIST_MAX_LIMIT}"
+        )
+    return limit
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -201,6 +217,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Turn-list schema version (default: 1).",
     )
     turns_parser.add_argument(
+        "--limit",
+        type=_turn_list_limit,
+        default=TURN_LIST_DEFAULT_LIMIT,
+        help=(
+            "Maximum turns in this page "
+            f"(default: {TURN_LIST_DEFAULT_LIMIT}, maximum: {TURN_LIST_MAX_LIMIT})."
+        ),
+    )
+    turn_page_position = turns_parser.add_mutually_exclusive_group()
+    turn_page_position.add_argument(
+        "--cursor",
+        default=None,
+        help="Opaque cursor for the next page.",
+    )
+    turn_page_position.add_argument(
+        "--since",
+        default=None,
+        help="Opaque token for turns newer than a completed traversal.",
+    )
+    turns_parser.add_argument(
         "--db-path",
         dest="db_path",
         default=None,
@@ -228,7 +264,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pending_parser = subparsers.add_parser(
         "pending",
-        help="Print neutral public pending interactions derived from the current snapshot.",
+        help="Print neutral public pending interactions from daemon or durable store state.",
     )
     pending_parser.add_argument(
         "--json",
@@ -236,6 +272,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help="Print pending interactions as JSON (default).",
+    )
+    pending_parser.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="SQLite database path for store-backed pending fallback (default: config path).",
     )
 
     command_parser = subparsers.add_parser(
@@ -320,6 +362,68 @@ def _add_store_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     cleanup_parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
     cleanup_parser.add_argument("--retention-days", dest="retention_days", type=int, default=None)
     cleanup_parser.add_argument("--max-outbox-attempts", dest="max_outbox_attempts", type=int, default=None)
+    cleanup_parser.add_argument(
+        "--snapshot-retention-days",
+        dest="snapshot_retention_days",
+        type=int,
+        default=None,
+    )
+    cleanup_parser.add_argument(
+        "--snapshot-retention-count",
+        dest="snapshot_retention_count",
+        type=int,
+        default=None,
+    )
+    cleanup_parser.add_argument(
+        "--snapshot-batch-size",
+        dest="snapshot_batch_size",
+        type=int,
+        default=None,
+    )
+
+    compact_parser = actions.add_parser(
+        "compact",
+        help="Inspect or explicitly compact the current store while offline.",
+    )
+    add_common(compact_parser)
+    compact_mode = compact_parser.add_mutually_exclusive_group(required=True)
+    compact_mode.add_argument(
+        "--dry-run",
+        dest="compact_dry_run",
+        action="store_true",
+        default=False,
+    )
+    compact_mode.add_argument(
+        "--execute",
+        dest="compact_execute",
+        action="store_true",
+        default=False,
+    )
+    compact_parser.add_argument(
+        "--acknowledge-offline",
+        dest="acknowledge_offline",
+        action="store_true",
+        default=False,
+    )
+    compact_parser.add_argument("--backup-path", dest="backup_path", default=None)
+    compact_parser.add_argument(
+        "--snapshot-retention-days",
+        dest="snapshot_retention_days",
+        type=int,
+        default=None,
+    )
+    compact_parser.add_argument(
+        "--snapshot-retention-count",
+        dest="snapshot_retention_count",
+        type=int,
+        default=None,
+    )
+    compact_parser.add_argument(
+        "--batch-size",
+        dest="snapshot_batch_size",
+        type=int,
+        default=None,
+    )
 
 
 def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -598,17 +702,20 @@ def _try_daemon_attempt(
     *,
     preserve_content_text: bool = False,
 ) -> _DaemonAttempt:
-    """Return a daemon result when a Tendwire daemon socket is reachable."""
+    """Return a daemon result only when a daemon socket was explicitly selected."""
+    if config.socket_path is None:
+        return _DaemonAttempt(error_kind="unavailable", request_started=False)
     socket_path = config.socket_path
-    if socket_path is None:
-        if config.herdr_backend != "socket":
-            return _DaemonAttempt(error_kind="unavailable")
-        socket_path = config.data_dir / "tendwire.sock"
 
     try:
-        from .daemon_api import DaemonAPIClient, DaemonAPIError, DaemonUnavailable
+        from .daemon_api import (
+            DaemonAPIClient,
+            DaemonAPIError,
+            DaemonProtocolError,
+            DaemonUnavailable,
+        )
     except Exception:
-        return _DaemonAttempt(error_kind="unavailable")
+        return _DaemonAttempt(error_kind="protocol", request_started=False)
     try:
         timeout_seconds = _daemon_client_timeout_seconds(config, method)
         if config.socket_group is None:
@@ -625,16 +732,33 @@ def _try_daemon_attempt(
         response = client.request(method, params or {})
     except DaemonUnavailable as exc:
         cause = exc.__cause__
+        if exc.request_started is False:
+            return _DaemonAttempt(error_kind="unavailable", request_started=False)
         if exc.timed_out or isinstance(cause, (TimeoutError, socket.timeout)):
-            return _DaemonAttempt(error_kind="timeout")
-        return _DaemonAttempt(error_kind="unavailable")
-    except DaemonAPIError:
-        return _DaemonAttempt(error_kind="protocol")
-    if not response.get("ok"):
+            return _DaemonAttempt(error_kind="timeout", request_started=True)
         return _DaemonAttempt(
-            error_kind="daemon_error",
-            response_error=sanitize_public_mapping(response),
+            error_kind="unavailable",
+            request_started=exc.request_started,
         )
+    except DaemonProtocolError as exc:
+        return _DaemonAttempt(
+            error_kind="protocol",
+            request_started=exc.request_started,
+        )
+    except DaemonAPIError:
+        return _DaemonAttempt(error_kind="protocol", request_started=None)
+    if not isinstance(response, dict):
+        return _DaemonAttempt(error_kind="protocol", request_started=True)
+    if response.get("ok") is False:
+        if isinstance(response.get("error"), dict):
+            return _DaemonAttempt(
+                error_kind="daemon_error",
+                response_error=sanitize_public_mapping(response),
+                request_started=True,
+            )
+        return _DaemonAttempt(error_kind="protocol", request_started=True)
+    if response.get("ok") is not True:
+        return _DaemonAttempt(error_kind="protocol", request_started=True)
     result = response.get("result")
     if isinstance(result, dict):
         sanitized = sanitize_public_mapping(result)
@@ -644,8 +768,8 @@ def _try_daemon_attempt(
             _restore_cli_turn_list_text(sanitized, result)
         if method == "connector.prepare":
             _restore_cli_plan_token(sanitized, result)
-        return _DaemonAttempt(result=sanitized)
-    return _DaemonAttempt(error_kind="protocol")
+        return _DaemonAttempt(result=sanitized, request_started=True)
+    return _DaemonAttempt(error_kind="protocol", request_started=True)
 
 
 def _try_daemon_result(
@@ -808,54 +932,74 @@ def cmd_turns(
     *,
     json_output: bool = True,
     schema_version: int = 1,
+    limit: int = TURN_LIST_DEFAULT_LIMIT,
+    cursor: str | None = None,
+    since: str | None = None,
 ) -> int:
-    """Build and print neutral public turns."""
+    """Print exactly one insertion-stable public turn-list page."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    daemon_result = _try_daemon_result(
-        config,
-        "turn.list",
-        {"schema_version": schema_version},
-    )
-    if daemon_result is not None:
-        print(_turn_list_payload_json(daemon_result, indent=2))
-        return 0 if daemon_result.get("status") != "upgrade_required" else 1
-    snapshot = _current_public_snapshot(config)
-    if config.db_path is not None and Path(config.db_path).exists():
-        refresh_structured_turn_content(config)
-        payload = (
-            turns_payload_from_store(
-                config.db_path,
-                config.host_id,
-                snapshot=snapshot,
-            )
-            if schema_version == 1
-            else turns_payload_from_store(
-                config.db_path,
-                config.host_id,
-                snapshot=snapshot,
-                schema_version=2,
-            )
-        )
-        print(_turn_list_payload_json(payload, indent=2))
-        return 0 if payload.get("status") != "upgrade_required" else 1
-    if schema_version == 1:
-        try:
-            payload = turns_payload_from_snapshot(snapshot)
-        except ValueError as exc:
-            if str(exc) != "upgrade_required":
-                raise
+    params: dict[str, Any] = {
+        "schema_version": schema_version,
+        "limit": limit,
+        "cursor": cursor,
+        "since": since,
+    }
+    daemon_attempt = _try_daemon_attempt(config, "turn.list", params)
+    if daemon_attempt.result is not None:
+        payload = daemon_attempt.result
+    elif daemon_attempt.response_error is not None:
+        payload = daemon_attempt.response_error
+    elif (
+        daemon_attempt.error_kind in {"unavailable", "timeout"}
+        and daemon_attempt.request_started is False
+    ):
+        if config.db_path is None:
             payload = {
-                "schema_version": 1,
+                "schema_version": schema_version,
+                "host_id": config.host_id,
                 "ok": False,
-                "status": "upgrade_required",
-                "required_turn_schema_version": 2,
+                "status": "store_unavailable",
             }
+        else:
+            if cursor is None and since is None:
+                refresh_structured_turn_content(
+                    config,
+                    adapter_timeout_seconds=config.herdr_timeout_seconds,
+                    max_workers=config.turn_refresh_workers,
+                    total_timeout_seconds=config.herdr_timeout_seconds + 1.0,
+                )
+            payload = turns_payload_from_store(
+                config.db_path,
+                config.host_id,
+                schema_version=schema_version,
+                limit=limit,
+                cursor=cursor,
+                since=since,
+            )
+    elif daemon_attempt.error_kind == "timeout":
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "daemon_timeout",
+            "error": {
+                "code": "daemon_timeout",
+                "message": "Tendwire daemon request timed out",
+            },
+        }
     else:
-        payload = turns_payload_from_snapshot(snapshot, schema_version=2)
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "daemon_protocol_error",
+            "error": {
+                "code": "daemon_protocol_error",
+                "message": "Tendwire daemon returned an invalid response",
+            },
+        }
     print(_turn_list_payload_json(payload, indent=2))
-    return 0 if payload.get("status") != "upgrade_required" else 1
+    return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
@@ -947,17 +1091,43 @@ def cmd_pending(
     *,
     json_output: bool = True,
 ) -> int:
-    """Build and print neutral public pending interactions."""
+    """Print pending interactions from one daemon attempt or durable fallback."""
     if not json_output:
         print("error: only --json output is supported", file=sys.stderr)
         return 2
-    daemon_result = _try_daemon_result(config, "pending.list")
-    if daemon_result is not None:
-        print(payload_to_json(daemon_result, indent=2))
-        return 0
-    snapshot = _current_public_snapshot(config)
-    print(payload_to_json(pending_payload_from_snapshot(snapshot), indent=2))
-    return 0
+
+    daemon_attempt = _try_daemon_attempt(config, "pending.list")
+    if daemon_attempt.result is not None:
+        payload = daemon_attempt.result
+    elif daemon_attempt.response_error is not None:
+        payload = daemon_attempt.response_error
+    elif (
+        daemon_attempt.error_kind == "unavailable"
+        and daemon_attempt.request_started is False
+    ):
+        payload = pending_payload_from_store(config.db_path, config.host_id)
+    elif daemon_attempt.error_kind == "timeout":
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "daemon_timeout",
+            "error": {
+                "code": "daemon_timeout",
+                "message": "Tendwire daemon request timed out",
+            },
+        }
+    else:
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": "daemon_protocol_error",
+            "error": {
+                "code": "daemon_protocol_error",
+                "message": "Tendwire daemon returned an invalid response",
+            },
+        }
+    print(public_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
 
 
 def cmd_doctor(
@@ -1357,7 +1527,14 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
         print(public_json_dumps(payload, indent=2))
         return 1
     if args.store_action == "status":
-        payload = store_status(config.db_path, config.host_id)
+        payload = store_status(
+            config.db_path,
+            config.host_id,
+            snapshot_retention_days=config.snapshot_retention_days,
+            snapshot_retention_count=config.snapshot_retention_count,
+            maintenance_batch_size=config.snapshot_maintenance_batch_size,
+            maintenance_cadence_seconds=config.store_maintenance_cadence_seconds,
+        )
     elif args.store_action == "events-tail":
         payload = tail_event_metadata(config.db_path, config.host_id, limit=args.limit)
     elif args.store_action == "cleanup":
@@ -1371,7 +1548,46 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             if args.max_outbox_attempts is not None
             else config.max_outbox_attempts,
             dry_run=args.dry_run,
+            snapshot_retention_days=args.snapshot_retention_days
+            if args.snapshot_retention_days is not None
+            else config.snapshot_retention_days,
+            snapshot_retention_count=args.snapshot_retention_count
+            if args.snapshot_retention_count is not None
+            else config.snapshot_retention_count,
+            snapshot_batch_size=args.snapshot_batch_size
+            if args.snapshot_batch_size is not None
+            else config.snapshot_maintenance_batch_size,
         )
+    elif args.store_action == "compact":
+        try:
+            options = CompactionOptions(
+                dry_run=bool(args.compact_dry_run),
+                acknowledge_offline=bool(args.acknowledge_offline),
+                backup_path=Path(args.backup_path)
+                if args.backup_path is not None
+                else None,
+                snapshot_retention_days=args.snapshot_retention_days
+                if args.snapshot_retention_days is not None
+                else config.snapshot_retention_days,
+                snapshot_retention_count=args.snapshot_retention_count
+                if args.snapshot_retention_count is not None
+                else config.snapshot_retention_count,
+                batch_size=args.snapshot_batch_size
+                if args.snapshot_batch_size is not None
+                else config.snapshot_maintenance_batch_size,
+            )
+        except (TypeError, ValueError):
+            options = CompactionOptions(dry_run=True)
+            payload = {
+                "schema_version": 1,
+                "ok": False,
+                "status": "invalid_request",
+                "command": "store.compact",
+                "scope": "database",
+                "dry_run": bool(args.compact_dry_run),
+            }
+        else:
+            payload = compact_store(config.db_path, options=options)
     else:
         payload = {
             "schema_version": 1,
@@ -1379,7 +1595,10 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             "status": "invalid_params",
             "host_id": config.host_id,
         }
-    print(public_json_dumps(payload, indent=2))
+    if args.store_action == "compact":
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        print(public_json_dumps(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -1406,7 +1625,9 @@ def main(argv: list[str] | None = None) -> int:
         socket_group=getattr(args, "socket_group", None),
         herdr_timeout_seconds=args.herdr_timeout_seconds,
     )
-    if args.command not in {"daemon", "doctor"}:
+    if args.command not in {"daemon", "doctor"} and not (
+        args.command == "store" and args.store_action == "compact"
+    ):
         repair_config_state(
             config.data_dir,
             config.db_path,
@@ -1436,6 +1657,9 @@ def main(argv: list[str] | None = None) -> int:
             config,
             json_output=args.json_output,
             schema_version=args.schema_version,
+            limit=args.limit,
+            cursor=args.cursor,
+            since=args.since,
         )
 
     if args.command == "turn":

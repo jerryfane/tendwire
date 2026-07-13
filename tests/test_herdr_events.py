@@ -46,10 +46,12 @@ from tendwire.core.projector import project_from_observations
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
+    SnapshotRetentionPolicy,
     init_store,
     latest_snapshot,
     list_attention_items,
     list_worker_bindings,
+    maybe_run_automatic_store_maintenance,
     merge_turn_content,
     save_snapshot,
     turns_payload_from_store,
@@ -1997,6 +1999,138 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
         ("none", "2026-01-01T00:00:30Z"),
     ]
 
+def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(
+        host_id="same-fingerprint-cadence",
+        data_dir=tmp_path,
+        db_path=tmp_path / "same-fingerprint-cadence.db",
+        herdr_backend="socket",
+        snapshot_retention_days=14,
+        snapshot_retention_count=1,
+        snapshot_maintenance_batch_size=100,
+        store_maintenance_cadence_seconds=3600,
+    )
+    init_store(Path(config.db_path))
+    maintenance_times = iter(
+        (
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:10Z",
+            "2026-01-01T00:00:20Z",
+            "2026-01-01T01:00:10Z",
+        )
+    )
+    maintenance_calls: list[tuple[SnapshotRetentionPolicy, int, dict[str, Any]]] = []
+
+    def fixed_clock_maintenance(
+        db_path: Path,
+        *,
+        policy: SnapshotRetentionPolicy,
+        cadence_seconds: int = 3600,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        assert now is None
+        result = maybe_run_automatic_store_maintenance(
+            db_path,
+            policy=policy,
+            cadence_seconds=cadence_seconds,
+            now=next(maintenance_times),
+        )
+        maintenance_calls.append((policy, cadence_seconds, result))
+        return result
+
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_events.maybe_run_automatic_store_maintenance",
+        fixed_clock_maintenance,
+    )
+    saved_fingerprints: list[str] = []
+
+    def recording_save(
+        db_path: Path,
+        snapshot: Any,
+        *,
+        observation: SnapshotObservationContext | None = None,
+    ) -> None:
+        saved_fingerprints.append(snapshot.content_fingerprint)
+        save_snapshot(db_path, snapshot, observation=observation)
+
+    monkeypatch.setattr("tendwire.backends.herdr_events.save_snapshot", recording_save)
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:00Z")
+    backend.reconcile_once(client=_initial_pane_client())
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:10Z")
+    assert backend.queue_event_envelope(_status_event("blocked")) is True
+    assert _attention_lifecycle_rows(backend)[0][4] == "2026-01-01T00:00:10+00:00"
+
+    _set_observation_time(monkeypatch, "2026-01-01T00:00:20Z")
+    backend._persist_current_state(observed_at="2026-01-01T00:00:20Z")
+    assert _attention_lifecycle_rows(backend)[0][4] == "2026-01-01T00:00:20+00:00"
+
+    _set_observation_time(monkeypatch, "2026-01-01T01:00:10Z")
+    backend._persist_current_state(observed_at="2026-01-01T01:00:10Z")
+
+    assert len(maintenance_calls) == 4
+    assert len(saved_fingerprints) == 4
+    assert len(set(saved_fingerprints[1:])) == 1
+    assert [result["status"] for _, _, result in maintenance_calls] == [
+        "ok",
+        "not_due",
+        "not_due",
+        "ok",
+    ]
+    assert sum(bool(result["due"]) for _, _, result in maintenance_calls) == 2
+    assert {
+        (policy.retention_days, policy.retention_count, policy.batch_size, cadence)
+        for policy, cadence, _ in maintenance_calls
+    } == {(14, 1, 100, 3600)}
+    assert _table_count(backend.db_path, config.host_id, "snapshots") == 1
+    assert _attention_lifecycle_rows(backend)[0][4] == "2026-01-01T01:00:10+00:00"
+    assert backend.operational_status["automatic_maintenance"] == {
+        "ok": True,
+        "status": "ok",
+        "due": True,
+        "examined": 1,
+        "deleted": 1,
+        "remaining_candidates": False,
+    }
+
+
+def test_maintenance_failure_cannot_undo_committed_backend_snapshot(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "maintenance-failure-contained")
+
+    def fail_maintenance(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError(f"private maintenance failure at {tmp_path}/secret.db")
+
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_events.maybe_run_automatic_store_maintenance",
+        fail_maintenance,
+    )
+
+    snapshot = backend.reconcile_once(client=_initial_pane_client())
+    persisted = latest_snapshot(backend.db_path, backend.config.host_id)
+    status = backend.operational_status
+    encoded = json.dumps(status, sort_keys=True)
+
+    assert persisted is not None
+    assert persisted.content_fingerprint == snapshot.content_fingerprint
+    assert status["automatic_maintenance"] == {
+        "ok": False,
+        "status": "failed",
+        "due": False,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+    }
+    assert str(tmp_path) not in encoded
+    assert "secret.db" not in encoded
+    _assert_no_public_json_forbidden(status)
+
 
 def test_incremental_positive_lifecycle_and_complete_absence_are_separate(
     tmp_path: Path,
@@ -2372,6 +2506,280 @@ def test_concurrent_queueing_applies_events_in_backend_lock_order(
     assert len(snapshot.workers) == 1
     assert len(list_worker_bindings(backend.db_path, backend.config.host_id, backend="herdr")) == 1
 
+def test_reconcile_turn_refresh_observes_durable_state_and_replaced_ownership_maps(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "reconcile-turn-refresh")
+    client = _StaticClient(
+        workspaces=[{"id": "space-1", "name": "Build", "status": "active"}],
+        panes=[
+            {
+                "pane_id": "pane-1",
+                "terminal_id": "terminal-1",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "status": "running",
+            }
+        ],
+        agents=[],
+    )
+    observed: list[tuple[str, str]] = []
+
+    def callback() -> None:
+        assert not backend._lock._is_owned()
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        bindings = list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        )
+        assert snapshot is not None
+        assert bindings
+        assert backend._pane_terminals == {"pane-1": "terminal-1"}
+        observed.append((snapshot.to_json(), bindings[0].private_fingerprint))
+        # The callback-state lock must also be released before invocation.
+        backend.set_turn_refresh_callback(None)
+
+    backend.set_turn_refresh_callback(callback)
+    reconciled = backend.reconcile_once(client=client)
+
+    assert observed == [
+        (
+            reconciled.to_json(),
+            list_worker_bindings(
+                backend.db_path,
+                backend.config.host_id,
+                backend="herdr",
+            )[0].private_fingerprint,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_name", "data"),
+    [
+        (
+            "pane.created",
+            {
+                "pane_id": "pane-1",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "status": "working",
+            },
+        ),
+        (
+            "pane.focused",
+            {
+                "pane_id": "pane-1",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "status": "working",
+            },
+        ),
+        (
+            "pane.moved",
+            {
+                "old_pane_id": "pane-1",
+                "pane_id": "pane-2",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+            },
+        ),
+        ("pane.closed", {"pane_id": "pane-1"}),
+        ("pane.exited", {"pane_id": "pane-1"}),
+        (
+            "pane.agent_detected",
+            {
+                "pane_id": "pane-1",
+                "agent": "Agent One",
+                "workspace_id": "space-1",
+                "status": "working",
+            },
+        ),
+        (
+            "pane.agent_status_changed",
+            {
+                "pane_id": "pane-1",
+                "agent": "Agent One",
+                "status": "blocked",
+            },
+        ),
+        ("pane.output_matched", {"pane_id": "pane-1"}),
+    ],
+)
+def test_each_turn_relevant_event_notifies_once(
+    tmp_path: Path,
+    event_name: str,
+    data: dict[str, Any],
+) -> None:
+    backend = _backend(tmp_path, f"turn-refresh-{event_name.replace('.', '-')}")
+    backend.reconcile_once(client=_initial_pane_client())
+    calls: list[None] = []
+    backend.set_turn_refresh_callback(lambda: calls.append(None))
+
+    assert backend.queue_event_envelope({"event": event_name, "data": data}) is True
+
+    assert calls == [None]
+
+
+def test_relevant_event_burst_notifies_once_after_batch_commit(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "turn-refresh-burst", debounce_seconds=60)
+    backend.reconcile_once(client=_initial_pane_client())
+    calls: list[str] = []
+    identity = HerdrEventId("turn-refresh-burst")
+
+    def callback() -> None:
+        assert not backend._lock._is_owned()
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert snapshot is not None
+        assert snapshot.workers[0].status == "blocked"
+        assert identity in backend._producer_dedupe
+        calls.append(snapshot.updated_at)
+
+    backend.set_turn_refresh_callback(callback)
+    assert backend.queue_event_envelope(
+        {"event": "pane.focused", "data": {"pane_id": "pane-1", "agent": "Agent One"}},
+        flush=False,
+    )
+    assert backend.queue_event_envelope(
+        {**_status_event("blocked"), "event_id": identity.value},
+        flush=False,
+    )
+    assert backend.queue_event_envelope(
+        {"event": "pane.output_matched", "data": {"pane_id": "pane-1"}},
+        flush=False,
+    )
+
+    backend.flush()
+
+    assert len(calls) == 1
+
+
+def test_projection_neutral_output_match_notifies_without_rewriting_snapshot(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "turn-refresh-output")
+    backend.reconcile_once(client=_initial_pane_client())
+    before = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert before is not None
+    calls: list[None] = []
+    backend.set_turn_refresh_callback(lambda: calls.append(None))
+
+    assert backend.queue_event_envelope(
+        {"event": "pane.output_matched", "data": {"pane_id": "pane-1"}}
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert after.to_json() == before.to_json()
+    assert calls == [None]
+
+
+def test_irrelevant_duplicate_and_invalid_events_do_not_notify(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "turn-refresh-noop")
+    backend.reconcile_once(client=_initial_pane_client())
+    calls: list[None] = []
+    backend.set_turn_refresh_callback(lambda: calls.append(None))
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "workspace.updated",
+            "data": {"workspace_id": "space-1", "name": "Renamed"},
+        }
+    )
+    assert backend.queue_event_envelope(
+        {
+            "event": "worktree.created",
+            "data": {"workspace_id": "missing-space", "name": "Ignored"},
+        }
+    )
+    assert backend.queue_event_envelope({"event": "not.official", "data": {}}) is False
+    assert backend.queue_event_envelope({"event": 7, "data": {}}) is False
+    assert calls == []
+
+    backend.set_turn_refresh_callback(None)
+    duplicate = {
+        "event": "pane.output_matched",
+        "event_id": "already-applied",
+        "data": {"pane_id": "pane-1"},
+    }
+    assert backend.queue_event_envelope(duplicate) is True
+    backend.set_turn_refresh_callback(lambda: calls.append(None))
+    assert backend.queue_event_envelope(duplicate) is False
+    assert calls == []
+
+
+def test_persistence_failure_does_not_notify_turn_refresh(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    backend = _backend(tmp_path, "turn-refresh-persist-failure")
+    backend.reconcile_once(client=_initial_pane_client())
+    calls: list[None] = []
+    backend.set_turn_refresh_callback(lambda: calls.append(None))
+
+    def fail_persistence(*, observed_at: str | None = None) -> Any:
+        raise RuntimeError(f"snapshot unavailable at {observed_at}")
+
+    monkeypatch.setattr(backend, "_persist_current_state", fail_persistence)
+
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        backend.queue_event_envelope(_status_event("blocked"))
+    assert calls == []
+
+
+def test_callback_failure_cannot_roll_back_durable_event_state(tmp_path: Path) -> None:
+    backend = _backend(tmp_path, "turn-refresh-callback-failure")
+    backend.reconcile_once(client=_initial_pane_client())
+    identity = HerdrEventId("callback-failure")
+
+    def fail_callback() -> None:
+        raise RuntimeError("scheduler unavailable")
+
+    backend.set_turn_refresh_callback(fail_callback)
+    assert backend.queue_event_envelope(
+        {**_status_event("blocked"), "event_id": identity.value}
+    )
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.workers[0].status == "blocked"
+    assert identity in backend._producer_dedupe
+    assert backend.queue_event_envelope(
+        {**_status_event("blocked"), "event_id": identity.value}
+    ) is False
+
+
+@pytest.mark.parametrize("event_name", ["pane.closed", "pane.exited"])
+def test_close_refresh_callback_observes_expired_binding(
+    tmp_path: Path,
+    event_name: str,
+) -> None:
+    backend = _backend(tmp_path, f"turn-refresh-{event_name.replace('.', '-')}-binding")
+    backend.reconcile_once(client=_initial_pane_client())
+    observed_reasons: list[str | None] = []
+
+    def callback() -> None:
+        assert list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+        ) == []
+        expired = list_worker_bindings(
+            backend.db_path,
+            backend.config.host_id,
+            backend="herdr",
+            include_expired=True,
+        )
+        assert len(expired) == 1
+        observed_reasons.append(expired[0].reason)
+
+    backend.set_turn_refresh_callback(callback)
+    assert backend.queue_event_envelope(
+        {"event": event_name, "data": {"pane_id": "pane-1"}}
+    )
+
+    assert observed_reasons == [event_name.replace(".", "_")]
+
+
 
 def test_pane_moved_preserves_public_worker_and_updates_private_binding(tmp_path: Path) -> None:
     backend = _backend(tmp_path, "pane-moved")
@@ -2476,6 +2884,7 @@ def test_worker_cap_exceeded_preserves_previous_authoritative_snapshot(tmp_path:
         herdr_backend="socket",
         herdr_timeout_seconds=0.5,
         max_workers=1,
+        turn_refresh_workers=1,
     )
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -2544,6 +2953,7 @@ def test_incremental_event_over_worker_cap_is_ignored_with_degraded_health(tmp_p
         herdr_backend="socket",
         herdr_timeout_seconds=0.5,
         max_workers=1,
+        turn_refresh_workers=1,
     )
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -2575,6 +2985,7 @@ def test_closed_worker_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -
         herdr_backend="socket",
         herdr_timeout_seconds=0.5,
         max_workers=1,
+        turn_refresh_workers=1,
     )
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -2631,6 +3042,7 @@ def test_pane_moved_reactivation_over_worker_cap_is_ignored(tmp_path: Path) -> N
         herdr_backend="socket",
         herdr_timeout_seconds=0.5,
         max_workers=1,
+        turn_refresh_workers=1,
     )
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -3392,18 +3804,32 @@ def _run_authoritative_recovery_trace(
 
     adapter_calls: list[tuple[str, str | None]] = []
 
-    def read_existing_final(_config: Config, binding: Any) -> dict[str, Any]:
+    def refresh_existing_final(
+        config: Config,
+        binding: Any,
+        *,
+        adapter_timeout_seconds: float | None = None,
+    ) -> Any:
+        del adapter_timeout_seconds
         adapter_calls.append((binding.worker_id, binding.turn_target_value))
-        return {
-            "user_text": "Recover the deterministic producer final.",
-            "assistant_stream_text": None,
-            "assistant_final_text": "The durable producer final.",
-            "complete": True,
-            "has_open_turn": False,
-            "source_turn_id": "producer-turn-42",
-        }
+        applied = herdr_turns.apply_turn_refresh(
+            config.db_path,
+            config.host_id,
+            binding.worker_id,
+            {
+                "user_text": "Recover the deterministic producer final.",
+                "assistant_stream_text": None,
+                "assistant_final_text": "The durable producer final.",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "producer-turn-42",
+            },
+            expected_binding=binding,
+        )
+        assert applied.updated == 1
+        return herdr_turns.TurnRefreshResult("updated", 1, applied.pending_changed)
 
-    monkeypatch.setattr(herdr_turns, "_read_turn_for_binding", read_existing_final)
+    monkeypatch.setattr(herdr_turns, "refresh_turn_binding", refresh_existing_final)
     pane_b = {
         "workspace_id": "wR9",
         "pane_id": "wR9:pB",
@@ -3484,12 +3910,10 @@ def _run_authoritative_recovery_trace(
     assert recovered_binding.turn_target_kind == "codex_session_id"
     assert recovered_binding.turn_target_value == "session-private-recovery"
 
-    assert herdr_turns.refresh_structured_turn_content(restarted.config) == {
-        "ok": True,
-        "status": "ok",
-        "updated": 1,
-        "attempted": 1,
-    }
+    assert herdr_turns.refresh_turn_binding(
+        restarted.config,
+        recovered_binding,
+    ) == herdr_turns.TurnRefreshResult("updated", 1)
     assert adapter_calls == [(worker.id, "session-private-recovery")]
 
     final_payload = turns_payload_from_store(

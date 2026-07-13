@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tendwire.command_submission as command_submission
 
 from tendwire.backends.herdr_protocol import HerdrProtocolError
 from tendwire.backends.herdr_socket import (
@@ -29,10 +30,13 @@ from tendwire.core.commands import (
     STATUS_STALE_TARGET,
 )
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
+from tendwire.core.turns import PendingObservation, PendingObservedChoice
 from tendwire.store.sqlite import (
+    apply_backend_pending_observation,
     get_command_receipt,
     init_store,
     save_snapshot,
+    pending_payload_from_store,
     turns_payload_from_store,
     upsert_worker_bindings,
 )
@@ -131,6 +135,8 @@ def _binding(
     reason: str | None = None,
     fingerprint: str | None = None,
     private_fingerprint: str = "private-secret",
+    turn_target_kind: str | None = "pane_id",
+    turn_target_value: str | None = "pane-secret",
 ) -> WorkerBinding:
     return WorkerBinding(
         host_id="cmd-host",
@@ -139,6 +145,8 @@ def _binding(
         backend="herdr",
         target_kind=target_kind,
         target_value=value,
+        turn_target_kind=turn_target_kind,
+        turn_target_value=turn_target_value,
         sendable=sendable,
         reason=reason,
         observed_at="2026-01-01T00:00:00+00:00",
@@ -413,7 +421,6 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         "command.submitted",
         "command.cached",
         "command.duplicate",
-        "snapshot.saved",
     ]
     assert command_row is not None
     assert json.loads(command_row[0])["request_id"] == "req-1"
@@ -780,3 +787,664 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     assert "command.send_started" in events
     assert "command.submitted" in events
     assert "command.uncertain" in events
+
+
+def _answer_request(
+    *,
+    request_id: str = "answer-1",
+    dry_run: bool = False,
+    pending_id: str = "pending-public",
+    pending_fingerprint: str = "revision-public",
+    choice_id: str = "choice-public",
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "action": "answer_pending",
+        "request_id": request_id,
+        "dry_run": dry_run,
+        "params": {
+            "pending_id": pending_id,
+            "pending_fingerprint": pending_fingerprint,
+            "choice_id": choice_id,
+        },
+    }
+
+
+class _PendingClaim:
+    def __init__(
+        self,
+        status: str,
+        worker: Worker,
+        *,
+        claim_token: str | None,
+        private_fingerprint: str = "binding-private",
+        turn_target_value: str = "pane-secret",
+        picker_ordinal: int = 2,
+    ) -> None:
+        self.status = status
+        self.claim_token = claim_token
+        self.worker_id = worker.id if status in {"claimed", "validated"} else None
+        self.worker_fingerprint = worker.fingerprint if status in {"claimed", "validated"} else None
+        self.binding_private_fingerprint = (
+            private_fingerprint if status in {"claimed", "validated"} else None
+        )
+        self.turn_target_value = (
+            turn_target_value if status in {"claimed", "validated"} else None
+        )
+        self.picker_ordinal = picker_ordinal if status in {"claimed", "validated"} else None
+
+
+class _PendingSend:
+    def __init__(
+        self,
+        status: str,
+        worker: Worker,
+        *,
+        private_fingerprint: str = "binding-private",
+        turn_target_value: str = "pane-secret",
+        picker_ordinal: int = 2,
+    ) -> None:
+        self.status = status
+        self.worker_id = worker.id if status == "started" else None
+        self.worker_fingerprint = worker.fingerprint if status == "started" else None
+        self.binding_private_fingerprint = private_fingerprint if status == "started" else None
+        self.turn_target_value = turn_target_value if status == "started" else None
+        self.picker_ordinal = picker_ordinal if status == "started" else None
+
+
+def _patch_pending_store_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    worker: Worker,
+    *,
+    claim_status: str = "claimed",
+    private_fingerprint: str = "binding-private",
+    picker_ordinal: int = 2,
+    turn_target_value: str = "pane-secret",
+    finish_result: bool = True,
+) -> list[tuple[Any, ...]]:
+    transitions: list[tuple[Any, ...]] = []
+
+    def claim(
+        db_path: Path,
+        host_id: str,
+        pending_id: str,
+        pending_fingerprint: str,
+        choice_id: str,
+        *,
+        claim: bool = True,
+        observed_at: str | None = None,
+    ) -> _PendingClaim:
+        transitions.append(
+            ("claim", claim, pending_id, pending_fingerprint, choice_id, observed_at)
+        )
+        status = claim_status
+        token: str | None = "claim-private" if status == "claimed" else None
+        if not claim and status == "claimed":
+            status = "validated"
+        return _PendingClaim(
+            status,
+            worker,
+            claim_token=token,
+            private_fingerprint=private_fingerprint,
+            turn_target_value=turn_target_value,
+            picker_ordinal=picker_ordinal,
+        )
+
+    def start(
+        db_path: Path,
+        host_id: str,
+        claim_token: str,
+        *,
+        observed_at: str | None = None,
+    ) -> _PendingSend:
+        transitions.append(("start", claim_token, observed_at))
+        return _PendingSend(
+            "started",
+            worker,
+            private_fingerprint=private_fingerprint,
+            turn_target_value=turn_target_value,
+            picker_ordinal=picker_ordinal,
+        )
+
+    def finish(
+        db_path: Path,
+        host_id: str,
+        claim_token: str,
+        *,
+        accepted: bool,
+    ) -> bool:
+        transitions.append(("finish", claim_token, accepted))
+        return finish_result
+
+    def abandon(db_path: Path, host_id: str, claim_token: str) -> bool:
+        transitions.append(("abandon", claim_token))
+        return True
+
+    monkeypatch.setattr(command_submission, "claim_backend_pending_choice", claim)
+    monkeypatch.setattr(command_submission, "start_backend_pending_choice_send", start)
+    monkeypatch.setattr(command_submission, "finish_backend_pending_choice_send", finish)
+    monkeypatch.setattr(command_submission, "abandon_backend_pending_choice_claim", abandon)
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    return transitions
+
+
+def _expected_answer_calls(
+    *,
+    pane_id: str = "pane-secret",
+    ordinal: int = 2,
+) -> list[dict[str, Any]]:
+    return [
+        *_expected_private_clear_calls(pane_id),
+        {"method": "pane.send_text", "params": {"pane_id": pane_id, "text": str(ordinal)}},
+        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
+    ]
+
+
+def test_answer_pending_dry_run_validates_current_choice_without_claim_or_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _answer_request(request_id="", dry_run=True),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert envelope.ok is True
+    assert envelope.status == "dry_run"
+    assert envelope.result == {
+        "target": {"worker_id": "w-1"},
+        "pending": {"id": "pending-public", "fingerprint": "revision-public"},
+        "choice": {"choice_id": "choice-public"},
+        "delivery_state": "not_submitted",
+    }
+    assert transitions == [
+        (
+            "claim",
+            False,
+            "pending-public",
+            "revision-public",
+            "choice-public",
+            None,
+        )
+    ]
+    assert calls == []
+    assert config.db_path is not None
+    assert get_command_receipt(config.db_path, "cmd-host", "", "answer_pending") is None
+
+
+def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+    monkeypatch.setattr(
+        command_submission,
+        "list_worker_bindings",
+        lambda *args, **kwargs: pytest.fail(
+            "answer_pending must use the binding authenticated by the claim API"
+        ),
+    )
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _answer_request(),
+        socket_client_factory=_factory(calls),
+    )
+    monkeypatch.setattr(
+        command_submission,
+        "_append_command_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("cached audit unavailable")
+        ),
+    )
+    replay = submit_command(
+        config,
+        _answer_request(),
+        socket_client_factory=_factory(calls),
+    )
+    changed_payload = submit_command(
+        config,
+        _answer_request(choice_id="different-choice"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.ok is True
+    assert first.status == STATUS_ACCEPTED
+    assert first.result == {
+        "target": {"worker_id": "w-1"},
+        "pending": {"id": "pending-public", "fingerprint": "revision-public"},
+        "choice": {"choice_id": "choice-public"},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "observed_pending_state": "pending_observation",
+    }
+    assert replay.to_dict() == first.to_dict()
+    assert changed_payload.status == STATUS_DUPLICATE_REQUEST
+    assert calls == _expected_answer_calls()
+    assert transitions == [
+        (
+            "claim",
+            True,
+            "pending-public",
+            "revision-public",
+            "choice-public",
+            None,
+        ),
+        ("start", "claim-private", None),
+        ("finish", "claim-private", True),
+    ]
+
+    assert config.db_path is not None
+    receipt = get_command_receipt(config.db_path, "cmd-host", "answer-1", "answer_pending")
+    assert receipt is not None
+    assert receipt["status"] == STATUS_ACCEPTED
+    turns = turns_payload_from_store(config.db_path, config.host_id)["turns"]
+    assert not any(turn.get("origin_command_id") == "answer-1" for turn in turns)
+
+
+@pytest.mark.parametrize(
+    "claim_status",
+    ["not_found", "stale", "changed", "unknown_choice", "already_claimed"],
+)
+def test_answer_pending_changed_disappeared_stale_or_unknown_fails_before_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim_status: str,
+) -> None:
+    config = _config(tmp_path / claim_status)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(
+        monkeypatch,
+        worker,
+        claim_status=claim_status,
+    )
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _answer_request(request_id=f"answer-{claim_status}"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_STALE_TARGET
+    assert envelope.error == {
+        "code": STATUS_STALE_TARGET,
+        "message": "pending interaction changed or is no longer answerable",
+        "details": {},
+    }
+    assert calls == []
+    assert len(transitions) == 1
+    assert transitions[0][0] == "claim"
+
+
+
+
+def test_answer_pending_second_request_loses_claim_race_without_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+    original_claim = command_submission.claim_backend_pending_choice
+    claim_count = 0
+
+    def racing_claim(*args: Any, **kwargs: Any) -> _PendingClaim:
+        nonlocal claim_count
+        claim_count += 1
+        if claim_count == 2:
+            transitions.append(("claim_race_lost",))
+            return _PendingClaim("already_claimed", worker, claim_token=None)
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(command_submission, "claim_backend_pending_choice", racing_claim)
+    calls: list[dict[str, Any]] = []
+    losing_result: list[Any] = []
+
+    class _RacingClient(_FakeSocketClient):
+        def connect(self) -> "_FakeSocketClient":
+            losing_result.append(
+                submit_command(
+                    config,
+                    _answer_request(request_id="answer-race-loser"),
+                    socket_client_factory=lambda _config: pytest.fail(
+                        "losing request must not create a socket client"
+                    ),
+                )
+            )
+            return self
+
+    winner = submit_command(
+        config,
+        _answer_request(request_id="answer-race-winner"),
+        socket_client_factory=lambda _config: _RacingClient(calls),
+    )
+
+    assert winner.status == STATUS_ACCEPTED
+    assert len(losing_result) == 1
+    assert losing_result[0].status == STATUS_STALE_TARGET
+    assert calls == _expected_answer_calls()
+
+
+def test_answer_pending_post_send_failure_is_uncertain_and_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _answer_request(request_id="answer-uncertain"),
+        socket_client_factory=_factory(
+            calls,
+            raises=HerdrSocketDisconnectedError("disconnected"),
+        ),
+    )
+    replay = submit_command(
+        config,
+        _answer_request(request_id="answer-uncertain"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert transitions[-1] == ("finish", "claim-private", False)
+    assert calls == [
+        *_expected_private_clear_calls(),
+        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "2"}},
+    ]
+    assert config.db_path is not None
+    receipt = get_command_receipt(
+        config.db_path,
+        "cmd-host",
+        "answer-uncertain",
+        "answer_pending",
+    )
+    assert receipt is not None
+    assert receipt["uncertain"] is True
+
+
+def test_answer_pending_public_surfaces_recursively_exclude_private_route_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    private_binding = "raw-binding-sentinel"
+    private_target = "raw-target-sentinel"
+    private_pane = "raw-pane-sentinel"
+    _seed(
+        config,
+        [worker],
+        [
+            _binding(
+                worker,
+                value=private_target,
+                private_fingerprint=private_binding,
+                turn_target_kind="pane_id",
+                turn_target_value=private_pane,
+            )
+        ],
+    )
+    _patch_pending_store_flow(
+        monkeypatch,
+        worker,
+        private_fingerprint=private_binding,
+        turn_target_value=private_pane,
+        picker_ordinal=3,
+    )
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _answer_request(request_id="answer-private"),
+        socket_client_factory=_factory(calls, pane_id=private_pane),
+    )
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert calls == _expected_answer_calls(
+        pane_id=private_pane,
+        ordinal=3,
+    )
+    assert config.db_path is not None
+    receipt = get_command_receipt(
+        config.db_path,
+        "cmd-host",
+        "answer-private",
+        "answer_pending",
+    )
+    assert receipt is not None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        event_payloads = [
+            json.loads(row[0])
+            for row in conn.execute(
+                "SELECT payload_json FROM events WHERE aggregate_id = ? ORDER BY id",
+                ("answer-private",),
+            ).fetchall()
+        ]
+    public_surfaces = [
+        envelope.to_dict(),
+        json.loads(receipt["result_json"]),
+        *event_payloads,
+    ]
+    encoded = json.dumps(public_surfaces)
+    assert private_binding not in encoded
+    assert private_target not in encoded
+    assert private_pane not in encoded
+    for surface in public_surfaces:
+        _assert_no_private_json(surface)
+
+
+def test_answer_pending_integrates_with_durable_two_phase_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    binding = _binding(
+        worker,
+        private_fingerprint="binding-private",
+        turn_target_kind="pane_id",
+        turn_target_value="pane-secret",
+    )
+    _seed(config, [worker], [binding])
+    assert config.db_path is not None
+    assert apply_backend_pending_observation(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        PendingObservation(
+            kind="open_prompt",
+            question="Choose a safe option",
+            pending_kind="choice",
+            choices=(
+                PendingObservedChoice(
+                    choice_id="choice-aaaaaaaaaaaaaaaaaaaaaaaa",
+                    label="First",
+                    picker_ordinal=1,
+                ),
+                PendingObservedChoice(
+                    choice_id="choice-bbbbbbbbbbbbbbbbbbbbbbbb",
+                    label="Second",
+                    picker_ordinal=2,
+                ),
+            ),
+            revision_digest="private-revision-digest",
+        ),
+        binding_private_fingerprint=binding.private_fingerprint,
+        observed_turn_target_value=binding.turn_target_value,
+    )
+    pending_before = pending_payload_from_store(config.db_path, config.host_id)
+    assert len(pending_before["pending_interactions"]) == 1
+    interaction = pending_before["pending_interactions"][0]
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+
+    envelope = submit_command(
+        config,
+        _answer_request(
+            request_id="answer-real-claim",
+            pending_id=interaction["id"],
+            pending_fingerprint=interaction["fingerprint"],
+            choice_id=interaction["choices"][1]["choice_id"],
+        ),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.result == {
+        "target": {"worker_id": worker.id},
+        "pending": {
+            "id": interaction["id"],
+            "fingerprint": interaction["fingerprint"],
+        },
+        "choice": {"choice_id": interaction["choices"][1]["choice_id"]},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "observed_pending_state": "pending_observation",
+    }
+    assert calls == _expected_answer_calls(ordinal=2)
+    pending_after = pending_payload_from_store(config.db_path, config.host_id)
+    assert pending_after["pending_interactions"] == []
+
+
+@pytest.mark.parametrize("start_status", ["changed", "stale", "binding_changed"])
+def test_answer_pending_second_cas_rejects_change_before_pane_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_status: str,
+) -> None:
+    config = _config(tmp_path / start_status)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+
+    def changed_start(
+        db_path: Path,
+        host_id: str,
+        claim_token: str,
+        *,
+        observed_at: str | None = None,
+    ) -> _PendingSend:
+        transitions.append(("start", claim_token, start_status))
+        return _PendingSend(start_status, worker)
+
+    monkeypatch.setattr(
+        command_submission,
+        "start_backend_pending_choice_send",
+        changed_start,
+    )
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _answer_request(request_id=f"answer-start-{start_status}"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert envelope.status == STATUS_STALE_TARGET
+    assert envelope.error == {
+        "code": STATUS_STALE_TARGET,
+        "message": "pending interaction changed or is no longer answerable",
+        "details": {},
+    }
+    assert calls == []
+    assert transitions[-1] == ("abandon", "claim-private")
+
+
+def test_answer_pending_failed_pre_send_release_is_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="replacement-private")],
+    )
+    transitions = _patch_pending_store_flow(
+        monkeypatch,
+        worker,
+        private_fingerprint="claimed-private",
+    )
+
+    def failed_abandon(db_path: Path, host_id: str, claim_token: str) -> bool:
+        transitions.append(("abandon_failed", claim_token))
+        return False
+
+    monkeypatch.setattr(
+        command_submission,
+        "abandon_backend_pending_choice_claim",
+        failed_abandon,
+    )
+    def failed_factory(config: Config) -> Any:
+        raise OSError("socket unavailable")
+
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _answer_request(request_id="answer-release-failed"),
+        socket_client_factory=failed_factory,
+    )
+
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert envelope.error == {
+        "code": STATUS_REQUEST_STATE_UNCERTAIN,
+        "message": "pending answer claim could not be safely released",
+        "details": {},
+    }
+    assert calls == []
+    assert transitions[-1] == ("abandon_failed", "claim-private")
+    assert config.db_path is not None
+    receipt = get_command_receipt(
+        config.db_path,
+        config.host_id,
+        "answer-release-failed",
+        "answer_pending",
+    )
+    assert receipt is not None
+    assert receipt["uncertain"] is True

@@ -6,30 +6,51 @@ provided for optional persistence and is kept intentionally stdlib-only.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import secrets
 import sqlite3
 import stat
-from collections.abc import Collection, Iterable, Mapping
+import time
+import weakref
+import threading
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlsplit
 
+from ..config import DEFAULT_PENDING_STALE_GRACE_SECONDS
 from ..local_state import (
-    canonical_path_from_fd,
+    EntryIdentity,
+    EntryType,
     LocalStateError,
     LocalStateErrorCode,
     PermissionState,
+    _SQLiteFamilyMemberSnapshot,
+    _snapshot_sqlite_family_at,
+    canonical_path_from_fd,
+    cleanup_private_sqlite_replacement_at,
+    create_private_file_at,
+    entry_identity,
+    identity_matches,
+    inspect_private_file_at,
     local_state_error,
-    inspect_sqlite_family_at,
     open_resolved_parent,
-    private_file_creation_umask,
-    prepare_resolved_private_parent,
+    prepare_private_sqlite_replacement_at,
+    prepare_resolved_private_sqlite_parent,
     prepare_sqlite_family_at,
+    private_file_creation_umask,
+    publish_private_sqlite_replacement_at,
+    release_private_sqlite_replacement_at,
+    sqlite_parent_available_bytes_at,
     validate_owned_directory_stat,
+    validate_owned_regular_stat,
+    verify_created_private_sqlite_replacement_at,
+    verify_entry_identity,
 )
 from ..core.commands import CommandEnvelope
 from ..core.models import (
@@ -46,42 +67,160 @@ from ..core.models import (
     utc_timestamp,
 )
 from ..core.turns import (
+    InteractionChoice,
+    PendingInteraction,
+    PendingObservation,
+    PendingObservedChoice,
     Turn,
     TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
     TURN_CONTENT_PREVIEW_MAX_CHARS,
+    TURN_LIST_CURSOR_TTL_SECONDS,
+    TURN_LIST_DEFAULT_LIMIT,
+    TURN_LIST_MAX_LIMIT,
     TURN_LIST_SCHEMA_VERSION,
+    TURN_SCHEMA_VERSION,
     TURN_TEXT_MAX_CHARS,
     ContentCursorPosition,
+    TurnListCursorPosition,
     content_cursor,
     content_revision,
     content_segment_id,
     decode_content_cursor,
+    decode_turn_list_cursor,
+    decode_turn_since_token,
     is_internal_automation_turn_payload,
+    pending_from_snapshot,
+    pending_payload_from_snapshot,
     project_persisted_turn_content,
     project_turn_content,
+    recompute_pending_content_fingerprint,
     segment_canonical_text,
-    pending_from_snapshot,
+    turn_list_cursor,
+    turn_since_token,
     turns_from_snapshot,
     turns_payload_from_snapshot,
 )
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 7
+STORE_SCHEMA_VERSION = 10
 ATTENTION_LIFECYCLE_OPEN = "open"
 ATTENTION_LIFECYCLE_RESOLVED = "resolved"
 ATTENTION_RESOLVED_REASON_GONE = "gone"
 ATTENTION_RESOLVED_REASON_SUPERSEDED = "superseded"
 ATTENTION_OUTBOX_CONNECTOR = "attention"
+BACKEND_PENDING_CLAIM_LEASE_SECONDS = 30.0
 ATTENTION_MISSING_REQUIRED = 2
 ATTENTION_MISSING_GRACE_SECONDS = 120
 _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+
+
+class StoreSchemaError(RuntimeError):
+    """Raised when a store schema cannot be opened safely."""
+
+    def __init__(self, status: str) -> None:
+        self.status = str(status)
+        super().__init__(self.status)
+
+
+@dataclass(frozen=True)
+class Migration:
+    """One exact, transaction-external schema transition."""
+
+    from_version: int
+    to_version: int
+    apply: Callable[[sqlite3.Connection], None]
+
+
+
+@dataclass(frozen=True)
+class BackendPendingChoiceClaim:
+    status: Literal[
+        "claimed",
+        "validated",
+        "not_found",
+        "stale",
+        "changed",
+        "unknown_choice",
+        "already_claimed",
+    ]
+    claim_token: str | None = None
+    worker_id: str | None = None
+    worker_fingerprint: str | None = None
+    binding_private_fingerprint: str | None = None
+    turn_target_value: str | None = None
+    picker_ordinal: int | None = None
+
+
+@dataclass(frozen=True)
+class BackendPendingChoiceSend:
+    status: Literal[
+        "started",
+        "not_found",
+        "stale",
+        "changed",
+        "binding_changed",
+        "already_started",
+    ]
+    worker_id: str | None = None
+    worker_fingerprint: str | None = None
+    binding_private_fingerprint: str | None = None
+    turn_target_value: str | None = None
+    picker_ordinal: int | None = None
+
+
+@dataclass(frozen=True)
+class SnapshotRetentionPolicy:
+    """Database-wide snapshot history bounds."""
+
+    retention_days: int = 14
+    retention_count: int = 4096
+    batch_size: int = 100
+
+    def __post_init__(self) -> None:
+        for name in ("retention_days", "retention_count", "batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class CompactionOptions:
+    """Policy and explicit offline authority for one compaction."""
+
+    dry_run: bool
+    acknowledge_offline: bool = False
+    backup_path: Path | None = None
+    snapshot_retention_days: int = 14
+    snapshot_retention_count: int = 4096
+    batch_size: int = 100
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+        if not isinstance(self.acknowledge_offline, bool):
+            raise ValueError("acknowledge_offline must be a boolean")
+        if self.backup_path is not None:
+            object.__setattr__(self, "backup_path", Path(self.backup_path))
 
 
 @dataclass(frozen=True)
 class SnapshotObservationContext:
     authority: Literal["none", "positive", "complete"] = "none"
     observed_at: str | None = None
+
+@dataclass(frozen=True)
+class TurnRefreshApplyResult:
+    """Atomic turn and backend-pending persistence outcome."""
+
+    updated: int
+    pending_changed: bool
+    stale_binding: bool = False
+    cancelled: bool = False
+
+
+_UNSET = object()
+
 
 @dataclass
 class TurnContentWorkCounters:
@@ -131,7 +270,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 """
 
-CREATE_INDEXES = (
+CREATE_LEGACY_SNAPSHOT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_snapshots_host_id ON snapshots(host_id)",
     "CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON snapshots(created_at)",
     (
@@ -139,6 +278,44 @@ CREATE_INDEXES = (
         "ON snapshots(content_fingerprint)"
     ),
 )
+
+CREATE_SNAPSHOT_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_host_newest "
+        "ON snapshots(host_id, id DESC)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_created_host_id "
+        "ON snapshots(created_at, host_id, id)"
+    ),
+)
+# Leading "~" sorts after every canonical timestamp under SQLite BINARY
+# collation, so raw indexed age comparisons never delete unknown history.
+_SNAPSHOT_CREATED_AT_QUARANTINE = "~invalid-snapshot-created-at"
+_LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE = (
+    "9999-12-31T23:59:59.999999+00:00"
+)
+
+CREATE_STORE_MAINTENANCE_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS store_maintenance_state (
+    scope TEXT PRIMARY KEY CHECK (scope = 'automatic'),
+    last_started_at TEXT,
+    last_completed_at TEXT,
+    last_status TEXT NOT NULL DEFAULT 'never'
+        CHECK (last_status IN ('never', 'ok', 'failed')),
+    last_examined INTEGER NOT NULL DEFAULT 0 CHECK (last_examined >= 0),
+    last_deleted INTEGER NOT NULL DEFAULT 0 CHECK (last_deleted >= 0),
+    last_examined_id INTEGER
+);
+"""
+
+INSERT_STORE_MAINTENANCE_STATE = """
+INSERT INTO store_maintenance_state (
+    scope, last_started_at, last_completed_at, last_status,
+    last_examined, last_deleted, last_examined_id
+) VALUES ('automatic', NULL, NULL, 'never', 0, 0, NULL)
+ON CONFLICT(scope) DO NOTHING
+"""
 
 CREATE_COMMAND_RECEIPTS_TABLE = """
 CREATE TABLE IF NOT EXISTS command_receipts (
@@ -258,9 +435,36 @@ CREATE TABLE IF NOT EXISTS turns (
     snapshot_content_fingerprint TEXT NOT NULL,
     observed_at TEXT NOT NULL,
     payload_json TEXT NOT NULL,
+    list_sequence INTEGER NOT NULL CHECK (list_sequence > 0),
     PRIMARY KEY (host_id, turn_id)
 );
 """
+
+CREATE_TURN_LIST_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_list_state (
+    scope TEXT PRIMARY KEY CHECK (scope = 'turn-list'),
+    store_epoch TEXT NOT NULL
+);
+"""
+
+CREATE_TURN_LIST_HOSTS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_list_hosts (
+    host_id TEXT PRIMARY KEY,
+    next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+    traversal_generation INTEGER NOT NULL CHECK (traversal_generation > 0)
+);
+"""
+
+CREATE_TURN_LIST_INDEXES = (
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_turns_host_list_sequence "
+        "ON turns(host_id, list_sequence)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turns_host_worker_list_sequence "
+        "ON turns(host_id, worker_id, list_sequence DESC, turn_id)"
+    ),
+)
 
 CREATE_TURN_CONTENT_REVISIONS_TABLE = """
 CREATE TABLE IF NOT EXISTS turn_content_revisions (
@@ -578,6 +782,35 @@ CREATE TABLE IF NOT EXISTS backend_health (
 );
 """
 
+
+CREATE_LEGACY_BACKEND_PENDING_TABLE = """
+CREATE TABLE IF NOT EXISTS backend_pending (
+    host_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, worker_id)
+);
+"""
+
+
+CREATE_BACKEND_PENDING_CLAIMS_TABLE = """
+CREATE TABLE IF NOT EXISTS backend_pending_claims (
+    host_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    claim_token TEXT NOT NULL UNIQUE,
+    revision_digest TEXT NOT NULL,
+    choice_id TEXT NOT NULL,
+    picker_ordinal INTEGER NOT NULL CHECK (picker_ordinal >= 1),
+    worker_fingerprint TEXT NOT NULL,
+    binding_private_fingerprint TEXT NOT NULL,
+    turn_target_value TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('claimed', 'send_started')),
+    claimed_at TEXT NOT NULL,
+    send_started_at TEXT,
+    PRIMARY KEY (host_id, worker_id)
+);
+"""
 CREATE_PR6_TABLES = (
     CREATE_EVENTS_TABLE,
     CREATE_SPACES_TABLE,
@@ -611,14 +844,7 @@ CREATE_PR6_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_pending_interactions_host_status "
         "ON pending_interactions(host_id, status)"
     ),
-    (
-        "CREATE TABLE IF NOT EXISTS backend_pending ("
-        "host_id TEXT NOT NULL, "
-        "worker_id TEXT NOT NULL, "
-        "payload_json TEXT NOT NULL, "
-        "observed_at TEXT NOT NULL, "
-        "PRIMARY KEY (host_id, worker_id))"
-    ),
+    CREATE_LEGACY_BACKEND_PENDING_TABLE,
     (
         "CREATE INDEX IF NOT EXISTS idx_attention_items_host_source "
         "ON attention_items(host_id, source)"
@@ -674,11 +900,27 @@ def _is_memory_db(db_path: Path | str) -> bool:
         query = urlsplit(raw).query
     except ValueError:
         return False
-    mode: str | None = None
-    for name, value in parse_qsl(query, keep_blank_values=True):
-        if name == "mode":
-            mode = value
-    return mode == "memory"
+    modes = [
+        value
+        for name, value in parse_qsl(query, keep_blank_values=True)
+        if name == "mode"
+    ]
+    return modes == ["memory"]
+
+
+def _has_duplicate_sqlite_uri_mode(db_path: Path | str) -> bool:
+    raw = str(db_path)
+    if not raw.startswith("file:"):
+        return False
+    try:
+        query = urlsplit(raw).query
+    except ValueError:
+        return False
+    return sum(
+        1
+        for name, _value in parse_qsl(query, keep_blank_values=True)
+        if name == "mode"
+    ) > 1
 
 
 def _validate_parent_fd(parent_fd: int, *, private: bool) -> None:
@@ -701,10 +943,18 @@ def _bare_relative_parent(db_path: Path | str) -> bool:
 
 
 def _open_filesystem_db(
-    db_path: Path | str, *, prepare: bool
+    db_path: Path | str,
+    *,
+    prepare: bool,
+    retain_parent_shared_lock: bool,
 ) -> tuple[int, str]:
+    shared_lock_held = False
     if prepare and not _bare_relative_parent(db_path):
-        parent_fd, leaf, _result = prepare_resolved_private_parent(db_path)
+        parent_fd, leaf, _result = prepare_resolved_private_sqlite_parent(
+            db_path,
+            retain_parent_shared_lock=retain_parent_shared_lock,
+        )
+        shared_lock_held = retain_parent_shared_lock
     else:
         parent_fd, leaf = open_resolved_parent(db_path)
         try:
@@ -713,8 +963,17 @@ def _open_filesystem_db(
             os.close(parent_fd)
             raise
     try:
+        if retain_parent_shared_lock and not shared_lock_held:
+            try:
+                fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
         if prepare:
-            prepare_sqlite_family_at(parent_fd, leaf)
+            prepare_sqlite_family_at(
+                parent_fd,
+                leaf,
+                retain_parent_shared_lock=retain_parent_shared_lock,
+            )
         _validate_sqlite_family_at(parent_fd, leaf)
         return parent_fd, leaf
     except Exception:
@@ -723,12 +982,12 @@ def _open_filesystem_db(
 
 
 def _validate_sqlite_family_at(parent_fd: int, leaf: str) -> None:
-    inspected = inspect_sqlite_family_at(parent_fd, leaf)
-    for suffix, result in zip(_SQLITE_FAMILY_SUFFIXES, inspected, strict=True):
-        if result.state is PermissionState.ABSENT and suffix:
-            continue
-        if result.state is PermissionState.ABSENT:
-            raise local_state_error(LocalStateErrorCode.MISSING_ENTRY)
+    inspected = _snapshot_sqlite_family_at(
+        parent_fd,
+        leaf,
+        require_main=True,
+    )
+    for result in inspected:
         if result.state is PermissionState.REPAIR_REQUIRED:
             raise local_state_error(LocalStateErrorCode.INSECURE_MODE)
 
@@ -743,37 +1002,215 @@ def _sqlite_store_exists(db_path: Path | str) -> bool:
             return False
         raise
     try:
-        _validate_parent_fd(parent_fd, private=True)
-        inspected = inspect_sqlite_family_at(parent_fd, leaf)
+        inspected = _snapshot_sqlite_family_at(
+            parent_fd,
+            leaf,
+            require_main=False,
+        )
         return inspected[0].state is not PermissionState.ABSENT
     finally:
         os.close(parent_fd)
 
 
 def _apply_connection_pragmas(conn: sqlite3.Connection, db_path: Path | str) -> None:
+    """Apply cheap, connection-local safety settings."""
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
-    if not _is_memory_db(db_path):
-        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
 
+def _configure_persistent_database_conn(conn: sqlite3.Connection) -> None:
+    """Negotiate persistent WAL once, only while initializing or migrating."""
+    database_row = conn.execute("PRAGMA database_list").fetchone()
+    if database_row is None or not str(database_row[2] or ""):
+        return
+    mode_row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    if mode_row is None or str(mode_row[0]).lower() != "wal":
+        raise StoreSchemaError("wal_unavailable")
+
+
+@dataclass(frozen=True)
+class _SchemaConnectionAuthority:
+    parent_fd: int | None
+    parent_identity: EntryIdentity | None
+    leaf: str | None
+    selected_identity: EntryIdentity | None
+    retains_parent_shared_lock: bool
+
+
+_SCHEMA_CONNECTION_AUTHORITIES: dict[
+    int, tuple[weakref.ReferenceType[Any], _SchemaConnectionAuthority]
+] = {}
+_SCHEMA_CONNECTION_AUTHORITIES_LOCK = threading.RLock()
+_SCHEMA_PARENT_SHARED_LOCK_RECOVERY_ATTEMPTS = 3
+
+
+def _parent_directory_identity(parent_fd: int) -> EntryIdentity:
+    try:
+        return entry_identity(os.fstat(parent_fd))
+    except OSError:
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+
+
+def _close_schema_authority(authority: _SchemaConnectionAuthority) -> None:
+    if authority.parent_fd is not None:
+        try:
+            os.close(authority.parent_fd)
+        except OSError:
+            pass
+
+
+def _release_abandoned_schema_connection_authority(
+    connection_id: int,
+    reference: weakref.ReferenceType[Any],
+) -> None:
+    authority: _SchemaConnectionAuthority | None = None
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        registered = _SCHEMA_CONNECTION_AUTHORITIES.get(connection_id)
+        if registered is None or registered[0] is not reference:
+            return
+        _SCHEMA_CONNECTION_AUTHORITIES.pop(connection_id)
+        authority = registered[1]
+    _close_schema_authority(authority)
+
+
+def _register_schema_connection_authority(
+    conn: sqlite3.Connection,
+    *,
+    parent_fd: int | None = None,
+    leaf: str | None = None,
+    selected_identity: EntryIdentity | None = None,
+    retains_parent_shared_lock: bool = False,
+) -> None:
+    parent_identity = (
+        _parent_directory_identity(parent_fd) if parent_fd is not None else None
+    )
+    connection_id = id(conn)
+
+    def release(reference: weakref.ReferenceType[Any]) -> None:
+        _release_abandoned_schema_connection_authority(connection_id, reference)
+
+    authority = _SchemaConnectionAuthority(
+        parent_fd=parent_fd,
+        parent_identity=parent_identity,
+        leaf=leaf,
+        selected_identity=selected_identity,
+        retains_parent_shared_lock=retains_parent_shared_lock,
+    )
+    stale_authority: _SchemaConnectionAuthority | None = None
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        registered = _SCHEMA_CONNECTION_AUTHORITIES.get(connection_id)
+        if registered is not None:
+            existing = registered[0]()
+            if existing is conn:
+                return
+            if existing is not None:
+                raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+            _SCHEMA_CONNECTION_AUTHORITIES.pop(connection_id)
+            stale_authority = registered[1]
+        _SCHEMA_CONNECTION_AUTHORITIES[connection_id] = (
+            weakref.ref(conn, release),
+            authority,
+        )
+    if stale_authority is not None:
+        _close_schema_authority(stale_authority)
+
+
+def _schema_connection_authority(
+    conn: sqlite3.Connection,
+) -> _SchemaConnectionAuthority:
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        registered = _SCHEMA_CONNECTION_AUTHORITIES.get(id(conn))
+        if registered is None or registered[0]() is not conn:
+            raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+        return registered[1]
+
+
+def _release_schema_connection_authority(
+    conn: sqlite3.Connection,
+) -> _SchemaConnectionAuthority | None:
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        registered = _SCHEMA_CONNECTION_AUTHORITIES.get(id(conn))
+        if registered is None or registered[0]() is not conn:
+            return None
+        _SCHEMA_CONNECTION_AUTHORITIES.pop(id(conn))
+        return registered[1]
+
+
+def _has_other_shared_parent_schema_authority(
+    conn: sqlite3.Connection,
+    authority: _SchemaConnectionAuthority,
+) -> bool:
+    if authority.parent_identity is None:
+        return False
+    stale_authorities: list[_SchemaConnectionAuthority] = []
+    has_other = False
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        for connection_id, (reference, candidate) in tuple(
+            _SCHEMA_CONNECTION_AUTHORITIES.items()
+        ):
+            registered_conn = reference()
+            if registered_conn is None:
+                registered = _SCHEMA_CONNECTION_AUTHORITIES.get(connection_id)
+                if (
+                    registered is not None
+                    and registered[0] is reference
+                    and registered[1] is candidate
+                ):
+                    _SCHEMA_CONNECTION_AUTHORITIES.pop(connection_id)
+                    stale_authorities.append(candidate)
+                continue
+            if registered_conn is conn:
+                continue
+            if (
+                candidate.retains_parent_shared_lock
+                and candidate.parent_identity == authority.parent_identity
+            ):
+                has_other = True
+                break
+    for stale_authority in stale_authorities:
+        _close_schema_authority(stale_authority)
+    return has_other
+
+
+def _restore_schema_parent_lock(authority: _SchemaConnectionAuthority) -> bool:
+    parent_fd = authority.parent_fd
+    if parent_fd is None:
+        return False
+    if not authority.retains_parent_shared_lock:
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        except (BlockingIOError, OSError):
+            raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+        return False
+    retried = False
+    for _attempt in range(_SCHEMA_PARENT_SHARED_LOCK_RECOVERY_ATTEMPTS):
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            retried = True
+            continue
+        return retried
+    raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+
+
+def _fail_closed_schema_connection(conn: sqlite3.Connection) -> None:
+    try:
+        conn.close()
+    except Exception:
+        authority = _release_schema_connection_authority(conn)
+        if authority is not None:
+            _close_schema_authority(authority)
+
+
 class _ClosingConnection(sqlite3.Connection):
-    """Connection that owns its resolved database parent descriptor until close."""
-
-    _parent_fd: int | None = None
-
-    def _own_parent_fd(self, parent_fd: int) -> None:
-        self._parent_fd = parent_fd
+    """Connection that owns its registered schema authority until close."""
 
     def close(self) -> None:
-        parent_fd = self._parent_fd
-        self._parent_fd = None
-        try:
-            super().close()
-        finally:
-            if parent_fd is not None:
-                os.close(parent_fd)
+        super().close()
+        authority = _release_schema_connection_authority(self)
+        if authority is not None:
+            _close_schema_authority(authority)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
         try:
@@ -782,26 +1219,174 @@ class _ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+@contextmanager
+def _filesystem_schema_mutation_authority(
+    conn: sqlite3.Connection,
+) -> Iterator[None]:
+    """Hold exclusive authority for one non-current filesystem schema branch."""
+
+    authority = _schema_connection_authority(conn)
+    parent_fd = authority.parent_fd
+    leaf = authority.leaf
+    selected_identity = authority.selected_identity
+    if parent_fd is None or leaf is None or selected_identity is None:
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        if _has_other_shared_parent_schema_authority(conn, authority):
+            raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+        try:
+            fcntl.flock(parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            try:
+                restored_after_contention = _restore_schema_parent_lock(authority)
+            except LocalStateError:
+                _fail_closed_schema_connection(conn)
+            else:
+                if restored_after_contention:
+                    _fail_closed_schema_connection(conn)
+            raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
+    try:
+        _validate_parent_fd(parent_fd, private=True)
+        _verify_expected_identity_at(parent_fd, leaf, selected_identity)
+        _validate_sqlite_family_at(parent_fd, leaf)
+        try:
+            yield
+        finally:
+            prepare_sqlite_family_at(
+                parent_fd,
+                leaf,
+                retain_parent_shared_lock=authority.retains_parent_shared_lock,
+                _parent_exclusive_lock_held=True,
+                _expected_main_identity=selected_identity,
+            )
+            _validate_parent_fd(parent_fd, private=True)
+            _verify_expected_identity_at(parent_fd, leaf, selected_identity)
+            _validate_sqlite_family_at(parent_fd, leaf)
+            _verify_expected_identity_at(parent_fd, leaf, selected_identity)
+    finally:
+        try:
+            restored_after_contention = _restore_schema_parent_lock(authority)
+        except LocalStateError:
+            _fail_closed_schema_connection(conn)
+            raise
+        if restored_after_contention:
+            _fail_closed_schema_connection(conn)
+            raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+
+
+def _verify_expected_identity_at(
+    parent_fd: int,
+    leaf: str,
+    expected_identity: EntryIdentity,
+) -> os.stat_result:
+    return verify_entry_identity(
+        parent_fd,
+        leaf,
+        expected_identity,
+        expected_type=EntryType.REGULAR_FILE,
+    )
+
+
 def _connect(
     db_path: Path | str,
     *,
     isolation_level: str | None = "",
     prepare: bool = False,
+    read_only: bool = False,
+    _store_lock_held: bool = False,
+    _expected_db_identity: EntryIdentity | None = None,
 ) -> sqlite3.Connection:
+    with _SCHEMA_CONNECTION_AUTHORITIES_LOCK:
+        return _connect_unlocked(
+            db_path,
+            isolation_level=isolation_level,
+            prepare=prepare,
+            read_only=read_only,
+            _store_lock_held=_store_lock_held,
+            _expected_db_identity=_expected_db_identity,
+        )
+
+
+def _connect_unlocked(
+    db_path: Path | str,
+    *,
+    isolation_level: str | None = "",
+    prepare: bool = False,
+    read_only: bool = False,
+    _store_lock_held: bool = False,
+    _expected_db_identity: EntryIdentity | None = None,
+) -> sqlite3.Connection:
+    if prepare and read_only:
+        raise ValueError("read-only connections cannot prepare store state")
     raw_db_path = str(db_path)
+    if _has_duplicate_sqlite_uri_mode(raw_db_path):
+        raise ValueError("sqlite URI must have at most one mode parameter")
     memory_db = _is_memory_db(raw_db_path)
+    if memory_db and _expected_db_identity is not None:
+        raise ValueError("memory databases do not have filesystem identities")
     parent_fd: int | None = None
     leaf: str | None = None
-    expected_db: os.stat_result | None = None
+    selected_identity: EntryIdentity | None = None
     if memory_db:
         connect_target = raw_db_path
         connect_uri = raw_db_path.startswith("file:")
     else:
-        parent_fd, leaf = _open_filesystem_db(db_path, prepare=prepare)
         try:
-            expected_db = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            parent_fd, leaf = _open_filesystem_db(
+                db_path,
+                prepare=prepare,
+                retain_parent_shared_lock=not _store_lock_held,
+            )
+        except LocalStateError as exc:
+            if (
+                _expected_db_identity is not None
+                and exc.code is LocalStateErrorCode.MISSING_ENTRY
+            ):
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED) from None
+            raise
+        try:
+            selected_family = _snapshot_sqlite_family_at(
+                parent_fd,
+                leaf,
+                require_main=True,
+            )
+            selected = selected_family[0]
+            if selected.identity is None:
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
+            selected_identity = selected.identity
+            if (
+                _expected_db_identity is not None
+                and selected_identity != _expected_db_identity
+            ):
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
             canonical_path = canonical_path_from_fd(parent_fd, leaf)
-            connect_target = f"file:{quote(canonical_path, safe='/')}?mode=rw"
+            mode = "ro" if read_only else "rw"
+            immutable_query = ""
+            if read_only:
+                wal = selected_family[1]
+                shm = selected_family[2]
+                settled = (
+                    wal.state is PermissionState.ABSENT
+                    or wal.size == 0
+                )
+                if settled:
+                    immutable_query = "&immutable=1"
+                elif shm.state is PermissionState.ABSENT:
+                    raise local_state_error(
+                        LocalStateErrorCode.OPERATION_FAILED
+                    )
+            connect_target = (
+                f"file:{quote(canonical_path, safe='/')}?mode={mode}"
+                f"{immutable_query}"
+            )
+        except LocalStateError as exc:
+            os.close(parent_fd)
+            if (
+                _expected_db_identity is not None
+                and exc.code is LocalStateErrorCode.MISSING_ENTRY
+            ):
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED) from None
+            raise
         except Exception:
             os.close(parent_fd)
             raise
@@ -826,33 +1411,51 @@ def _connect(
             if parent_fd is not None:
                 os.close(parent_fd)
         raise local_state_error(LocalStateErrorCode.OPERATION_FAILED) from None
-    if parent_fd is not None and leaf is not None and expected_db is not None:
+    if parent_fd is not None and leaf is not None and selected_identity is not None:
         try:
             # Catch path substitution across sqlite3.connect before any pragma
             # can mutate a database other than the securely resolved one.
             canonical_path_from_fd(parent_fd, leaf)
-            current_db = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-            if (
-                current_db.st_dev != expected_db.st_dev
-                or current_db.st_ino != expected_db.st_ino
-            ):
-                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
+            _verify_expected_identity_at(parent_fd, leaf, selected_identity)
         except Exception:
             conn.close()
             os.close(parent_fd)
             raise
     if parent_fd is not None:
-        conn._own_parent_fd(parent_fd)
+        assert leaf is not None
+        assert selected_identity is not None
+        _register_schema_connection_authority(
+            conn,
+            parent_fd=parent_fd,
+            leaf=leaf,
+            selected_identity=selected_identity,
+            retains_parent_shared_lock=not _store_lock_held,
+        )
         parent_fd = None
+    else:
+        assert memory_db
+        _register_schema_connection_authority(conn)
     try:
         with private_file_creation_umask():
             _apply_connection_pragmas(conn, db_path)
             if leaf is not None:
-                # Activate sidecars under the restrictive creation umask, then
-                # inspect metadata without opening another family descriptor.
-                conn.execute("PRAGMA user_version").fetchone()
-                assert conn._parent_fd is not None
-                _validate_sqlite_family_at(conn._parent_fd, leaf)
+                authority = _schema_connection_authority(conn)
+                assert authority.parent_fd is not None
+                assert authority.selected_identity is not None
+                _verify_expected_identity_at(
+                    authority.parent_fd,
+                    leaf,
+                    authority.selected_identity,
+                )
+                if not read_only:
+                    # Activate new sidecars only on normal store connections.
+                    conn.execute("PRAGMA user_version").fetchone()
+                _validate_sqlite_family_at(authority.parent_fd, leaf)
+                _verify_expected_identity_at(
+                    authority.parent_fd,
+                    leaf,
+                    authority.selected_identity,
+                )
         return conn
     except Exception:
         conn.close()
@@ -3518,39 +4121,39 @@ def _worker_binding_from_row(row: Any) -> WorkerBinding:
 
 
 def _dedupe_command_receipts(conn: sqlite3.Connection) -> None:
-    """Keep the latest legacy receipt per logical command key before uniquing."""
-    rows = conn.execute(
-        """
-        SELECT
-            id,
-            host_id,
-            request_id,
-            action,
-            created_at,
-            completed_at
-        FROM command_receipts
-        ORDER BY id
-        """
-    ).fetchall()
-    keep_by_key: dict[tuple[str, str, str], tuple[str, str, int]] = {}
-    for row in rows:
-        row_id = int(row[0])
-        key = (str(row[1]), str(row[2]), str(row[3]))
-        created_at = str(row[4] or "")
-        completed_at = str(row[5] or "")
-        sort_key = (completed_at or created_at, created_at, row_id)
-        if key not in keep_by_key or sort_key > keep_by_key[key]:
-            keep_by_key[key] = sort_key
-
-    keep_ids = {item[2] for item in keep_by_key.values()}
-    delete_ids = [int(row[0]) for row in rows if int(row[0]) not in keep_ids]
-    if not delete_ids:
-        return
-    placeholders = ",".join("?" for _ in delete_ids)
-    conn.execute(
-        f"DELETE FROM command_receipts WHERE id IN ({placeholders})",
-        delete_ids,
-    )
+    """Keep the latest legacy receipt per logical key using bounded batches."""
+    while True:
+        delete_ids = [
+            int(row[0])
+            for row in conn.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY host_id, request_id, action
+                            ORDER BY
+                                COALESCE(completed_at, created_at) DESC,
+                                created_at DESC,
+                                id DESC
+                        ) AS receipt_rank
+                    FROM command_receipts
+                )
+                SELECT id
+                FROM ranked
+                WHERE receipt_rank > 1
+                ORDER BY id
+                LIMIT 500
+                """
+            ).fetchall()
+        ]
+        if not delete_ids:
+            return
+        placeholders = ",".join("?" for _ in delete_ids)
+        conn.execute(
+            f"DELETE FROM command_receipts WHERE id IN ({placeholders})",
+            delete_ids,
+        )
 
 
 def _ensure_command_receipt_unique_index(conn: sqlite3.Connection) -> None:
@@ -3953,7 +4556,7 @@ def _delete_turn_if_unreferenced_conn(
     host_id: str,
     turn_id: str,
 ) -> bool:
-    """Delete one whole historical turn only when no durable delivery reference remains."""
+    """Delete one historical turn and invalidate active list traversals."""
     protected = conn.execute(
         """
         SELECT 1
@@ -3985,6 +4588,7 @@ def _delete_turn_if_unreferenced_conn(
     ).fetchone()
     if protected is not None:
         return False
+    _ensure_turn_list_host_state_conn(conn, host_id)
     conn.execute(
         "DELETE FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
         (str(host_id), str(turn_id)),
@@ -3993,7 +4597,10 @@ def _delete_turn_if_unreferenced_conn(
         "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
         (str(host_id), str(turn_id)),
     )
-    return cursor.rowcount > 0
+    deleted = cursor.rowcount > 0
+    if deleted:
+        _increment_turn_list_generation_conn(conn, host_id)
+    return deleted
 
 
 def _prune_turn_projection(
@@ -4075,11 +4682,30 @@ def _strict_utc_timestamp(value: Any) -> str | None:
         raw = raw[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
         return None
-    return parsed.astimezone(timezone.utc).isoformat()
+    try:
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _legacy_snapshot_created_at_is_authoritative(
+    created_at: Any,
+    payload: Any,
+) -> bool:
+    """Distinguish a real year-9999 observation from the former sentinel."""
+    canonical_created_at = _strict_utc_timestamp(created_at)
+    canonical_payload_at = _strict_utc_timestamp(
+        _json_object(payload).get("updated_at")
+    )
+    return (
+        canonical_created_at
+        == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
+        and canonical_payload_at == canonical_created_at
+    )
 
 
 def _attention_family_key(host_id: str, item: Mapping[str, Any]) -> str:
@@ -4653,36 +5279,131 @@ def _apply_attention_observation_conn(
         states[family_key] = next_state
 
 
-def _upsert_snapshot_projections(
+def _append_snapshot_saved_event_conn(
     conn: sqlite3.Connection,
     snapshot: Snapshot,
-    payload_data: Mapping[str, Any],
     *,
     snapshot_id: int,
     content_fingerprint: str,
-    private_snapshot_data: Mapping[str, Any] | None = None,
+    private_snapshot_data: Mapping[str, Any],
 ) -> None:
-    private_event_snapshot = dict(
-        payload_data if private_snapshot_data is None else private_snapshot_data
-    )
-    payload_data = sanitize_public_mapping(payload_data)
-    host_id = str(snapshot.host_id)
-    observed_at = str(snapshot.updated_at)
-
     _append_event_conn(
         conn,
-        host_id=host_id,
+        host_id=str(snapshot.host_id),
         event_type="snapshot.saved",
         aggregate_type="snapshot",
         aggregate_id=str(content_fingerprint),
-        observed_at=observed_at,
+        observed_at=str(snapshot.updated_at),
         content_fingerprint=str(content_fingerprint),
         payload={
             "snapshot_id": int(snapshot_id),
             "content_fingerprint": str(content_fingerprint),
-            "snapshot": private_event_snapshot,
+            "snapshot": dict(private_snapshot_data),
         },
     )
+
+
+def _ensure_turn_list_host_state_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO turn_list_hosts (
+            host_id,
+            next_sequence,
+            traversal_generation
+        )
+        SELECT ?, COALESCE(MAX(list_sequence), 0) + 1, 1
+        FROM turns
+        WHERE host_id = ?
+        ON CONFLICT(host_id) DO NOTHING
+        """,
+        (str(host_id), str(host_id)),
+    )
+
+
+def _turn_list_host_state_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+) -> tuple[int, int]:
+    row = conn.execute(
+        """
+        SELECT next_sequence, traversal_generation
+        FROM turn_list_hosts
+        WHERE host_id = ?
+        """,
+        (str(host_id),),
+    ).fetchone()
+    if row is not None:
+        return max(0, int(row[0]) - 1), int(row[1])
+    row = conn.execute(
+        "SELECT COALESCE(MAX(list_sequence), 0) FROM turns WHERE host_id = ?",
+        (str(host_id),),
+    ).fetchone()
+    return int(row[0] if row is not None else 0), 1
+
+
+def _turn_list_sequence_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: str,
+) -> int:
+    """Return an existing immutable sequence or consume one durable host counter."""
+    row = conn.execute(
+        """
+        SELECT list_sequence
+        FROM turns
+        WHERE host_id = ? AND turn_id = ?
+        """,
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    if row is not None:
+        return int(row[0])
+    _ensure_turn_list_host_state_conn(conn, host_id)
+    row = conn.execute(
+        "SELECT next_sequence FROM turn_list_hosts WHERE host_id = ?",
+        (str(host_id),),
+    ).fetchone()
+    if row is None:
+        raise StoreSchemaError("turn_list_host_state_unavailable")
+    sequence = int(row[0])
+    conn.execute(
+        """
+        UPDATE turn_list_hosts
+        SET next_sequence = next_sequence + 1
+        WHERE host_id = ?
+        """,
+        (str(host_id),),
+    )
+    return sequence
+
+
+def _increment_turn_list_generation_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+) -> None:
+    _ensure_turn_list_host_state_conn(conn, host_id)
+    conn.execute(
+        """
+        UPDATE turn_list_hosts
+        SET traversal_generation = traversal_generation + 1
+        WHERE host_id = ?
+        """,
+        (str(host_id),),
+    )
+
+
+def _refresh_snapshot_projections_conn(
+    conn: sqlite3.Connection,
+    snapshot: Snapshot,
+    payload_data: Mapping[str, Any],
+    *,
+    content_fingerprint: str,
+) -> None:
+    payload_data = sanitize_public_mapping(payload_data)
+    host_id = str(snapshot.host_id)
+    observed_at = str(snapshot.updated_at)
 
     space_ids: set[str] = set()
     for item in payload_data.get("spaces", []):
@@ -4777,6 +5498,7 @@ def _upsert_snapshot_projections(
         item = sanitize_public_mapping(turn.to_dict())
         turn_id = str(item.get("id") or "unknown")
         turn_ids.add(turn_id)
+        list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
         conn.execute(
             """
             INSERT INTO turns (
@@ -4791,8 +5513,9 @@ def _upsert_snapshot_projections(
                 fingerprint,
                 snapshot_content_fingerprint,
                 observed_at,
-                payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                payload_json,
+                list_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id, turn_id) DO UPDATE SET
                 worker_id = excluded.worker_id,
                 worker_fingerprint = excluded.worker_fingerprint,
@@ -4818,6 +5541,7 @@ def _upsert_snapshot_projections(
                 str(content_fingerprint),
                 observed_at,
                 _canonical_json(item),
+                list_sequence,
             ),
         )
         _ensure_payload_turn_content_revision_conn(
@@ -5778,29 +6502,54 @@ def _migrate_v4_attention_outbox_conn(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE temp.attention_v5_jobs")
 
 
+def _migrate_v0_to_v1_conn(conn: sqlite3.Connection) -> None:
+    conn.execute(CREATE_SNAPSHOTS_TABLE)
+    if "content_fingerprint" not in _table_columns(conn):
+        conn.execute(
+            "ALTER TABLE snapshots ADD COLUMN "
+            "content_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
+    _backfill_content_fingerprints(conn)
+    for statement in CREATE_LEGACY_SNAPSHOT_INDEXES:
+        conn.execute(statement)
+
+
+def _migrate_v1_to_v2_conn(conn: sqlite3.Connection) -> None:
+    _migrate_v0_to_v1_conn(conn)
+    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    _ensure_command_receipt_columns(conn)
+    _dedupe_command_receipts(conn)
+    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+        conn.execute(statement)
+    _ensure_command_receipt_unique_index(conn)
+    conn.execute(CREATE_WORKER_BINDINGS_TABLE)
+    _ensure_worker_binding_columns(conn)
+    for statement in CREATE_WORKER_BINDING_INDEXES:
+        conn.execute(statement)
+    conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
+
+
+def _migrate_v2_to_v3_conn(conn: sqlite3.Connection) -> None:
+    _migrate_v1_to_v2_conn(conn)
+    for statement in CREATE_PR6_TABLES:
+        conn.execute(statement)
+    _ensure_pr6_columns(conn)
+    for statement in CREATE_PR6_INDEXES:
+        conn.execute(statement)
+    _backfill_command_audit(conn)
+
+
+def _migrate_v3_to_v4_conn(conn: sqlite3.Connection) -> None:
+    _migrate_v2_to_v3_conn(conn)
+    _backfill_legacy_attention_columns(conn)
+
+
 def _migrate_v4_to_v5_conn(conn: sqlite3.Connection) -> None:
-    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 5:
-        return
-    owns_transaction = not conn.in_transaction
-    if owns_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
-        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 5:
-            if owns_transaction:
-                conn.commit()
-            return
-        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
-        for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
-            conn.execute(statement)
-        _migrate_v4_attention_rows_conn(conn)
-        _migrate_v4_attention_outbox_conn(conn)
-        conn.execute("PRAGMA user_version = 5")
-        if owns_transaction:
-            conn.commit()
-    except Exception:
-        if owns_transaction:
-            conn.rollback()
-        raise
+    conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
+    for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
+        conn.execute(statement)
+    _migrate_v4_attention_rows_conn(conn)
+    _migrate_v4_attention_outbox_conn(conn)
 
 
 _LEGACY_TRUNCATION_MARKER = "\n[truncated]"
@@ -6215,113 +6964,24 @@ def _rebuild_v6_presentation_plans_conn(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v6_to_v7_conn(conn: sqlite3.Connection) -> None:
-    """Atomically add explicit failed-plan generations and immutable recovery audit."""
-    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 7:
-        return
-    owns_transaction = not conn.in_transaction
-    if owns_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
-        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 7:
-            if owns_transaction:
-                conn.commit()
-            return
-        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-        _backfill_missing_turn_content_revisions_conn(conn)
-        _backfill_missing_turn_content_page_boundaries_conn(conn)
-        plan_columns = {
-            str(row[1])
-            for row in conn.execute(
-                "PRAGMA table_info(turn_presentation_plans)"
-            ).fetchall()
-        }
-        if "generation" not in plan_columns:
-            _rebuild_v6_presentation_plans_conn(conn)
-        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-        for statement in CREATE_TURN_PRESENTATION_INDEXES:
-            conn.execute(statement)
-        conn.execute("PRAGMA user_version = 7")
-        if owns_transaction:
-            conn.commit()
-    except Exception:
-        if owns_transaction:
-            conn.rollback()
-        raise
+    """Add explicit failed-plan generations and immutable recovery audit."""
+    conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+    _backfill_missing_turn_content_revisions_conn(conn)
+    _backfill_missing_turn_content_page_boundaries_conn(conn)
+    plan_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(turn_presentation_plans)"
+        ).fetchall()
+    }
+    if "generation" not in plan_columns:
+        _rebuild_v6_presentation_plans_conn(conn)
+    conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+    for statement in CREATE_TURN_PRESENTATION_INDEXES:
+        conn.execute(statement)
 
 
 def _migrate_v5_to_v6_conn(conn: sqlite3.Connection) -> None:
-    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 6:
-        return
-    owns_transaction = not conn.in_transaction
-    if owns_transaction:
-        conn.execute("BEGIN IMMEDIATE")
-    try:
-        if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 6:
-            if owns_transaction:
-                conn.commit()
-            return
-        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
-        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
-        for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
-            conn.execute(statement)
-        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
-        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
-        for statement in CREATE_TURN_PRESENTATION_INDEXES:
-            conn.execute(statement)
-        _backfill_legacy_turn_content_conn(conn)
-        _backfill_missing_turn_content_revisions_conn(conn)
-        conn.execute("PRAGMA user_version = 6")
-        if owns_transaction:
-            conn.commit()
-    except Exception:
-        if owns_transaction:
-            conn.rollback()
-        raise
-
-
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    entered_with_transaction = conn.in_transaction
-    conn.execute(CREATE_SNAPSHOTS_TABLE)
-    columns = _table_columns(conn)
-    if "content_fingerprint" not in columns:
-        conn.execute(
-            "ALTER TABLE snapshots ADD COLUMN "
-            "content_fingerprint TEXT NOT NULL DEFAULT ''"
-        )
-    _backfill_content_fingerprints(conn)
-    for statement in CREATE_INDEXES:
-        conn.execute(statement)
-    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
-    _ensure_command_receipt_columns(conn)
-    _dedupe_command_receipts(conn)
-    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
-        conn.execute(statement)
-    _ensure_command_receipt_unique_index(conn)
-    conn.execute(CREATE_WORKER_BINDINGS_TABLE)
-    _ensure_worker_binding_columns(conn)
-    for statement in CREATE_WORKER_BINDING_INDEXES:
-        conn.execute(statement)
-    conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
-    for statement in CREATE_PR6_TABLES:
-        conn.execute(statement)
-    _ensure_pr6_columns(conn)
-    _backfill_legacy_attention_columns(conn)
-    for statement in CREATE_PR6_INDEXES:
-        conn.execute(statement)
-    _backfill_command_audit(conn)
-    if (
-        not entered_with_transaction
-        and conn.in_transaction
-        and int(conn.execute("PRAGMA user_version").fetchone()[0]) < STORE_SCHEMA_VERSION
-    ):
-        conn.commit()
-    _migrate_v4_to_v5_conn(conn)
-    conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
-    for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
-        conn.execute(statement)
-    _migrate_v5_to_v6_conn(conn)
-    _migrate_v6_to_v7_conn(conn)
     conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
     conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
     for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
@@ -6331,27 +6991,419 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
     for statement in CREATE_TURN_PRESENTATION_INDEXES:
         conn.execute(statement)
+    _backfill_legacy_turn_content_conn(conn)
+    _backfill_missing_turn_content_revisions_conn(conn)
+
+
+def _normalize_snapshot_created_at_v8_conn(
+    conn: sqlite3.Connection,
+) -> None:
+    """Canonicalize legacy ordering keys before the v8 age index is built."""
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, payload
+            FROM snapshots
+            WHERE id > ?
+            ORDER BY id
+            LIMIT 500
+            """,
+            (last_id,),
+        ).fetchall()
+        if not rows:
+            return
+        updates: list[tuple[str, int]] = []
+        for row_id, raw_created_at, raw_payload in rows:
+            raw_created_at_text = str(raw_created_at)
+            canonical = _strict_utc_timestamp(raw_created_at_text)
+            if (
+                canonical == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
+                and not _legacy_snapshot_created_at_is_authoritative(
+                    raw_created_at,
+                    raw_payload,
+                )
+            ):
+                canonical = None
+            canonical = canonical or _SNAPSHOT_CREATED_AT_QUARANTINE
+            if str(raw_created_at) != canonical:
+                updates.append((canonical, int(row_id)))
+            last_id = int(row_id)
+        if updates:
+            conn.executemany(
+                "UPDATE snapshots SET created_at = ? WHERE id = ?",
+                updates,
+            )
+
+
+def _migrate_v7_to_v8_conn(conn: sqlite3.Connection) -> None:
+    conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
+    conn.execute(INSERT_STORE_MAINTENANCE_STATE)
+    _normalize_snapshot_created_at_v8_conn(conn)
+    for statement in CREATE_SNAPSHOT_INDEXES:
+        conn.execute(statement)
+    for index_name in (
+        "idx_snapshots_host_id",
+        "idx_snapshots_created_at",
+        "idx_snapshots_content_fingerprint",
+        "idx_snapshots_host_created_id",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+
+def _ensure_turn_list_state_conn(conn: sqlite3.Connection) -> str:
+    conn.execute(CREATE_TURN_LIST_STATE_TABLE)
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
+    ).fetchone()
+    if row is not None and str(row[0]):
+        return str(row[0])
+    epoch = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO turn_list_state (scope, store_epoch)
+        VALUES ('turn-list', ?)
+        ON CONFLICT(scope) DO NOTHING
+        """,
+        (epoch,),
+    )
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_list_state_unavailable")
+    return str(row[0])
+
+
+def _turn_list_store_epoch_conn(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_list_state WHERE scope = 'turn-list'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_list_state_unavailable")
+    return str(row[0])
+
+
+def _ensure_turn_list_host_states_conn(conn: sqlite3.Connection) -> None:
+    conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
+    conn.execute(
+        """
+        INSERT INTO turn_list_hosts (
+            host_id,
+            next_sequence,
+            traversal_generation
+        )
+        SELECT host_id, COALESCE(MAX(list_sequence), 0) + 1, 1
+        FROM turns
+        GROUP BY host_id
+        ON CONFLICT(host_id) DO NOTHING
+        """
+    )
+
+
+def _migrate_v8_to_v9_conn(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "turns")
+    if "list_sequence" not in columns:
+        conn.execute(
+            "ALTER TABLE turns ADD COLUMN list_sequence "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        """
+        WITH ranked AS (
+            SELECT
+                host_id,
+                turn_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY host_id
+                    ORDER BY COALESCE(updated_at, observed_at, ''), turn_id
+                ) AS assigned_sequence
+            FROM turns
+        )
+        UPDATE turns
+        SET list_sequence = (
+            SELECT assigned_sequence
+            FROM ranked
+            WHERE ranked.host_id = turns.host_id
+              AND ranked.turn_id = turns.turn_id
+        )
+        WHERE list_sequence <= 0
+        """
+    )
+    for statement in CREATE_TURN_LIST_INDEXES:
+        conn.execute(statement)
+    _ensure_turn_list_state_conn(conn)
+    _ensure_turn_list_host_states_conn(conn)
+
+
+def _migrate_v9_to_v10_conn(conn: sqlite3.Connection) -> None:
+    """Add explicit pending freshness, private routing, and two-phase claims."""
+    conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
+    columns = _table_columns(conn, "backend_pending")
+    additions = (
+        ("revision_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("choice_routes_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("binding_private_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("observed_turn_target_value", "TEXT NOT NULL DEFAULT ''"),
+        ("observation_state", "TEXT NOT NULL DEFAULT 'open'"),
+        ("freshness", "TEXT NOT NULL DEFAULT 'fresh'"),
+        ("last_success_at", "TEXT"),
+        ("last_failure_at", "TEXT"),
+        ("grace_deadline", "TEXT"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE backend_pending ADD COLUMN {name} {declaration}"
+            )
+    rows = conn.execute(
+        """
+        SELECT host_id, worker_id, payload_json, observed_at,
+               revision_digest, last_success_at, updated_at
+        FROM backend_pending
+        """
+    ).fetchall()
+    for (
+        host_id,
+        worker_id,
+        payload_json,
+        observed_at,
+        revision_digest,
+        last_success_at,
+        updated_at,
+    ) in rows:
+        timestamp = _strict_utc_timestamp(observed_at) or "1970-01-01T00:00:00+00:00"
+        digest = str(revision_digest or "") or stable_fingerprint(
+            {"legacy_backend_pending": str(payload_json)}
+        )
+        conn.execute(
+            """
+            UPDATE backend_pending
+            SET revision_digest = ?,
+                freshness = 'fresh',
+                last_success_at = ?,
+                updated_at = ?
+            WHERE host_id = ? AND worker_id = ?
+            """,
+            (
+                digest,
+                str(last_success_at or timestamp),
+                str(updated_at or timestamp),
+                str(host_id),
+                str(worker_id),
+            ),
+        )
+    conn.execute(CREATE_BACKEND_PENDING_CLAIMS_TABLE)
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(0, 1, _migrate_v0_to_v1_conn),
+    Migration(1, 2, _migrate_v1_to_v2_conn),
+    Migration(2, 3, _migrate_v2_to_v3_conn),
+    Migration(3, 4, _migrate_v3_to_v4_conn),
+    Migration(4, 5, _migrate_v4_to_v5_conn),
+    Migration(5, 6, _migrate_v5_to_v6_conn),
+    Migration(6, 7, _migrate_v6_to_v7_conn),
+    Migration(7, 8, _migrate_v7_to_v8_conn),
+    Migration(8, 9, _migrate_v8_to_v9_conn),
+    Migration(9, 10, _migrate_v9_to_v10_conn),
+)
+
+
+def _validate_migration_registry(
+    migrations: tuple[Migration, ...] | None = None,
+    *,
+    target_version: int = STORE_SCHEMA_VERSION,
+) -> None:
+    registry = MIGRATIONS if migrations is None else migrations
+    expected = 0
+    for migration in registry:
+        if (
+            migration.from_version != expected
+            or migration.to_version != expected + 1
+        ):
+            raise RuntimeError("invalid migration registry")
+        expected = migration.to_version
+    if expected != STORE_SCHEMA_VERSION:
+        raise RuntimeError("invalid migration registry target")
+    if not 0 <= int(target_version) <= STORE_SCHEMA_VERSION:
+        raise RuntimeError("unsupported migration target")
+
+
+def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
+    """Create an empty database directly at the current schema."""
+    if conn.in_transaction:
+        raise StoreSchemaError("schema_migration_in_transaction")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(CREATE_SNAPSHOTS_TABLE)
+        conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+        conn.execute(CREATE_WORKER_BINDINGS_TABLE)
+        for statement in CREATE_PR6_TABLES:
+            conn.execute(statement)
+        conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
+        _migrate_v9_to_v10_conn(conn)
+        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
+        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
+        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+        conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
+        conn.execute(CREATE_TURN_LIST_STATE_TABLE)
+        conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
+        for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+            conn.execute(statement)
+        conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
+        for statement in CREATE_WORKER_BINDING_INDEXES:
+            conn.execute(statement)
+        conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
+        for statement in CREATE_PR6_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_LIST_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_PRESENTATION_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_SNAPSHOT_INDEXES:
+            conn.execute(statement)
+        conn.execute(INSERT_STORE_MAINTENANCE_STATE)
+        _ensure_turn_list_state_conn(conn)
+        conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _database_has_application_objects(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'view', 'trigger')
+            LIMIT 1
+            """
+        ).fetchone()
+        is not None
+    )
+
+
+def _run_migrations(
+    conn: sqlite3.Connection,
+    *,
+    target_version: int = STORE_SCHEMA_VERSION,
+) -> None:
+    """Run exact ordered transitions with one transaction per version."""
+    if conn.in_transaction:
+        raise StoreSchemaError("schema_migration_in_transaction")
+    _validate_migration_registry(target_version=target_version)
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    while current < int(target_version):
+        migration = MIGRATIONS[current]
+        if migration.from_version != current:
+            raise RuntimeError("invalid migration registry dispatch")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            migration.apply(conn)
+            conn.execute(f"PRAGMA user_version = {migration.to_version}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if current != migration.to_version:
+            raise StoreSchemaError("schema_version_not_advanced")
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Gate the current schema cheaply, or initialize/migrate older stores."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version == STORE_SCHEMA_VERSION:
+        return
+    if version > STORE_SCHEMA_VERSION:
+        raise StoreSchemaError("schema_too_new")
+    if not isinstance(conn, _ClosingConnection):
+        raise local_state_error(LocalStateErrorCode.OPERATION_FAILED)
+    schema_authority = _schema_connection_authority(conn)
+    authority = (
+        nullcontext()
+        if schema_authority.parent_fd is None
+        else _filesystem_schema_mutation_authority(conn)
+    )
+    with authority:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version == STORE_SCHEMA_VERSION:
+            return
+        if version > STORE_SCHEMA_VERSION:
+            raise StoreSchemaError("schema_too_new")
+        with private_file_creation_umask():
+            _configure_persistent_database_conn(conn)
+            if version == 0 and not _database_has_application_objects(conn):
+                _create_current_schema_conn(conn)
+                return
+            _run_migrations(conn)
+
+
+_ensure_schema = ensure_schema
 
 
 def init_store(db_path: Path) -> None:
     """Initialize or migrate the sqlite store to the current schema."""
     with _connect(db_path, prepare=True) as conn:
-        _ensure_schema(conn)
-        _backfill_missing_turn_content_revisions_conn(conn)
-        _backfill_missing_turn_content_page_boundaries_conn(conn)
+        ensure_schema(conn)
 
 
-def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
-    """Return bounded public-safe host-scoped store and outbox counts."""
-    if not _sqlite_store_exists(db_path):
-        return sanitize_public_value({
+def store_status(
+    db_path: Path,
+    host_id: str,
+    *,
+    snapshot_retention_days: int = 14,
+    snapshot_retention_count: int = 4096,
+    maintenance_batch_size: int = 100,
+    maintenance_cadence_seconds: int = 3600,
+    require_current_schema: bool = False,
+) -> dict[str, Any]:
+    """Return bounded public-safe host state and database maintenance aggregates."""
+    policy = SnapshotRetentionPolicy(
+        retention_days=snapshot_retention_days,
+        retention_count=snapshot_retention_count,
+        batch_size=maintenance_batch_size,
+    )
+    maintenance_empty = {
+        "last_completed_at": None,
+        "status": "not_initialized",
+        "snapshot_count": 0,
+        "snapshot_retention_days": policy.retention_days,
+        "snapshot_retention_count": policy.retention_count,
+        "maintenance_batch_size": policy.batch_size,
+        "maintenance_cadence_seconds": int(maintenance_cadence_seconds),
+        "backlog": False,
+    }
+    def unavailable(status: str) -> dict[str, Any]:
+        return dict(sanitize_public_value({
             "schema_version": 1,
             "ok": False,
-            "status": "store_unavailable",
+            "status": status,
             "host_id": str(host_id),
             "counts": {},
-            "outbox": {"pending": 0, "leased": 0, "terminal": 0, "by_status": {}},
-        })
+            "outbox": {
+                "pending": 0,
+                "leased": 0,
+                "terminal": 0,
+                "by_status": {},
+            },
+            "maintenance": maintenance_empty,
+        }))
+
+    if not require_current_schema and not _sqlite_store_exists(db_path):
+        return unavailable("store_unavailable")
     tables = (
         "snapshots",
         "events",
@@ -6364,43 +7416,73 @@ def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
         "command_receipts",
         "backend_health",
     )
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        counts = {
-            table: int(
-                conn.execute(f"SELECT COUNT(*) FROM {table} WHERE host_id = ?", (str(host_id),)).fetchone()[0]
+    try:
+        with _connect(db_path, read_only=require_current_schema) as conn:
+            if require_current_schema:
+                conn.execute("PRAGMA query_only=ON")
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if version != STORE_SCHEMA_VERSION:
+                    return unavailable("schema_not_current")
+            else:
+                _ensure_schema(conn)
+            counts = {
+                table: int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE host_id = ?",
+                        (str(host_id),),
+                    ).fetchone()[0]
+                )
+                for table in tables
+            }
+            last_event_row = conn.execute(
+                """
+                SELECT observed_at
+                FROM events
+                WHERE host_id = ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (str(host_id),),
+            ).fetchone()
+            last_snapshot_row = conn.execute(
+                """
+                SELECT created_at
+                FROM snapshots
+                WHERE host_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(host_id),),
+            ).fetchone()
+            outbox_rows = conn.execute(
+                """
+                SELECT status, COUNT(*)
+                FROM connector_outbox
+                WHERE host_id = ?
+                GROUP BY status
+                """,
+                (str(host_id),),
+            ).fetchall()
+            maintenance_row = conn.execute(
+                """
+                SELECT last_completed_at, last_status
+                FROM store_maintenance_state
+                WHERE scope = 'automatic'
+                """
+            ).fetchone()
+            snapshot_count = int(
+                conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
             )
-            for table in tables
-        }
-        last_event_row = conn.execute(
-            """
-            SELECT observed_at
-            FROM events
-            WHERE host_id = ?
-            ORDER BY observed_at DESC, id DESC
-            LIMIT 1
-            """,
-            (str(host_id),),
-        ).fetchone()
-        last_snapshot_row = conn.execute(
-            """
-            SELECT created_at
-            FROM snapshots
-            WHERE host_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (str(host_id),),
-        ).fetchone()
-        outbox_rows = conn.execute(
-            """
-            SELECT status, COUNT(*)
-            FROM connector_outbox
-            WHERE host_id = ?
-            GROUP BY status
-            """,
-            (str(host_id),),
-        ).fetchall()
+            backlog_ids, _ = _snapshot_retention_candidates_conn(
+                conn,
+                cutoff_at=_utc_cutoff(retention_days=policy.retention_days),
+                retention_count=policy.retention_count,
+                batch_size=1,
+            )
+    except (LocalStateError, StoreSchemaError, sqlite3.Error):
+        if require_current_schema:
+            return unavailable("store_unavailable")
+        raise
     by_status: dict[str, int] = {}
     for row in outbox_rows:
         status = _store_public_label(row[0], allowed=_CONNECTOR_PUBLIC_OUTBOX_STATUSES)
@@ -6412,10 +7494,30 @@ def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
         _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
     }
     outbox = {
-        "pending": sum(count for status, count in by_status.items() if status in pending_statuses),
+        "pending": sum(
+            count for status, count in by_status.items() if status in pending_statuses
+        ),
         "leased": int(by_status.get(_CONNECTOR_LEASE_STATUS, 0)),
-        "terminal": sum(count for status, count in by_status.items() if status in terminal_statuses),
+        "terminal": sum(
+            count for status, count in by_status.items() if status in terminal_statuses
+        ),
         "by_status": by_status,
+    }
+    maintenance = {
+        **maintenance_empty,
+        "last_completed_at": (
+            maintenance_row[0] if maintenance_row is not None else None
+        ),
+        "status": (
+            _store_public_label(
+                maintenance_row[1],
+                allowed={"never", "ok", "failed"},
+            )
+            if maintenance_row is not None
+            else "not_initialized"
+        ),
+        "snapshot_count": snapshot_count,
+        "backlog": bool(backlog_ids),
     }
     return sanitize_public_value({
         "schema_version": 1,
@@ -6426,6 +7528,7 @@ def store_status(db_path: Path, host_id: str) -> dict[str, Any]:
         "outbox": outbox,
         "last_event_at": last_event_row[0] if last_event_row is not None else None,
         "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
+        "maintenance": maintenance,
     })
 
 
@@ -6492,6 +7595,1495 @@ _TURN_CONTENT_TERMINAL_OUTBOX_STATES = frozenset(
 )
 
 
+_SNAPSHOT_AGE_CANDIDATE_SQL = """
+SELECT candidate.id
+FROM snapshots AS candidate INDEXED BY idx_snapshots_created_host_id
+WHERE candidate.created_at < :cutoff_at
+  AND candidate.id <> (
+      SELECT newest.id
+      FROM snapshots AS newest INDEXED BY idx_snapshots_host_newest
+      WHERE newest.host_id = candidate.host_id
+      ORDER BY newest.id DESC
+      LIMIT 1
+  )
+ORDER BY candidate.created_at, candidate.host_id, candidate.id
+LIMIT :candidate_limit
+"""
+
+_SNAPSHOT_COUNT_CANDIDATE_SQL = """
+WITH RECURSIVE
+hosts(host_id) AS (
+    SELECT MIN(first_host.host_id)
+    FROM snapshots AS first_host INDEXED BY idx_snapshots_host_newest
+    UNION ALL
+    SELECT (
+        SELECT MIN(next_host.host_id)
+        FROM snapshots AS next_host INDEXED BY idx_snapshots_host_newest
+        WHERE next_host.host_id > hosts.host_id
+    )
+    FROM hosts
+    WHERE hosts.host_id IS NOT NULL
+),
+boundaries(host_id, boundary_id) AS MATERIALIZED (
+    SELECT
+        hosts.host_id,
+        (
+            SELECT boundary.id
+            FROM snapshots AS boundary INDEXED BY idx_snapshots_host_newest
+            WHERE boundary.host_id = hosts.host_id
+            ORDER BY boundary.id DESC
+            LIMIT 1 OFFSET :retention_offset
+        )
+    FROM hosts
+    WHERE hosts.host_id IS NOT NULL
+)
+SELECT candidate.id
+FROM boundaries
+JOIN snapshots AS candidate INDEXED BY idx_snapshots_host_newest
+  ON candidate.host_id = boundaries.host_id
+ AND candidate.id < boundaries.boundary_id
+WHERE boundaries.boundary_id IS NOT NULL
+LIMIT :candidate_limit
+"""
+
+
+def _snapshot_retention_candidates_conn(
+    conn: sqlite3.Connection,
+    *,
+    cutoff_at: str,
+    retention_count: int,
+    batch_size: int,
+) -> tuple[list[int], bool]:
+    candidate_limit = int(batch_size) + 1
+    age_ids = [
+        int(row[0])
+        for row in conn.execute(
+            _SNAPSHOT_AGE_CANDIDATE_SQL,
+            {
+                "cutoff_at": str(cutoff_at),
+                "candidate_limit": candidate_limit,
+            },
+        ).fetchall()
+    ]
+    if len(age_ids) == candidate_limit:
+        return sorted(set(age_ids))[: int(batch_size)], True
+    count_ids = [
+        int(row[0])
+        for row in conn.execute(
+            _SNAPSHOT_COUNT_CANDIDATE_SQL,
+            {
+                "retention_offset": int(retention_count) - 1,
+                "candidate_limit": candidate_limit,
+            },
+        ).fetchall()
+    ]
+    merged = sorted(set(age_ids).union(count_ids))
+    candidates = merged[: int(batch_size)]
+    saturated = (
+        len(merged) > int(batch_size)
+        or len(count_ids) == candidate_limit
+    )
+    return candidates, saturated
+
+
+def _delete_snapshot_candidates_conn(
+    conn: sqlite3.Connection,
+    candidate_ids: Iterable[int],
+) -> int:
+    ids = tuple(int(candidate_id) for candidate_id in candidate_ids)
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    return int(
+        conn.execute(
+            f"DELETE FROM snapshots WHERE id IN ({placeholders})",
+            ids,
+        ).rowcount
+        or 0
+    )
+
+
+def _snapshot_retention_result(
+    *,
+    ok: bool,
+    status: str,
+    dry_run: bool,
+    policy: SnapshotRetentionPolicy,
+    cutoff_at: str,
+    examined: int,
+    deleted: int,
+    eligible: int,
+    remaining_candidates: bool,
+    latest_hosts_retained: int,
+) -> dict[str, Any]:
+    return dict(sanitize_public_value({
+        "schema_version": 1,
+        "ok": bool(ok),
+        "status": str(status),
+        "scope": "database",
+        "dry_run": bool(dry_run),
+        "retention_days": policy.retention_days,
+        "retention_count": policy.retention_count,
+        "cutoff_at": str(cutoff_at),
+        "batch_size": policy.batch_size,
+        "examined": int(examined),
+        "deleted": int(deleted),
+        "eligible": int(eligible),
+        "remaining_candidates": bool(remaining_candidates),
+        "latest_hosts_retained": int(latest_hosts_retained),
+    }))
+
+
+def cleanup_snapshot_retention(
+    db_path: Path,
+    *,
+    retention_days: int,
+    retention_count: int,
+    batch_size: int = 100,
+    now: str | None = None,
+    dry_run: bool = False,
+    _store_lock_held: bool = False,
+    _expected_db_identity: EntryIdentity | None = None,
+) -> dict[str, Any]:
+    """Apply one bounded database-wide snapshot retention batch."""
+    try:
+        policy = SnapshotRetentionPolicy(
+            retention_days=retention_days,
+            retention_count=retention_count,
+            batch_size=batch_size,
+        )
+    except ValueError:
+        fallback = SnapshotRetentionPolicy()
+        return _snapshot_retention_result(
+            ok=False,
+            status="invalid_policy",
+            dry_run=bool(dry_run),
+            policy=fallback,
+            cutoff_at=_utc_cutoff(retention_days=fallback.retention_days, now=now),
+            examined=0,
+            deleted=0,
+            eligible=0,
+            remaining_candidates=False,
+            latest_hosts_retained=0,
+        )
+    cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=now)
+    if not _sqlite_store_exists(db_path):
+        return _snapshot_retention_result(
+            ok=False,
+            status="store_unavailable",
+            dry_run=bool(dry_run),
+            policy=policy,
+            cutoff_at=cutoff_at,
+            examined=0,
+            deleted=0,
+            eligible=0,
+            remaining_candidates=False,
+            latest_hosts_retained=0,
+        )
+    with _connect(
+        db_path,
+        isolation_level=None,
+        _store_lock_held=_store_lock_held,
+        _expected_db_identity=_expected_db_identity,
+    ) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            candidates, saturated = _snapshot_retention_candidates_conn(
+                conn,
+                cutoff_at=cutoff_at,
+                retention_count=policy.retention_count,
+                batch_size=policy.batch_size,
+            )
+            deleted = (
+                0
+                if dry_run
+                else _delete_snapshot_candidates_conn(conn, candidates)
+            )
+            if dry_run:
+                remaining = saturated
+                conn.rollback()
+            else:
+                remaining_ids, _ = _snapshot_retention_candidates_conn(
+                    conn,
+                    cutoff_at=cutoff_at,
+                    retention_count=policy.retention_count,
+                    batch_size=1,
+                )
+                remaining = bool(remaining_ids)
+                conn.commit()
+            latest_hosts_retained = int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT host_id) FROM snapshots"
+                ).fetchone()[0]
+            )
+        except Exception:
+            conn.rollback()
+            raise
+    return _snapshot_retention_result(
+        ok=True,
+        status="ok",
+        dry_run=bool(dry_run),
+        policy=policy,
+        cutoff_at=cutoff_at,
+        examined=len(candidates),
+        deleted=deleted,
+        eligible=len(candidates),
+        remaining_candidates=remaining,
+        latest_hosts_retained=latest_hosts_retained,
+    )
+
+
+_COMPACTION_STATUSES = frozenset(
+    {
+        "dry_run",
+        "completed",
+        "invalid_request",
+        "store_unavailable",
+        "schema_not_current",
+        "permissions_failed",
+        "offline_required",
+        "integrity_failed",
+        "insufficient_space",
+        "backup_failed",
+        "maintenance_failed",
+        "checkpoint_failed",
+        "replacement_failed",
+        "rollback_completed",
+        "rollback_failed",
+    }
+)
+
+
+class _CompactionAbort(RuntimeError):
+    def __init__(self, status: str) -> None:
+        if status not in _COMPACTION_STATUSES:
+            status = "replacement_failed"
+        self.status = status
+        super().__init__(status)
+
+
+def _compaction_report(options: CompactionOptions) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ok": False,
+        "status": "invalid_request",
+        "command": "store.compact",
+        "scope": "database",
+        "dry_run": bool(options.dry_run),
+        "maintenance_window_acknowledged": bool(options.acknowledge_offline),
+        "permissions": {"ok": False, "outcome": "unsafe"},
+        "integrity": {
+            "before": "not_run",
+            "backup": "not_run",
+            "replacement": "not_run",
+            "after": "not_run",
+        },
+        "space": {
+            "available_bytes": 0,
+            "required_bytes": 0,
+            "headroom_ok": False,
+        },
+        "snapshots": {
+            "before": 0,
+            "retained": 0,
+            "eligible": 0,
+            "examined": 0,
+            "deleted": 0,
+            "remaining": 0,
+            "latest_hosts_retained": 0,
+        },
+        "storage": {
+            "before_bytes": 0,
+            "estimated_reclaimable_bytes": 0,
+            "after_bytes": None,
+        },
+        "backup": {
+            "required": True,
+            "created": False,
+            "verified": False,
+        },
+        "checkpoint": {"status": "not_run"},
+        "replacement": {"status": "not_run"},
+        "rollback": {"status": "not_needed"},
+    }
+
+
+def _public_compaction_report(
+    report: dict[str, Any], *, status: str, ok: bool = False
+) -> dict[str, Any]:
+    report["status"] = status if status in _COMPACTION_STATUSES else "replacement_failed"
+    report["ok"] = bool(ok)
+    public = dict(sanitize_public_value(report))
+    public["command"] = "store.compact"
+    return public
+
+
+def _call_compaction_phase(
+    phase_hook: Callable[[str], None] | None,
+    phase: str,
+    *,
+    failure_status: str,
+) -> None:
+    if phase_hook is None:
+        return
+    try:
+        phase_hook(phase)
+    except Exception:
+        raise _CompactionAbort(failure_status) from None
+
+
+def _readonly_sqlite_at(
+    parent_fd: int,
+    leaf: str,
+    *,
+    immutable: bool = False,
+    expected_identity: EntryIdentity | None = None,
+) -> sqlite3.Connection:
+    if expected_identity is not None:
+        _verify_expected_identity_at(parent_fd, leaf, expected_identity)
+    canonical_path = canonical_path_from_fd(parent_fd, leaf)
+    immutable_query = "&immutable=1" if immutable else ""
+    target = f"file:{quote(canonical_path, safe='/')}?mode=ro{immutable_query}"
+    conn = sqlite3.connect(target, timeout=0.0, isolation_level=None, uri=True)
+    try:
+        if expected_identity is not None:
+            _verify_expected_identity_at(parent_fd, leaf, expected_identity)
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _writable_sqlite_at(
+    parent_fd: int,
+    leaf: str,
+    *,
+    expected_identity: EntryIdentity | None = None,
+) -> sqlite3.Connection:
+    if expected_identity is not None:
+        _verify_expected_identity_at(parent_fd, leaf, expected_identity)
+    canonical_path = canonical_path_from_fd(parent_fd, leaf)
+    target = f"file:{quote(canonical_path, safe='/')}?mode=rw"
+    with private_file_creation_umask():
+        conn = sqlite3.connect(target, timeout=0.0, isolation_level=None, uri=True)
+    try:
+        if expected_identity is not None:
+            _verify_expected_identity_at(parent_fd, leaf, expected_identity)
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _quick_check_ok(conn: sqlite3.Connection) -> bool:
+    try:
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error:
+        return False
+    return len(rows) == 1 and str(rows[0][0]).lower() == "ok"
+
+
+def _foreign_key_check_ok(conn: sqlite3.Connection) -> bool:
+    try:
+        return conn.execute("PRAGMA foreign_key_check").fetchone() is None
+    except sqlite3.Error:
+        return False
+
+
+def _compaction_snapshot_metrics(
+    conn: sqlite3.Connection,
+    *,
+    cutoff_at: str,
+    retention_count: int,
+) -> tuple[int, int, int, int]:
+    row = conn.execute(
+        """
+        WITH ranked AS (
+            SELECT
+                host_id,
+                created_at,
+                payload,
+                content_fingerprint,
+                ROW_NUMBER() OVER (
+                    PARTITION BY host_id
+                    ORDER BY id DESC
+                ) AS newest_rank
+            FROM snapshots
+        )
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(
+                CASE
+                    WHEN newest_rank > 1
+                     AND (created_at < ? OR newest_rank > ?)
+                    THEN 1
+                    ELSE 0
+                END
+            ), 0),
+            COUNT(DISTINCT host_id),
+            COALESCE(SUM(
+                CASE
+                    WHEN newest_rank > 1
+                     AND (created_at < ? OR newest_rank > ?)
+                    THEN LENGTH(payload)
+                       + LENGTH(host_id)
+                       + LENGTH(created_at)
+                       + LENGTH(content_fingerprint)
+                       + 64
+                    ELSE 0
+                END
+            ), 0)
+        FROM ranked
+        """,
+        (
+            str(cutoff_at),
+            int(retention_count),
+            str(cutoff_at),
+            int(retention_count),
+        ),
+    ).fetchone()
+    if row is None:
+        raise _CompactionAbort("store_unavailable")
+    return int(row[0]), int(row[1]), int(row[2]), int(row[3])
+
+
+def _compaction_page_metrics(conn: sqlite3.Connection) -> tuple[int, int]:
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    live_bytes = max(page_size, max(0, page_count - freelist_count) * page_size)
+    reclaimable = max(0, freelist_count * page_size)
+    return live_bytes, reclaimable
+
+
+def _compaction_family_metrics(
+    members: tuple[_SQLiteFamilyMemberSnapshot, ...],
+) -> tuple[int, int, int, EntryIdentity]:
+    if len(members) != len(_SQLITE_FAMILY_SUFFIXES):
+        raise _CompactionAbort("permissions_failed")
+    main = members[0]
+    if main.state is PermissionState.ABSENT:
+        raise _CompactionAbort("store_unavailable")
+    if any(
+        member.state is PermissionState.REPAIR_REQUIRED
+        for member in members
+    ):
+        raise _CompactionAbort("permissions_failed")
+
+    identities: set[EntryIdentity] = set()
+    family_bytes = 0
+    for member in members:
+        if member.state is PermissionState.ABSENT:
+            if any(
+                value is not None
+                for value in (
+                    member.mode,
+                    member.identity,
+                    member.size,
+                    member.link_count,
+                )
+            ):
+                raise _CompactionAbort("permissions_failed")
+            continue
+        if (
+            member.mode is None
+            or member.identity is None
+            or member.size is None
+            or member.link_count is None
+            or member.link_count != 1
+            or member.size < 0
+        ):
+            raise _CompactionAbort("permissions_failed")
+        if member.identity in identities:
+            raise _CompactionAbort("permissions_failed")
+        identities.add(member.identity)
+        family_bytes += member.size
+
+    if (
+        main.mode is None
+        or main.identity is None
+        or main.size is None
+    ):
+        raise _CompactionAbort("store_unavailable")
+    return family_bytes, main.size, main.mode, main.identity
+
+
+def _sqlite_family_bytes_and_identity(
+    parent_fd: int,
+    leaf: str,
+) -> tuple[int, int, int, EntryIdentity]:
+    members = _snapshot_sqlite_family_at(
+        parent_fd,
+        leaf,
+        require_main=False,
+    )
+    return _compaction_family_metrics(members)
+
+
+def _compaction_family_permissions_ok(
+    members: tuple[_SQLiteFamilyMemberSnapshot, ...],
+    *,
+    expected_main: EntryIdentity,
+) -> bool:
+    if len(members) != len(_SQLITE_FAMILY_SUFFIXES):
+        return False
+    main = members[0]
+    if (
+        main.state is not PermissionState.PRIVATE
+        or main.identity != expected_main
+    ):
+        return False
+    return all(
+        member.state in {PermissionState.PRIVATE, PermissionState.ABSENT}
+        for member in members
+    )
+
+
+def _create_verified_compaction_backup(
+    source_parent_fd: int,
+    source_leaf: str,
+    backup_parent_fd: int,
+    backup_leaf: str,
+    *,
+    retained_mode: int,
+    source_identity: EntryIdentity,
+) -> EntryIdentity:
+    if inspect_private_file_at(backup_parent_fd, backup_leaf).state is not PermissionState.ABSENT:
+        raise _CompactionAbort("invalid_request")
+    backup_fd = create_private_file_at(backup_parent_fd, backup_leaf)
+    try:
+        created = os.fstat(backup_fd)
+        validate_owned_regular_stat(created)
+        backup_identity = entry_identity(created)
+        if backup_identity == source_identity:
+            raise _CompactionAbort("invalid_request")
+        source_conn = _readonly_sqlite_at(
+            source_parent_fd,
+            source_leaf,
+            expected_identity=source_identity,
+        )
+        destination = _writable_sqlite_at(
+            backup_parent_fd,
+            backup_leaf,
+            expected_identity=backup_identity,
+        )
+        try:
+            source_conn.backup(destination)
+            mode_row = destination.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if mode_row is None or str(mode_row[0]).lower() != "delete":
+                raise _CompactionAbort("backup_failed")
+        finally:
+            destination.close()
+            source_conn.close()
+        current = verify_entry_identity(
+            backup_parent_fd,
+            backup_leaf,
+            backup_identity,
+            expected_type=EntryType.REGULAR_FILE,
+        )
+        if int(current.st_nlink) != 1 or identity_matches(source_identity, current):
+            raise _CompactionAbort("backup_failed")
+        os.fchmod(backup_fd, retained_mode)
+        os.fsync(backup_fd)
+        current = os.fstat(backup_fd)
+        if stat.S_IMODE(current.st_mode) != retained_mode:
+            raise _CompactionAbort("backup_failed")
+    except _CompactionAbort:
+        raise
+    except Exception:
+        raise _CompactionAbort("backup_failed") from None
+    finally:
+        os.close(backup_fd)
+    backup_conn = _readonly_sqlite_at(
+        backup_parent_fd,
+        backup_leaf,
+        expected_identity=backup_identity,
+    )
+    try:
+        if not _quick_check_ok(backup_conn):
+            raise _CompactionAbort("backup_failed")
+    finally:
+        backup_conn.close()
+    return backup_identity
+
+
+def _checkpoint_truncate(
+    db_path: Path,
+    *,
+    expected_identity: EntryIdentity,
+    store_lock_held: bool = False,
+) -> bool:
+    try:
+        with _connect(
+            db_path,
+            isolation_level=None,
+            _store_lock_held=store_lock_held,
+            _expected_db_identity=expected_identity,
+        ) as conn:
+            conn.execute("PRAGMA busy_timeout=0")
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except (LocalStateError, sqlite3.Error, StoreSchemaError):
+        return False
+    return (
+        row is not None
+        and len(row) >= 2
+        and int(row[0]) == 0
+        and int(row[1]) == 0
+    )
+
+
+def _activate_compacted_wal(
+    db_path: Path,
+    *,
+    expected_identity: EntryIdentity,
+    store_lock_held: bool = False,
+) -> bool:
+    try:
+        with _connect(
+            db_path,
+            isolation_level=None,
+            _store_lock_held=store_lock_held,
+            _expected_db_identity=expected_identity,
+        ) as conn:
+            conn.execute("PRAGMA busy_timeout=0")
+            with private_file_creation_umask():
+                _configure_persistent_database_conn(conn)
+    except (LocalStateError, sqlite3.Error, StoreSchemaError):
+        return False
+    return True
+
+
+def _vacuum_into_replacement(
+    db_path: Path,
+    handle: Any,
+    phase_hook: Callable[[str], None] | None,
+    *,
+    source_identity: EntryIdentity,
+    store_lock_held: bool = False,
+) -> Any:
+    released_handle: Any = handle
+    try:
+        with release_private_sqlite_replacement_at(handle) as (
+            released_handle,
+            replacement_target,
+        ):
+            _call_compaction_phase(
+                phase_hook,
+                "during_replacement",
+                failure_status="replacement_failed",
+            )
+            with _connect(
+                db_path,
+                isolation_level=None,
+                _store_lock_held=store_lock_held,
+                _expected_db_identity=source_identity,
+            ) as source:
+                source.execute("PRAGMA busy_timeout=0")
+                source.execute("VACUUM INTO ?", (replacement_target,))
+        return verify_created_private_sqlite_replacement_at(released_handle)
+    except Exception:
+        try:
+            created_handle = verify_created_private_sqlite_replacement_at(
+                released_handle
+            )
+            cleanup_private_sqlite_replacement_at(created_handle)
+        except LocalStateError:
+            pass
+        raise _CompactionAbort("replacement_failed") from None
+
+
+def _copy_backup_into_replacement(
+    backup_parent_fd: int,
+    backup_leaf: str,
+    handle: Any,
+    *,
+    backup_identity: EntryIdentity,
+) -> Any:
+    released_handle: Any = handle
+    try:
+        with release_private_sqlite_replacement_at(handle) as (
+            released_handle,
+            replacement_target,
+        ):
+            source = _readonly_sqlite_at(
+                backup_parent_fd,
+                backup_leaf,
+                expected_identity=backup_identity,
+            )
+            with private_file_creation_umask():
+                destination = sqlite3.connect(
+                    replacement_target,
+                    timeout=0.0,
+                    isolation_level=None,
+                )
+            try:
+                source.backup(destination)
+                mode_row = destination.execute(
+                    "PRAGMA journal_mode=DELETE"
+                ).fetchone()
+                if mode_row is None or str(mode_row[0]).lower() != "delete":
+                    raise _CompactionAbort("rollback_failed")
+            finally:
+                destination.close()
+                source.close()
+        return verify_created_private_sqlite_replacement_at(released_handle)
+    except Exception:
+        try:
+            created_handle = verify_created_private_sqlite_replacement_at(
+                released_handle
+            )
+            cleanup_private_sqlite_replacement_at(created_handle)
+        except LocalStateError:
+            pass
+        raise
+
+
+def _replacement_integrity_ok(
+    parent_fd: int,
+    replacement_leaf: str,
+    *,
+    expected_identity: EntryIdentity,
+) -> bool:
+    conn = _readonly_sqlite_at(
+        parent_fd,
+        replacement_leaf,
+        expected_identity=expected_identity,
+    )
+    try:
+        return _quick_check_ok(conn) and _foreign_key_check_ok(conn)
+    finally:
+        conn.close()
+
+
+def _restore_verified_compaction_backup(
+    db_path: Path,
+    source_parent_fd: int,
+    source_leaf: str,
+    backup_parent_fd: int,
+    backup_leaf: str,
+    *,
+    backup_identity: EntryIdentity,
+    retained_mode: int,
+    expected_source_identity: EntryIdentity,
+    store_lock_held: bool = False,
+) -> bool:
+    rollback_handle: Any = None
+    published = False
+    try:
+        backup_stat = verify_entry_identity(
+            backup_parent_fd,
+            backup_leaf,
+            backup_identity,
+            expected_type=EntryType.REGULAR_FILE,
+        )
+        if int(backup_stat.st_nlink) != 1:
+            return False
+        backup_conn = _readonly_sqlite_at(
+            backup_parent_fd,
+            backup_leaf,
+            expected_identity=backup_identity,
+        )
+        try:
+            if not _quick_check_ok(backup_conn):
+                return False
+        finally:
+            backup_conn.close()
+
+        current_members = _snapshot_sqlite_family_at(
+            source_parent_fd,
+            source_leaf,
+            require_main=True,
+        )
+        _family_bytes, _main_bytes, _main_mode, current_identity = (
+            _compaction_family_metrics(current_members)
+        )
+        if current_identity != expected_source_identity:
+            return False
+        if not _checkpoint_truncate(
+            db_path,
+            expected_identity=expected_source_identity,
+            store_lock_held=store_lock_held,
+        ):
+            return False
+        rollback_handle = prepare_private_sqlite_replacement_at(
+            source_parent_fd,
+            basename=source_leaf,
+            retained_mode=retained_mode,
+        )
+        rollback_handle = _copy_backup_into_replacement(
+            backup_parent_fd,
+            backup_leaf,
+            rollback_handle,
+            backup_identity=backup_identity,
+        )
+        replacement_identity = rollback_handle._replacement_identity
+        if replacement_identity is None or not _replacement_integrity_ok(
+            source_parent_fd,
+            rollback_handle._replacement_name,
+            expected_identity=replacement_identity,
+        ):
+            return False
+        restored_identity = publish_private_sqlite_replacement_at(
+            rollback_handle,
+            expected_source=expected_source_identity,
+        )
+        published = True
+        if not _activate_compacted_wal(
+            db_path,
+            expected_identity=restored_identity,
+            store_lock_held=store_lock_held,
+        ):
+            return False
+        restored = _readonly_sqlite_at(
+            source_parent_fd,
+            source_leaf,
+            expected_identity=restored_identity,
+        )
+        try:
+            restored_ok = (
+                _quick_check_ok(restored)
+                and _foreign_key_check_ok(restored)
+            )
+        finally:
+            restored.close()
+        restored_members = _snapshot_sqlite_family_at(
+            source_parent_fd,
+            source_leaf,
+            require_main=True,
+        )
+        return restored_ok and _compaction_family_permissions_ok(
+            restored_members,
+            expected_main=restored_identity,
+        )
+    except Exception:
+        return False
+    finally:
+        if rollback_handle is not None and not published:
+            try:
+                cleanup_private_sqlite_replacement_at(rollback_handle)
+            except LocalStateError:
+                pass
+
+
+def compact_store(
+    db_path: Path,
+    *,
+    options: CompactionOptions,
+    now: str | None = None,
+    phase_hook: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Inspect or explicitly compact one current-v9 store while offline."""
+    report = _compaction_report(options)
+    try:
+        policy = SnapshotRetentionPolicy(
+            retention_days=options.snapshot_retention_days,
+            retention_count=options.snapshot_retention_count,
+            batch_size=options.batch_size,
+        )
+        cutoff_at = _utc_cutoff(
+            retention_days=policy.retention_days,
+            now=now,
+        )
+    except (TypeError, ValueError):
+        return _public_compaction_report(report, status="invalid_request")
+    source_parent_fd = -1
+    backup_parent_fd = -1
+    backup_leaf = ""
+    backup_identity: EntryIdentity | None = None
+    replacement_handle: Any = None
+    replacement_published = False
+    source_mutated = False
+    stable_lock_held = False
+    retained_mode = 0o600
+    authoritative_source_identity: EntryIdentity | None = None
+    stage = "preflight"
+    try:
+        if options.dry_run and (
+            options.acknowledge_offline or options.backup_path is not None
+        ):
+            raise _CompactionAbort("invalid_request")
+        if _is_memory_db(db_path):
+            raise _CompactionAbort("invalid_request")
+        if not options.dry_run and (
+            options.acknowledge_offline is not True or options.backup_path is None
+        ):
+            raise _CompactionAbort("invalid_request")
+
+        source_parent_fd, source_leaf = open_resolved_parent(db_path)
+        _validate_parent_fd(source_parent_fd, private=True)
+        source_members = _snapshot_sqlite_family_at(
+            source_parent_fd,
+            source_leaf,
+            require_main=False,
+        )
+        try:
+            (
+                family_bytes,
+                source_bytes,
+                retained_mode,
+                source_identity,
+            ) = _compaction_family_metrics(source_members)
+        except _CompactionAbort as exc:
+            if exc.status == "permissions_failed":
+                report["permissions"]["outcome"] = (
+                    "repair_required"
+                    if any(
+                        member.state is PermissionState.REPAIR_REQUIRED
+                        for member in source_members
+                    )
+                    else "unsafe"
+                )
+            raise
+        if not options.dry_run:
+            try:
+                fcntl.flock(
+                    source_parent_fd,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except (BlockingIOError, OSError):
+                raise _CompactionAbort("offline_required") from None
+            stable_lock_held = True
+            stage = "offline"
+            locked_members = _snapshot_sqlite_family_at(
+                source_parent_fd,
+                source_leaf,
+                require_main=False,
+            )
+            if locked_members[0].identity != source_identity:
+                raise local_state_error(LocalStateErrorCode.ENTRY_CHANGED)
+            source_members = locked_members
+            try:
+                (
+                    family_bytes,
+                    source_bytes,
+                    retained_mode,
+                    source_identity,
+                ) = _compaction_family_metrics(source_members)
+            except _CompactionAbort as exc:
+                if exc.status == "permissions_failed":
+                    report["permissions"]["outcome"] = (
+                        "repair_required"
+                        if any(
+                            member.state is PermissionState.REPAIR_REQUIRED
+                            for member in source_members
+                        )
+                        else "unsafe"
+                    )
+                raise
+        report["permissions"] = {"ok": True, "outcome": "compliant"}
+        authoritative_source_identity = source_identity
+        report["storage"]["before_bytes"] = family_bytes
+
+        wal = source_members[1]
+        shm = source_members[2]
+        preflight_immutable = (
+            wal.state is PermissionState.ABSENT
+            or wal.size == 0
+        )
+        if not preflight_immutable and shm.state is PermissionState.ABSENT:
+            raise _CompactionAbort(
+                "store_unavailable" if options.dry_run else "offline_required"
+            )
+        source = _readonly_sqlite_at(
+            source_parent_fd,
+            source_leaf,
+            immutable=preflight_immutable,
+            expected_identity=source_identity,
+        )
+        try:
+            version_row = source.execute("PRAGMA user_version").fetchone()
+            if version_row is None or int(version_row[0]) != STORE_SCHEMA_VERSION:
+                raise _CompactionAbort("schema_not_current")
+            if not _quick_check_ok(source):
+                report["integrity"]["before"] = "failed"
+                raise _CompactionAbort("integrity_failed")
+            report["integrity"]["before"] = "ok"
+            (
+                before,
+                eligible,
+                latest_hosts,
+                eligible_logical_bytes,
+            ) = _compaction_snapshot_metrics(
+                source,
+                cutoff_at=cutoff_at,
+                retention_count=policy.retention_count,
+            )
+            live_bytes, reclaimable_bytes = _compaction_page_metrics(source)
+        except sqlite3.Error:
+            raise _CompactionAbort("store_unavailable") from None
+        finally:
+            source.close()
+        report["snapshots"].update(
+            {
+                "before": before,
+                "retained": before - eligible,
+                "eligible": eligible,
+                "remaining": eligible,
+                "latest_hosts_retained": latest_hosts,
+            }
+        )
+        report["storage"]["estimated_reclaimable_bytes"] = min(
+            source_bytes,
+            reclaimable_bytes + eligible_logical_bytes,
+        )
+        required_bytes = family_bytes * 2 + max(source_bytes, live_bytes)
+        available_bytes = sqlite_parent_available_bytes_at(source_parent_fd)
+        report["space"] = {
+            "available_bytes": available_bytes,
+            "required_bytes": required_bytes,
+            "headroom_ok": available_bytes >= required_bytes,
+        }
+        if available_bytes < required_bytes and not options.dry_run:
+            raise _CompactionAbort("insufficient_space")
+
+        if options.dry_run:
+            return _public_compaction_report(report, status="dry_run", ok=True)
+
+        assert options.backup_path is not None
+        backup_parent_fd, backup_leaf = open_resolved_parent(options.backup_path)
+        _validate_parent_fd(backup_parent_fd, private=True)
+        source_parent_stat = os.fstat(source_parent_fd)
+        backup_parent_stat = os.fstat(backup_parent_fd)
+        if (
+            identity_matches(entry_identity(source_parent_stat), backup_parent_stat)
+            and source_leaf == backup_leaf
+        ):
+            raise _CompactionAbort("invalid_request")
+        if inspect_private_file_at(
+            backup_parent_fd, backup_leaf
+        ).state is not PermissionState.ABSENT:
+            raise _CompactionAbort("invalid_request")
+        backup_available = sqlite_parent_available_bytes_at(backup_parent_fd)
+        if (
+            source_parent_stat.st_dev != backup_parent_stat.st_dev
+            and backup_available < family_bytes
+        ):
+            report["space"]["available_bytes"] = min(
+                int(report["space"]["available_bytes"]),
+                backup_available,
+            )
+            report["space"]["headroom_ok"] = False
+            raise _CompactionAbort("insufficient_space")
+
+        stage = "offline"
+        try:
+            with _connect(
+                db_path,
+                isolation_level=None,
+                _store_lock_held=True,
+                _expected_db_identity=source_identity,
+            ) as exclusive:
+                exclusive.execute("PRAGMA busy_timeout=0")
+                exclusive.execute("BEGIN EXCLUSIVE")
+                if int(exclusive.execute("PRAGMA user_version").fetchone()[0]) != STORE_SCHEMA_VERSION:
+                    exclusive.rollback()
+                    raise _CompactionAbort("schema_not_current")
+                if not _quick_check_ok(exclusive):
+                    report["integrity"]["before"] = "failed"
+                    exclusive.rollback()
+                    raise _CompactionAbort("integrity_failed")
+                exclusive.commit()
+        except sqlite3.OperationalError:
+            raise _CompactionAbort("offline_required") from None
+        _call_compaction_phase(
+            phase_hook,
+            "after_precheck",
+            failure_status="backup_failed",
+        )
+
+        stage = "backup"
+        _call_compaction_phase(
+            phase_hook,
+            "before_backup",
+            failure_status="backup_failed",
+        )
+        backup_identity = _create_verified_compaction_backup(
+            source_parent_fd,
+            source_leaf,
+            backup_parent_fd,
+            backup_leaf,
+            retained_mode=retained_mode,
+            source_identity=source_identity,
+        )
+        report["backup"] = {
+            "required": True,
+            "created": True,
+            "verified": True,
+        }
+        report["integrity"]["backup"] = "ok"
+        _call_compaction_phase(
+            phase_hook,
+            "after_backup",
+            failure_status="maintenance_failed",
+        )
+
+        stage = "maintenance"
+        while True:
+            batch = cleanup_snapshot_retention(
+                db_path,
+                retention_days=policy.retention_days,
+                retention_count=policy.retention_count,
+                batch_size=policy.batch_size,
+                now=now,
+                dry_run=False,
+                _store_lock_held=True,
+                _expected_db_identity=source_identity,
+            )
+            if not batch.get("ok"):
+                raise _CompactionAbort("maintenance_failed")
+            examined = int(batch.get("examined") or 0)
+            deleted = int(batch.get("deleted") or 0)
+            source_mutated = source_mutated or deleted > 0
+            report["snapshots"]["examined"] += examined
+            report["snapshots"]["deleted"] += deleted
+            if not batch.get("remaining_candidates"):
+                break
+            if examined <= 0 or deleted <= 0:
+                raise _CompactionAbort("maintenance_failed")
+        report["snapshots"]["remaining"] = 0
+        report["snapshots"]["retained"] = (
+            report["snapshots"]["before"] - report["snapshots"]["deleted"]
+        )
+
+        stage = "checkpoint"
+        source_mutated = True
+        if not _checkpoint_truncate(
+            db_path,
+            store_lock_held=True,
+            expected_identity=source_identity,
+        ):
+            report["checkpoint"]["status"] = "failed"
+            raise _CompactionAbort("checkpoint_failed")
+        report["checkpoint"]["status"] = "completed"
+
+        stage = "replacement"
+        replacement_handle = prepare_private_sqlite_replacement_at(
+            source_parent_fd,
+            basename=source_leaf,
+            retained_mode=retained_mode,
+        )
+        replacement_handle = _vacuum_into_replacement(
+            db_path,
+            replacement_handle,
+            phase_hook,
+            store_lock_held=True,
+            source_identity=source_identity,
+        )
+        report["replacement"]["status"] = "built"
+        replacement_identity = replacement_handle._replacement_identity
+        if replacement_identity is None or not _replacement_integrity_ok(
+            source_parent_fd,
+            replacement_handle._replacement_name,
+            expected_identity=replacement_identity,
+        ):
+            report["integrity"]["replacement"] = "failed"
+            raise _CompactionAbort("replacement_failed")
+        report["integrity"]["replacement"] = "ok"
+        _call_compaction_phase(
+            phase_hook,
+            "after_replacement_check",
+            failure_status="replacement_failed",
+        )
+        _call_compaction_phase(
+            phase_hook,
+            "before_publish",
+            failure_status="replacement_failed",
+        )
+        published_identity = publish_private_sqlite_replacement_at(
+            replacement_handle,
+            expected_source=source_identity,
+        )
+        authoritative_source_identity = published_identity
+        replacement_published = True
+        report["replacement"]["status"] = "published"
+        if not _activate_compacted_wal(
+            db_path,
+            store_lock_held=True,
+            expected_identity=published_identity,
+        ):
+            raise _CompactionAbort("replacement_failed")
+        _call_compaction_phase(
+            phase_hook,
+            "publication_failed",
+            failure_status="replacement_failed",
+        )
+
+        stage = "post_publish"
+        post = _readonly_sqlite_at(
+            source_parent_fd,
+            source_leaf,
+            expected_identity=published_identity,
+        )
+        try:
+            post_ok = _quick_check_ok(post) and _foreign_key_check_ok(post)
+        finally:
+            post.close()
+        post_members = _snapshot_sqlite_family_at(
+            source_parent_fd,
+            source_leaf,
+            require_main=True,
+        )
+        post_ok = post_ok and _compaction_family_permissions_ok(
+            post_members,
+            expected_main=published_identity,
+        )
+        report["integrity"]["after"] = "ok" if post_ok else "failed"
+        if not post_ok:
+            raise _CompactionAbort("replacement_failed")
+        _call_compaction_phase(
+            phase_hook,
+            "after_publish_check",
+            failure_status="replacement_failed",
+        )
+        after_family, _after_main, _mode, after_identity = (
+            _compaction_family_metrics(post_members)
+        )
+        if after_identity != published_identity:
+            raise _CompactionAbort("replacement_failed")
+        report["storage"]["after_bytes"] = after_family
+        return _public_compaction_report(report, status="completed", ok=True)
+    except _CompactionAbort as exc:
+        if replacement_published or source_mutated:
+            report["rollback"]["status"] = "failed"
+            if (
+                backup_identity is not None
+                and backup_parent_fd >= 0
+                and authoritative_source_identity is not None
+                and _restore_verified_compaction_backup(
+                    db_path,
+                    source_parent_fd,
+                    source_leaf,
+                    backup_parent_fd,
+                    backup_leaf,
+                    backup_identity=backup_identity,
+                    expected_source_identity=authoritative_source_identity,
+                    retained_mode=retained_mode,
+                    store_lock_held=stable_lock_held,
+                )
+            ):
+                report["rollback"]["status"] = "completed"
+                report["integrity"]["after"] = "ok"
+                return _public_compaction_report(
+                    report,
+                    status="rollback_completed",
+                )
+            return _public_compaction_report(report, status="rollback_failed")
+        if stage == "backup" and report["backup"]["created"]:
+            report["integrity"]["backup"] = "failed"
+        if stage == "replacement":
+            report["replacement"]["status"] = "failed"
+        return _public_compaction_report(report, status=exc.status)
+    except LocalStateError:
+        if replacement_published or source_mutated:
+            report["rollback"]["status"] = "failed"
+            if (
+                backup_identity is not None
+                and backup_parent_fd >= 0
+                and authoritative_source_identity is not None
+                and _restore_verified_compaction_backup(
+                    db_path,
+                    source_parent_fd,
+                    source_leaf,
+                    backup_parent_fd,
+                    backup_leaf,
+                    backup_identity=backup_identity,
+                    expected_source_identity=authoritative_source_identity,
+                    retained_mode=retained_mode,
+                    store_lock_held=stable_lock_held,
+                )
+            ):
+                report["rollback"]["status"] = "completed"
+                report["integrity"]["after"] = "ok"
+                return _public_compaction_report(
+                    report,
+                    status="rollback_completed",
+                )
+            return _public_compaction_report(report, status="rollback_failed")
+        status = (
+            "permissions_failed"
+            if stage in {"preflight", "offline"}
+            else "backup_failed"
+            if stage == "backup"
+            else "checkpoint_failed"
+            if stage == "checkpoint"
+            else "replacement_failed"
+        )
+        return _public_compaction_report(report, status=status)
+    except Exception:
+        if replacement_published or source_mutated:
+            report["rollback"]["status"] = "failed"
+            if (
+                backup_identity is not None
+                and backup_parent_fd >= 0
+                and authoritative_source_identity is not None
+                and _restore_verified_compaction_backup(
+                    db_path,
+                    source_parent_fd,
+                    source_leaf,
+                    backup_parent_fd,
+                    backup_leaf,
+                    backup_identity=backup_identity,
+                    expected_source_identity=authoritative_source_identity,
+                    retained_mode=retained_mode,
+                    store_lock_held=stable_lock_held,
+                )
+            ):
+                report["rollback"]["status"] = "completed"
+                report["integrity"]["after"] = "ok"
+                return _public_compaction_report(
+                    report,
+                    status="rollback_completed",
+                )
+            return _public_compaction_report(report, status="rollback_failed")
+        status = {
+            "preflight": "store_unavailable",
+            "offline": "offline_required",
+            "backup": "backup_failed",
+            "maintenance": "maintenance_failed",
+            "checkpoint": "checkpoint_failed",
+            "replacement": "replacement_failed",
+        }.get(stage, "replacement_failed")
+        return _public_compaction_report(report, status=status)
+    finally:
+        if replacement_handle is not None and not replacement_published:
+            try:
+                cleanup_private_sqlite_replacement_at(replacement_handle)
+            except LocalStateError:
+                pass
+        if backup_parent_fd >= 0:
+            os.close(backup_parent_fd)
+        if source_parent_fd >= 0:
+            os.close(source_parent_fd)
+
+
+def maybe_run_automatic_store_maintenance(
+    db_path: Path,
+    *,
+    policy: SnapshotRetentionPolicy,
+    cadence_seconds: int = 3600,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Run one serialized automatic batch when the persisted cadence is due."""
+    if (
+        isinstance(cadence_seconds, bool)
+        or not isinstance(cadence_seconds, int)
+        or cadence_seconds <= 0
+    ):
+        raise ValueError("cadence_seconds must be a positive integer")
+    current_at = _connector_now(now)
+    if not _sqlite_store_exists(db_path):
+        return dict(sanitize_public_value({
+            "schema_version": 1,
+            "ok": False,
+            "status": "store_unavailable",
+            "due": False,
+            "last_completed_at": None,
+            "next_due_at": None,
+            "snapshot": {
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+            },
+            "batch_size": policy.batch_size,
+        }))
+    cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            state = conn.execute(
+                """
+                SELECT last_completed_at
+                FROM store_maintenance_state
+                WHERE scope = 'automatic'
+                """
+            ).fetchone()
+            last_completed_at = (
+                str(state[0]) if state is not None and state[0] is not None else None
+            )
+            next_due_at = (
+                _connector_add_seconds(last_completed_at, cadence_seconds)
+                if last_completed_at is not None
+                else None
+            )
+            due = (
+                next_due_at is None
+                or _connector_datetime(current_at) >= _connector_datetime(next_due_at)
+            )
+            if not due:
+                conn.rollback()
+                return dict(sanitize_public_value({
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "not_due",
+                    "due": False,
+                    "last_completed_at": last_completed_at,
+                    "next_due_at": next_due_at,
+                    "snapshot": {
+                        "examined": 0,
+                        "deleted": 0,
+                        "remaining_candidates": False,
+                    },
+                    "batch_size": policy.batch_size,
+                }))
+            candidates, _ = _snapshot_retention_candidates_conn(
+                conn,
+                cutoff_at=cutoff_at,
+                retention_count=policy.retention_count,
+                batch_size=policy.batch_size,
+            )
+            deleted = _delete_snapshot_candidates_conn(conn, candidates)
+            remaining_ids, _ = _snapshot_retention_candidates_conn(
+                conn,
+                cutoff_at=cutoff_at,
+                retention_count=policy.retention_count,
+                batch_size=1,
+            )
+            conn.execute(
+                """
+                UPDATE store_maintenance_state
+                SET last_started_at = ?,
+                    last_completed_at = ?,
+                    last_status = 'ok',
+                    last_examined = ?,
+                    last_deleted = ?,
+                    last_examined_id = ?
+                WHERE scope = 'automatic'
+                """,
+                (
+                    current_at,
+                    current_at,
+                    len(candidates),
+                    deleted,
+                    max(candidates) if candidates else None,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return dict(sanitize_public_value({
+        "schema_version": 1,
+        "ok": True,
+        "status": "ok",
+        "due": True,
+        "last_completed_at": current_at,
+        "next_due_at": _connector_add_seconds(current_at, cadence_seconds),
+        "snapshot": {
+            "examined": len(candidates),
+            "deleted": deleted,
+            "remaining_candidates": bool(remaining_ids),
+        },
+        "batch_size": policy.batch_size,
+    }))
+
+
 def cleanup_event_retention(
     db_path: Path,
     host_id: str,
@@ -6499,56 +9091,86 @@ def cleanup_event_retention(
     retention_days: int,
     now: str | None = None,
     dry_run: bool = False,
+    batch_size: int = 100,
 ) -> dict[str, Any]:
-    """Delete only host-scoped old rows from the events/history table."""
+    """Delete one bounded host-scoped batch from event history."""
     days = max(1, int(retention_days))
+    bounded_batch = max(1, min(int(batch_size), 1_000))
     cutoff_at = _utc_cutoff(retention_days=days, now=now)
-    if not _sqlite_store_exists(db_path):
-        return sanitize_public_value({
-            "schema_version": 1,
-            "ok": False,
-            "status": "store_unavailable",
-            "host_id": str(host_id),
-            "dry_run": bool(dry_run),
-            "retention_days": days,
-            "cutoff_at": cutoff_at,
-            "deleted": 0,
-        })
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        row = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM events
-            WHERE host_id = ? AND observed_at < ?
-            """,
-            (str(host_id), cutoff_at),
-        ).fetchone()
-        deleted = int(row[0] or 0)
-        if deleted and not dry_run:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    """
-                    DELETE FROM events
-                    WHERE host_id = ? AND observed_at < ?
-                    """,
-                    (str(host_id), cutoff_at),
-                )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-    return sanitize_public_value({
+    base = {
         "schema_version": 1,
-        "ok": True,
-        "status": "ok",
         "host_id": str(host_id),
         "dry_run": bool(dry_run),
         "retention_days": days,
         "cutoff_at": cutoff_at,
-        "deleted": deleted,
-    })
+        "batch_size": bounded_batch,
+    }
+    if not _sqlite_store_exists(db_path):
+        return dict(sanitize_public_value({
+            **base,
+            "ok": False,
+            "status": "store_unavailable",
+            "examined": 0,
+            "deleted": 0,
+            "remaining_candidates": False,
+        }))
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            candidate_pool = [
+                int(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT id
+                    FROM events
+                    WHERE host_id = ? AND observed_at < ?
+                    ORDER BY observed_at, id
+                    LIMIT ?
+                    """,
+                    (str(host_id), cutoff_at, bounded_batch + 1),
+                ).fetchall()
+            ]
+            candidate_ids = candidate_pool[:bounded_batch]
+            deleted = 0
+            if candidate_ids and not dry_run:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                deleted = int(
+                    conn.execute(
+                        f"DELETE FROM events WHERE id IN ({placeholders})",
+                        candidate_ids,
+                    ).rowcount
+                    or 0
+                )
+            if dry_run:
+                remaining = len(candidate_pool) > bounded_batch
+            else:
+                remaining = bool(
+                    conn.execute(
+                        """
+                        SELECT 1
+                        FROM events
+                        WHERE host_id = ? AND observed_at < ?
+                        LIMIT 1
+                        """,
+                        (str(host_id), cutoff_at),
+                    ).fetchone()
+                )
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return dict(sanitize_public_value({
+        **base,
+        "ok": True,
+        "status": "ok",
+        "examined": len(candidate_ids),
+        "deleted": len(candidate_ids) if dry_run else deleted,
+        "remaining_candidates": remaining,
+    }))
 
 
 def _turn_content_retention_candidates_conn(
@@ -7062,12 +9684,25 @@ def run_store_maintenance(
     now: str | None = None,
     dry_run: bool = False,
     content_batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
+    event_batch_size: int = 100,
+    snapshot_retention_days: int = 14,
+    snapshot_retention_count: int = 4096,
+    snapshot_batch_size: int = 100,
 ) -> dict[str, Any]:
-    """Run bounded host-scoped store maintenance and return public-safe counts."""
+    """Run one bounded batch for every online store-maintenance class."""
     retention = cleanup_event_retention(
         db_path,
         host_id,
         retention_days=retention_days,
+        now=now,
+        dry_run=dry_run,
+        batch_size=event_batch_size,
+    )
+    snapshots = cleanup_snapshot_retention(
+        db_path,
+        retention_days=snapshot_retention_days,
+        retention_count=snapshot_retention_count,
+        batch_size=snapshot_batch_size,
         now=now,
         dry_run=dry_run,
     )
@@ -7088,6 +9723,7 @@ def run_store_maintenance(
     )
     ok = (
         bool(retention.get("ok"))
+        and bool(snapshots.get("ok"))
         and bool(outbox.get("ok"))
         and bool(turn_content.get("ok"))
     )
@@ -7100,7 +9736,34 @@ def run_store_maintenance(
         "retention": {
             "retention_days": int(retention.get("retention_days") or retention_days),
             "cutoff_at": retention.get("cutoff_at"),
+            "batch_size": int(retention.get("batch_size") or event_batch_size),
+            "examined": int(retention.get("examined") or 0),
             "deleted": int(retention.get("deleted") or 0),
+            "remaining_candidates": bool(
+                retention.get("remaining_candidates")
+            ),
+        },
+        "snapshots": {
+            "scope": "database",
+            "retention_days": int(
+                snapshots.get("retention_days") or snapshot_retention_days
+            ),
+            "retention_count": int(
+                snapshots.get("retention_count") or snapshot_retention_count
+            ),
+            "cutoff_at": snapshots.get("cutoff_at"),
+            "batch_size": int(
+                snapshots.get("batch_size") or snapshot_batch_size
+            ),
+            "examined": int(snapshots.get("examined") or 0),
+            "deleted": int(snapshots.get("deleted") or 0),
+            "eligible": int(snapshots.get("eligible") or 0),
+            "remaining_candidates": bool(
+                snapshots.get("remaining_candidates")
+            ),
+            "latest_hosts_retained": int(
+                snapshots.get("latest_hosts_retained") or 0
+            ),
         },
         "outbox": {
             "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
@@ -7210,39 +9873,579 @@ def _turn_content_matches_origin(payload: Mapping[str, Any], content: Mapping[st
     if not incoming_user:
         return False
     return incoming_user == _turn_merge_match_text(payload.get("user_text"))
+def _normalize_backend_pending_payload(
+    pending: Mapping[str, Any],
+    choice_routes: tuple[tuple[str, int], ...],
+) -> tuple[dict[str, Any], str]:
+    """Validate and canonicalize one complete public overlay before persistence."""
+    clean = sanitize_public_mapping(pending)
+    if not isinstance(clean, dict) or not set(clean) <= {
+        "question",
+        "kind",
+        "choices",
+        "meta",
+    }:
+        raise ValueError("invalid backend pending payload")
+    question = clean.get("question")
+    kind = clean.get("kind")
+    choices = clean.get("choices", [])
+    meta = clean.get("meta", {"source": "backend"})
+    if (
+        not isinstance(question, str)
+        or not question.strip()
+        or not isinstance(kind, str)
+        or not kind.strip()
+        or not isinstance(choices, list)
+        or not isinstance(meta, Mapping)
+    ):
+        raise ValueError("invalid backend pending payload")
+    normalized_choices: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for choice in choices:
+        if not isinstance(choice, Mapping) or set(choice) != {"choice_id", "label"}:
+            raise ValueError("invalid backend pending choice")
+        choice_id = choice.get("choice_id")
+        label = choice.get("label")
+        if (
+            type(choice_id) is not str
+            or not choice_id
+            or choice_id in seen
+            or type(label) is not str
+            or not label.strip()
+        ):
+            raise ValueError("invalid backend pending choice")
+        seen.add(choice_id)
+        normalized_choices.append({"choice_id": choice_id, "label": label})
+    route_map = dict(choice_routes)
+    if set(route_map) != seen or any(
+        type(ordinal) is not int or ordinal < 1 for ordinal in route_map.values()
+    ):
+        raise ValueError("backend pending choices do not match private routes")
+    normalized = {
+        "question": question,
+        "kind": kind,
+        "choices": normalized_choices,
+        "meta": sanitize_public_mapping(meta),
+    }
+    return normalized, _canonical_json(route_map)
+
+
+def _pending_observed_time(observed_at: str | None) -> tuple[str, datetime]:
+    value = observed_at or utc_timestamp()
+    canonical = _strict_utc_timestamp(value)
+    if canonical is None:
+        raise ValueError("observed_at must be a UTC timestamp")
+    return canonical, datetime.fromisoformat(canonical)
+
+
+def _apply_backend_pending_observation_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    observation: PendingObservation,
+    *,
+    observed_at: str,
+    stale_grace_seconds: float,
+    binding_private_fingerprint: str = "",
+    observed_turn_target_value: str = "",
+) -> bool:
+    """Apply one binding-scoped durable backend-pending transition."""
+    current_time, current_dt = _pending_observed_time(observed_at)
+    if (
+        isinstance(stale_grace_seconds, bool)
+        or not isinstance(stale_grace_seconds, (int, float))
+        or not float(stale_grace_seconds) > 0
+    ):
+        raise ValueError("stale_grace_seconds must be positive")
+    source_binding = str(binding_private_fingerprint or "")
+    source_target = str(observed_turn_target_value or "")
+    key = (str(host_id), str(worker_id))
+    row = conn.execute(
+        """
+        SELECT payload_json, revision_digest, choice_routes_json,
+               binding_private_fingerprint, observed_turn_target_value,
+               observation_state, freshness, grace_deadline, observed_at
+        FROM backend_pending
+        WHERE host_id = ? AND worker_id = ?
+        """,
+        key,
+    ).fetchone()
+    stored_binding = str(row[3]) if row is not None else ""
+    stored_target = str(row[4]) if row is not None else ""
+    stored_observed_at = (
+        _strict_utc_timestamp(row[8]) if row is not None else None
+    )
+    if (
+        stored_observed_at is not None
+        and current_dt < datetime.fromisoformat(stored_observed_at)
+    ):
+        return False
+
+    if observation.kind == "worker_authoritatively_absent":
+        if source_binding:
+            cursor = conn.execute(
+                """
+                DELETE FROM backend_pending
+                WHERE host_id = ? AND worker_id = ?
+                  AND binding_private_fingerprint = ?
+                """,
+                (*key, source_binding),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
+                key,
+            )
+        if cursor.rowcount:
+            conn.execute(
+                "DELETE FROM backend_pending_claims "
+                "WHERE host_id = ? AND worker_id = ?",
+                key,
+            )
+        return bool(cursor.rowcount)
+
+    binding_changed = (
+        row is not None
+        and source_binding
+        and stored_binding
+        and source_binding != stored_binding
+    )
+    if binding_changed:
+        return False
+    effective_binding = source_binding or stored_binding
+    effective_target = source_target or stored_target
+
+    if observation.kind == "read_failed":
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO backend_pending (
+                    host_id, worker_id, payload_json, observed_at,
+                    revision_digest, choice_routes_json,
+                    binding_private_fingerprint, observed_turn_target_value,
+                    observation_state, freshness, last_success_at,
+                    last_failure_at, grace_deadline, updated_at
+                ) VALUES (?, ?, '{}', ?, '', '{}', ?, ?, 'failed', 'stale',
+                          NULL, ?, NULL, ?)
+                """,
+                (
+                    *key,
+                    current_time,
+                    effective_binding,
+                    effective_target,
+                    current_time,
+                    current_time,
+                ),
+            )
+            return True
+        state = str(row[5])
+        freshness = str(row[6])
+        if state == "open":
+            deadline = _strict_utc_timestamp(row[7])
+            if (
+                deadline is not None
+                and current_dt >= datetime.fromisoformat(deadline)
+            ):
+                conn.execute(
+                    """
+                    UPDATE backend_pending
+                    SET observed_at = ?,
+                        binding_private_fingerprint = ?,
+                        observed_turn_target_value = ?,
+                        observation_state = 'failed', freshness = 'stale',
+                        last_failure_at = ?, grace_deadline = NULL,
+                        updated_at = ?
+                    WHERE host_id = ? AND worker_id = ?
+                    """,
+                    (
+                        current_time,
+                        effective_binding,
+                        effective_target,
+                        current_time,
+                        current_time,
+                        *key,
+                    ),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM backend_pending_claims
+                    WHERE host_id = ? AND worker_id = ? AND state = 'claimed'
+                    """,
+                    key,
+                )
+                return True
+            if freshness == "stale":
+                conn.execute(
+                    """
+                    UPDATE backend_pending
+                    SET observed_at = ?, last_failure_at = ?
+                    WHERE host_id = ? AND worker_id = ?
+                    """,
+                    (current_time, current_time, *key),
+                )
+                return False
+            grace_deadline = (
+                current_dt + timedelta(seconds=float(stale_grace_seconds))
+            ).isoformat(timespec="microseconds")
+            conn.execute(
+                """
+                UPDATE backend_pending
+                SET observed_at = ?, binding_private_fingerprint = ?,
+                    observed_turn_target_value = ?, freshness = 'stale',
+                    last_failure_at = ?, grace_deadline = ?, updated_at = ?
+                WHERE host_id = ? AND worker_id = ?
+                """,
+                (
+                    current_time,
+                    effective_binding,
+                    effective_target,
+                    current_time,
+                    grace_deadline,
+                    current_time,
+                    *key,
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM backend_pending_claims
+                WHERE host_id = ? AND worker_id = ? AND state = 'claimed'
+                """,
+                key,
+            )
+            return True
+        if freshness == "stale":
+            conn.execute(
+                """
+                UPDATE backend_pending
+                SET observed_at = ?, last_failure_at = ?
+                WHERE host_id = ? AND worker_id = ?
+                """,
+                (current_time, current_time, *key),
+            )
+            return False
+        conn.execute(
+            """
+            UPDATE backend_pending
+            SET observed_at = ?, binding_private_fingerprint = ?,
+                observed_turn_target_value = ?, freshness = 'stale',
+                last_failure_at = ?, grace_deadline = NULL, updated_at = ?
+            WHERE host_id = ? AND worker_id = ?
+            """,
+            (
+                current_time,
+                effective_binding,
+                effective_target,
+                current_time,
+                current_time,
+                *key,
+            ),
+        )
+        return True
+
+    if observation.kind == "read_succeeded_invalid_prompt":
+        changed = row is None or (
+            str(row[5]),
+            str(row[6]),
+            stored_binding,
+            stored_target,
+        ) != ("invalid", "stale", effective_binding, effective_target)
+        conn.execute(
+            """
+            INSERT INTO backend_pending (
+                host_id, worker_id, payload_json, observed_at, revision_digest,
+                choice_routes_json, binding_private_fingerprint,
+                observed_turn_target_value, observation_state, freshness,
+                last_success_at, last_failure_at, grace_deadline, updated_at
+            ) VALUES (?, ?, '{}', ?, '', '{}', ?, ?, 'invalid', 'stale',
+                      NULL, ?, NULL, ?)
+            ON CONFLICT(host_id, worker_id) DO UPDATE SET
+                payload_json = '{}', observed_at = excluded.observed_at,
+                revision_digest = '', choice_routes_json = '{}',
+                binding_private_fingerprint =
+                    excluded.binding_private_fingerprint,
+                observed_turn_target_value =
+                    excluded.observed_turn_target_value,
+                observation_state = 'invalid', freshness = 'stale',
+                last_success_at = NULL,
+                last_failure_at = excluded.last_failure_at,
+                grace_deadline = NULL, updated_at = excluded.updated_at
+            """,
+            (
+                *key,
+                current_time,
+                effective_binding,
+                effective_target,
+                current_time,
+                current_time,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM backend_pending_claims "
+            "WHERE host_id = ? AND worker_id = ?",
+            key,
+        )
+        return changed
+
+    if observation.kind == "read_succeeded_no_prompt":
+        changed = row is None or (
+            str(row[5]),
+            str(row[6]),
+            stored_binding,
+            stored_target,
+        ) != ("none", "fresh", effective_binding, effective_target)
+        conn.execute(
+            """
+            INSERT INTO backend_pending (
+                host_id, worker_id, payload_json, observed_at, revision_digest,
+                choice_routes_json, binding_private_fingerprint,
+                observed_turn_target_value, observation_state, freshness,
+                last_success_at, last_failure_at, grace_deadline, updated_at
+            ) VALUES (?, ?, '{}', ?, '', '{}', ?, ?, 'none', 'fresh',
+                      ?, NULL, NULL, ?)
+            ON CONFLICT(host_id, worker_id) DO UPDATE SET
+                payload_json = '{}', observed_at = excluded.observed_at,
+                revision_digest = '', choice_routes_json = '{}',
+                binding_private_fingerprint =
+                    excluded.binding_private_fingerprint,
+                observed_turn_target_value =
+                    excluded.observed_turn_target_value,
+                observation_state = 'none', freshness = 'fresh',
+                last_success_at = excluded.last_success_at,
+                last_failure_at = NULL, grace_deadline = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                *key,
+                current_time,
+                effective_binding,
+                effective_target,
+                current_time,
+                current_time,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM backend_pending_claims "
+            "WHERE host_id = ? AND worker_id = ?",
+            key,
+        )
+        return changed
+
+    revision_digest = stable_fingerprint(
+        {
+            "decision_revision": str(observation.revision_digest),
+            "binding_private_fingerprint": source_binding,
+            "observed_turn_target_value": source_target,
+        }
+    )
+    persisted_choices = tuple(
+        (
+            "choice-"
+            + stable_fingerprint(
+                {
+                    "revision": revision_digest,
+                    "ordinal": choice.picker_ordinal,
+                    "label": choice.label,
+                }
+            ),
+            choice.label,
+            choice.picker_ordinal,
+        )
+        for choice in observation.choices
+    )
+    public_payload = {
+        "question": observation.question,
+        "kind": observation.pending_kind or "question",
+        "choices": [
+            {"choice_id": choice_id, "label": label}
+            for choice_id, label, _ordinal in persisted_choices
+        ],
+        "meta": {"source": "backend"},
+    }
+    routes = tuple(
+        (choice_id, ordinal)
+        for choice_id, _label, ordinal in persisted_choices
+    )
+    normalized, routes_json = _normalize_backend_pending_payload(
+        public_payload,
+        routes,
+    )
+    payload_json = _canonical_json(normalized)
+    changed = row is None or (
+        str(row[0]),
+        str(row[1]),
+        str(row[2]),
+        stored_binding,
+        stored_target,
+        str(row[5]),
+        str(row[6]),
+    ) != (
+        payload_json,
+        revision_digest,
+        routes_json,
+        source_binding,
+        source_target,
+        "open",
+        "fresh",
+    )
+    conn.execute(
+        """
+        DELETE FROM backend_pending_claims
+        WHERE host_id = ? AND worker_id = ?
+          AND (
+               revision_digest != ?
+            OR binding_private_fingerprint != ?
+            OR turn_target_value != ?
+          )
+        """,
+        (*key, revision_digest, source_binding, source_target),
+    )
+    conn.execute(
+        """
+        INSERT INTO backend_pending (
+            host_id, worker_id, payload_json, observed_at, revision_digest,
+            choice_routes_json, binding_private_fingerprint,
+            observed_turn_target_value, observation_state, freshness,
+            last_success_at, last_failure_at, grace_deadline, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 'fresh', ?, NULL, NULL, ?)
+        ON CONFLICT(host_id, worker_id) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            observed_at = excluded.observed_at,
+            revision_digest = excluded.revision_digest,
+            choice_routes_json = excluded.choice_routes_json,
+            binding_private_fingerprint =
+                excluded.binding_private_fingerprint,
+            observed_turn_target_value =
+                excluded.observed_turn_target_value,
+            observation_state = 'open', freshness = 'fresh',
+            last_success_at = excluded.last_success_at,
+            last_failure_at = NULL, grace_deadline = NULL,
+            updated_at = excluded.updated_at
+        """,
+        (
+            *key,
+            payload_json,
+            current_time,
+            revision_digest,
+            routes_json,
+            source_binding,
+            source_target,
+            current_time,
+            current_time,
+        ),
+    )
+    return changed
+
+
+def _merge_backend_pending_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    pending: Mapping[str, Any] | None,
+    *,
+    observed_at: str,
+) -> bool:
+    """Compatibility entrypoint routed through the explicit transition helper."""
+    if pending is None:
+        observation = PendingObservation("read_succeeded_no_prompt")
+    else:
+        clean = sanitize_public_mapping(pending)
+        raw_choices = clean.get("choices", []) if isinstance(clean, Mapping) else []
+        normalized_choices = [
+            InteractionChoice.from_dict(choice)
+            for choice in raw_choices
+            if isinstance(choice, Mapping)
+        ]
+        choices = tuple(
+            PendingObservedChoice(
+                choice_id=choice.choice_id,
+                label=choice.label,
+                picker_ordinal=ordinal,
+            )
+            for ordinal, choice in enumerate(normalized_choices, 1)
+        )
+        question = str(clean.get("question") or clean.get("kind") or "Pending action")
+        observation = PendingObservation(
+            "open_prompt",
+            question=question,
+            pending_kind=str(clean.get("kind") or "question"),
+            choices=choices,
+            revision_digest=stable_fingerprint({"legacy_pending_revision": clean}),
+        )
+    return _apply_backend_pending_observation_conn(
+        conn,
+        host_id,
+        worker_id,
+        observation,
+        observed_at=observed_at,
+        stale_grace_seconds=DEFAULT_PENDING_STALE_GRACE_SECONDS,
+    )
+
+
+def apply_backend_pending_observation(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+    observation: PendingObservation,
+    *,
+    observed_at: str | None = None,
+    stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS,
+    binding_private_fingerprint: str | None = None,
+    observed_turn_target_value: str | None = None,
+) -> bool:
+    """Apply one explicit observation in a short writer transaction."""
+    if not _sqlite_store_exists(db_path):
+        return False
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = _apply_backend_pending_observation_conn(
+                conn,
+                host_id,
+                worker_id,
+                observation,
+                observed_at=current_time,
+                stale_grace_seconds=stale_grace_seconds,
+                binding_private_fingerprint=str(
+                    binding_private_fingerprint or ""
+                ),
+                observed_turn_target_value=str(
+                    observed_turn_target_value or ""
+                ),
+            )
+            conn.commit()
+            return changed
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def merge_backend_pending(
     db_path: Path | str,
     host_id: str,
     worker_id: str,
     pending: Mapping[str, Any] | None,
 ) -> bool:
-    """Presence-sync one worker's backend-provided pending prompt (a REAL pane prompt with choices,
-    read through the turn adapter). `pending=None` prunes the row (the prompt was answered)."""
+    """Presence-sync one worker's backend-provided pending prompt."""
     if not _sqlite_store_exists(db_path):
         return False
-    with _connect(db_path) as conn:
+    with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
-        if pending is None:
-            cur = conn.execute(
-                "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
-                (host_id, worker_id),
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = _merge_backend_pending_conn(
+                conn,
+                host_id,
+                worker_id,
+                pending,
+                observed_at=utc_timestamp(),
             )
-            return cur.rowcount > 0
-        payload = _canonical_json(sanitize_public_mapping(pending))
-        row = conn.execute(
-            "SELECT payload_json FROM backend_pending WHERE host_id = ? AND worker_id = ?",
-            (host_id, worker_id),
-        ).fetchone()
-        if row and row[0] == payload:
-            return False
-        conn.execute(
-            "INSERT INTO backend_pending (host_id, worker_id, payload_json, observed_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(host_id, worker_id) DO UPDATE SET payload_json = excluded.payload_json, "
-            "observed_at = excluded.observed_at",
-            (host_id, worker_id, payload, utc_timestamp()),
-        )
-        return True
+            conn.commit()
+            return changed
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[str, Any]]:
@@ -7253,7 +10456,8 @@ def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[st
     with _connect(db_path) as conn:
         _ensure_schema(conn)
         for worker_id, payload_json in conn.execute(
-            "SELECT worker_id, payload_json FROM backend_pending WHERE host_id = ?",
+            "SELECT worker_id, payload_json FROM backend_pending "
+            "WHERE host_id = ? AND observation_state = 'open'",
             (host_id,),
         ).fetchall():
             try:
@@ -7265,36 +10469,800 @@ def list_backend_pending(db_path: Path | str, host_id: str) -> dict[str, dict[st
     return sanitize_public_mapping(out)
 
 
-def prune_backend_pending(db_path: Path | str, host_id: str, live_worker_ids: Iterable[str]) -> int:
-    """Delete backend_pending rows whose worker no longer has a live binding. Presence-sync only
-    prunes workers still being polled; this reaps rows orphaned when a worker/pane disappears with
-    a prompt still open (otherwise get_pending would surface a phantom prompt for a dead worker)."""
+def _backend_pending_health_from_rows(
+    freshness_values: Iterable[Any],
+) -> dict[str, Any]:
+    fresh = 0
+    stale = 0
+    for value in freshness_values:
+        if str(value) == "stale":
+            stale += 1
+        else:
+            fresh += 1
+    return {
+        "status": "degraded" if stale else "healthy",
+        "counts": {"fresh": fresh, "stale": stale, "total": fresh + stale},
+    }
+
+
+def backend_pending_health(
+    db_path: Path | str,
+    host_id: str,
+) -> dict[str, Any]:
+    """Return only aggregate pending freshness; never transitions state."""
+    unavailable = {
+        "status": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+    if not _sqlite_store_exists(db_path):
+        return unavailable
+    try:
+        with _connect(db_path) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            if (
+                int(conn.execute("PRAGMA user_version").fetchone()[0])
+                != STORE_SCHEMA_VERSION
+            ):
+                return unavailable
+            rows = conn.execute(
+                """
+                SELECT freshness
+                FROM backend_pending
+                WHERE host_id = ?
+                  AND (observation_state = 'open' OR freshness = 'stale')
+                """,
+                (str(host_id),),
+            ).fetchall()
+    except Exception:
+        return unavailable
+    return _backend_pending_health_from_rows(row[0] for row in rows)
+
+
+def _backend_pending_interaction(
+    *,
+    host_id: str,
+    worker_id: str,
+    pending: Mapping[str, Any],
+    routes_json: Any,
+    revision_digest: Any,
+    freshness: Any,
+    last_success_at: Any,
+    grace_deadline: Any,
+    updated_at: Any,
+    worker: Any,
+) -> dict[str, Any]:
+    routes = json.loads(routes_json)
+    if not isinstance(routes, Mapping) or not all(
+        type(key) is str
+        and key
+        and type(value) is int
+        and value >= 1
+        for key, value in routes.items()
+    ):
+        raise ValueError("invalid backend pending routes")
+    validation_routes = tuple(
+        (str(key), int(value)) for key, value in routes.items()
+    )
+    if not validation_routes:
+        raw_choices = pending.get("choices", [])
+        if isinstance(raw_choices, list):
+            validation_routes = tuple(
+                (str(choice.get("choice_id")), ordinal)
+                for ordinal, choice in enumerate(raw_choices, 1)
+                if isinstance(choice, Mapping) and choice.get("choice_id")
+            )
+    normalized, _ = _normalize_backend_pending_payload(
+        pending,
+        validation_routes,
+    )
+    if type(revision_digest) is not str or not revision_digest:
+        raise ValueError("invalid backend pending revision")
+    state = str(freshness)
+    if state not in {"fresh", "stale"}:
+        raise ValueError("invalid backend pending freshness")
+    meta = dict(normalized["meta"])
+    meta["freshness"] = state
+    interaction = PendingInteraction.from_dict(
+        {
+            "id": f"pending-{stable_fingerprint({'revision': revision_digest, 'worker_id': worker_id})}",
+            "host_id": host_id,
+            "worker_id": worker_id,
+            "question": normalized["question"],
+            "kind": normalized["kind"],
+            "choices": normalized["choices"],
+            "status": "open",
+            "worker_fingerprint": (
+                worker.fingerprint if worker is not None else None
+            ),
+            "space_id": worker.space_id if worker is not None else None,
+            "created_at": last_success_at,
+            "updated_at": updated_at,
+            "expires_at": grace_deadline if state == "stale" else None,
+            "meta": meta,
+        }
+    )
+    return interaction.to_dict()
+
+
+def pending_payload_from_store(
+    db_path: Path | str,
+    host_id: str,
+) -> dict[str, Any]:
+    """Project one coherent snapshot plus a strictly validated pending overlay."""
+    unavailable = {
+        "schema_version": TURN_SCHEMA_VERSION,
+        "host_id": str(host_id),
+        "ok": False,
+        "status": "store_unavailable",
+        "pending_interactions": [],
+        "backend_health": [],
+        "pending_health": {
+            "status": "store_unavailable",
+            "counts": {"fresh": 0, "stale": 0, "total": 0},
+        },
+    }
+    if not _sqlite_store_exists(db_path):
+        return unavailable
+
+    try:
+        with _connect(db_path) as conn:
+            conn.execute("PRAGMA query_only=ON")
+            if (
+                int(conn.execute("PRAGMA user_version").fetchone()[0])
+                != STORE_SCHEMA_VERSION
+            ):
+                return unavailable
+            conn.execute("BEGIN")
+            try:
+                snapshot_row = conn.execute(
+                    """
+                    SELECT payload
+                    FROM snapshots
+                    WHERE host_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (str(host_id),),
+                ).fetchone()
+                backend_rows = conn.execute(
+                    """
+                    SELECT worker_id, payload_json, choice_routes_json,
+                           revision_digest, freshness, last_success_at,
+                           grace_deadline, updated_at, observation_state
+                    FROM backend_pending
+                    WHERE host_id = ?
+                    ORDER BY worker_id
+                    """,
+                    (str(host_id),),
+                ).fetchall()
+            finally:
+                conn.rollback()
+    except Exception:
+        return unavailable
+
+    if snapshot_row is None:
+        return unavailable
+    raw_snapshot = snapshot_row[0]
+    if not isinstance(raw_snapshot, str) or not raw_snapshot:
+        return unavailable
+    try:
+        decoded_snapshot = json.loads(raw_snapshot)
+    except (TypeError, ValueError):
+        return unavailable
+    if not isinstance(decoded_snapshot, Mapping):
+        return unavailable
+    if decoded_snapshot.get("host_id") != str(host_id):
+        return unavailable
+    if _strict_utc_timestamp(decoded_snapshot.get("updated_at")) is None:
+        return unavailable
+    for collection_name in ("spaces", "workers", "attention", "backend_health"):
+        collection = decoded_snapshot.get(collection_name, [])
+        if not isinstance(collection, list) or not all(
+            isinstance(item, Mapping) for item in collection
+        ):
+            return unavailable
+    for collection_name in ("spaces", "workers", "attention"):
+        for item in decoded_snapshot.get(collection_name, []):
+            if "meta" in item and not isinstance(item.get("meta"), Mapping):
+                return unavailable
+    for item in decoded_snapshot.get("attention", []):
+        actions = item.get("suggested_actions", item.get("actions", []))
+        if not isinstance(actions, list) or not all(
+            isinstance(action, Mapping) for action in actions
+        ):
+            return unavailable
+        for action in actions:
+            if "params" in action and not isinstance(action.get("params"), Mapping):
+                return unavailable
+    for item in decoded_snapshot.get("backend_health", []):
+        if "counts" in item and not isinstance(item.get("counts"), Mapping):
+            return unavailable
+    try:
+        stored_snapshot = Snapshot.from_dict(
+            sanitize_public_mapping(decoded_snapshot)
+        )
+    except Exception:
+        return unavailable
+    if stored_snapshot.host_id != str(host_id):
+        return unavailable
+
+    payload = dict(pending_payload_from_snapshot(stored_snapshot))
+    workers = {worker.id: worker for worker in stored_snapshot.workers}
+    built: dict[str, dict[str, Any]] = {}
+    suppressed_worker_ids: set[str] = set()
+    for (
+        worker_id,
+        payload_json,
+        routes_json,
+        revision_digest,
+        freshness,
+        last_success_at,
+        grace_deadline,
+        updated_at,
+        observation_state,
+    ) in backend_rows:
+        if str(observation_state) == "none":
+            suppressed_worker_ids.add(str(worker_id))
+            continue
+        if str(observation_state) != "open":
+            continue
+        try:
+            pending = json.loads(payload_json)
+            if not isinstance(pending, Mapping):
+                continue
+            built[str(worker_id)] = _backend_pending_interaction(
+                host_id=str(host_id),
+                worker_id=str(worker_id),
+                pending=pending,
+                routes_json=routes_json,
+                revision_digest=revision_digest,
+                freshness=freshness,
+                last_success_at=last_success_at,
+                grace_deadline=grace_deadline,
+                updated_at=updated_at,
+                worker=workers.get(str(worker_id)),
+            )
+        except (TypeError, ValueError):
+            continue
+
+    rows = [
+        row
+        for row in payload.get("pending_interactions", [])
+        if row.get("worker_id") not in built
+        and row.get("worker_id") not in suppressed_worker_ids
+    ]
+    rows.extend(built.values())
+    rows.sort(
+        key=lambda row: (
+            str(row.get("id") or ""),
+            str(row.get("fingerprint") or ""),
+        )
+    )
+    payload["pending_interactions"] = rows
+    payload["pending_health"] = _backend_pending_health_from_rows(
+        row[4]
+        for row in backend_rows
+        if str(row[8]) == "open" or str(row[4]) == "stale"
+    )
+    payload["content_fingerprint"] = recompute_pending_content_fingerprint(payload)
+    return sanitize_public_mapping(payload)
+
+
+def _backend_pending_claim_context_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    binding_private_fingerprint: str,
+    observed_turn_target_value: str,
+    *,
+    observed_at: str,
+) -> tuple[Any, str, str, str] | None:
+    if (
+        not str(binding_private_fingerprint)
+        or not str(observed_turn_target_value)
+    ):
+        return None
+    snapshot_row = conn.execute(
+        "SELECT payload FROM snapshots WHERE host_id = ? ORDER BY id DESC LIMIT 1",
+        (str(host_id),),
+    ).fetchone()
+    if snapshot_row is None:
+        return None
+    try:
+        snapshot = Snapshot.from_dict(json.loads(snapshot_row[0]))
+    except Exception:
+        return None
+    worker = next(
+        (item for item in snapshot.workers if item.id == str(worker_id)),
+        None,
+    )
+    if worker is None or worker.status in {"closed", "failed", "unknown"}:
+        return None
+    binding_row = conn.execute(
+        """
+        SELECT private_fingerprint, worker_fingerprint, turn_target_value
+        FROM worker_bindings
+        WHERE host_id = ? AND worker_id = ? AND worker_fingerprint = ?
+          AND backend = 'herdr' AND turn_target_kind = 'pane_id'
+          AND private_fingerprint = ? AND turn_target_value = ?
+          AND sendable = 1 AND expires_at > ?
+        """,
+        (
+            str(host_id),
+            str(worker_id),
+            str(worker.fingerprint),
+            str(binding_private_fingerprint),
+            str(observed_turn_target_value),
+            str(observed_at),
+        ),
+    ).fetchone()
+    if binding_row is None:
+        return None
+    return (
+        worker,
+        str(binding_row[0]),
+        str(binding_row[1]),
+        str(binding_row[2]),
+    )
+
+
+def _backend_pending_claim_expired(
+    claimed_at: Any,
+    current_time: str,
+    lease_seconds: float,
+) -> bool:
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, (int, float))
+        or not float(lease_seconds) > 0
+    ):
+        raise ValueError("claim_lease_seconds must be positive")
+    claimed = _strict_utc_timestamp(claimed_at)
+    if claimed is None:
+        return False
+    return datetime.fromisoformat(current_time) >= (
+        datetime.fromisoformat(claimed)
+        + timedelta(seconds=float(lease_seconds))
+    )
+
+
+def claim_backend_pending_choice(
+    db_path: Path | str,
+    host_id: str,
+    pending_id: str,
+    pending_fingerprint: str,
+    choice_id: str,
+    *,
+    claim: bool = True,
+    observed_at: str | None = None,
+    claim_lease_seconds: float = BACKEND_PENDING_CLAIM_LEASE_SECONDS,
+) -> BackendPendingChoiceClaim:
+    """Validate, and optionally durably claim, one exact fresh public choice."""
+    if not _sqlite_store_exists(db_path):
+        return BackendPendingChoiceClaim("not_found")
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE" if claim else "BEGIN")
+        try:
+            candidates = conn.execute(
+                """
+                SELECT worker_id, payload_json, choice_routes_json,
+                       revision_digest, freshness, last_success_at,
+                       grace_deadline, updated_at,
+                       binding_private_fingerprint,
+                       observed_turn_target_value
+                FROM backend_pending
+                WHERE host_id = ? AND observation_state = 'open'
+                ORDER BY worker_id
+                """,
+                (str(host_id),),
+            ).fetchall()
+            matched: tuple[Any, ...] | None = None
+            interaction: dict[str, Any] | None = None
+            context: tuple[Any, str, str, str] | None = None
+            for candidate in candidates:
+                candidate_context = _backend_pending_claim_context_conn(
+                    conn,
+                    str(host_id),
+                    str(candidate[0]),
+                    str(candidate[8]),
+                    str(candidate[9]),
+                    observed_at=current_time,
+                )
+                if candidate_context is None:
+                    continue
+                try:
+                    candidate_interaction = _backend_pending_interaction(
+                        host_id=str(host_id),
+                        worker_id=str(candidate[0]),
+                        pending=json.loads(candidate[1]),
+                        routes_json=candidate[2],
+                        revision_digest=candidate[3],
+                        freshness=candidate[4],
+                        last_success_at=candidate[5],
+                        grace_deadline=candidate[6],
+                        updated_at=candidate[7],
+                        worker=candidate_context[0],
+                    )
+                except Exception:
+                    continue
+                if candidate_interaction["id"] == str(pending_id):
+                    matched = candidate
+                    interaction = candidate_interaction
+                    context = candidate_context
+                    break
+            if matched is None or interaction is None or context is None:
+                conn.rollback()
+                return BackendPendingChoiceClaim("not_found")
+            if str(matched[4]) != "fresh":
+                conn.rollback()
+                return BackendPendingChoiceClaim("stale")
+            if interaction["fingerprint"] != str(pending_fingerprint):
+                conn.rollback()
+                return BackendPendingChoiceClaim("changed")
+            routes = json.loads(matched[2])
+            ordinal = routes.get(str(choice_id)) if isinstance(routes, Mapping) else None
+            if type(ordinal) is not int or ordinal < 1:
+                conn.rollback()
+                return BackendPendingChoiceClaim("unknown_choice")
+            existing = conn.execute(
+                """
+                SELECT state, claimed_at
+                FROM backend_pending_claims
+                WHERE host_id = ? AND worker_id = ?
+                """,
+                (str(host_id), str(matched[0])),
+            ).fetchone()
+            if existing is not None:
+                reclaimable = (
+                    str(existing[0]) == "claimed"
+                    and _backend_pending_claim_expired(
+                        existing[1],
+                        current_time,
+                        claim_lease_seconds,
+                    )
+                )
+                if reclaimable and claim:
+                    conn.execute(
+                        """
+                        DELETE FROM backend_pending_claims
+                        WHERE host_id = ? AND worker_id = ? AND state = 'claimed'
+                          AND claimed_at = ?
+                        """,
+                        (str(host_id), str(matched[0]), str(existing[1])),
+                    )
+                elif not reclaimable:
+                    conn.rollback()
+                    return BackendPendingChoiceClaim("already_claimed")
+            fields = {
+                "worker_id": str(matched[0]),
+                "worker_fingerprint": context[2],
+                "binding_private_fingerprint": context[1],
+                "turn_target_value": context[3],
+                "picker_ordinal": ordinal,
+            }
+            if not claim:
+                conn.rollback()
+                return BackendPendingChoiceClaim("validated", **fields)
+            token = secrets.token_urlsafe(32)
+            conn.execute(
+                """
+                INSERT INTO backend_pending_claims (
+                    host_id, worker_id, claim_token, revision_digest, choice_id,
+                    picker_ordinal, worker_fingerprint, binding_private_fingerprint,
+                    turn_target_value, state, claimed_at, send_started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, NULL)
+                """,
+                (
+                    str(host_id), str(matched[0]), token, str(matched[3]),
+                    str(choice_id), ordinal, context[2], context[1], context[3],
+                    current_time,
+                ),
+            )
+            conn.commit()
+            return BackendPendingChoiceClaim("claimed", claim_token=token, **fields)
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def start_backend_pending_choice_send(
+    db_path: Path | str,
+    host_id: str,
+    claim_token: str,
+    *,
+    observed_at: str | None = None,
+    claim_lease_seconds: float = BACKEND_PENDING_CLAIM_LEASE_SECONDS,
+) -> BackendPendingChoiceSend:
+    """CAS a pre-send claim against the current revision and exact binding."""
+    if not _sqlite_store_exists(db_path):
+        return BackendPendingChoiceSend("not_found")
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT worker_id, revision_digest, choice_id, picker_ordinal,
+                       worker_fingerprint, binding_private_fingerprint,
+                       turn_target_value, state, claimed_at
+                FROM backend_pending_claims
+                WHERE host_id = ? AND claim_token = ?
+                """,
+                (str(host_id), str(claim_token)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return BackendPendingChoiceSend("not_found")
+            fields = {
+                "worker_id": str(row[0]),
+                "worker_fingerprint": str(row[4]),
+                "binding_private_fingerprint": str(row[5]),
+                "turn_target_value": str(row[6]),
+                "picker_ordinal": int(row[3]),
+            }
+            if (
+                str(row[7]) == "claimed"
+                and _backend_pending_claim_expired(
+                    row[8],
+                    current_time,
+                    claim_lease_seconds,
+                )
+            ):
+                conn.execute(
+                    """
+                    DELETE FROM backend_pending_claims
+                    WHERE host_id = ? AND claim_token = ? AND state = 'claimed'
+                    """,
+                    (str(host_id), str(claim_token)),
+                )
+                conn.commit()
+                return BackendPendingChoiceSend("not_found")
+            if str(row[7]) == "send_started":
+                conn.rollback()
+                return BackendPendingChoiceSend("already_started", **fields)
+            current = conn.execute(
+                """
+                SELECT revision_digest, choice_routes_json, freshness,
+                       binding_private_fingerprint,
+                       observed_turn_target_value
+                FROM backend_pending
+                WHERE host_id = ? AND worker_id = ? AND observation_state = 'open'
+                """,
+                (str(host_id), str(row[0])),
+            ).fetchone()
+            if current is None:
+                conn.rollback()
+                return BackendPendingChoiceSend("changed")
+            if str(current[2]) != "fresh":
+                conn.rollback()
+                return BackendPendingChoiceSend("stale")
+            try:
+                routes = json.loads(current[1])
+            except (TypeError, ValueError):
+                routes = {}
+            if (
+                str(current[0]) != str(row[1])
+                or str(current[3]) != str(row[5])
+                or str(current[4]) != str(row[6])
+                or not isinstance(routes, Mapping)
+                or routes.get(str(row[2])) != int(row[3])
+            ):
+                conn.rollback()
+                return BackendPendingChoiceSend("changed")
+            context = _backend_pending_claim_context_conn(
+                conn,
+                str(host_id),
+                str(row[0]),
+                str(row[5]),
+                str(row[6]),
+                observed_at=current_time,
+            )
+            if context is None or (context[1], context[2], context[3]) != (
+                str(row[5]),
+                str(row[4]),
+                str(row[6]),
+            ):
+                conn.rollback()
+                return BackendPendingChoiceSend("binding_changed")
+            cursor = conn.execute(
+                """
+                UPDATE backend_pending_claims
+                SET state = 'send_started', send_started_at = ?
+                WHERE host_id = ? AND claim_token = ? AND state = 'claimed'
+                """,
+                (current_time, str(host_id), str(claim_token)),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return BackendPendingChoiceSend("changed")
+            conn.commit()
+            return BackendPendingChoiceSend("started", **fields)
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def abandon_backend_pending_choice_claim(
+    db_path: Path | str,
+    host_id: str,
+    claim_token: str,
+) -> bool:
+    """Release only a claim that has not crossed the pane-I/O boundary."""
+    if not _sqlite_store_exists(db_path):
+        return False
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                """
+                DELETE FROM backend_pending_claims
+                WHERE host_id = ? AND claim_token = ? AND state = 'claimed'
+                """,
+                (str(host_id), str(claim_token)),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def finish_backend_pending_choice_send(
+    db_path: Path | str,
+    host_id: str,
+    claim_token: str,
+    *,
+    accepted: bool,
+    observed_at: str | None = None,
+) -> bool:
+    """Tombstone an accepted exact revision; retain failed sends as uncertain."""
+    if not accepted or not _sqlite_store_exists(db_path):
+        return False
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT worker_id, revision_digest,
+                       binding_private_fingerprint, turn_target_value
+                FROM backend_pending_claims
+                WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
+                """,
+                (str(host_id), str(claim_token)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            updated = conn.execute(
+                """
+                UPDATE backend_pending
+                SET payload_json = '{}',
+                    observed_at = ?,
+                    revision_digest = '',
+                    choice_routes_json = '{}',
+                    observation_state = 'none',
+                    freshness = 'fresh',
+                    last_success_at = ?,
+                    last_failure_at = NULL,
+                    grace_deadline = NULL,
+                    updated_at = ?
+                WHERE host_id = ?
+                  AND worker_id = ?
+                  AND revision_digest = ?
+                  AND binding_private_fingerprint = ?
+                  AND observed_turn_target_value = ?
+                  AND observation_state IN ('open', 'failed')
+                """,
+                (
+                    current_time,
+                    current_time,
+                    current_time,
+                    str(host_id),
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                ),
+            )
+            deleted = conn.execute(
+                """
+                DELETE FROM backend_pending_claims
+                WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
+                """,
+                (str(host_id), str(claim_token)),
+            )
+            conn.commit()
+            return updated.rowcount == 1 and deleted.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def prune_backend_pending(
+    db_path: Path | str,
+    host_id: str,
+    live_binding_private_fingerprints: Iterable[str],
+    *,
+    deadline_monotonic: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    observed_at: str | None = None,
+) -> int:
+    """Delete state whose exact authoritative pane binding disappeared."""
     if not _sqlite_store_exists(db_path):
         return 0
-    live = {str(worker_id) for worker_id in live_worker_ids}
-    with _connect(db_path) as conn:
+    live = {
+        str(private_fingerprint)
+        for private_fingerprint in live_binding_private_fingerprints
+        if str(private_fingerprint)
+    }
+    current_time, _ = _pending_observed_time(observed_at)
+    with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
-        stored = [
-            str(row[0])
-            for row in conn.execute(
-                "SELECT worker_id FROM backend_pending WHERE host_id = ?",
-                (host_id,),
-            ).fetchall()
-        ]
-        stale = [worker_id for worker_id in stored if worker_id not in live]
-        for worker_id in stale:
-            conn.execute(
-                "DELETE FROM backend_pending WHERE host_id = ? AND worker_id = ?",
-                (host_id, worker_id),
-            )
-        return len(stale)
+        if not _begin_turn_refresh_transaction(
+            conn,
+            deadline_monotonic=deadline_monotonic,
+            cancelled=cancelled,
+        ):
+            return 0
+        try:
+            if _turn_refresh_is_cancelled(
+                deadline_monotonic=deadline_monotonic,
+                cancelled=cancelled,
+            ):
+                conn.rollback()
+                return 0
+            stored = [
+                (str(row[0]), str(row[1]), str(row[2]))
+                for row in conn.execute(
+                    """
+                    SELECT worker_id, binding_private_fingerprint,
+                           observed_turn_target_value
+                    FROM backend_pending
+                    WHERE host_id = ?
+                    """,
+                    (str(host_id),),
+                ).fetchall()
+            ]
+            stale = [
+                (worker_id, private_fingerprint, turn_target_value)
+                for worker_id, private_fingerprint, turn_target_value in stored
+                if private_fingerprint not in live
+            ]
+            for worker_id, private_fingerprint, turn_target_value in stale:
+                _apply_backend_pending_observation_conn(
+                    conn,
+                    str(host_id),
+                    worker_id,
+                    PendingObservation("worker_authoritatively_absent"),
+                    observed_at=current_time,
+                    stale_grace_seconds=DEFAULT_PENDING_STALE_GRACE_SECONDS,
+                    binding_private_fingerprint=private_fingerprint,
+                    observed_turn_target_value=turn_target_value,
+                )
+            if _turn_refresh_is_cancelled(
+                deadline_monotonic=deadline_monotonic,
+                cancelled=cancelled,
+            ):
+                conn.rollback()
+                return 0
+            conn.commit()
+            return len(stale)
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _current_turn_content_rows_conn(
     conn: sqlite3.Connection,
     host_id: str,
     worker_id: str,
-) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None]]:
+) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
     rows = conn.execute(
         """
         SELECT
@@ -7304,7 +11272,8 @@ def _current_turn_content_rows_conn(
             revisions.user_text,
             revisions.assistant_final_text,
             revisions.user_state,
-            revisions.final_state
+            revisions.final_state,
+            turns.observed_at
         FROM turns
         LEFT JOIN turn_content_revisions AS revisions
           ON revisions.host_id = turns.host_id
@@ -7314,7 +11283,7 @@ def _current_turn_content_rows_conn(
         """,
         (str(host_id), str(worker_id)),
     ).fetchall()
-    decoded: list[tuple[Any, dict[str, Any], dict[str, Any] | None]] = []
+    decoded: list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]] = []
     for (
         turn_id,
         payload_json,
@@ -7323,6 +11292,7 @@ def _current_turn_content_rows_conn(
         final_text,
         user_state,
         final_state,
+        stored_observed_at,
     ) in rows:
         try:
             loaded = json.loads(str(payload_json or "{}"))
@@ -7340,7 +11310,7 @@ def _current_turn_content_rows_conn(
             if revision is not None
             else None
         )
-        decoded.append((turn_id, payload, current))
+        decoded.append((turn_id, payload, current, str(stored_observed_at or "")))
     return decoded
 
 
@@ -7382,15 +11352,49 @@ def _merge_canonical_field(
 def _retain_authoritative_completion(
     metadata: Mapping[str, Any],
     current: Mapping[str, Any] | None,
+    existing: Mapping[str, Any],
+    *,
+    incoming_final: str | None,
+    observed_at: str,
 ) -> dict[str, Any]:
     merged = dict(metadata)
-    if current is None or str(current.get("final_state") or "") != "complete":
-        return merged
-    if merged.get("complete") is False:
-        merged.pop("complete", None)
-    if merged.get("has_open_turn") is True:
-        merged.pop("has_open_turn", None)
+    terminal = (
+        existing.get("complete") is True
+        or (current is not None and str(current.get("final_state") or "") == "complete")
+    )
+    completes_now = merged.get("complete") is True or bool(incoming_final)
+    if terminal or completes_now:
+        merged["complete"] = True
+        merged["has_open_turn"] = False
+        merged["assistant_stream_text"] = None
+        merged["completed_at"] = existing.get("completed_at") or observed_at
     return merged
+
+
+def _turn_observation_is_newer(incoming: str, stored: str) -> bool:
+    if not stored:
+        return True
+    incoming_timestamp = _strict_utc_timestamp(incoming)
+    stored_timestamp = _strict_utc_timestamp(stored)
+    if incoming_timestamp is not None and stored_timestamp is not None:
+        return _connector_datetime(incoming_timestamp) > _connector_datetime(stored_timestamp)
+    return str(incoming) > str(stored)
+
+def _turn_has_authoritative_observation(
+    payload: Mapping[str, Any],
+    current: Mapping[str, Any] | None,
+) -> bool:
+    if str(payload.get("source_turn_id") or "").strip():
+        return True
+    if any(
+        payload.get(key) not in (None, "", False)
+        for key in ("assistant_stream_text", "complete", "has_open_turn")
+    ):
+        return True
+    return current is not None and any(
+        str(current.get(key) or "") != "absent"
+        for key in ("user_state", "final_state")
+    )
 
 
 def _replace_current_turn_content_conn(
@@ -7476,206 +11480,428 @@ def _strip_canonical_turn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return lightweight
 
 
+def _merge_turn_content_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    content: Mapping[str, Any],
+    *,
+    observed_at: str,
+) -> int:
+    if not any(key in content for key in _TURN_CONTENT_FIELDS):
+        return 0
+    incoming_user = (
+        sanitize_canonical_turn_text(content.get("user_text"))
+        if "user_text" in content
+        else None
+    )
+    incoming_final = (
+        sanitize_canonical_turn_text(content.get("assistant_final_text"))
+        if "assistant_final_text" in content
+        else None
+    )
+    clean_content = sanitize_public_mapping(
+        {
+            key: content.get(key)
+            for key in _TURN_CONTENT_FIELDS
+            if key in content and key not in {"user_text", "assistant_final_text"}
+        }
+    )
+    automation_probe = {
+        **clean_content,
+        "user_text": incoming_user,
+        "assistant_final_text": incoming_final,
+    }
+    if is_internal_automation_turn_payload(automation_probe):
+        return 0
+    rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
+    if not rows:
+        return 0
+    incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
+    exact_source_rows = [
+        row
+        for row in rows
+        if incoming_source_turn
+        and _source_turn_matches(row[1], incoming_source_turn)
+    ]
+    scored_rows = [
+        (
+            turn_id,
+            payload,
+            current,
+            stored_observed_at,
+            _turn_with_current_content(payload, current),
+        )
+        for turn_id, payload, current, stored_observed_at in rows
+    ]
+    base_turn_id, base_payload, base_current, base_observed_at, base_view = max(
+        scored_rows,
+        key=lambda row: _turn_merge_score(row[4], automation_probe),
+    )
+    changed = False
+    if exact_source_rows:
+        turn_id, payload, current, stored_observed_at = exact_source_rows[0]
+        if not _turn_observation_is_newer(observed_at, stored_observed_at):
+            return 0
+        payload.update(
+            _retain_authoritative_completion(
+                clean_content,
+                current,
+                payload,
+                incoming_final=incoming_final,
+                observed_at=observed_at,
+            )
+        )
+        metadata_changed = _update_turn_row(
+            conn,
+            host_id,
+            turn_id,
+            payload,
+            observed_at,
+        )
+        revision_changed = _replace_current_turn_content_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            current=current,
+            incoming_user=incoming_user,
+            incoming_final=incoming_final,
+            current_time=observed_at,
+        )
+        revision_repaired = _ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            observed_at=observed_at,
+        )
+        changed = metadata_changed or revision_changed or revision_repaired
+    elif incoming_source_turn:
+        seed = {
+            key: base_payload.get(key)
+            for key in _TURN_IDENTITY_SEED_FIELDS
+            if base_payload.get(key) is not None
+        }
+        if seed.get("origin_command_id") and not _turn_content_matches_origin(
+            base_view,
+            automation_probe,
+        ):
+            seed.pop("origin_command_id", None)
+            if str(seed.get("source") or "") == "command":
+                seed["source"] = "snapshot"
+        seed.update(
+            _retain_authoritative_completion(
+                clean_content,
+                None,
+                {},
+                incoming_final=incoming_final,
+                observed_at=observed_at,
+            )
+        )
+        item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
+        turn_id = str(item.get("id") or "unknown")
+        list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, worker_fingerprint, space_id,
+                status, kind, updated_at, fingerprint,
+                snapshot_content_fingerprint, observed_at, payload_json,
+                list_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, turn_id) DO UPDATE SET
+                status = excluded.status,
+                kind = excluded.kind,
+                updated_at = excluded.updated_at,
+                fingerprint = excluded.fingerprint,
+                observed_at = excluded.observed_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                str(host_id),
+                turn_id,
+                str(item.get("worker_id") or worker_id),
+                item.get("worker_fingerprint"),
+                item.get("space_id"),
+                str(item.get("status") or "unknown"),
+                str(item.get("kind") or "unknown"),
+                observed_at,
+                str(item.get("fingerprint") or ""),
+                "",
+                observed_at,
+                _canonical_json(item),
+                list_sequence,
+            ),
+        )
+        _replace_current_turn_content_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            current=None,
+            incoming_user=incoming_user,
+            incoming_final=incoming_final,
+            current_time=observed_at,
+        )
+        _ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            observed_at=observed_at,
+        )
+        if not str(base_payload.get("source_turn_id") or "").strip():
+            base_payload["assistant_stream_text"] = None
+            _update_turn_row(
+                conn,
+                host_id,
+                base_turn_id,
+                base_payload,
+                observed_at,
+            )
+        _prune_source_turn_history(conn, host_id, worker_id)
+        changed = True
+    else:
+        if (
+            _turn_has_authoritative_observation(base_payload, base_current)
+            and not _turn_observation_is_newer(observed_at, base_observed_at)
+        ):
+            return 0
+        payload = dict(base_payload)
+        payload.update(
+            _retain_authoritative_completion(
+                clean_content,
+                base_current,
+                payload,
+                incoming_final=incoming_final,
+                observed_at=observed_at,
+            )
+        )
+        metadata_changed = _update_turn_row(
+            conn,
+            host_id,
+            base_turn_id,
+            payload,
+            observed_at,
+        )
+        revision_changed = _replace_current_turn_content_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(base_turn_id),
+            current=base_current,
+            incoming_user=incoming_user,
+            incoming_final=incoming_final,
+            current_time=observed_at,
+        )
+        revision_repaired = _ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(base_turn_id),
+            observed_at=observed_at,
+        )
+        changed = metadata_changed or revision_changed or revision_repaired
+    return int(changed)
+
+
+def _turn_refresh_binding_matches_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    expected: WorkerBinding,
+) -> bool:
+    if (
+        str(expected.host_id) != str(host_id)
+        or str(expected.worker_id) != str(worker_id)
+    ):
+        return False
+    row = conn.execute(
+        """
+        SELECT
+            worker_id,
+            worker_fingerprint,
+            backend,
+            turn_target_kind,
+            turn_target_value
+        FROM worker_bindings
+        WHERE host_id = ?
+          AND backend = ?
+          AND private_fingerprint = ?
+          AND expires_at > ?
+        """,
+        (
+            str(host_id),
+            str(expected.backend),
+            str(expected.private_fingerprint),
+            utc_timestamp(),
+        ),
+    ).fetchone()
+    return row is not None and tuple(row) == (
+        str(expected.worker_id),
+        str(expected.worker_fingerprint),
+        str(expected.backend),
+        expected.turn_target_kind,
+        expected.turn_target_value,
+    )
+
+
+def _turn_refresh_is_cancelled(
+    *,
+    deadline_monotonic: float | None,
+    cancelled: Callable[[], bool] | None,
+) -> bool:
+    if cancelled is not None:
+        try:
+            if cancelled():
+                return True
+        except Exception:
+            return True
+    return (
+        deadline_monotonic is not None
+        and time.monotonic() >= float(deadline_monotonic)
+    )
+
+
+def _begin_turn_refresh_transaction(
+    conn: sqlite3.Connection,
+    *,
+    deadline_monotonic: float | None,
+    cancelled: Callable[[], bool] | None,
+) -> bool:
+    if deadline_monotonic is None and cancelled is None:
+        conn.execute("BEGIN IMMEDIATE")
+        return True
+    conn.execute("PRAGMA busy_timeout=50")
+    while True:
+        if _turn_refresh_is_cancelled(
+            deadline_monotonic=deadline_monotonic,
+            cancelled=cancelled,
+        ):
+            return False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            return True
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+
+
+def apply_turn_refresh(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+    content: Mapping[str, Any],
+    *,
+    backend_pending: Mapping[str, Any] | None | object = _UNSET,
+    backend_pending_observation: PendingObservation | object = _UNSET,
+    expected_binding: WorkerBinding | None = None,
+    deadline_monotonic: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    observed_at: str | None = None,
+    pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS,
+) -> TurnRefreshApplyResult:
+    """Atomically apply one binding's turn observation and optional pending state."""
+    if not _sqlite_store_exists(db_path):
+        return TurnRefreshApplyResult(0, False)
+    current_time, _ = _pending_observed_time(observed_at)
+    if (
+        backend_pending is not _UNSET
+        and backend_pending_observation is not _UNSET
+    ):
+        raise ValueError("provide only one backend pending observation")
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        # Transaction acquisition must precede every merge-base read. Use
+        # cancellable short waits for daemon-owned refresh work so a stopped
+        # scheduler cannot commit after its deadline.
+        if not _begin_turn_refresh_transaction(
+            conn,
+            deadline_monotonic=deadline_monotonic,
+            cancelled=cancelled,
+        ):
+            return TurnRefreshApplyResult(0, False, False, True)
+        try:
+            if _turn_refresh_is_cancelled(
+                deadline_monotonic=deadline_monotonic,
+                cancelled=cancelled,
+            ):
+                conn.rollback()
+                return TurnRefreshApplyResult(0, False, False, True)
+            if expected_binding is not None and not _turn_refresh_binding_matches_conn(
+                conn,
+                str(host_id),
+                str(worker_id),
+                expected_binding,
+            ):
+                conn.rollback()
+                return TurnRefreshApplyResult(0, False, True)
+            updated = _merge_turn_content_conn(
+                conn,
+                str(host_id),
+                str(worker_id),
+                content,
+                observed_at=current_time,
+            )
+            if backend_pending_observation is not _UNSET:
+                if not isinstance(
+                    backend_pending_observation,
+                    PendingObservation,
+                ):
+                    raise TypeError("invalid backend pending observation")
+                pending_changed = _apply_backend_pending_observation_conn(
+                    conn,
+                    str(host_id),
+                    str(worker_id),
+                    backend_pending_observation,
+                    observed_at=current_time,
+                    stale_grace_seconds=pending_stale_grace_seconds,
+                    binding_private_fingerprint=(
+                        str(expected_binding.private_fingerprint)
+                        if expected_binding is not None
+                        else ""
+                    ),
+                    observed_turn_target_value=(
+                        str(expected_binding.turn_target_value or "")
+                        if expected_binding is not None
+                        else ""
+                    ),
+                )
+            elif backend_pending is not _UNSET:
+                pending_changed = _merge_backend_pending_conn(
+                    conn,
+                    str(host_id),
+                    str(worker_id),
+                    backend_pending,
+                    observed_at=current_time,
+                )
+            else:
+                pending_changed = False
+            if _turn_refresh_is_cancelled(
+                deadline_monotonic=deadline_monotonic,
+                cancelled=cancelled,
+            ):
+                conn.rollback()
+                return TurnRefreshApplyResult(0, False, False, True)
+            conn.commit()
+            return TurnRefreshApplyResult(updated, pending_changed)
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def merge_turn_content(
-    db_path: Path,
+    db_path: Path | str,
     host_id: str,
     worker_id: str,
     content: Mapping[str, Any],
     *,
     observed_at: str | None = None,
 ) -> int:
-    """Atomically merge authoritative turn content into immutable canonical revisions."""
-    if not _sqlite_store_exists(db_path):
-        return 0
-    if not any(key in content for key in _TURN_CONTENT_FIELDS):
-        return 0
-    current_time = observed_at or utc_timestamp()
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            incoming_user = (
-                sanitize_canonical_turn_text(content.get("user_text"))
-                if "user_text" in content
-                else None
-            )
-            incoming_final = (
-                sanitize_canonical_turn_text(content.get("assistant_final_text"))
-                if "assistant_final_text" in content
-                else None
-            )
-            clean_content = sanitize_public_mapping(
-                {
-                    key: content.get(key)
-                    for key in _TURN_CONTENT_FIELDS
-                    if key in content
-                    and key not in {"user_text", "assistant_final_text"}
-                }
-            )
-            automation_probe = {
-                **clean_content,
-                "user_text": incoming_user,
-                "assistant_final_text": incoming_final,
-            }
-            if is_internal_automation_turn_payload(automation_probe):
-                conn.rollback()
-                return 0
-            rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
-            if not rows:
-                conn.rollback()
-                return 0
-            incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
-            exact_source_rows = [
-                row
-                for row in rows
-                if incoming_source_turn
-                and _source_turn_matches(row[1], incoming_source_turn)
-            ]
-            scored_rows = [
-                (
-                    turn_id,
-                    payload,
-                    current,
-                    _turn_with_current_content(payload, current),
-                )
-                for turn_id, payload, current in rows
-            ]
-            base_turn_id, base_payload, base_current, base_view = max(
-                scored_rows,
-                key=lambda row: _turn_merge_score(row[3], automation_probe),
-            )
-            changed = False
-            if exact_source_rows:
-                turn_id, payload, current = exact_source_rows[0]
-                payload.update(_retain_authoritative_completion(clean_content, current))
-                metadata_changed = _update_turn_row(
-                    conn,
-                    host_id,
-                    turn_id,
-                    payload,
-                    current_time,
-                )
-                revision_changed = _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(turn_id),
-                    current=current,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=current_time,
-                )
-                revision_repaired = _ensure_absent_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(turn_id),
-                    observed_at=current_time,
-                )
-                changed = metadata_changed or revision_changed or revision_repaired
-            elif incoming_source_turn:
-                seed = {
-                    key: base_payload.get(key)
-                    for key in _TURN_IDENTITY_SEED_FIELDS
-                    if base_payload.get(key) is not None
-                }
-                if seed.get("origin_command_id") and not _turn_content_matches_origin(
-                    base_view,
-                    automation_probe,
-                ):
-                    seed.pop("origin_command_id", None)
-                    if str(seed.get("source") or "") == "command":
-                        seed["source"] = "snapshot"
-                seed.update(clean_content)
-                item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
-                turn_id = str(item.get("id") or "unknown")
-                conn.execute(
-                    """
-                    INSERT INTO turns (
-                        host_id, turn_id, worker_id, worker_fingerprint, space_id,
-                        status, kind, updated_at, fingerprint,
-                        snapshot_content_fingerprint, observed_at, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(host_id, turn_id) DO UPDATE SET
-                        status = excluded.status,
-                        kind = excluded.kind,
-                        updated_at = excluded.updated_at,
-                        fingerprint = excluded.fingerprint,
-                        observed_at = excluded.observed_at,
-                        payload_json = excluded.payload_json
-                    """,
-                    (
-                        str(host_id),
-                        turn_id,
-                        str(item.get("worker_id") or worker_id),
-                        item.get("worker_fingerprint"),
-                        item.get("space_id"),
-                        str(item.get("status") or "unknown"),
-                        str(item.get("kind") or "unknown"),
-                        current_time,
-                        str(item.get("fingerprint") or ""),
-                        "",
-                        current_time,
-                        _canonical_json(item),
-                    ),
-                )
-                _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=turn_id,
-                    current=None,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=current_time,
-                )
-                _ensure_absent_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(turn_id),
-                    observed_at=current_time,
-                )
-                if not str(base_payload.get("source_turn_id") or "").strip():
-                    base_payload["assistant_stream_text"] = None
-                    _update_turn_row(
-                        conn,
-                        host_id,
-                        base_turn_id,
-                        base_payload,
-                        current_time,
-                    )
-                _prune_source_turn_history(conn, host_id, worker_id)
-                changed = True
-            else:
-                payload = dict(base_payload)
-                payload.update(
-                    _retain_authoritative_completion(clean_content, base_current)
-                )
-                metadata_changed = _update_turn_row(
-                    conn,
-                    host_id,
-                    base_turn_id,
-                    payload,
-                    current_time,
-                )
-                revision_changed = _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(base_turn_id),
-                    current=base_current,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=current_time,
-                )
-                revision_repaired = _ensure_absent_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(base_turn_id),
-                    observed_at=current_time,
-                )
-                changed = metadata_changed or revision_changed or revision_repaired
-            conn.commit()
-            return int(changed)
-        except Exception:
-            conn.rollback()
-            raise
+    """Compatibility wrapper for the transactional authoritative turn merge."""
+    return apply_turn_refresh(
+        db_path,
+        host_id,
+        worker_id,
+        content,
+        observed_at=observed_at,
+    ).updated
 
 
 def _update_turn_row(
@@ -7808,9 +12034,12 @@ def upsert_command_pending_turn(
             "turn_fingerprint": item.get("fingerprint"),
         }
     )
-    with _connect(db_path, prepare=True) as conn:
+    with _connect(db_path, prepare=True, isolation_level=None) as conn:
         _ensure_schema(conn)
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
+            conn.execute(
             """
             INSERT INTO turns (
                 host_id,
@@ -7824,8 +12053,9 @@ def upsert_command_pending_turn(
                 fingerprint,
                 snapshot_content_fingerprint,
                 observed_at,
-                payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                payload_json,
+                list_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(host_id, turn_id) DO UPDATE SET
                 worker_id = excluded.worker_id,
                 worker_fingerprint = excluded.worker_fingerprint,
@@ -7851,27 +12081,36 @@ def upsert_command_pending_turn(
                 content_fingerprint,
                 current_time,
                 _canonical_json(item),
+                list_sequence,
             ),
-        )
-        _ensure_payload_turn_content_revision_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=turn_id,
-            payload=item,
-            observed_at=current_time,
-        )
+            )
+            _ensure_payload_turn_content_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=turn_id,
+                payload=item,
+                observed_at=current_time,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     return sanitize_public_mapping(item)
 
 
 def turns_payload_from_store(
-    db_path: Path,
+    db_path: Path | str,
     host_id: str,
     *,
     snapshot: Snapshot | None = None,
     schema_version: int = 1,
+    limit: int = TURN_LIST_DEFAULT_LIMIT,
+    cursor: str | None = None,
+    since: str | None = None,
+    now: float | int | None = None,
     work_counters: TurnContentWorkCounters | None = None,
 ) -> dict[str, Any]:
-    """Return a negotiated bounded turn-list projection from canonical content."""
+    """Return one insertion-stable, byte-bounded turn-list page."""
     requested_schema = int(schema_version)
     if requested_schema not in {1, TURN_LIST_SCHEMA_VERSION}:
         return {
@@ -7880,98 +12119,137 @@ def turns_payload_from_store(
             "status": "unsupported_turn_schema_version",
             "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
         }
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= TURN_LIST_MAX_LIMIT
+        or cursor is not None and since is not None
+        or cursor is not None and (not isinstance(cursor, str) or not cursor)
+        or since is not None and (not isinstance(since, str) or not since)
+    ):
+        return {
+            "schema_version": requested_schema,
+            "ok": False,
+            "status": "invalid_cursor",
+        }
     if not _sqlite_store_exists(db_path):
-        if snapshot is not None:
-            projected = turns_payload_from_snapshot(
-                snapshot,
-                schema_version=TURN_LIST_SCHEMA_VERSION,
-            )
-            if requested_schema == TURN_LIST_SCHEMA_VERSION:
-                return projected
-            incompatible = any(
-                field.get("availability") != "absent" and not field.get("inline")
-                for turn in projected.get("turns", [])
-                for field in (turn.get("content") or {}).get("fields", {}).values()
-            )
-            if incompatible:
-                return {
-                    "schema_version": 1,
-                    "ok": False,
-                    "status": "upgrade_required",
-                    "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
-                }
-            projected["schema_version"] = 1
-            for turn in projected.get("turns", []):
-                turn["schema_version"] = 1
-                turn.pop("content", None)
-            return projected
         return {
             "schema_version": requested_schema,
             "host_id": str(host_id),
-            "updated_at": None,
-            "content_fingerprint": stable_fingerprint(
-                {"host_id": str(host_id), "turns": []}
-            ),
-            "turns": [],
-            "backend_health": [],
+            "ok": False,
+            "status": "store_unavailable",
         }
-    with _connect(db_path) as conn:
+    current_clock = time.time() if now is None else float(now)
+    try:
+        decoded_cursor = (
+            decode_turn_list_cursor(
+                cursor,
+                host_id=str(host_id),
+                schema_version=requested_schema,
+                limit=limit,
+                now=current_clock,
+            )
+            if cursor is not None
+            else None
+        )
+        decoded_since = (
+            decode_turn_since_token(
+                since,
+                host_id=str(host_id),
+                schema_version=requested_schema,
+            )
+            if since is not None
+            else None
+        )
+    except ValueError as exc:
+        status = "cursor_expired" if str(exc) == "cursor_expired" else "invalid_cursor"
+        return {
+            "schema_version": requested_schema,
+            "ok": False,
+            "status": status,
+        }
+    with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
-        rows = conn.execute(
-            """
-            SELECT
-                turns.payload_json,
-                turns.observed_at,
-                turns.turn_id,
-                revisions.content_revision,
-                revisions.user_state,
-                revisions.user_char_length,
-                revisions.user_byte_length,
-                CASE WHEN revisions.user_state = 'complete'
-                     THEN revisions.user_page_count ELSE 0 END,
-                CASE
-                    WHEN revisions.user_state = 'complete'
-                     AND revisions.user_char_length BETWEEN 1 AND ?
-                    THEN revisions.user_text
-                END,
-                CASE
-                    WHEN revisions.user_state != 'absent'
-                     AND NOT (
-                         revisions.user_state = 'complete'
-                         AND revisions.user_char_length BETWEEN 1 AND ?
-                     )
-                    THEN substr(revisions.user_text, 1, ?)
-                END,
-                revisions.final_state,
-                revisions.final_char_length,
-                revisions.final_byte_length,
-                CASE WHEN revisions.final_state = 'complete'
-                     THEN revisions.final_page_count ELSE 0 END,
-                CASE
-                    WHEN revisions.final_state = 'complete'
-                     AND revisions.final_char_length BETWEEN 1 AND ?
-                    THEN revisions.assistant_final_text
-                END,
-                CASE
-                    WHEN revisions.final_state != 'absent'
-                     AND NOT (
-                         revisions.final_state = 'complete'
-                         AND revisions.final_char_length BETWEEN 1 AND ?
-                     )
-                    THEN substr(revisions.assistant_final_text, 1, ?)
-                END
-            FROM turns
-            LEFT JOIN turn_content_revisions AS revisions
-              ON revisions.host_id = turns.host_id
-             AND revisions.turn_id = turns.turn_id
-             AND revisions.is_current = 1
-            WHERE turns.host_id = ?
-            ORDER BY
-                turns.worker_id,
-                COALESCE(turns.updated_at, turns.observed_at, '') DESC,
-                turns.turn_id
-            """,
-            (
+        conn.execute("BEGIN")
+        try:
+            store_epoch = _turn_list_store_epoch_conn(conn)
+            row = conn.execute(
+                """
+                SELECT COALESCE(MIN(list_sequence), 0)
+                FROM turns
+                WHERE host_id = ?
+                """,
+                (str(host_id),),
+            ).fetchone()
+            current_floor = int(row[0] if row is not None else 0)
+            current_high, current_generation = _turn_list_host_state_conn(
+                conn,
+                str(host_id),
+            )
+            if decoded_cursor is not None:
+                if (
+                    decoded_cursor.store_epoch != store_epoch
+                    or decoded_cursor.watermark > current_high
+                    or decoded_cursor.traversal_generation != current_generation
+                    or (
+                        decoded_cursor.floor_sequence
+                        and current_floor > decoded_cursor.floor_sequence
+                    )
+                ):
+                    conn.rollback()
+                    return {
+                        "schema_version": requested_schema,
+                        "ok": False,
+                        "status": "cursor_expired",
+                    }
+                anchor = conn.execute(
+                    """
+                    SELECT 1
+                    FROM turns
+                    WHERE host_id = ?
+                      AND worker_id = ?
+                      AND list_sequence = ?
+                      AND turn_id = ?
+                    """,
+                    (
+                        str(host_id),
+                        decoded_cursor.worker_id,
+                        decoded_cursor.list_sequence,
+                        decoded_cursor.turn_id,
+                    ),
+                ).fetchone()
+                if anchor is None:
+                    conn.rollback()
+                    return {
+                        "schema_version": requested_schema,
+                        "ok": False,
+                        "status": "cursor_expired",
+                    }
+                original_since = decoded_cursor.since_sequence
+                watermark = decoded_cursor.watermark
+                floor_sequence = decoded_cursor.floor_sequence
+                traversal_generation = decoded_cursor.traversal_generation
+                expires_at = decoded_cursor.expires_at
+            else:
+                if decoded_since is not None:
+                    if (
+                        decoded_since.store_epoch != store_epoch
+                        or decoded_since.watermark > current_high
+                    ):
+                        conn.rollback()
+                        return {
+                            "schema_version": requested_schema,
+                            "ok": False,
+                            "status": "since_expired",
+                        }
+                    original_since = decoded_since.watermark
+                else:
+                    original_since = 0
+                watermark = current_high
+                floor_sequence = current_floor
+                traversal_generation = current_generation
+                expires_at = int(current_clock) + TURN_LIST_CURSOR_TTL_SECONDS
+            parameters: list[Any] = [
                 TURN_TEXT_MAX_CHARS,
                 TURN_TEXT_MAX_CHARS,
                 TURN_CONTENT_PREVIEW_MAX_CHARS,
@@ -7979,68 +12257,149 @@ def turns_payload_from_store(
                 TURN_TEXT_MAX_CHARS,
                 TURN_CONTENT_PREVIEW_MAX_CHARS,
                 str(host_id),
-            ),
-        ).fetchall()
-        if work_counters is not None:
-            work_counters.list_sql_queries += 1
-            work_counters.list_descriptor_rows += len(rows)
-            work_counters.list_inline_chars_examined += sum(
-                len(value)
-                for row in rows
-                for value in (row[8], row[14])
-                if isinstance(value, str)
-            )
-            work_counters.list_preview_chars_examined += sum(
-                len(value)
-                for row in rows
-                for value in (row[9], row[15])
-                if isinstance(value, str)
-            )
-    if not rows and snapshot is not None:
-        projected = turns_payload_from_snapshot(
-            snapshot,
-            schema_version=TURN_LIST_SCHEMA_VERSION,
-        )
-        if requested_schema == TURN_LIST_SCHEMA_VERSION:
-            return projected
-        incompatible = any(
-            field.get("availability") != "absent" and not field.get("inline")
-            for turn in projected.get("turns", [])
-            for field in (turn.get("content") or {}).get("fields", {}).values()
-        )
-        if incompatible:
-            return {
-                "schema_version": 1,
-                "ok": False,
-                "status": "upgrade_required",
-                "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
-            }
-        projected["schema_version"] = 1
-        for turn in projected.get("turns", []):
-            turn["schema_version"] = 1
-            turn.pop("content", None)
-        return projected
+                original_since,
+                watermark,
+            ]
+            continuation = ""
+            if decoded_cursor is not None:
+                continuation = """
+                  AND (
+                        turns.worker_id > ?
+                     OR (
+                            turns.worker_id = ?
+                        AND (
+                               turns.list_sequence < ?
+                            OR (
+                                   turns.list_sequence = ?
+                               AND turns.turn_id > ?
+                            )
+                        )
+                     )
+                  )
+                """
+                parameters.extend(
+                    [
+                        decoded_cursor.worker_id,
+                        decoded_cursor.worker_id,
+                        decoded_cursor.list_sequence,
+                        decoded_cursor.list_sequence,
+                        decoded_cursor.turn_id,
+                    ]
+                )
+            parameters.append(limit + 1)
+            rows = conn.execute(
+                f"""
+                SELECT
+                    turns.payload_json,
+                    turns.observed_at,
+                    turns.turn_id,
+                    turns.worker_id,
+                    turns.list_sequence,
+                    revisions.content_revision,
+                    revisions.user_state,
+                    revisions.user_char_length,
+                    revisions.user_byte_length,
+                    CASE WHEN revisions.user_state = 'complete'
+                         THEN revisions.user_page_count ELSE 0 END,
+                    CASE
+                        WHEN revisions.user_state = 'complete'
+                         AND revisions.user_char_length BETWEEN 1 AND ?
+                        THEN revisions.user_text
+                    END,
+                    CASE
+                        WHEN revisions.user_state != 'absent'
+                         AND NOT (
+                             revisions.user_state = 'complete'
+                             AND revisions.user_char_length BETWEEN 1 AND ?
+                         )
+                        THEN substr(revisions.user_text, 1, ?)
+                    END,
+                    revisions.final_state,
+                    revisions.final_char_length,
+                    revisions.final_byte_length,
+                    CASE WHEN revisions.final_state = 'complete'
+                         THEN revisions.final_page_count ELSE 0 END,
+                    CASE
+                        WHEN revisions.final_state = 'complete'
+                         AND revisions.final_char_length BETWEEN 1 AND ?
+                        THEN revisions.assistant_final_text
+                    END,
+                    CASE
+                        WHEN revisions.final_state != 'absent'
+                         AND NOT (
+                             revisions.final_state = 'complete'
+                             AND revisions.final_char_length BETWEEN 1 AND ?
+                         )
+                        THEN substr(revisions.assistant_final_text, 1, ?)
+                    END
+                FROM turns
+                LEFT JOIN turn_content_revisions AS revisions
+                  ON revisions.host_id = turns.host_id
+                 AND revisions.turn_id = turns.turn_id
+                 AND revisions.is_current = 1
+                WHERE turns.host_id = ?
+                  AND turns.list_sequence > ?
+                  AND turns.list_sequence <= ?
+                  {continuation}
+                ORDER BY
+                    turns.worker_id ASC,
+                    turns.list_sequence DESC,
+                    turns.turn_id ASC
+                LIMIT ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+            if work_counters is not None:
+                work_counters.list_sql_queries += 1
+                work_counters.list_descriptor_rows += len(rows)
+                work_counters.list_inline_chars_examined += sum(
+                    len(value)
+                    for row in rows
+                    for value in (row[10], row[16])
+                    if isinstance(value, str)
+                )
+                work_counters.list_preview_chars_examined += sum(
+                    len(value)
+                    for row in rows
+                    for value in (row[11], row[17])
+                    if isinstance(value, str)
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     turns: list[dict[str, Any]] = []
+    positions: list[tuple[str, int, str]] = []
     observed_values: list[str] = []
     incompatible_v1 = False
-    for (
-        payload_json,
-        observed_at,
-        turn_id,
-        revision,
-        user_state,
-        user_char_length,
-        user_byte_length,
-        user_page_count,
-        user_inline,
-        user_preview,
-        final_state,
-        final_char_length,
-        final_byte_length,
-        final_page_count,
-        final_inline,
-        final_preview,
-    ) in rows:
+    accumulated_row_bytes = 0
+    more_unprocessed = False
+    last_scanned_position: tuple[str, int, str] | None = None
+    for row_index, row in enumerate(rows):
+        if row_index >= limit:
+            more_unprocessed = True
+            break
+        (
+            payload_json,
+            observed_at,
+            turn_id,
+            worker_id,
+            list_sequence,
+            revision,
+            user_state,
+            user_char_length,
+            user_byte_length,
+            user_page_count,
+            user_inline,
+            user_preview,
+            final_state,
+            final_char_length,
+            final_byte_length,
+            final_page_count,
+            final_inline,
+            final_preview,
+        ) = row
+        current_position = (str(worker_id), int(list_sequence), str(turn_id))
         try:
             loaded = json.loads(str(payload_json or "{}"))
         except (TypeError, json.JSONDecodeError):
@@ -8048,68 +12407,77 @@ def turns_payload_from_store(
         if not isinstance(loaded, Mapping):
             loaded = {}
         turn_payload = sanitize_public_mapping(loaded)
-        if turn_payload and not is_internal_automation_turn_payload(turn_payload):
-            serialized = Turn.from_dict(turn_payload).to_dict()
-            item = _strip_canonical_turn_payload(serialized)
-            if revision is not None:
-                projection = project_persisted_turn_content(
-                    str(revision),
-                    user_state=str(user_state),
-                    user_char_length=int(user_char_length),
-                    user_byte_length=int(user_byte_length),
-                    user_page_count=int(user_page_count),
-                    user_inline=user_inline,
-                    user_preview=user_preview,
-                    final_state=str(final_state),
-                    final_char_length=int(final_char_length),
-                    final_byte_length=int(final_byte_length),
-                    final_page_count=int(final_page_count),
-                    final_inline=final_inline,
-                    final_preview=final_preview,
-                )
-                fields = projection["content"]["fields"]
-                incompatible_v1 = incompatible_v1 or any(
-                    descriptor["availability"] != "absent"
-                    and not descriptor["inline"]
-                    for descriptor in fields.values()
-                )
-                item.update(projection)
-            else:
-                legacy_user, legacy_user_state = _legacy_canonical_field(
-                    serialized.get("user_text")
-                )
-                legacy_final, legacy_final_state = _legacy_canonical_field(
-                    serialized.get("assistant_final_text")
-                )
-                if requested_schema == TURN_LIST_SCHEMA_VERSION and (
-                    legacy_user_state != "absent" or legacy_final_state != "absent"
-                ):
-                    item.update(
-                        project_turn_content(
-                            str(turn_id),
-                            legacy_user,
-                            legacy_final,
-                            user_state=legacy_user_state,
-                            final_state=legacy_final_state,
-                        )
+        if not turn_payload or is_internal_automation_turn_payload(turn_payload):
+            last_scanned_position = current_position
+            continue
+        serialized = Turn.from_dict(turn_payload).to_dict()
+        item = _strip_canonical_turn_payload(serialized)
+        if revision is not None:
+            projection = project_persisted_turn_content(
+                str(revision),
+                user_state=str(user_state),
+                user_char_length=int(user_char_length),
+                user_byte_length=int(user_byte_length),
+                user_page_count=int(user_page_count),
+                user_inline=user_inline,
+                user_preview=user_preview,
+                final_state=str(final_state),
+                final_char_length=int(final_char_length),
+                final_byte_length=int(final_byte_length),
+                final_page_count=int(final_page_count),
+                final_inline=final_inline,
+                final_preview=final_preview,
+            )
+            fields = projection["content"]["fields"]
+            incompatible_v1 = incompatible_v1 or any(
+                descriptor["availability"] != "absent"
+                and not descriptor["inline"]
+                for descriptor in fields.values()
+            )
+            item.update(projection)
+        else:
+            legacy_user, legacy_user_state = _legacy_canonical_field(
+                serialized.get("user_text")
+            )
+            legacy_final, legacy_final_state = _legacy_canonical_field(
+                serialized.get("assistant_final_text")
+            )
+            if requested_schema == TURN_LIST_SCHEMA_VERSION and (
+                legacy_user_state != "absent" or legacy_final_state != "absent"
+            ):
+                item.update(
+                    project_turn_content(
+                        str(turn_id),
+                        legacy_user,
+                        legacy_final,
+                        user_state=legacy_user_state,
+                        final_state=legacy_final_state,
                     )
-                elif requested_schema == 1:
-                    incompatible_v1 = incompatible_v1 or (
-                        legacy_user_state == "known_incomplete"
-                        or legacy_final_state == "known_incomplete"
-                    )
-                    if legacy_user_state == "complete":
-                        item["user_text"] = legacy_user
-                    if legacy_final_state == "complete":
-                        item["assistant_final_text"] = legacy_final
-            if requested_schema == 1:
-                item["schema_version"] = 1
-                item.pop("content", None)
-                item.pop("user_preview", None)
-                item.pop("assistant_final_preview", None)
-                item.setdefault("user_text", None)
-                item.setdefault("assistant_final_text", None)
-            turns.append(item)
+                )
+            elif requested_schema == 1:
+                incompatible_v1 = incompatible_v1 or (
+                    legacy_user_state == "known_incomplete"
+                    or legacy_final_state == "known_incomplete"
+                )
+                if legacy_user_state == "complete":
+                    item["user_text"] = legacy_user
+                if legacy_final_state == "complete":
+                    item["assistant_final_text"] = legacy_final
+        if requested_schema == 1:
+            item["schema_version"] = 1
+            item.pop("content", None)
+            item.pop("user_preview", None)
+            item.pop("assistant_final_preview", None)
+            item.setdefault("user_text", None)
+            item.setdefault("assistant_final_text", None)
+        item_bytes = len(_canonical_json(item).encode("utf-8")) + 1
+        if turns and accumulated_row_bytes + item_bytes > 850_000:
+            more_unprocessed = True
+            break
+        turns.append(item)
+        positions.append((str(worker_id), int(list_sequence), str(turn_id)))
+        last_scanned_position = current_position
+        accumulated_row_bytes += item_bytes
         if observed_at:
             observed_values.append(str(observed_at))
     if requested_schema == 1 and incompatible_v1:
@@ -8119,6 +12487,32 @@ def turns_payload_from_store(
             "status": "upgrade_required",
             "required_turn_schema_version": TURN_LIST_SCHEMA_VERSION,
         }
+    has_more = more_unprocessed
+    if has_more and last_scanned_position is not None:
+        last_worker, last_sequence, last_turn = last_scanned_position
+        next_cursor = turn_list_cursor(
+            str(host_id),
+            schema_version=requested_schema,
+            limit=limit,
+            since_sequence=original_since,
+            watermark=watermark,
+            floor_sequence=floor_sequence,
+            traversal_generation=traversal_generation,
+            worker_id=last_worker,
+            list_sequence=last_sequence,
+            turn_id=last_turn,
+            store_epoch=store_epoch,
+            expires_at=expires_at,
+        )
+    else:
+        has_more = False
+        next_cursor = None
+    watermark_token = turn_since_token(
+        str(host_id),
+        schema_version=requested_schema,
+        watermark=watermark,
+        store_epoch=store_epoch,
+    )
     backend_health = sanitize_public_value(
         [health.to_dict() for health in snapshot.backend_health]
         if snapshot is not None
@@ -8136,15 +12530,52 @@ def turns_payload_from_store(
         ),
         "turns": turns,
         "backend_health": backend_health,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "as_of": watermark_token,
+        "since": watermark_token,
     }
     payload["content_fingerprint"] = stable_fingerprint(
         {
-            "schema_version": payload["schema_version"],
-            "host_id": payload["host_id"],
-            "turns": payload["turns"],
-            "backend_health": payload["backend_health"],
+            "schema_version": requested_schema,
+            "host_id": str(host_id),
+            "turns": turns,
+            "backend_health": backend_health,
+            "has_more": has_more,
+            "as_of": watermark_token,
         }
     )
+    while (
+        len(_canonical_json(payload).encode("utf-8")) >= 1024 * 1024
+        and len(turns) > 1
+    ):
+        turns.pop()
+        last_worker, last_sequence, last_turn = positions[len(turns) - 1]
+        payload["has_more"] = True
+        payload["next_cursor"] = turn_list_cursor(
+            str(host_id),
+            schema_version=requested_schema,
+            limit=limit,
+            since_sequence=original_since,
+            watermark=watermark,
+            floor_sequence=floor_sequence,
+            traversal_generation=traversal_generation,
+            worker_id=last_worker,
+            list_sequence=last_sequence,
+            turn_id=last_turn,
+            store_epoch=store_epoch,
+            expires_at=expires_at,
+        )
+        payload["content_fingerprint"] = stable_fingerprint(
+            {
+                "schema_version": requested_schema,
+                "host_id": str(host_id),
+                "turns": turns,
+                "backend_health": backend_health,
+                "has_more": True,
+                "as_of": watermark_token,
+            }
+        )
     _record_response_size(work_counters, payload)
     return payload
 
@@ -8176,6 +12607,7 @@ def _ensure_turn_content_page_boundaries_conn(
     total_byte_length: int,
     page_count: int,
     work_counters: TurnContentWorkCounters | None,
+    allow_rebuild: bool = True,
 ) -> None:
     existing_count = int(
         conn.execute(
@@ -8200,6 +12632,8 @@ def _ensure_turn_content_page_boundaries_conn(
         return
     if existing_count:
         raise ValueError("invalid_content_metadata")
+    if not allow_rebuild:
+        raise ValueError("content_not_available")
     blob = conn.blobopen(
         "turn_content_revisions",
         str(column),
@@ -8495,6 +12929,7 @@ def get_turn_content(
                 total_byte_length=total_byte_length,
                 page_count=count,
                 work_counters=work_counters,
+                allow_rebuild=False,
             )
             expected_boundary = conn.execute(
                 """
@@ -8629,6 +13064,9 @@ def save_snapshot(
     """Persist a canonical snapshot and its authorized lifecycle transitions."""
     context = observation or SnapshotObservationContext()
     private_snapshot_data = _snapshot_dict(snapshot)
+    created_at = _strict_utc_timestamp(private_snapshot_data.get("updated_at"))
+    if created_at is None:
+        raise ValueError("invalid snapshot updated_at")
     public_snapshot = Snapshot.from_dict(
         sanitize_public_mapping(private_snapshot_data)
     )
@@ -8638,27 +13076,83 @@ def save_snapshot(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
-            cursor = conn.execute(
+            latest = conn.execute(
                 """
-                INSERT INTO snapshots (
-                    host_id, created_at, content_fingerprint, payload
-                ) VALUES (?, ?, ?, ?)
+                SELECT id, content_fingerprint, created_at, payload
+                FROM snapshots
+                WHERE host_id = ?
+                ORDER BY id DESC
+                LIMIT 1
                 """,
-                (
-                    public_snapshot.host_id,
-                    public_snapshot.updated_at,
-                    fingerprint,
-                    payload,
-                ),
-            )
-            _upsert_snapshot_projections(
-                conn,
-                public_snapshot,
-                data,
-                snapshot_id=int(cursor.lastrowid),
-                content_fingerprint=fingerprint,
-                private_snapshot_data=private_snapshot_data,
-            )
+                (str(public_snapshot.host_id),),
+            ).fetchone()
+            if latest is not None and str(latest[1]) == fingerprint:
+                snapshot_id = int(latest[0])
+                retained_created_at = str(latest[2])
+                retained_at = _strict_utc_timestamp(retained_created_at)
+                retained_is_unknown = (
+                    retained_at is None
+                    or (
+                        retained_at
+                        == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
+                        and not _legacy_snapshot_created_at_is_authoritative(
+                            retained_created_at,
+                            latest[3],
+                        )
+                    )
+                )
+                refresh_current = (
+                    retained_is_unknown
+                    or (
+                        retained_at is not None
+                        and _connector_datetime(created_at)
+                        >= _connector_datetime(retained_at)
+                    )
+                )
+                if refresh_current:
+                    conn.execute(
+                        """
+                        UPDATE snapshots
+                        SET created_at = ?, content_fingerprint = ?, payload = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            created_at,
+                            fingerprint,
+                            payload,
+                            snapshot_id,
+                        ),
+                    )
+            else:
+                refresh_current = True
+                cursor = conn.execute(
+                    """
+                    INSERT INTO snapshots (
+                        host_id, created_at, content_fingerprint, payload
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        public_snapshot.host_id,
+                        created_at,
+                        fingerprint,
+                        payload,
+                    ),
+                )
+                snapshot_id = int(cursor.lastrowid)
+                _append_snapshot_saved_event_conn(
+                    conn,
+                    public_snapshot,
+                    snapshot_id=snapshot_id,
+                    content_fingerprint=fingerprint,
+                    private_snapshot_data=private_snapshot_data,
+                )
+            if refresh_current:
+                _refresh_snapshot_projections_conn(
+                    conn,
+                    public_snapshot,
+                    data,
+                    content_fingerprint=fingerprint,
+                )
             _apply_attention_observation_conn(
                 conn,
                 snapshot=public_snapshot,
@@ -9260,8 +13754,8 @@ def reserve_command_receipt(
     """
     conn = _connect(db_path, isolation_level=None, prepare=True)
     try:
-        conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
         row = _latest_command_receipt_row(conn, host_id, request_id, action)
         if row is not None:
             _upsert_command_audit_from_receipt_row(conn, row)
@@ -9337,8 +13831,8 @@ def save_command_receipt(
     now = utc_timestamp()
     conn = _connect(db_path, isolation_level=None, prepare=True)
     try:
-        conn.execute("BEGIN IMMEDIATE")
         _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
             SELECT id, payload_fingerprint

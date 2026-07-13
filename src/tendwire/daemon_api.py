@@ -12,6 +12,8 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import Future, wait
+from queue import Empty, Queue
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,12 @@ from .core.models import (
     public_json_dumps,
     sanitize_public_mapping,
 )
-from .core.turns import pending_payload_from_snapshot, turns_payload_from_snapshot
+from .core.turns import (
+    TURN_LIST_DEFAULT_LIMIT,
+    TURN_LIST_MAX_LIMIT,
+    pending_payload_from_snapshot,
+    turns_payload_from_snapshot,
+)
 from .local_state import (
     EntryIdentity,
     LocalStateError,
@@ -51,6 +58,7 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_PUBLIC_REQUEST_ID_CHARS = 128
 _SOCKET_STARTUP_LOCK_TIMEOUT_SECONDS = 1.0
 _SOCKET_STARTUP_LOCK_RETRY_SECONDS = 0.01
+_SERVER_LISTEN_BACKLOG = 32
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _REQUEST_ID_FORBIDDEN_SEGMENTS = frozenset(
     {
@@ -162,15 +170,25 @@ class DaemonUnavailable(DaemonAPIError):
         *,
         code: LocalStateErrorCode | None = None,
         timed_out: bool = False,
+        request_started: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.timed_out = timed_out
+        self.request_started = request_started
 
 
 class DaemonProtocolError(DaemonAPIError):
     """Raised when a daemon response cannot be parsed or trusted."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_started: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.request_started = request_started
 
 def _request_id_has_forbidden_segment_sequence(normalized: str) -> bool:
     parts = tuple(part for part in normalized.split("_") if part)
@@ -352,7 +370,15 @@ class TendwireDaemonAPI:
                     return success_response(self._get_attention(), request_id=request_id)
                 return success_response(attention_payload_from_snapshot(self._get_snapshot()), request_id=request_id)
             if method == "turn.list":
-                unknown_params = sorted(str(key) for key in params if str(key) != "schema_version")
+                allowed_turn_params = {
+                    "schema_version",
+                    "limit",
+                    "cursor",
+                    "since",
+                }
+                unknown_params = sorted(
+                    str(key) for key in params if str(key) not in allowed_turn_params
+                )
                 if unknown_params:
                     return error_response(
                         "invalid_params",
@@ -368,8 +394,50 @@ class TendwireDaemonAPI:
                         details={"supported_turn_schema_versions": [1, 2]},
                         request_id=request_id,
                     )
+                limit = params.get("limit", TURN_LIST_DEFAULT_LIMIT)
+                if (
+                    not isinstance(limit, int)
+                    or isinstance(limit, bool)
+                    or not 1 <= limit <= TURN_LIST_MAX_LIMIT
+                ):
+                    return error_response(
+                        "invalid_params",
+                        "limit must be an integer in the supported range",
+                        details={
+                            "field": "limit",
+                            "minimum": 1,
+                            "maximum": TURN_LIST_MAX_LIMIT,
+                        },
+                        request_id=request_id,
+                    )
+                cursor = params.get("cursor")
+                since = params.get("since")
+                for token_name, token in (("cursor", cursor), ("since", since)):
+                    if token is not None and (
+                        not isinstance(token, str) or not token
+                    ):
+                        return error_response(
+                            "invalid_params",
+                            f"{token_name} must be a non-empty string or null",
+                            details={"field": token_name},
+                            request_id=request_id,
+                        )
+                if cursor is not None and since is not None:
+                    return error_response(
+                        "invalid_params",
+                        "cursor and since cannot be combined",
+                        details={"fields": ["cursor", "since"]},
+                        request_id=request_id,
+                    )
                 if self._get_turns is not None:
-                    turn_result = dict(self._get_turns(schema_version=schema_version))
+                    turn_result = dict(
+                        self._get_turns(
+                            schema_version=schema_version,
+                            limit=limit,
+                            cursor=cursor,
+                            since=since,
+                        )
+                    )
                 else:
                     snapshot = self._get_snapshot()
                     if schema_version == 1:
@@ -604,10 +672,20 @@ def _ensure_unix_socket_supported() -> None:
         raise DaemonUnavailable("Unix domain sockets are not supported on this platform")
 
 
-def _read_json_frame(conn: socket.socket, *, max_bytes: int = MAX_REQUEST_BYTES) -> bytes:
+def _read_json_frame(
+    conn: socket.socket,
+    *,
+    max_bytes: int = MAX_REQUEST_BYTES,
+    deadline: float | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     total = 0
     while True:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("JSON frame deadline exceeded")
+            conn.settimeout(remaining)
         chunk = conn.recv(4096)
         if not chunk:
             break
@@ -698,8 +776,94 @@ def _cleanup_stale_socket(parent_fd: int, leaf: str, address: str) -> None:
             pass
 
 
+class _DaemonRequestExecutor:
+    """Fixed daemon-worker executor that cannot block interpreter shutdown."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int,
+        queue_capacity: int,
+        thread_name_prefix: str,
+    ) -> None:
+        self._queue: Queue[
+            tuple[Future[Any], Callable[..., Any], tuple[Any, ...]] | None
+        ] = Queue(maxsize=queue_capacity)
+        self._lock = threading.Lock()
+        self._shutdown = False
+        threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"{thread_name_prefix}_{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+        started_threads: list[threading.Thread] = []
+        try:
+            for thread in threads:
+                thread.start()
+                started_threads.append(thread)
+        except BaseException:  # noqa: BLE001
+            self._shutdown = True
+            for _thread in started_threads:
+                self._queue.put_nowait(None)
+            raise
+        self._threads = tuple(started_threads)
+
+    def submit(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+    ) -> Future[Any]:
+        future: Future[Any] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("request executor has shut down")
+            self._queue.put_nowait((future, function, args))
+        return future
+
+    def shutdown(self, *, cancel_futures: bool) -> None:
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except Empty:
+                    break
+                try:
+                    if item is not None:
+                        future, _function, _args = item
+                        future.cancel()
+                finally:
+                    self._queue.task_done()
+        for _thread in self._threads:
+            self._queue.put_nowait(None)
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                future, function, args = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    result = function(*args)
+                except BaseException as exc:  # noqa: BLE001
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+            finally:
+                self._queue.task_done()
+
+
 class UnixSocketJSONServer:
-    """Small sequential Unix-socket JSON server for local daemon requests."""
+    """Bounded concurrent Unix-socket JSON request server."""
 
     def __init__(
         self,
@@ -713,7 +877,31 @@ class UnixSocketJSONServer:
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         socket_group: str | None = None,
         prepare_parent: bool = False,
+        request_workers: int = 8,
+        max_in_flight_requests: int = 32,
+        shutdown_grace_seconds: float = 6.0,
     ) -> None:
+        if (
+            not isinstance(request_workers, int)
+            or isinstance(request_workers, bool)
+            or request_workers < 1
+        ):
+            raise ValueError("request_workers must be a positive integer")
+        if (
+            not isinstance(max_in_flight_requests, int)
+            or isinstance(max_in_flight_requests, bool)
+            or max_in_flight_requests < request_workers
+        ):
+            raise ValueError(
+                "max_in_flight_requests must be an integer at least request_workers"
+            )
+        if (
+            isinstance(shutdown_grace_seconds, bool)
+            or not isinstance(shutdown_grace_seconds, (int, float))
+            or not math.isfinite(float(shutdown_grace_seconds))
+            or shutdown_grace_seconds < 0
+        ):
+            raise ValueError("shutdown_grace_seconds must be finite and non-negative")
         self.socket_path = Path(socket_path)
         self.dispatcher = dispatcher
         self.stop_event = stop_event or threading.Event()
@@ -723,12 +911,23 @@ class UnixSocketJSONServer:
         self.max_response_bytes = max_response_bytes
         self.socket_group = socket_group
         self.prepare_parent = prepare_parent
+        self.request_workers = request_workers
+        self.max_in_flight_requests = max_in_flight_requests
+        self.shutdown_grace_seconds = float(shutdown_grace_seconds)
         self._listener: socket.socket | None = None
         self._identity: EntryIdentity | None = None
         self._pin_fd: int | None = None
         self._parent_fd: int | None = None
         self._leaf: str | None = None
         self._lifecycle_lock = threading.Lock()
+        self._tracking_lock = threading.RLock()
+        self._admission = threading.BoundedSemaphore(max_in_flight_requests)
+        self._executor: _DaemonRequestExecutor | None = None
+        self._closed = False
+        self._accepting = False
+        self._connections: set[socket.socket] = set()
+        self._futures: set[Future[None]] = set()
+        self._future_connections: dict[Future[None], socket.socket] = {}
 
     @property
     def listening(self) -> bool:
@@ -747,7 +946,7 @@ class UnixSocketJSONServer:
                 "daemon socket cleanup is pending",
                 code=LocalStateErrorCode.OPERATION_FAILED,
             )
-        if self.stop_event.is_set():
+        if self.stop_event.is_set() or self._closed:
             raise DaemonUnavailable("daemon socket server has already stopped")
         _ensure_unix_socket_supported()
 
@@ -809,8 +1008,13 @@ class UnixSocketJSONServer:
                         socket_group=self.socket_group,
                         expected=identity,
                     )
-                    listener.listen()
+                    listener.listen(_SERVER_LISTEN_BACKLOG)
                     listener.settimeout(self.accept_timeout_seconds)
+                    executor = _DaemonRequestExecutor(
+                        max_workers=self.request_workers,
+                        queue_capacity=self.max_in_flight_requests,
+                        thread_name_prefix="tendwire-daemon-api",
+                    )
                 except Exception:
                     self._rollback_bound_socket(
                         listener,
@@ -825,6 +1029,9 @@ class UnixSocketJSONServer:
             self._pin_fd = pin_fd
             self._parent_fd = parent_fd
             self._leaf = leaf
+            self._executor = executor
+            with self._tracking_lock:
+                self._accepting = True
             listener = None
             parent_fd = None
         except LocalStateError as exc:
@@ -876,7 +1083,6 @@ class UnixSocketJSONServer:
             except OSError:
                 pass
 
-
     def serve_forever(self) -> None:
         self.start()
         try:
@@ -894,15 +1100,98 @@ class UnixSocketJSONServer:
                     if self.stop_event.is_set():
                         break
                     raise DaemonUnavailable("daemon socket request loop failed") from None
-                self._handle_connection(conn)
+                self._submit_connection(conn)
         finally:
             self.close()
 
+    def _submit_connection(self, conn: socket.socket) -> None:
+        if not self._admission.acquire(blocking=False):
+            self._reject_connection(conn, "server_busy")
+            return
+        with self._tracking_lock:
+            executor = self._executor
+            if not self._accepting or executor is None:
+                self._admission.release()
+                self._reject_connection(conn, "daemon_stopping")
+                return
+            self._connections.add(conn)
+            try:
+                future = executor.submit(self._handle_connection, conn)
+            except RuntimeError:
+                self._connections.discard(conn)
+                self._admission.release()
+                self._reject_connection(conn, "daemon_stopping")
+                return
+            self._futures.add(future)
+            self._future_connections[future] = conn
+            future.add_done_callback(self._request_finished)
+
+    def _request_finished(self, future: Future[None]) -> None:
+        with self._tracking_lock:
+            conn = self._future_connections.pop(future, None)
+            self._futures.discard(future)
+            if conn is not None:
+                self._connections.discard(conn)
+        if conn is not None:
+            if future.cancelled() and self.stop_event.is_set():
+                self._reject_connection(conn, "daemon_stopping")
+            else:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            self._admission.release()
+
+    def _reject_connection(self, conn: socket.socket, code: str) -> None:
+        try:
+            if code == "server_busy":
+                response = error_response(
+                    "server_busy",
+                    "daemon request capacity is full",
+                    details={"retryable": True},
+                )
+            else:
+                response = error_response(
+                    "daemon_stopping",
+                    "daemon is stopping",
+                    details={"retryable": True},
+                )
+            encoded = _serialized_response(response)
+            conn.settimeout(0.01)
+            conn.sendall(encoded + b"\n")
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            for _chunk_index in range(4):
+                try:
+                    chunk = conn.recv(
+                        4096,
+                        getattr(socket, "MSG_DONTWAIT", 0),
+                    )
+                except (BlockingIOError, InterruptedError):
+                    break
+                except OSError:
+                    break
+                if not chunk or b"\n" in chunk:
+                    break
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     def _handle_connection(self, conn: socket.socket) -> None:
         with conn:
-            conn.settimeout(self.client_timeout_seconds)
+            read_deadline = time.monotonic() + self.client_timeout_seconds
             try:
-                raw = _read_json_frame(conn, max_bytes=self.max_request_bytes)
+                raw = _read_json_frame(
+                    conn,
+                    max_bytes=self.max_request_bytes,
+                    deadline=read_deadline,
+                )
                 if not raw:
                     response = error_response("invalid_request", "empty request")
                 else:
@@ -920,6 +1209,8 @@ class UnixSocketJSONServer:
                     "daemon request failed",
                     details={"type": type(exc).__name__},
                 )
+            if self.stop_event.is_set():
+                return
             try:
                 encoded = _serialized_response(response)
                 if len(encoded) > self.max_response_bytes:
@@ -930,8 +1221,11 @@ class UnixSocketJSONServer:
                             details={"max_response_bytes": self.max_response_bytes},
                         )
                     )
+                if self.stop_event.is_set():
+                    return
+                conn.settimeout(self.client_timeout_seconds)
                 conn.sendall(encoded + b"\n")
-            except OSError:
+            except (OSError, TimeoutError):
                 return
 
     def close(self) -> None:
@@ -940,10 +1234,37 @@ class UnixSocketJSONServer:
 
     def _close_locked(self) -> None:
         self.stop_event.set()
+        with self._tracking_lock:
+            self._accepting = False
+            self._closed = True
+            executor = self._executor
+            self._executor = None
+            futures = tuple(self._futures) if executor is not None else ()
         listener = self._listener
         self._listener = None
         if listener is not None:
             listener.close()
+
+        if executor is not None:
+            for future in futures:
+                future.cancel()
+            with self._tracking_lock:
+                running = tuple(self._futures)
+            if running and self.shutdown_grace_seconds > 0:
+                wait(running, timeout=self.shutdown_grace_seconds)
+            with self._tracking_lock:
+                connections = tuple(self._connections)
+            for conn in connections:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            executor.shutdown(cancel_futures=True)
+
         identity = self._identity
         pin_fd = self._pin_fd
         parent_fd = self._parent_fd
@@ -1111,6 +1432,7 @@ class DaemonAPIClient:
 
     def request(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         _ensure_unix_socket_supported()
+        deadline = time.monotonic() + self.timeout_seconds
         payload = {"method": method, "params": dict(params or {})}
         raw_payload = json.dumps(
             payload,
@@ -1124,7 +1446,10 @@ class DaemonAPIClient:
         ) as (parent_fd, leaf, identity, expected_peer_uid, address):
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                conn.settimeout(self.timeout_seconds)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("daemon request deadline exceeded")
+                conn.settimeout(remaining)
                 conn.connect(address)
                 _recheck_connected_socket(
                     parent_fd,
@@ -1138,37 +1463,64 @@ class DaemonAPIClient:
                 raise DaemonUnavailable(
                     "daemon socket request timed out",
                     timed_out=True,
+                    request_started=False,
                 ) from None
             except DaemonUnavailable:
                 conn.close()
                 raise
             except OSError:
                 conn.close()
-                raise DaemonUnavailable("daemon socket is unavailable") from None
+                raise DaemonUnavailable(
+                    "daemon socket is unavailable",
+                    request_started=False,
+                ) from None
+            request_started = False
             try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("daemon request deadline exceeded")
+                conn.settimeout(remaining)
+                request_started = True
                 conn.sendall(raw_payload)
                 raw_response = _read_json_frame(
                     conn,
                     max_bytes=self.max_response_bytes,
+                    deadline=deadline,
                 )
             except (TimeoutError, socket.timeout):
                 raise DaemonUnavailable(
                     "daemon socket request timed out",
                     timed_out=True,
+                    request_started=request_started,
+                ) from None
+            except DaemonProtocolError as exc:
+                raise DaemonProtocolError(
+                    str(exc),
+                    request_started=request_started,
                 ) from None
             except OSError:
                 raise DaemonProtocolError(
-                    "daemon request outcome is uncertain"
+                    "daemon request outcome is uncertain",
+                    request_started=request_started,
                 ) from None
             finally:
                 conn.close()
 
         if not raw_response:
-            raise DaemonProtocolError("empty daemon response")
+            raise DaemonProtocolError(
+                "empty daemon response",
+                request_started=True,
+            )
         try:
             response = json.loads(raw_response.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise DaemonProtocolError("invalid daemon response JSON") from None
+            raise DaemonProtocolError(
+                "invalid daemon response JSON",
+                request_started=True,
+            ) from None
         if not isinstance(response, dict):
-            raise DaemonProtocolError("daemon response must be a JSON object")
+            raise DaemonProtocolError(
+                "daemon response must be a JSON object",
+                request_started=True,
+            )
         return response

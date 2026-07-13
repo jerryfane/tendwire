@@ -429,7 +429,11 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
             try:
                 raise socket.timeout("timed out")
             except socket.timeout as exc:
-                raise DaemonUnavailable("timed out") from exc
+                raise DaemonUnavailable(
+                    "timed out",
+                    timed_out=True,
+                    request_started=True,
+                ) from exc
 
     monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_fetch)
     monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)

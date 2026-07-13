@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.cli import main
 from tendwire.config import Config
 from tendwire.core.commands import STATUS_ACCEPTED, STATUS_INVALID_REQUEST, CommandEnvelope
@@ -30,6 +31,10 @@ from tendwire.core.models import (
     WorkerBinding,
 )
 from tendwire.core.projector import project_from_raw
+from tendwire.core.turns import (
+    pending_payload_from_snapshot,
+    recompute_pending_content_fingerprint,
+)
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.daemon_api import (
     DaemonAPIClient,
@@ -39,13 +44,16 @@ from tendwire.daemon_api import (
     UnixSocketJSONServer,
     MAX_RESPONSE_BYTES,
 )
-from tendwire.local_state import LocalStateError, LocalStateErrorCode
+from tendwire.local_state import LocalStateError, LocalStateErrorCode, LocalStateKind
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     attention_payload_from_store,
     get_command_receipt,
     init_store,
     latest_snapshot,
+    merge_backend_pending,
+    pending_payload_from_store,
+    merge_turn_content,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -177,6 +185,16 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
         encoded = json.dumps(response)
         assert "sentinel-private" not in encoded
         _assert_no_public_json_forbidden(response)
+    default_pending = api.dispatch({"method": "pending.list"})["result"]
+    assert default_pending == pending_payload_from_snapshot(snapshot)
+    assert default_pending["pending_health"] == {
+        "status": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+    assert (
+        default_pending["content_fingerprint"]
+        == recompute_pending_content_fingerprint(default_pending)
+    )
 
     command_response = api.dispatch(
         {
@@ -195,17 +213,420 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     _assert_no_public_json_forbidden(command_response)
 
 
-def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> None:
-    turn_calls: list[int] = []
-    page_calls: list[dict[str, Any]] = []
-    page_text = "\n  " + ("α" * 20_000) + "  \r\n"
+def test_daemon_answer_pending_response_is_recursively_public_safe() -> None:
+    snapshot = _public_snapshot()
     api = TendwireDaemonAPI(
-        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_snapshot=lambda: snapshot,
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {
+            "schema_version": 1,
+            "action": "answer_pending",
+            "request_id": "answer-public",
+            "ok": True,
+            "dry_run": False,
+            "status": "accepted",
+            "result": {
+                "target": {
+                    "worker_id": "worker-public",
+                    "pane_id": "sentinel-private-pane",
+                    "private_binding": "sentinel-private-binding",
+                },
+                "pending": {
+                    "id": "pending-" + ("a" * 24),
+                    "fingerprint": "b" * 24,
+                    "decision_id": "sentinel-private-decision",
+                },
+                "choice": {
+                    "choice_id": "choice-" + ("c" * 24),
+                    "tool_id": "sentinel-private-tool",
+                    "raw_payload": "sentinel-private-option",
+                },
+                "delivery_state": "submitted",
+                "transport_state": "submitted",
+                "observed_pending_state": "pending_observation",
+            },
+            "error": None,
+            "warnings": [],
+        },
+    )
+
+    response = api.dispatch(
+        {
+            "method": "command.submit",
+            "params": {
+                "schema_version": 1,
+                "action": "answer_pending",
+                "request_id": "answer-public",
+                "dry_run": False,
+                "params": {
+                    "pending_id": "pending-" + ("a" * 24),
+                    "pending_fingerprint": "b" * 24,
+                    "choice_id": "choice-" + ("c" * 24),
+                },
+            },
+        }
+    )
+    result = response["result"]["result"]
+
+    assert result == {
+        "target": {"worker_id": "worker-public"},
+        "pending": {
+            "id": "pending-" + ("a" * 24),
+            "fingerprint": "b" * 24,
+        },
+        "choice": {"choice_id": "choice-" + ("c" * 24)},
+        "delivery_state": "submitted",
+        "transport_state": "submitted",
+        "observed_pending_state": "pending_observation",
+    }
+    assert "sentinel-private" not in json.dumps(response, sort_keys=True)
+    _assert_no_public_json_forbidden(response)
+
+
+def test_daemon_connector_pending_projection_is_recursively_public_safe() -> None:
+    snapshot = _public_snapshot()
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: snapshot,
         get_health=lambda: {"schema_version": 1, "status": "ok"},
         submit_command=lambda _params: {},
-        get_turns=lambda *, schema_version: turn_calls.append(schema_version)
-        or {
-            "schema_version": schema_version,
+        connector_call=lambda _method, _params: {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "items": [
+                {
+                    "pending_id": "pending-" + ("d" * 24),
+                    "choice_id": "choice-" + ("e" * 24),
+                    "pane_id": "sentinel-private-pane",
+                    "decision_id": "sentinel-private-decision",
+                    "tool_id": "sentinel-private-tool",
+                    "raw_payload": "sentinel-private-option",
+                }
+            ],
+        },
+    )
+
+    response = api.dispatch(
+        {
+            "method": "connector.poll",
+            "params": {"name": "pending-public"},
+        }
+    )
+
+    assert response["result"]["items"] == [
+        {"choice_id": "choice-" + ("e" * 24)}
+    ]
+    assert "sentinel-private" not in json.dumps(response, sort_keys=True)
+    _assert_no_public_json_forbidden(response)
+
+
+def test_daemon_pending_matches_shared_durable_projection_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "pending-parity.db"
+    snapshot = _public_snapshot()
+    config = Config(host_id=snapshot.host_id, db_path=db_path)
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    baseline = pending_payload_from_snapshot(snapshot)
+    assert baseline["pending_health"] == {
+        "status": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+    }
+    degraded = dict(baseline)
+    degraded["pending_health"] = {
+        "status": "degraded",
+        "counts": {"fresh": 0, "stale": 1, "total": 1},
+    }
+    assert (
+        recompute_pending_content_fingerprint(degraded)
+        != baseline["content_fingerprint"]
+    )
+    merge_backend_pending(
+        db_path,
+        snapshot.host_id,
+        "worker-1",
+        {
+            "question": "Choose the durable option?",
+            "kind": "choice",
+            "choices": [
+                {"choice_id": "safe", "label": "Safe"},
+                {
+                    "choice_id": "private",
+                    "label": "sentinel-private-pane",
+                    "value": "sentinel-private-command",
+                },
+            ],
+            "meta": {
+                "source": "backend",
+                "pane_id": "sentinel-private-pane",
+            },
+        },
+    )
+
+    daemon_payload = TendwireDaemon(config).get_pending()
+    shared_payload = pending_payload_from_store(db_path, snapshot.host_id)
+
+    assert daemon_payload == shared_payload
+    assert daemon_payload["content_fingerprint"] != baseline["content_fingerprint"]
+    assert daemon_payload["pending_interactions"][0]["question"] == "Choose the durable option?"
+    assert "sentinel-private" not in json.dumps(daemon_payload, sort_keys=True)
+    _assert_no_public_json_forbidden(daemon_payload)
+
+
+@pytest.mark.parametrize(
+    "stored_payload",
+    [
+        "not-json sentinel-private-invalid",
+        json.dumps("sentinel-private-scalar"),
+        json.dumps(["sentinel-private-list"]),
+        json.dumps(
+            {
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "workers": [],
+                "sentinel": "sentinel-private-missing-host",
+            }
+        ),
+        json.dumps(
+            {
+                "host_id": "malformed-pending",
+                "workers": [],
+                "sentinel": "sentinel-private-missing-updated",
+            }
+        ),
+        json.dumps(
+            {
+                "host_id": "sentinel-private-cross-host",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "workers": [],
+            }
+        ),
+        json.dumps(
+            {
+                "host_id": "malformed-pending",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "workers": [["sentinel-private-nested"]],
+            }
+        ),
+        json.dumps(
+            {
+                "host_id": "malformed-pending",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "workers": [
+                    {
+                        "id": "worker-1",
+                        "name": "Worker One",
+                        "meta": ["sentinel-private-nested-meta"],
+                    }
+                ],
+            }
+        ),
+    ],
+    ids=[
+        "invalid-json",
+        "scalar-json",
+        "list-json",
+        "missing-host",
+        "missing-updated-at",
+        "cross-host",
+        "malformed-nested",
+        "malformed-nested-meta",
+    ],
+)
+def test_malformed_durable_snapshot_is_fixed_unavailable_for_daemon_and_cli(
+    tmp_path: Path,
+    capsys,
+    stored_payload: str,
+) -> None:
+    db_path = tmp_path / "malformed-pending.db"
+    host_id = "malformed-pending"
+    config = Config(host_id=host_id, data_dir=tmp_path, db_path=db_path)
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO snapshots (
+                host_id, created_at, content_fingerprint, payload
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                host_id,
+                "2026-01-01T00:00:00+00:00",
+                "sentinel-private-fingerprint",
+                stored_payload,
+            ),
+        )
+
+    daemon_payload = TendwireDaemon(config).get_pending()
+    cli_code = main(
+        [
+            "--host-id",
+            host_id,
+            "--socket-path",
+            str(tmp_path / "missing.sock"),
+            "pending",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    cli_payload = json.loads(capsys.readouterr().out)
+    expected = {
+        "schema_version": 1,
+        "host_id": host_id,
+        "ok": False,
+        "status": "store_unavailable",
+        "pending_interactions": [],
+        "backend_health": [],
+        "pending_health": {
+            "status": "store_unavailable",
+            "counts": {"fresh": 0, "stale": 0, "total": 0},
+        },
+    }
+
+    assert cli_code == 1
+    assert daemon_payload == cli_payload == expected
+    assert "sentinel-private" not in json.dumps(
+        {"daemon": daemon_payload, "cli": cli_payload},
+        sort_keys=True,
+    )
+    _assert_no_public_json_forbidden(daemon_payload)
+    _assert_no_public_json_forbidden(cli_payload)
+
+
+def test_pending_store_projection_reads_snapshot_and_overlay_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    import tendwire.store.sqlite as sqlite_store
+
+    db_path = tmp_path / "pending-atomic.db"
+    config = Config(host_id="atomic-pending", db_path=db_path)
+    snapshot_a = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "status": "blocked",
+                "summary": "snapshot-a",
+            }
+        ],
+    )
+    snapshot_b = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker One",
+                "status": "waiting",
+                "summary": "snapshot-b",
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot_a)
+    merge_backend_pending(
+        db_path,
+        config.host_id,
+        "worker-1",
+        {"question": "Backend A?", "kind": "question", "meta": {"source": "backend"}},
+    )
+
+    allow_writer = threading.Event()
+    writer_done = threading.Event()
+    writer_errors: list[BaseException] = []
+    reader_thread_id = threading.get_ident()
+    original_connect = sqlite_store._connect
+
+    @contextmanager
+    def traced_connect(*args: Any, **kwargs: Any) -> Any:
+        with original_connect(*args, **kwargs) as conn:
+            if threading.get_ident() == reader_thread_id:
+                def trace(statement: str) -> None:
+                    normalized = " ".join(statement.lower().split())
+                    if normalized.startswith(
+                        "select worker_id, payload_json, choice_routes_json"
+                    ):
+                        allow_writer.set()
+                        writer_done.wait(timeout=5)
+
+                conn.set_trace_callback(trace)
+            yield conn
+
+    def publish_new_view() -> None:
+        try:
+            assert allow_writer.wait(timeout=5)
+            save_snapshot(db_path, snapshot_b)
+            merge_backend_pending(
+                db_path,
+                config.host_id,
+                "worker-1",
+                {
+                    "question": "Backend B?",
+                    "kind": "question",
+                    "meta": {"source": "backend"},
+                },
+            )
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(sqlite_store, "_connect", traced_connect)
+    writer = threading.Thread(target=publish_new_view)
+    writer.start()
+    first = pending_payload_from_store(db_path, config.host_id)
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert first["pending_interactions"][0]["question"] == "Backend A?"
+    assert (
+        first["pending_interactions"][0]["worker_fingerprint"]
+        == snapshot_a.workers[0].fingerprint
+    )
+
+    second = pending_payload_from_store(db_path, config.host_id)
+    assert second["pending_interactions"][0]["question"] == "Backend B?"
+    assert (
+        second["pending_interactions"][0]["worker_fingerprint"]
+        == snapshot_b.workers[0].fingerprint
+    )
+    assert TendwireDaemon(config).get_pending() == second
+
+
+def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> None:
+    turn_calls: list[dict[str, Any]] = []
+    page_calls: list[dict[str, Any]] = []
+    page_text = "\n  " + ("α" * 20_000) + "  \r\n"
+
+    def get_turns(**params: Any) -> dict[str, Any]:
+        turn_calls.append(dict(params))
+        cursor = params["cursor"]
+        since = params["since"]
+        if cursor in {"invalid", "expired"}:
+            status = "invalid_cursor" if cursor == "invalid" else "cursor_expired"
+            return {
+                "schema_version": params["schema_version"],
+                "ok": False,
+                "status": status,
+                "error": {"code": status, "message": "turn list cursor is unavailable"},
+            }
+        if since == "expired":
+            return {
+                "schema_version": params["schema_version"],
+                "ok": False,
+                "status": "since_expired",
+                "error": {
+                    "code": "since_expired",
+                    "message": "turn list watermark is unavailable",
+                },
+            }
+        return {
+            "schema_version": params["schema_version"],
             "turns": [
                 {
                     "id": "turn-public",
@@ -223,7 +644,13 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
                     },
                 }
             ],
-        },
+        }
+
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {"schema_version": 1, "status": "ok"},
+        submit_command=lambda _params: {},
+        get_turns=get_turns,
         get_turn_content=lambda params: page_calls.append(dict(params))
         or {
             "schema_version": 1,
@@ -245,7 +672,16 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
         },
     )
 
-    listed = api.dispatch({"method": "turn.list", "params": {"schema_version": 2}})
+    listed = api.dispatch(
+        {
+            "method": "turn.list",
+            "params": {
+                "schema_version": 2,
+                "limit": 17,
+                "cursor": "twlist1.valid",
+            },
+        }
+    )
     page = api.dispatch(
         {
             "method": "turn.content.get",
@@ -257,11 +693,40 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             },
         }
     )
-    unsupported = api.dispatch({"method": "turn.list", "params": {"schema_version": 3}})
+    invalid_cursor = api.dispatch(
+        {"method": "turn.list", "params": {"schema_version": 2, "cursor": "invalid"}}
+    )
+    expired_cursor = api.dispatch(
+        {"method": "turn.list", "params": {"schema_version": 2, "cursor": "expired"}}
+    )
+    expired_since = api.dispatch(
+        {"method": "turn.list", "params": {"schema_version": 2, "since": "expired"}}
+    )
+    calls_before_rejections = len(turn_calls)
+    rejected = [
+        api.dispatch({"method": "turn.list", "params": {"schema_version": 3}}),
+        api.dispatch({"method": "turn.list", "params": {"limit": True}}),
+        api.dispatch({"method": "turn.list", "params": {"limit": 0}}),
+        api.dispatch({"method": "turn.list", "params": {"limit": 251}}),
+        api.dispatch({"method": "turn.list", "params": {"cursor": ""}}),
+        api.dispatch({"method": "turn.list", "params": {"since": 7}}),
+        api.dispatch(
+            {
+                "method": "turn.list",
+                "params": {"cursor": "twlist1.valid", "since": "twsince1.valid"},
+            }
+        ),
+        api.dispatch({"method": "turn.list", "params": {"private": "sentinel"}}),
+    ]
 
     assert listed["result"]["schema_version"] == 2
     assert listed["result"]["turns"][0]["assistant_final_text"] == "\n exact inline  "
-    assert turn_calls == [2]
+    assert turn_calls[0] == {
+        "schema_version": 2,
+        "limit": 17,
+        "cursor": "twlist1.valid",
+        "since": None,
+    }
     assert page["result"]["text"] == page_text
     assert page_calls == [
         {
@@ -271,8 +736,85 @@ def test_daemon_api_versions_turn_list_and_preserves_exact_content_page() -> Non
             "field": "assistant_final_text",
         }
     ]
-    assert unsupported["ok"] is False
-    assert unsupported["error"]["code"] == "unsupported_schema"
+    assert invalid_cursor["ok"] is True
+    assert invalid_cursor["result"]["status"] == "invalid_cursor"
+    assert expired_cursor["ok"] is True
+    assert expired_cursor["result"]["status"] == "cursor_expired"
+    assert expired_since["ok"] is True
+    assert expired_since["result"]["status"] == "since_expired"
+    assert len(turn_calls) == calls_before_rejections
+    assert rejected[0]["error"]["code"] == "unsupported_schema"
+    assert all(response["ok"] is False for response in rejected)
+    assert all(
+        response["error"]["code"] in {"unsupported_schema", "invalid_params"}
+        for response in rejected
+    )
+    assert "sentinel" not in json.dumps(rejected, sort_keys=True)
+
+
+def test_daemon_turn_list_is_store_projection_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "projection.db"
+    config = Config(host_id="projection-host", db_path=db_path)
+    snapshot = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    save_snapshot(db_path, snapshot)
+    source_calls = 0
+    projection_calls: list[dict[str, Any]] = []
+
+    def forbidden_source_refresh(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal source_calls
+        source_calls += 1
+        raise AssertionError("turn source read reached a cached daemon handler")
+
+    def project(
+        path: Path,
+        host_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        projection_calls.append({"path": path, "host_id": host_id, **kwargs})
+        return {
+            "schema_version": kwargs["schema_version"],
+            "host_id": host_id,
+            "ok": True,
+            "status": "ok",
+            "turns": [],
+        }
+
+    monkeypatch.setattr(
+        "tendwire.backends.herdr_turns.refresh_structured_turn_content",
+        forbidden_source_refresh,
+    )
+    monkeypatch.setattr("tendwire.store.sqlite.turns_payload_from_store", project)
+    daemon = TendwireDaemon(config)
+
+    for _ in range(3):
+        result = daemon.get_turns(
+            schema_version=2,
+            limit=17,
+            cursor="twlist1.public",
+            since=None,
+        )
+        assert result["status"] == "ok"
+
+    assert source_calls == 0
+    assert len(projection_calls) == 3
+    assert all(
+        call == {
+            "path": db_path,
+            "host_id": config.host_id,
+            "snapshot": snapshot,
+            "schema_version": 2,
+            "limit": 17,
+            "cursor": "twlist1.public",
+            "since": None,
+        }
+        for call in projection_calls
+    )
 
 
 def test_daemon_api_protocol_errors_do_not_echo_private_request_names() -> None:
@@ -731,6 +1273,11 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         max_workers=8,
         max_outbox_attempts=4,
         connector_claim_ttl_seconds=33,
+        snapshot_retention_days=9,
+        snapshot_retention_count=70,
+        snapshot_maintenance_batch_size=6,
+        store_maintenance_cadence_seconds=44,
+        pending_stale_grace_seconds=31,
     )
     snapshot = project_from_raw(
         config,
@@ -772,13 +1319,47 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
             ),
         )
 
-    health = TendwireDaemon(config).get_health()
+    class PrivateSchedulerStatus:
+        def operational_status(self) -> dict[str, Any]:
+            return {
+                "status": "healthy",
+                "queue_depth": 2,
+                "active": 1,
+                "refreshed": 7,
+                "failed": 3,
+                "timed_out": 2,
+                "coalesced": 11,
+                "queue_full": 5,
+                "last_success": "2026-01-02T00:00:00+00:00",
+                "last_duration_ms": 12.5,
+                "stale_age_seconds": 0.25,
+                "max_workers": 999,
+                "queue_capacity": 64,
+                "refresh_interval_seconds": 999,
+                "adapter_timeout_seconds": 999,
+                "private_fingerprint": "sentinel-private-fingerprint",
+                "error": f"sentinel-private failure at {tmp_path}",
+            }
+
+    daemon = TendwireDaemon(config)
+    daemon._turn_scheduler = PrivateSchedulerStatus()
+    health = daemon.get_health()
     encoded = json.dumps(health)
 
     assert health["status"] == "ok"
     assert health["daemon"]["started_at"]
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["store"]["outbox"]["pending"] == 1
+    assert health["store"]["maintenance"] == {
+        "last_completed_at": None,
+        "status": "never",
+        "snapshot_count": 1,
+        "snapshot_retention_days": 9,
+        "snapshot_retention_count": 70,
+        "maintenance_batch_size": 6,
+        "maintenance_cadence_seconds": 44,
+        "backlog": False,
+    }
     assert health["limits"] == {
         "event_debounce_seconds": 0.2,
         "reconcile_interval_seconds": 0,
@@ -787,11 +1368,110 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "max_workers": 8,
         "max_outbox_attempts": 4,
         "outbox_claim_ttl_seconds": 33,
+        "snapshot_retention_days": 9,
+        "snapshot_retention_count": 70,
+        "snapshot_maintenance_batch_size": 6,
+        "store_maintenance_cadence_seconds": 44,
+    }
+    assert health["turn_ingestion"] == {
+        "status": "healthy",
+        "queue": 2,
+        "active": 1,
+        "refreshed": 7,
+        "failed": 3,
+        "timed_out": 2,
+        "coalesced": 11,
+        "queue_full": 5,
+        "last_success": "2026-01-02T00:00:00+00:00",
+        "last_duration_ms": 12.5,
+        "stale_age": 0.25,
+        "bounds": {
+            "refresh_interval_seconds": 2.0,
+            "max_workers": 4,
+            "queue_capacity": 64,
+            "adapter_timeout_seconds": 5.0,
+        },
+    }
+    assert health["pending_ingestion"] == {
+        "status": "healthy",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+        "bounds": {"stale_grace_seconds": 31.0},
     }
     assert "health.db" not in encoded
     assert str(tmp_path) not in encoded
     assert "sentinel-private" not in encoded
     _assert_no_public_json_forbidden(health)
+
+
+def test_daemon_health_pending_aggregate_is_fail_closed_and_public_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "pending-health.db"
+    config = Config(
+        host_id="health-host",
+        db_path=db_path,
+        pending_stale_grace_seconds=19,
+    )
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+
+    def degraded_health(_db_path: Path, _host_id: str) -> dict[str, Any]:
+        return {
+            "status": "degraded",
+            "counts": {"fresh": 4, "stale": 2, "total": 6},
+            "pane_id": "sentinel-private-pane",
+            "source_path": str(tmp_path / "sentinel-private-source"),
+            "tool_id": "sentinel-private-tool",
+            "error": "sentinel-private-error",
+        }
+
+    monkeypatch.setattr(store_sqlite, "backend_pending_health", degraded_health)
+
+    health = TendwireDaemon(config).get_health()
+    encoded = json.dumps(health, sort_keys=True)
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "healthy"
+    assert health["pending_ingestion"] == {
+        "status": "degraded",
+        "counts": {"fresh": 4, "stale": 2, "total": 6},
+        "bounds": {"stale_grace_seconds": 19.0},
+    }
+    assert "sentinel-private" not in encoded
+    assert str(tmp_path) not in encoded
+    _assert_no_public_json_forbidden(health)
+    monkeypatch.setattr(
+        store_sqlite,
+        "backend_pending_health",
+        lambda *_args: {
+            "status": "healthy",
+            "counts": {"fresh": 1, "stale": 1, "total": 2},
+        },
+    )
+    fail_closed = TendwireDaemon(config).get_health()
+    assert fail_closed["pending_ingestion"] == {
+        "status": "store_unavailable",
+        "counts": {"fresh": 0, "stale": 0, "total": 0},
+        "bounds": {"stale_grace_seconds": 19.0},
+    }
+    monkeypatch.setattr(
+        store_sqlite,
+        "backend_pending_health",
+        lambda *_args: {
+            "status": "healthy",
+            "counts": {"fresh": 1, "stale": 0, "total": 1},
+        },
+    )
+    recovered = TendwireDaemon(config).get_health()
+    assert recovered["status"] == "ok"
+    assert recovered["pending_ingestion"] == {
+        "status": "healthy",
+        "counts": {"fresh": 1, "stale": 0, "total": 1},
+        "bounds": {"stale_grace_seconds": 19.0},
+    }
 
 
 _UNIX_SOCKET_TEST = pytest.mark.skipif(
@@ -838,6 +1518,145 @@ def _assert_private_daemon_failure(
         assert os.fspath(path) not in rendered
     for value in forbidden:
         assert value not in rendered
+
+
+@_UNIX_SOCKET_TEST
+def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "cli-maintenance"
+    db_path = data_dir / "daemon.db"
+    config = Config(
+        host_id="daemon-host",
+        data_dir=data_dir,
+        db_path=db_path,
+        snapshot_retention_days=21,
+        snapshot_retention_count=123,
+        snapshot_maintenance_batch_size=17,
+        store_maintenance_cadence_seconds=91,
+    )
+    calls: list[tuple[Path, Any, int]] = []
+
+    def observe(_config: Config) -> Snapshot:
+        snapshot = _public_snapshot()
+        save_snapshot(db_path, snapshot)
+        return snapshot
+
+    def maintenance(
+        path: Path,
+        *,
+        policy: Any,
+        cadence_seconds: int = 3600,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        assert now is None
+        calls.append((path, policy, cadence_seconds))
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "status": "not_due",
+            "due": False,
+            "last_completed_at": "2026-01-01T00:00:00Z",
+            "next_due_at": "2026-01-01T00:01:31Z",
+            "snapshot": {
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+            },
+            "batch_size": policy.batch_size,
+        }
+
+    monkeypatch.setattr(
+        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        maintenance,
+    )
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+    )
+    try:
+        daemon.start()
+        daemon.get_snapshot()
+        daemon.get_snapshot()
+        daemon.get_attention()
+        health = daemon.get_health()
+        daemon.get_health()
+    finally:
+        daemon.stop()
+
+    assert len(calls) == 1
+    path, policy, cadence = calls[0]
+    assert path == db_path
+    assert (
+        policy.retention_days,
+        policy.retention_count,
+        policy.batch_size,
+        cadence,
+    ) == (21, 123, 17, 91)
+    assert health["store"]["maintenance"]["last_check"] == {
+        "ok": True,
+        "status": "not_due",
+        "due": False,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+    }
+
+
+@_UNIX_SOCKET_TEST
+def test_cli_snapshot_persists_when_automatic_maintenance_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "cli-maintenance-failure"
+    db_path = data_dir / "daemon.db"
+    config = Config(host_id="daemon-host", data_dir=data_dir, db_path=db_path)
+    calls = 0
+
+    def observe(_config: Config) -> Snapshot:
+        snapshot = _public_snapshot()
+        save_snapshot(db_path, snapshot)
+        return snapshot
+
+    def maintenance_failure(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError(f"sentinel-private failure at {tmp_path}/secret.db")
+
+    monkeypatch.setattr(
+        "tendwire.store.sqlite.maybe_run_automatic_store_maintenance",
+        maintenance_failure,
+    )
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(init_store=init_store, observe_initial_snapshot=observe),
+    )
+    try:
+        daemon.start()
+        persisted = latest_snapshot(db_path, config.host_id)
+        health = daemon.get_health()
+    finally:
+        daemon.stop()
+
+    encoded = json.dumps(health, sort_keys=True)
+    assert calls == 1
+    assert persisted is not None
+    assert persisted.content_fingerprint == _public_snapshot().content_fingerprint
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "degraded"
+    assert health["store"]["maintenance"]["last_check"] == {
+        "ok": False,
+        "status": "failed",
+        "due": False,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+    }
+    assert str(tmp_path) not in encoded
+    assert "secret.db" not in encoded
+    assert "sentinel-private" not in encoded
+    _assert_no_public_json_forbidden(health)
 
 
 @_UNIX_SOCKET_TEST
@@ -1417,6 +2236,8 @@ def test_unix_socket_server_start_is_idempotent(tmp_path: Path) -> None:
     assert not os.path.lexists(socket_path)
 
 
+
+
 @_UNIX_SOCKET_TEST
 def test_concurrent_startup_cannot_unlink_socket_before_first_listener_is_ready(
     tmp_path: Path,
@@ -1569,6 +2390,95 @@ def test_client_treats_disconnect_after_request_delivery_as_uncertain_protocol(
         assert request_received.wait(timeout=1)
         assert str(caught.value) == "empty daemon response"
         _assert_private_daemon_failure(caught.value, socket_path)
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+        socket_path.unlink(missing_ok=True)
+
+    assert not thread.is_alive()
+
+
+@_UNIX_SOCKET_TEST
+def test_client_transport_phase_is_false_before_send_and_true_after_send(
+    tmp_path: Path,
+) -> None:
+    missing_socket = tmp_path / "missing.sock"
+    with pytest.raises(DaemonUnavailable) as pre_send:
+        DaemonAPIClient(missing_socket, timeout_seconds=0.1).request("ping")
+
+    assert pre_send.value.request_started is False
+
+    socket_path = tmp_path / "timeout-after-send.sock"
+    listener = _bind_unix_listener(socket_path)
+    os.chmod(socket_path, 0o600)
+    request_received = threading.Event()
+    release = threading.Event()
+
+    def hold_after_request() -> None:
+        connection, _address = listener.accept()
+        with connection:
+            _read_request_frame(connection)
+            request_received.set()
+            release.wait(timeout=2)
+
+    thread = threading.Thread(target=hold_after_request)
+    thread.start()
+    try:
+        with pytest.raises(DaemonUnavailable) as post_send:
+            DaemonAPIClient(socket_path, timeout_seconds=0.05).request("ping")
+
+        assert request_received.wait(timeout=1)
+        assert post_send.value.timed_out is True
+        assert post_send.value.request_started is True
+    finally:
+        release.set()
+        listener.close()
+        thread.join(timeout=2)
+        socket_path.unlink(missing_ok=True)
+
+    assert not thread.is_alive()
+
+
+@_UNIX_SOCKET_TEST
+@pytest.mark.parametrize(
+    ("response_frame", "max_response_bytes", "expected_message"),
+    [
+        (b"", MAX_RESPONSE_BYTES, "empty daemon response"),
+        (b"not-json\n", MAX_RESPONSE_BYTES, "invalid daemon response JSON"),
+        (b"[]\n", MAX_RESPONSE_BYTES, "daemon response must be a JSON object"),
+        (b'{"ok":true,"padding":"' + (b"x" * 128) + b'"}\n', 32, "maximum frame size"),
+    ],
+    ids=["empty", "malformed", "non-object", "oversized"],
+)
+def test_client_protocol_distrust_after_send_records_started_phase(
+    tmp_path: Path,
+    response_frame: bytes,
+    max_response_bytes: int,
+    expected_message: str,
+) -> None:
+    socket_path = tmp_path / "protocol-distrust.sock"
+    listener = _bind_unix_listener(socket_path)
+    os.chmod(socket_path, 0o600)
+
+    def serve_untrusted_response() -> None:
+        connection, _address = listener.accept()
+        with connection:
+            _read_request_frame(connection)
+            if response_frame:
+                connection.sendall(response_frame)
+
+    thread = threading.Thread(target=serve_untrusted_response)
+    thread.start()
+    try:
+        with pytest.raises(DaemonProtocolError) as caught:
+            DaemonAPIClient(
+                socket_path,
+                timeout_seconds=1,
+                max_response_bytes=max_response_bytes,
+            ).request("ping")
+
+        assert expected_message in str(caught.value)
+        assert caught.value.request_started is True
     finally:
         listener.close()
         thread.join(timeout=2)
@@ -1794,23 +2704,39 @@ def test_unix_socket_server_close_preserves_substituted_socket(tmp_path: Path) -
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_binds_socket_before_store_initialization_and_observation(
+def test_daemon_publishes_socket_after_store_observation_and_scheduler_readiness(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "ordered-cli.sock"
     calls: list[str] = []
 
-    def assert_bound(stage: str) -> None:
-        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-        _assert_unix_socket_connects(socket_path)
+    def record_unpublished(stage: str) -> None:
+        assert not os.path.lexists(socket_path)
         calls.append(stage)
 
-    def initialize_store(_db_path: Path) -> None:
-        assert_bound("init_store")
+    def initialize_store(path: Path) -> None:
+        record_unpublished("init_store")
+        init_store(path)
 
     def observe(_config: Config) -> Snapshot:
-        assert_bound("observe")
-        return _public_snapshot()
+        record_unpublished("observe")
+        snapshot = _public_snapshot()
+        save_snapshot(tmp_path / "ordered-cli.db", snapshot)
+        return snapshot
+
+    class RecordingScheduler:
+        def start(self) -> None:
+            record_unpublished("scheduler_start")
+
+        def request_refresh(self) -> None:
+            record_unpublished("scheduler_request")
+
+        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
+
+    def scheduler_factory(_config: Config) -> RecordingScheduler:
+        record_unpublished("scheduler_factory")
+        return RecordingScheduler()
 
     config = Config(
         host_id="daemon-host",
@@ -1823,52 +2749,86 @@ def test_daemon_binds_socket_before_store_initialization_and_observation(
         hooks=DaemonHooks(
             init_store=initialize_store,
             observe_initial_snapshot=observe,
+            turn_scheduler_factory=scheduler_factory,
         ),
     )
 
     try:
         daemon.start()
-        assert calls == ["init_store", "observe"]
+        assert calls == [
+            "init_store",
+            "observe",
+            "scheduler_factory",
+            "scheduler_start",
+            "scheduler_request",
+        ]
+        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
+        _assert_unix_socket_connects(socket_path)
     finally:
         daemon.stop()
 
+    assert calls[-1] == "scheduler_stop:6.0"
     assert not os.path.lexists(socket_path)
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_binds_socket_before_event_backend_factory_and_start(
+def test_daemon_event_callback_is_attached_after_reconcile_before_socket_publish(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "ordered-events.sock"
     db_path = tmp_path / "ordered-events.db"
     calls: list[str] = []
 
-    def assert_bound(stage: str) -> None:
-        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-        _assert_unix_socket_connects(socket_path)
+    def record_unpublished(stage: str) -> None:
+        assert not os.path.lexists(socket_path)
         calls.append(stage)
 
     def initialize_store(path: Path) -> None:
-        assert_bound("init_store")
+        record_unpublished("init_store")
         init_store(path)
 
     class RecordingEventBackend:
         def __init__(self) -> None:
+            self.callback: Any | None = None
             self.stopped = False
 
         def start(self, *, wait_for_reconcile: bool) -> None:
             assert wait_for_reconcile is True
-            assert_bound("backend_start")
+            record_unpublished("backend_start")
             save_snapshot(db_path, _public_snapshot())
 
+        def set_turn_refresh_callback(self, callback: Any | None) -> None:
+            self.callback = callback
+            calls.append("callback_attached" if callback is not None else "callback_detached")
+
+        def flush(self) -> None:
+            calls.append("backend_flush")
+            if self.callback is not None:
+                self.callback()
+
         def stop(self) -> None:
+            calls.append("backend_stop")
             self.stopped = True
+
+    class RecordingScheduler:
+        def start(self) -> None:
+            record_unpublished("scheduler_start")
+
+        def request_refresh(self) -> None:
+            calls.append("scheduler_request")
+
+        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
 
     backend = RecordingEventBackend()
 
     def event_backend_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        assert_bound("backend_factory")
+        record_unpublished("backend_factory")
         return backend
+
+    def scheduler_factory(_config: Config) -> RecordingScheduler:
+        record_unpublished("scheduler_factory")
+        return RecordingScheduler()
 
     config = Config(
         host_id="daemon-host",
@@ -1882,38 +2842,57 @@ def test_daemon_binds_socket_before_event_backend_factory_and_start(
         hooks=DaemonHooks(
             init_store=initialize_store,
             event_backend_factory=event_backend_factory,
+            turn_scheduler_factory=scheduler_factory,
         ),
     )
 
-    try:
-        daemon.start()
-        assert calls == ["init_store", "backend_factory", "backend_start"]
-    finally:
-        daemon.stop()
+    daemon.start()
+    assert calls == [
+        "init_store",
+        "backend_factory",
+        "backend_start",
+        "scheduler_factory",
+        "callback_attached",
+        "scheduler_start",
+        "scheduler_request",
+    ]
+    assert backend.callback is not None
+    backend.callback()
+    assert calls[-1] == "scheduler_request"
+    daemon.stop()
+    daemon.stop()
 
+    assert calls[-5:] == [
+        "backend_flush",
+        "scheduler_request",
+        "callback_detached",
+        "scheduler_stop:6.0",
+        "backend_stop",
+    ]
+    assert backend.callback is None
     assert backend.stopped is True
     assert not os.path.lexists(socket_path)
 
 
 @_UNIX_SOCKET_TEST
 @pytest.mark.parametrize("failure_stage", ["init_store", "observe"])
-def test_daemon_startup_failure_closes_prebound_socket(
+def test_daemon_startup_failure_never_publishes_socket(
     tmp_path: Path,
     failure_stage: str,
 ) -> None:
     socket_path = tmp_path / f"{failure_stage}.sock"
 
-    def assert_bound() -> None:
-        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-        _assert_unix_socket_connects(socket_path)
+    def assert_unpublished() -> None:
+        assert not os.path.lexists(socket_path)
 
-    def initialize_store(_db_path: Path) -> None:
-        assert_bound()
+    def initialize_store(path: Path) -> None:
+        assert_unpublished()
         if failure_stage == "init_store":
             raise RuntimeError("sentinel startup failure")
+        init_store(path)
 
     def observe(_config: Config) -> Snapshot:
-        assert_bound()
+        assert_unpublished()
         if failure_stage == "observe":
             raise RuntimeError("sentinel startup failure")
         return _public_snapshot()
@@ -1946,14 +2925,13 @@ def test_daemon_startup_failure_closes_prebound_socket(
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_backend_start_failure_closes_socket_and_stops_started_backend(
+def test_daemon_backend_start_failure_stops_backend_without_publishing_socket(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "backend-failure.sock"
 
-    def assert_bound() -> None:
-        assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
-        _assert_unix_socket_connects(socket_path)
+    def assert_unpublished() -> None:
+        assert not os.path.lexists(socket_path)
 
     class FailingEventBackend:
         def __init__(self) -> None:
@@ -1962,7 +2940,7 @@ def test_daemon_backend_start_failure_closes_socket_and_stops_started_backend(
 
         def start(self, *, wait_for_reconcile: bool) -> None:
             assert wait_for_reconcile is True
-            assert_bound()
+            assert_unpublished()
             self.started = True
             raise RuntimeError("sentinel backend startup failure")
 
@@ -1971,8 +2949,12 @@ def test_daemon_backend_start_failure_closes_socket_and_stops_started_backend(
 
     backend = FailingEventBackend()
 
+    def initialize_store(path: Path) -> None:
+        assert_unpublished()
+        init_store(path)
+
     def event_backend_factory(_config: Config, _stop_event: threading.Event) -> Any:
-        assert_bound()
+        assert_unpublished()
         return backend
 
     config = Config(
@@ -1985,7 +2967,7 @@ def test_daemon_backend_start_failure_closes_socket_and_stops_started_backend(
     daemon = TendwireDaemon(
         config,
         hooks=DaemonHooks(
-            init_store=lambda _path: assert_bound(),
+            init_store=initialize_store,
             event_backend_factory=event_backend_factory,
         ),
     )
@@ -1994,12 +2976,80 @@ def test_daemon_backend_start_failure_closes_socket_and_stops_started_backend(
         with pytest.raises(RuntimeError, match="sentinel backend startup failure") as caught:
             daemon.start()
 
-        _assert_private_daemon_failure(caught.value, socket_path)
         assert backend.started is True
         assert backend.stopped is True
+        _assert_private_daemon_failure(caught.value, socket_path)
+        assert daemon.server is None
         assert not os.path.lexists(socket_path)
     finally:
         daemon.stop()
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_scheduler_start_failure_detaches_callback_and_cleans_components(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "scheduler-failure.sock"
+    db_path = tmp_path / "scheduler-failure.db"
+    calls: list[str] = []
+
+    class Backend:
+        callback: Any | None = None
+
+        def start(self, *, wait_for_reconcile: bool) -> None:
+            calls.append("backend_start")
+            save_snapshot(db_path, _public_snapshot())
+
+        def set_turn_refresh_callback(self, callback: Any | None) -> None:
+            self.callback = callback
+            calls.append("callback_set" if callback is not None else "callback_clear")
+
+        def stop(self) -> None:
+            calls.append("backend_stop")
+
+    class FailingScheduler:
+        def request_refresh(self) -> None:
+            calls.append("scheduler_request")
+
+        def start(self) -> None:
+            calls.append("scheduler_start")
+            raise RuntimeError("sentinel scheduler startup failure")
+
+        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            calls.append(f"scheduler_stop:{flush_timeout_seconds}")
+
+    backend = Backend()
+    scheduler = FailingScheduler()
+    config = Config(
+        host_id="daemon-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+        herdr_backend="socket",
+    )
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(
+            event_backend_factory=lambda _config, _stop_event: backend,
+            turn_scheduler_factory=lambda _config: scheduler,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sentinel scheduler startup failure"):
+        daemon.start()
+
+    assert calls == [
+        "backend_start",
+        "callback_set",
+        "scheduler_start",
+        "callback_clear",
+        "scheduler_stop:6.0",
+        "backend_stop",
+    ]
+    assert backend.callback is None
+    assert daemon.server is None
+    assert daemon._turn_scheduler is None
+    assert not os.path.lexists(socket_path)
 
 
 def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Path) -> None:
@@ -2048,6 +3098,278 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
 
     assert not thread.is_alive()
     assert not socket_path.exists()
+
+
+@_UNIX_SOCKET_TEST
+def test_blocked_turn_ingestion_does_not_delay_cached_real_socket_handlers(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "blocked-ingestion.db"
+    socket_path = tmp_path / "blocked-ingestion.sock"
+    entered = threading.Event()
+    release = threading.Event()
+    source_calls: list[str] = []
+    worker = Worker(id="worker-1", name="Worker One", status="active")
+    binding = WorkerBinding(
+        host_id="daemon-host",
+        worker_id=worker.id,
+        worker_fingerprint=worker.fingerprint,
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="sentinel-private-agent",
+        turn_target_kind="pane_id",
+        turn_target_value="sentinel-private-pane",
+        sendable=True,
+        reason=None,
+        observed_at="2026-01-01T00:00:00+00:00",
+        private_fingerprint="sentinel-private-binding",
+    )
+    config = Config(
+        host_id="daemon-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+        herdr_timeout_seconds=1,
+        turn_refresh_interval_seconds=3600,
+        turn_refresh_workers=1,
+    )
+
+    def observe(_config: Config) -> Snapshot:
+        snapshot = Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:00:00+00:00",
+            workers=[worker],
+            backend_health=[
+                BackendHealth(
+                    name="herdr",
+                    status="healthy",
+                    outcome="healthy_non_empty",
+                    observed_at="2026-01-01T00:00:00+00:00",
+                )
+            ],
+        )
+        save_snapshot(db_path, snapshot)
+        upsert_worker_bindings(db_path, [binding])
+        return snapshot
+
+    def blocked_reader(
+        _config: Config,
+        current: WorkerBinding,
+        *,
+        adapter_timeout_seconds: float,
+    ) -> TurnRefreshResult:
+        source_calls.append(current.private_fingerprint)
+        entered.set()
+        assert release.wait(timeout=10)
+        return TurnRefreshResult("unchanged", 0)
+
+    scheduler: TurnIngestionScheduler | None = None
+
+    def scheduler_factory(current: Config) -> TurnIngestionScheduler:
+        nonlocal scheduler
+        scheduler = TurnIngestionScheduler(
+            current,
+            refresh_interval_seconds=3600,
+            max_workers=1,
+            reader=blocked_reader,
+        )
+        return scheduler
+
+    command_calls: list[str] = []
+
+    def submit_command(_config: Config, payload: str) -> dict[str, Any]:
+        command_calls.append(payload)
+        return {
+            "schema_version": 1,
+            "action": "noop",
+            "request_id": None,
+            "ok": True,
+            "dry_run": True,
+            "status": "accepted",
+            "result": {"accepted": True},
+            "error": None,
+            "warnings": [],
+        }
+
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(
+            observe_initial_snapshot=observe,
+            submit_command=submit_command,
+            turn_scheduler_factory=scheduler_factory,
+        ),
+    )
+    server_thread: threading.Thread | None = None
+    try:
+        daemon.start()
+        server_thread = threading.Thread(target=daemon.serve_forever)
+        server_thread.start()
+        assert entered.wait(timeout=10)
+        client = DaemonAPIClient(socket_path, timeout_seconds=1)
+
+        for _ in range(3):
+            listed = client.request(
+                "turn.list",
+                {"schema_version": 2, "limit": 10, "cursor": None, "since": None},
+            )
+            health = client.request("health.get")
+            snapshot = client.request("snapshot.get")
+            pending = client.request("pending.list")
+            assert listed["ok"] is True
+            assert health["result"]["turn_ingestion"]["active"] == 1
+            assert snapshot["result"]["host_id"] == config.host_id
+            assert pending["ok"] is True
+
+        command = client.request(
+            "command.submit",
+            {"schema_version": 1, "action": "noop", "dry_run": True},
+        )
+        assert command["ok"] is True
+        assert command["result"]["status"] == "accepted"
+        assert source_calls == ["sentinel-private-binding"]
+        assert len(command_calls) == 1
+    finally:
+        release.set()
+        daemon.stop()
+        if server_thread is not None:
+            server_thread.join(timeout=2)
+
+    assert scheduler is not None
+    assert server_thread is not None and not server_thread.is_alive()
+    assert not os.path.lexists(socket_path)
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_restart_scans_durable_bindings_without_touching_final_or_outbox(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "restart.db"
+    socket_path = tmp_path / "restart.sock"
+    config = Config(
+        host_id="restart-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+    )
+    init_store(db_path)
+    worker = Worker(id="worker-1", name="Worker One", status="idle")
+    snapshot = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[worker],
+    )
+    save_snapshot(db_path, snapshot)
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="sentinel-private-agent",
+                turn_target_kind="pane_id",
+                turn_target_value="sentinel-private-pane",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                private_fingerprint="sentinel-private-binding",
+            )
+        ],
+    )
+    assert merge_turn_content(
+        db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "source-turn-1",
+            "assistant_final_text": "durable final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    ) == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, status, payload_json,
+                private_state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                config.host_id,
+                "attention",
+                "durable-delivery",
+                "queued",
+                '{"safe":"kept"}',
+                '{"opaque":"kept"}',
+                "2026-01-01T00:02:00+00:00",
+                "2026-01-01T00:02:00+00:00",
+            ),
+        )
+        before_turns = conn.execute(
+            "SELECT * FROM turns WHERE host_id = ? ORDER BY turn_id",
+            (config.host_id,),
+        ).fetchall()
+        before_outbox = conn.execute(
+            "SELECT * FROM connector_outbox WHERE host_id = ? ORDER BY id",
+            (config.host_id,),
+        ).fetchall()
+
+    scheduler_calls: list[tuple[str, int]] = []
+
+    class DurableScanScheduler:
+        def start(self) -> None:
+            scheduler_calls.append(("start", 0))
+
+        def request_refresh(self) -> None:
+            with sqlite3.connect(str(db_path)) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM worker_bindings WHERE host_id = ?",
+                    (config.host_id,),
+                ).fetchone()[0]
+            scheduler_calls.append(("request", int(count)))
+
+        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            scheduler_calls.append(("stop", int(flush_timeout_seconds or 0)))
+
+    for _ in range(2):
+        daemon = TendwireDaemon(
+            config,
+            hooks=DaemonHooks(
+                observe_initial_snapshot=lambda _config: latest_snapshot(
+                    db_path,
+                    config.host_id,
+                ),
+                turn_scheduler_factory=lambda _config: DurableScanScheduler(),
+            ),
+        )
+        daemon.start()
+        daemon.stop()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        after_turns = conn.execute(
+            "SELECT * FROM turns WHERE host_id = ? ORDER BY turn_id",
+            (config.host_id,),
+        ).fetchall()
+        after_outbox = conn.execute(
+            "SELECT * FROM connector_outbox WHERE host_id = ? ORDER BY id",
+            (config.host_id,),
+        ).fetchall()
+
+    assert scheduler_calls == [
+        ("start", 0),
+        ("request", 1),
+        ("stop", 6),
+        ("start", 0),
+        ("request", 1),
+        ("stop", 6),
+    ]
+    assert after_turns == before_turns
+    assert after_outbox == before_outbox
+    assert not os.path.lexists(socket_path)
 
 
 def test_daemon_server_survives_client_disconnect_during_response(tmp_path: Path) -> None:
@@ -2137,6 +3459,339 @@ def test_daemon_bounds_oversized_response_and_keeps_serving(tmp_path: Path) -> N
         thread.join(timeout=2)
 
     assert not thread.is_alive()
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_request_executor_enforces_worker_and_admission_bounds_and_recovers(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "bounded-concurrency.sock"
+    release = threading.Event()
+    eight_running = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+    dispatched = 0
+
+    def dispatch(request: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, maximum_active, dispatched
+        if request.get("method") != "block":
+            return {"ok": True, "result": {"pong": True}}
+        with state_lock:
+            active += 1
+            dispatched += 1
+            maximum_active = max(maximum_active, active)
+            if active == 8:
+                eight_running.set()
+        try:
+            assert release.wait(timeout=10)
+            return {"ok": True, "result": {"accepted": True}}
+        finally:
+            with state_lock:
+                active -= 1
+
+    server = UnixSocketJSONServer(
+        socket_path,
+        dispatch,
+        accept_timeout_seconds=0.01,
+        client_timeout_seconds=10,
+    )
+    server_thread = threading.Thread(target=server.serve_forever)
+    baseline_executor_threads = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("tendwire-daemon-api")
+    }
+    server_thread.start()
+    results: list[dict[str, Any]] = []
+    failures: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def request_block() -> None:
+        try:
+            response = DaemonAPIClient(
+                socket_path,
+                timeout_seconds=10,
+            ).request("block")
+            with result_lock:
+                results.append(response)
+        except BaseException as exc:  # noqa: BLE001
+            with result_lock:
+                failures.append(exc)
+
+    admitted_clients = [threading.Thread(target=request_block) for _index in range(32)]
+    overflow_clients = [threading.Thread(target=request_block) for _index in range(8)]
+    clients = admitted_clients + overflow_clients
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert server.listening is True
+        for client in admitted_clients:
+            client.start()
+        assert eight_running.wait(timeout=3)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with server._tracking_lock:
+                admitted = len(server._futures)
+            if admitted == 32:
+                break
+            time.sleep(0.005)
+        assert admitted == 32
+        for client in overflow_clients:
+            client.start()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with result_lock:
+                busy_count = sum(
+                    result.get("error", {}).get("code") == "server_busy"
+                    for result in results
+                    if isinstance(result.get("error"), dict)
+                )
+            if busy_count == 8:
+                break
+            time.sleep(0.005)
+
+        assert busy_count == 8
+        with state_lock:
+            assert active == 8
+            assert maximum_active == 8
+        busy_results = [
+            result
+            for result in results
+            if isinstance(result.get("error"), dict)
+            and result["error"].get("code") == "server_busy"
+        ]
+        assert all(
+            result
+            == {
+                "schema_version": 1,
+                "ok": False,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "code": "server_busy",
+                    "message": "daemon request capacity is full",
+                    "details": {"retryable": True},
+                },
+            }
+            for result in busy_results
+        )
+        for result in busy_results:
+            _assert_no_public_json_forbidden(result)
+
+        release.set()
+        for client in clients:
+            client.join(timeout=10)
+        assert all(not client.is_alive() for client in clients)
+        assert failures == []
+        successful = [result for result in results if result.get("ok") is True]
+        assert len(successful) == 32
+        assert len(busy_results) == 8
+        with state_lock:
+            assert dispatched == 32
+            assert maximum_active == 8
+
+        recovered = DaemonAPIClient(socket_path, timeout_seconds=1).request("ping")
+        assert recovered == {"ok": True, "result": {"pong": True}}
+    finally:
+        release.set()
+        server.close()
+        server_thread.join(timeout=2)
+        for client in clients:
+            client.join(timeout=2)
+
+    assert not server_thread.is_alive()
+    assert not os.path.lexists(socket_path)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        remaining = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.startswith("tendwire-daemon-api")
+        } - baseline_executor_threads
+        if not remaining:
+            break
+        time.sleep(0.005)
+    assert remaining == set()
+
+
+@_UNIX_SOCKET_TEST
+def test_blocked_handler_does_not_block_health_or_command_requests(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "independent-workers.sock"
+    blocked = threading.Event()
+    release = threading.Event()
+
+    def dispatch(request: dict[str, Any]) -> dict[str, Any]:
+        method = request.get("method")
+        if method == "blocked.adapter":
+            blocked.set()
+            assert release.wait(timeout=3)
+            return {"ok": True, "result": {"released": True}}
+        if method == "health.get":
+            return {"ok": True, "result": {"status": "ok"}}
+        if method == "command.submit":
+            return {"ok": True, "result": {"status": "accepted"}}
+        return {"ok": True, "result": {}}
+
+    server = UnixSocketJSONServer(
+        socket_path,
+        dispatch,
+        accept_timeout_seconds=0.01,
+        client_timeout_seconds=3,
+    )
+    server_thread = threading.Thread(target=server.serve_forever)
+    blocked_result: list[dict[str, Any]] = []
+    blocked_client = threading.Thread(
+        target=lambda: blocked_result.append(
+            DaemonAPIClient(socket_path, timeout_seconds=3).request(
+                "blocked.adapter"
+            )
+        )
+    )
+    server_thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.005)
+        blocked_client.start()
+        assert blocked.wait(timeout=2)
+
+        health = DaemonAPIClient(socket_path, timeout_seconds=0.5).request(
+            "health.get"
+        )
+        command = DaemonAPIClient(socket_path, timeout_seconds=0.5).request(
+            "command.submit"
+        )
+
+        assert health == {"ok": True, "result": {"status": "ok"}}
+        assert command == {"ok": True, "result": {"status": "accepted"}}
+        assert blocked_client.is_alive()
+    finally:
+        release.set()
+        blocked_client.join(timeout=2)
+        server.close()
+        server_thread.join(timeout=2)
+
+    assert blocked_result == [{"ok": True, "result": {"released": True}}]
+    assert not blocked_client.is_alive()
+    assert not server_thread.is_alive()
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_shutdown_is_bounded_closes_active_socket_and_reaps_executor(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "bounded-shutdown.sock"
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+
+    def dispatch(_request: dict[str, Any]) -> dict[str, Any]:
+        handler_started.set()
+        release_handler.wait()
+        return {"ok": True, "result": {"released": True}}
+
+    server = UnixSocketJSONServer(
+        socket_path,
+        dispatch,
+        accept_timeout_seconds=0.01,
+        client_timeout_seconds=3,
+        request_workers=1,
+        max_in_flight_requests=2,
+        shutdown_grace_seconds=0.05,
+    )
+    baseline_executor_threads = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("tendwire-daemon-api")
+    }
+    server_thread = threading.Thread(target=server.serve_forever)
+    first_outcome: list[BaseException | dict[str, Any]] = []
+    second_outcome: list[BaseException | dict[str, Any]] = []
+
+    def request_into(target: list[BaseException | dict[str, Any]]) -> None:
+        try:
+            target.append(
+                DaemonAPIClient(socket_path, timeout_seconds=3).request("blocked")
+            )
+        except BaseException as exc:  # noqa: BLE001
+            target.append(exc)
+
+    first_client = threading.Thread(target=request_into, args=(first_outcome,))
+    second_client = threading.Thread(target=request_into, args=(second_outcome,))
+    server_thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while not server.listening and time.monotonic() < deadline:
+            time.sleep(0.005)
+        first_client.start()
+        assert handler_started.wait(timeout=2)
+        second_client.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with server._tracking_lock:
+                admitted = len(server._futures)
+            if admitted == 2:
+                break
+            time.sleep(0.005)
+        assert admitted == 2
+
+        started_at = time.monotonic()
+        server.close()
+        close_duration = time.monotonic() - started_at
+
+        assert close_duration < 0.5
+        blocked_workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("tendwire-daemon-api")
+            and thread.ident not in baseline_executor_threads
+        ]
+        assert blocked_workers
+        assert all(thread.daemon for thread in blocked_workers)
+        second_client.join(timeout=2)
+        assert second_outcome == [
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "code": "daemon_stopping",
+                    "message": "daemon is stopping",
+                    "details": {"retryable": True},
+                },
+            }
+        ]
+        _assert_no_public_json_forbidden(second_outcome[0])
+    finally:
+        release_handler.set()
+        first_client.join(timeout=2)
+        second_client.join(timeout=2)
+        server.close()
+        server_thread.join(timeout=2)
+
+    assert len(first_outcome) == 1
+    assert isinstance(first_outcome[0], DaemonProtocolError)
+    assert first_outcome[0].request_started is True
+    assert not first_client.is_alive()
+    assert not second_client.is_alive()
+    assert not server_thread.is_alive()
+    assert not os.path.lexists(socket_path)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        remaining = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.startswith("tendwire-daemon-api")
+        } - baseline_executor_threads
+        if not remaining:
+            break
+        time.sleep(0.005)
+    assert remaining == set()
 
 
 def test_daemon_command_submit_uses_existing_receipt_idempotency(
@@ -2752,6 +4407,7 @@ def test_socket_client_rejects_leaf_replacement_after_anchored_connect(
             ).request("ping")
 
         assert caught.value.code is LocalStateErrorCode.ENTRY_CHANGED
+        assert caught.value.request_started is False
         _assert_private_daemon_failure(caught.value, socket_path)
         assert replacement_listener is not None
         assert replacement_identity is not None
@@ -2878,3 +4534,316 @@ def test_socket_startup_lock_retries_interrupted_nonblocking_flock(
         server.close()
 
     assert not os.path.lexists(socket_path)
+
+
+@_UNIX_SOCKET_TEST
+def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "private-daemon-race.db"
+    socket_path = tmp_path / "private-daemon-race.sock"
+    config = Config(
+        host_id="daemon-race-host",
+        data_dir=tmp_path,
+        db_path=db_path,
+        socket_path=socket_path,
+        turn_refresh_interval_seconds=3600,
+    )
+    worker = Worker(id="worker-race", name="Worker Race", status="active")
+    snapshot = Snapshot(
+        host_id=config.host_id,
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[worker],
+        backend_health=[
+            BackendHealth(
+                name="herdr",
+                status="healthy",
+                outcome="healthy_non_empty",
+                observed_at="2026-01-01T00:00:00+00:00",
+            )
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    upsert_worker_bindings(
+        db_path,
+        [
+            WorkerBinding(
+                host_id=config.host_id,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                backend="herdr",
+                target_kind="agent_id",
+                target_value="private-race-agent",
+                turn_target_kind="pane_id",
+                turn_target_value="private-race-pane",
+                sendable=True,
+                reason=None,
+                observed_at="2026-01-01T00:00:00+00:00",
+                private_fingerprint="private-race-binding",
+            )
+        ],
+    )
+    assert merge_turn_content(
+        db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "source-turn-race",
+            "assistant_final_text": "durable race final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    ) == 1
+    setup_connection = sqlite3.connect(str(db_path))
+    try:
+        assert setup_connection.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0] == "wal"
+        setup_connection.execute(
+            "CREATE TABLE IF NOT EXISTS daemon_race_churn "
+            "(cycle INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        setup_connection.commit()
+        assert setup_connection.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()[0] == 0
+    finally:
+        setup_connection.close()
+
+    cycle_count = 4
+    wal_path = Path(f"{db_path}-wal")
+    shm_path = Path(f"{db_path}-shm")
+    ready = threading.Barrier(2, timeout=10)
+    captured = threading.Barrier(2, timeout=10)
+    retired = threading.Barrier(2, timeout=10)
+    consumed = threading.Barrier(2, timeout=10)
+    race_enabled = threading.Event()
+    phase_calls: list[tuple[str, LocalStateKind]] = []
+    writer_errors: list[BaseException] = []
+
+    def phase_hook(phase: str, kind: LocalStateKind) -> None:
+        if (
+            phase == "captured"
+            and kind is LocalStateKind.DATABASE_WAL
+            and race_enabled.is_set()
+        ):
+            race_enabled.clear()
+            phase_calls.append((phase, kind))
+            captured.wait()
+            retired.wait()
+
+    monkeypatch.setattr(
+        "tendwire.local_state._sqlite_family_test_phase",
+        phase_hook,
+    )
+
+    def churn_wal() -> None:
+        try:
+            for cycle in range(cycle_count):
+                connection = sqlite3.connect(str(db_path), timeout=5)
+                try:
+                    assert connection.execute(
+                        "PRAGMA journal_mode=WAL"
+                    ).fetchone()[0] == "wal"
+                    connection.execute(
+                        "INSERT INTO daemon_race_churn (cycle, value) VALUES (?, ?)",
+                        (cycle, f"value-{cycle}"),
+                    )
+                    connection.commit()
+                    if not os.path.lexists(wal_path):
+                        raise AssertionError("WAL was not live before capture")
+                    ready.wait()
+                    captured.wait()
+                    assert connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()[0] == 0
+                finally:
+                    connection.close()
+                wal_path.unlink(missing_ok=True)
+                shm_path.unlink(missing_ok=True)
+                assert not os.path.lexists(wal_path)
+                assert not os.path.lexists(shm_path)
+                retired.wait()
+                consumed.wait()
+        except BaseException as exc:  # noqa: BLE001
+            writer_errors.append(exc)
+            for barrier in (ready, captured, retired, consumed):
+                try:
+                    barrier.abort()
+                except threading.BrokenBarrierError:
+                    pass
+
+    scheduler_calls: list[str] = []
+
+    class NoopScheduler:
+        def start(self) -> None:
+            scheduler_calls.append("start")
+
+        def request_refresh(self) -> None:
+            scheduler_calls.append("request")
+
+        def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            del flush_timeout_seconds
+            scheduler_calls.append("stop")
+
+        def operational_status(self) -> dict[str, Any]:
+            return {
+                "status": "healthy",
+                "queue_depth": 0,
+                "active": 0,
+                "queue_capacity": 1,
+            }
+
+    def direct_child_processes() -> set[int]:
+        children: set[int] = set()
+        for task in (Path("/proc/self/task")).iterdir():
+            try:
+                values = (task / "children").read_text(encoding="ascii").split()
+            except FileNotFoundError:
+                continue
+            children.update(int(value) for value in values)
+        return children
+
+    def fd_targets() -> dict[str, tuple[str, int, int, int]]:
+        targets: dict[str, tuple[str, int, int, int]] = {}
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+                fd_stat = os.fstat(int(fd))
+            except (FileNotFoundError, OSError):
+                continue
+            targets[fd] = (
+                target,
+                int(fd_stat.st_dev),
+                int(fd_stat.st_ino),
+                stat.S_IFMT(fd_stat.st_mode),
+            )
+        return targets
+
+    baseline_fds = fd_targets()
+    baseline_threads = {id(thread) for thread in threading.enumerate()}
+    baseline_children = direct_child_processes()
+    main_identity = (db_path.stat().st_dev, db_path.stat().st_ino)
+    daemon = TendwireDaemon(
+        config,
+        hooks=DaemonHooks(
+            observe_initial_snapshot=lambda _config: latest_snapshot(
+                db_path,
+                config.host_id,
+            ),
+            turn_scheduler_factory=lambda _config: NoopScheduler(),
+        ),
+    )
+    server_thread: threading.Thread | None = None
+    writer_thread = threading.Thread(target=churn_wal)
+    writer_started = False
+    requests_completed = False
+    responses: list[dict[str, Any]] = []
+    try:
+        daemon.start()
+        assert daemon.server is not None
+        api = daemon.server.dispatcher.__self__
+        assert isinstance(api, TendwireDaemonAPI)
+        for callback_name, method_name in (
+            ("_get_snapshot", "get_snapshot"),
+            ("_get_turns", "get_turns"),
+            ("_get_health", "get_health"),
+            ("_get_pending", "get_pending"),
+        ):
+            callback = getattr(api, callback_name)
+            assert callback.__self__ is daemon
+            assert callback.__func__ is getattr(TendwireDaemon, method_name)
+        server_thread = threading.Thread(target=daemon.serve_forever)
+        server_thread.start()
+        writer_thread.start()
+        writer_started = True
+        client = DaemonAPIClient(socket_path, timeout_seconds=5)
+        for _cycle in range(cycle_count):
+            ready.wait()
+            race_enabled.set()
+            snapshot_response = client.request("snapshot.get")
+            turn_response = client.request(
+                "turn.list",
+                {
+                    "schema_version": 2,
+                    "limit": 10,
+                    "cursor": None,
+                    "since": None,
+                },
+            )
+            health_response = client.request("health.get")
+            responses.extend(
+                (snapshot_response, turn_response, health_response)
+            )
+            assert snapshot_response["ok"] is True, (
+                snapshot_response,
+                writer_errors,
+            )
+            assert snapshot_response["result"]["host_id"] == config.host_id
+            assert turn_response["ok"] is True, turn_response
+            assert turn_response["result"]["schema_version"] == 2
+            assert any(
+                turn.get("assistant_final_text") == "durable race final"
+                for turn in turn_response["result"]["turns"]
+            )
+            assert health_response["ok"] is True, health_response
+            assert health_response["result"]["status"] == "ok"
+            assert health_response["result"]["store"]["status"] == "healthy"
+            consumed.wait()
+        requests_completed = True
+    finally:
+        race_enabled.clear()
+        if not requests_completed:
+            for barrier in (ready, captured, retired, consumed):
+                try:
+                    barrier.abort()
+                except threading.BrokenBarrierError:
+                    pass
+        daemon.stop()
+        if writer_started:
+            writer_thread.join(timeout=10)
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert not writer_thread.is_alive()
+    assert server_thread is not None and not server_thread.is_alive()
+    assert writer_errors == []
+    assert phase_calls == [
+        ("captured", LocalStateKind.DATABASE_WAL)
+    ] * cycle_count
+    assert scheduler_calls == ["start", "request", "stop"]
+    assert len(responses) == cycle_count * 3
+    assert (db_path.stat().st_dev, db_path.stat().st_ino) == main_identity
+    assert not os.path.lexists(socket_path)
+    current_fds = fd_targets()
+    changed_fds = {
+        fd: (baseline_fds.get(fd), current_fds.get(fd))
+        for fd in set(baseline_fds) | set(current_fds)
+        if baseline_fds.get(fd) != current_fds.get(fd)
+    }
+    assert current_fds == baseline_fds, changed_fds
+    assert {id(thread) for thread in threading.enumerate()} == baseline_threads
+    assert direct_child_processes() == baseline_children
+    for response in responses:
+        _assert_no_public_json_forbidden(response)
+        serialized = json.dumps(response, sort_keys=True)
+        for private_value in (
+            str(tmp_path),
+            str(db_path),
+            db_path.name,
+            str(socket_path),
+            socket_path.name,
+            "private-race-agent",
+            "private-race-pane",
+            "private-race-binding",
+            "-wal",
+            "-shm",
+            "-journal",
+            '"uid"',
+            '"gid"',
+            '"inode"',
+        ):
+            assert private_value not in serialized

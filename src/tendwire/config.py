@@ -7,6 +7,7 @@ No external config-file parser is required.
 from __future__ import annotations
 
 import os
+import math
 import platform
 import socket
 from dataclasses import dataclass, field
@@ -18,8 +19,16 @@ DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
 DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
+DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
+DEFAULT_TURN_REFRESH_WORKERS = 4
+DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
+DEFAULT_SNAPSHOT_RETENTION_DAYS = 14
+DEFAULT_SNAPSHOT_RETENTION_COUNT = 4096
+DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 100
+DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS = 3600
+MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -38,8 +47,15 @@ class Config:
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
     output_excerpt_chars: int = DEFAULT_OUTPUT_EXCERPT_CHARS
     max_workers: int = DEFAULT_MAX_WORKERS
+    turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
+    turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
+    pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
+    snapshot_retention_days: int = DEFAULT_SNAPSHOT_RETENTION_DAYS
+    snapshot_retention_count: int = DEFAULT_SNAPSHOT_RETENTION_COUNT
+    snapshot_maintenance_batch_size: int = DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE
+    store_maintenance_cadence_seconds: int = DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS
     socket_group: str | None = None
 
     def __post_init__(self) -> None:
@@ -93,6 +109,33 @@ class Config:
         )
         object.__setattr__(
             self,
+            "turn_refresh_interval_seconds",
+            _positive_finite_float(
+                self.turn_refresh_interval_seconds,
+                "turn_refresh_interval_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "turn_refresh_workers",
+            _bounded_positive_int(
+                self.turn_refresh_workers,
+                "turn_refresh_workers",
+                maximum=32,
+            ),
+        )
+        if self.turn_refresh_workers > self.max_workers:
+            raise ValueError("turn_refresh_workers must be <= max_workers")
+        object.__setattr__(
+            self,
+            "pending_stale_grace_seconds",
+            _positive_finite_float(
+                self.pending_stale_grace_seconds,
+                "pending_stale_grace_seconds",
+            ),
+        )
+        object.__setattr__(
+            self,
             "max_outbox_attempts",
             _positive_int(self.max_outbox_attempts, "max_outbox_attempts", minimum=1),
         )
@@ -103,6 +146,39 @@ class Config:
                 self.connector_claim_ttl_seconds,
                 "connector_claim_ttl_seconds",
                 minimum=1,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "snapshot_retention_days",
+            _bounded_positive_int(
+                self.snapshot_retention_days,
+                "snapshot_retention_days",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "snapshot_retention_count",
+            _bounded_positive_int(
+                self.snapshot_retention_count,
+                "snapshot_retention_count",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "snapshot_maintenance_batch_size",
+            _bounded_positive_int(
+                self.snapshot_maintenance_batch_size,
+                "snapshot_maintenance_batch_size",
+                maximum=MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "store_maintenance_cadence_seconds",
+            _bounded_positive_int(
+                self.store_maintenance_cadence_seconds,
+                "store_maintenance_cadence_seconds",
             ),
         )
 
@@ -132,6 +208,16 @@ def _non_negative_float(value: float | str, name: str) -> float:
     return parsed
 
 
+def _positive_finite_float(value: float | str, name: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return parsed
+
+
 def _positive_int(value: int | str, name: str, *, minimum: int = 1) -> int:
     try:
         parsed = int(value)
@@ -139,6 +225,25 @@ def _positive_int(value: int | str, name: str, *, minimum: int = 1) -> int:
         raise ValueError(f"{name} must be an integer >= {minimum}") from exc
     if parsed < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
+    return parsed
+
+
+def _bounded_positive_int(
+    value: int | str,
+    name: str,
+    *,
+    maximum: int | None = None,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"{name} must be an integer >= 1")
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer >= 1") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be >= 1")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
     return parsed
 
 
@@ -166,8 +271,15 @@ def load_config(
     event_retention_days: int | str | None = None,
     output_excerpt_chars: int | str | None = None,
     max_workers: int | str | None = None,
+    turn_refresh_interval_seconds: float | str | None = None,
+    turn_refresh_workers: int | str | None = None,
+    pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
+    snapshot_retention_days: int | str | None = None,
+    snapshot_retention_count: int | str | None = None,
+    snapshot_maintenance_batch_size: int | str | None = None,
+    store_maintenance_cadence_seconds: int | str | None = None,
 ) -> Config:
     """Build a Config from explicit args, then environment, then defaults."""
     env_host_id = os.environ.get("TENDWIRE_HOST_ID")
@@ -257,6 +369,21 @@ def load_config(
             "TENDWIRE_MAX_WORKERS",
             DEFAULT_MAX_WORKERS,
         ),
+        turn_refresh_interval_seconds=_resolve_value(
+            turn_refresh_interval_seconds,
+            "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
+        ),
+        turn_refresh_workers=_resolve_value(
+            turn_refresh_workers,
+            "TENDWIRE_TURN_REFRESH_WORKERS",
+            DEFAULT_TURN_REFRESH_WORKERS,
+        ),
+        pending_stale_grace_seconds=_resolve_value(
+            pending_stale_grace_seconds,
+            "TENDWIRE_PENDING_STALE_GRACE_SECONDS",
+            DEFAULT_PENDING_STALE_GRACE_SECONDS,
+        ),
         max_outbox_attempts=_resolve_value(
             max_outbox_attempts,
             "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
@@ -266,6 +393,26 @@ def load_config(
             connector_claim_ttl_seconds,
             "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
             DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
+        ),
+        snapshot_retention_days=_resolve_value(
+            snapshot_retention_days,
+            "TENDWIRE_SNAPSHOT_RETENTION_DAYS",
+            DEFAULT_SNAPSHOT_RETENTION_DAYS,
+        ),
+        snapshot_retention_count=_resolve_value(
+            snapshot_retention_count,
+            "TENDWIRE_SNAPSHOT_RETENTION_COUNT",
+            DEFAULT_SNAPSHOT_RETENTION_COUNT,
+        ),
+        snapshot_maintenance_batch_size=_resolve_value(
+            snapshot_maintenance_batch_size,
+            "TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE",
+            DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE,
+        ),
+        store_maintenance_cadence_seconds=_resolve_value(
+            store_maintenance_cadence_seconds,
+            "TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS",
+            DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS,
         ),
         socket_group=resolved_socket_group,
     )
