@@ -1319,7 +1319,9 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "revision_rows_unchanged": final_revisions == initial_revisions,
             "no_duplicate_revisions": final_revisions.get("duplicate_groups") == 0,
             "outbox_rows_unchanged": final_outbox == initial_outbox,
-            "single_outbox_row_preserved": len(final_outbox) == 1,
+            "expected_outbox_rows_preserved": (
+                len(final_outbox) == args.blocked_workers + 1
+            ),
             "expected_command_calls": command_calls == args.warmups + args.samples,
             "list_budget_met": bool(latency["turn_list"]["documented_host_budget_met"]),
             "pending_list_budget_met": bool(

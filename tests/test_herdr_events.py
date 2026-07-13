@@ -41,7 +41,7 @@ from tendwire.backends.herdr_protocol import (
     build_events_subscribe_params,
 )
 from tendwire.config import Config
-from tendwire.core.models import BackendHealth, Worker
+from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.projector import project_from_observations
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
@@ -1965,6 +1965,7 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
     monkeypatch: Any,
 ) -> None:
     calls: list[SnapshotObservationContext] = []
+    binding_calls: list[tuple[Any, str | None, bool, bool]] = []
     original_save_snapshot = save_snapshot
 
     def recording_save_snapshot(
@@ -1972,10 +1973,30 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
         snapshot: Any,
         *,
         observation: SnapshotObservationContext | None = None,
-    ) -> None:
+        worker_bindings: Any = None,
+        binding_backend: str | None = None,
+        binding_observation_authoritative: bool = False,
+        binding_workers_present: bool = True,
+    ) -> bool:
         assert observation is not None
         calls.append(observation)
-        original_save_snapshot(db_path, snapshot, observation=observation)
+        binding_calls.append(
+            (
+                worker_bindings,
+                binding_backend,
+                binding_observation_authoritative,
+                binding_workers_present,
+            )
+        )
+        return original_save_snapshot(
+            db_path,
+            snapshot,
+            observation=observation,
+            worker_bindings=worker_bindings,
+            binding_backend=binding_backend,
+            binding_observation_authoritative=binding_observation_authoritative,
+            binding_workers_present=binding_workers_present,
+        )
 
     monkeypatch.setattr(
         "tendwire.backends.herdr_events.save_snapshot",
@@ -1998,6 +2019,134 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
         ("none", "2026-01-01T00:00:20Z"),
         ("none", "2026-01-01T00:00:30Z"),
     ]
+    assert binding_calls[0][0]
+    assert binding_calls[0][1:] == ("herdr", True, True)
+    assert all(call[0] is None for call in binding_calls[1:])
+
+def test_event_snapshot_expiry_serializes_delayed_older_observer(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    backend = _backend(tmp_path, "herdr-atomic-expiry")
+    worker = Worker(id="worker-expiry", name="Worker Expiry", status="active")
+
+    def binding(target: str, observed_at: str, fingerprint: str) -> WorkerBinding:
+        return WorkerBinding(
+            host_id=backend.config.host_id,
+            worker_id=worker.id,
+            worker_fingerprint=worker.fingerprint,
+            backend="herdr",
+            target_kind="terminal_id",
+            target_value=target,
+            sendable=True,
+            observed_at=observed_at,
+            private_fingerprint=fingerprint,
+        )
+
+    initial = Snapshot(
+        host_id=backend.config.host_id,
+        updated_at="2026-01-01T00:00:00+00:00",
+        workers=[worker],
+    )
+    init_store(backend.db_path)
+    assert save_snapshot(
+        backend.db_path,
+        initial,
+        worker_bindings=[
+            binding(
+                "initial-private-target",
+                "2026-01-01T00:00:00+00:00",
+                "initial-private-owner",
+            )
+        ],
+        binding_backend="herdr",
+        binding_observation_authoritative=True,
+    ) is True
+    older = Snapshot(
+        host_id=backend.config.host_id,
+        updated_at="2026-01-01T00:00:01+00:00",
+        workers=[],
+    )
+    newer = Snapshot(
+        host_id=backend.config.host_id,
+        updated_at="2026-01-01T00:00:02+00:00",
+        workers=[worker],
+    )
+    newer_binding = binding(
+        "newer-private-target",
+        "2026-01-01T00:00:02+00:00",
+        "newer-private-owner",
+    )
+    original_expire = store_sqlite._expire_stale_worker_bindings_conn
+    older_inside_transaction = threading.Event()
+    release_older = threading.Event()
+
+    def delayed_expire(conn: sqlite3.Connection, host_id: str, **kwargs: Any) -> int:
+        if kwargs.get("now") == "2026-01-01T00:00:01+00:00":
+            older_inside_transaction.set()
+            assert release_older.wait(timeout=10)
+        return original_expire(conn, host_id, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_expire_stale_worker_bindings_conn",
+        delayed_expire,
+    )
+    errors: list[BaseException] = []
+
+    def save_older() -> None:
+        try:
+            backend._save_snapshot(
+                older,
+                observation=SnapshotObservationContext(
+                    authority="complete",
+                    observed_at=older.updated_at,
+                ),
+                worker_bindings=[],
+                binding_observation_authoritative=True,
+                binding_workers_present=False,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def save_newer() -> None:
+        try:
+            backend._save_snapshot(
+                newer,
+                observation=SnapshotObservationContext(
+                    authority="complete",
+                    observed_at=newer.updated_at,
+                ),
+                worker_bindings=[newer_binding],
+                binding_observation_authoritative=True,
+                binding_workers_present=True,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    older_thread = threading.Thread(target=save_older)
+    newer_thread = threading.Thread(target=save_newer)
+    older_thread.start()
+    assert older_inside_transaction.wait(timeout=10)
+    newer_thread.start()
+    time.sleep(0.05)
+    release_older.set()
+    older_thread.join(timeout=10)
+    newer_thread.join(timeout=10)
+
+    assert not errors
+    assert not older_thread.is_alive() and not newer_thread.is_alive()
+    active = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+        now="2026-01-01T00:00:03+00:00",
+    )
+    assert len(active) == 1
+    assert active[0].target_value == "newer-private-target"
+
 
 def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence(
     tmp_path: Path,
@@ -2012,6 +2161,8 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         snapshot_retention_count=1,
         snapshot_maintenance_batch_size=100,
         store_maintenance_cadence_seconds=3600,
+        acknowledged_final_retention_days=33,
+        acknowledged_final_retention_count=456,
     )
     init_store(Path(config.db_path))
     maintenance_times = iter(
@@ -2022,12 +2173,16 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
             "2026-01-01T01:00:10Z",
         )
     )
-    maintenance_calls: list[tuple[SnapshotRetentionPolicy, int, dict[str, Any]]] = []
+    maintenance_calls: list[
+        tuple[SnapshotRetentionPolicy, int, int, int, dict[str, Any]]
+    ] = []
 
     def fixed_clock_maintenance(
         db_path: Path,
         *,
         policy: SnapshotRetentionPolicy,
+        acknowledged_final_retention_days: int = 30,
+        acknowledged_final_retention_count: int = 4096,
         cadence_seconds: int = 3600,
         now: str | None = None,
     ) -> dict[str, Any]:
@@ -2036,9 +2191,19 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
             db_path,
             policy=policy,
             cadence_seconds=cadence_seconds,
+            acknowledged_final_retention_days=acknowledged_final_retention_days,
+            acknowledged_final_retention_count=acknowledged_final_retention_count,
             now=next(maintenance_times),
         )
-        maintenance_calls.append((policy, cadence_seconds, result))
+        maintenance_calls.append(
+            (
+                policy,
+                acknowledged_final_retention_days,
+                acknowledged_final_retention_count,
+                cadence_seconds,
+                result,
+            )
+        )
         return result
 
     monkeypatch.setattr(
@@ -2052,9 +2217,21 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         snapshot: Any,
         *,
         observation: SnapshotObservationContext | None = None,
-    ) -> None:
+        worker_bindings: Any = None,
+        binding_backend: str | None = None,
+        binding_observation_authoritative: bool = False,
+        binding_workers_present: bool = True,
+    ) -> bool:
         saved_fingerprints.append(snapshot.content_fingerprint)
-        save_snapshot(db_path, snapshot, observation=observation)
+        return save_snapshot(
+            db_path,
+            snapshot,
+            observation=observation,
+            worker_bindings=worker_bindings,
+            binding_backend=binding_backend,
+            binding_observation_authoritative=binding_observation_authoritative,
+            binding_workers_present=binding_workers_present,
+        )
 
     monkeypatch.setattr("tendwire.backends.herdr_events.save_snapshot", recording_save)
     backend = HerdrEventBackend(config, debounce_seconds=0)
@@ -2075,17 +2252,24 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
     assert len(maintenance_calls) == 4
     assert len(saved_fingerprints) == 4
     assert len(set(saved_fingerprints[1:])) == 1
-    assert [result["status"] for _, _, result in maintenance_calls] == [
+    assert [result["status"] for *_, result in maintenance_calls] == [
         "ok",
         "not_due",
         "not_due",
         "ok",
     ]
-    assert sum(bool(result["due"]) for _, _, result in maintenance_calls) == 2
+    assert sum(bool(result["due"]) for *_, result in maintenance_calls) == 2
     assert {
-        (policy.retention_days, policy.retention_count, policy.batch_size, cadence)
-        for policy, cadence, _ in maintenance_calls
-    } == {(14, 1, 100, 3600)}
+        (
+            policy.retention_days,
+            policy.retention_count,
+            policy.batch_size,
+            final_days,
+            final_count,
+            cadence,
+        )
+        for policy, final_days, final_count, cadence, _ in maintenance_calls
+    } == {(14, 1, 100, 33, 456, 3600)}
     assert _table_count(backend.db_path, config.host_id, "snapshots") == 1
     assert _attention_lifecycle_rows(backend)[0][4] == "2026-01-01T01:00:10+00:00"
     assert backend.operational_status["automatic_maintenance"] == {

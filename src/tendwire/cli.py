@@ -115,6 +115,16 @@ def _turn_list_limit(value: str) -> int:
     return limit
 
 
+def _connector_inspect_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= limit <= 100:
+        raise argparse.ArgumentTypeError("limit must be between 1 and 100")
+    return limit
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tendwire",
@@ -363,6 +373,28 @@ def _add_store_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPa
     cleanup_parser.add_argument("--retention-days", dest="retention_days", type=int, default=None)
     cleanup_parser.add_argument("--max-outbox-attempts", dest="max_outbox_attempts", type=int, default=None)
     cleanup_parser.add_argument(
+        "--acknowledged-final-retention-days",
+        dest="acknowledged_final_retention_days",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help=(
+            "Retain proven acknowledged finals for this age window "
+            "(default: configured policy)."
+        ),
+    )
+    cleanup_parser.add_argument(
+        "--acknowledged-final-retention-count",
+        dest="acknowledged_final_retention_count",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Retain this many newest proven acknowledged finals "
+            "(default: configured policy)."
+        ),
+    )
+    cleanup_parser.add_argument(
         "--snapshot-retention-days",
         dest="snapshot_retention_days",
         type=int,
@@ -454,6 +486,21 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     add_common(poll_parser)
     poll_parser.add_argument("--limit", type=int, default=1)
     poll_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
+
+    inspect_parser = actions.add_parser(
+        "inspect",
+        help="Inspect bounded unresolved connector items by neutral status.",
+    )
+    add_common(inspect_parser)
+    inspect_parser.add_argument("--status", choices=("dead_letter",), required=True)
+    inspect_parser.add_argument("--limit", type=_connector_inspect_limit, default=100)
+
+    retry_parser = actions.add_parser(
+        "retry",
+        help="Explicitly requeue one unresolved final-ready item.",
+    )
+    add_common(retry_parser)
+    retry_parser.add_argument("--final-identity", dest="final_identity", required=True)
 
     reclaim_parser = actions.add_parser("reclaim", help="Expire stale connector leases.")
     add_common(reclaim_parser)
@@ -679,13 +726,10 @@ def observe_public_snapshot(
                 authority=authority,
                 observed_at=health.observed_at,
             ),
-        )
-        _persist_binding_observation(
-            config,
-            bindings,
-            observed_at=snapshot.updated_at,
-            workers_present=bool(workers),
-            authoritative=_herdr_health_from_items(backend_health).status == "healthy",
+            worker_bindings=bindings,
+            binding_backend=_HERDR_BACKEND,
+            binding_observation_authoritative=health.status == "healthy",
+            binding_workers_present=bool(workers),
         )
 
     return snapshot
@@ -766,7 +810,7 @@ def _try_daemon_attempt(
             _restore_cli_content_text(sanitized, result)
         if method == "turn.list":
             _restore_cli_turn_list_text(sanitized, result)
-        if method == "connector.prepare":
+        if method.startswith("connector."):
             _restore_cli_plan_token(sanitized, result)
         return _DaemonAttempt(result=sanitized, request_started=True)
     return _DaemonAttempt(error_kind="protocol", request_started=True)
@@ -895,12 +939,43 @@ def _restore_cli_plan_token(
     sanitized: dict[str, Any],
     original: dict[str, Any],
 ) -> None:
-    for key in ("plan_token", "failed_plan_token"):
-        plan_token = original.get(key)
-        if isinstance(plan_token, str) and re.fullmatch(
-            r"twplan1\.[A-Za-z0-9_-]+", plan_token
+    for key in (
+        "plan_token",
+        "failed_plan_token",
+        "recovered_plan_token",
+        "replaces_plan_token",
+        "recovers_plan_token",
+    ):
+        token = original.get(key)
+        if isinstance(token, str) and re.fullmatch(
+            r"twplan1\.[A-Za-z0-9_-]+", token
         ):
-            sanitized[key] = plan_token
+            sanitized[key] = token
+    final_identity = original.get("final_identity")
+    if isinstance(final_identity, str) and re.fullmatch(
+        r"twfinal1\.[A-Za-z0-9_-]+", final_identity
+    ):
+        sanitized["final_identity"] = final_identity
+    delivery_key = original.get("key")
+    if isinstance(delivery_key, str) and re.fullmatch(
+        r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+", delivery_key
+    ):
+        sanitized["key"] = delivery_key
+    for nested_key in ("turn", "final"):
+        nested_original = original.get(nested_key)
+        nested_sanitized = sanitized.get(nested_key)
+        if isinstance(nested_original, dict) and isinstance(nested_sanitized, dict):
+            _restore_cli_plan_token(nested_sanitized, nested_original)
+    original_items = original.get("items")
+    sanitized_items = sanitized.get("items")
+    if isinstance(original_items, list) and isinstance(sanitized_items, list):
+        for sanitized_item, original_item in zip(
+            sanitized_items,
+            original_items,
+            strict=False,
+        ):
+            if isinstance(sanitized_item, dict) and isinstance(original_item, dict):
+                _restore_cli_plan_token(sanitized_item, original_item)
 
 
 def _connector_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
@@ -1440,6 +1515,26 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         params.update(parsed)
         params["name"] = args.name
         return params
+    if args.connector_action == "inspect":
+        if args.name != "turn-final":
+            raise ValueError("inspect requires --name turn-final")
+        return {
+            "schema_version": 1,
+            "name": args.name,
+            "status": args.status,
+            "limit": args.limit,
+        }
+    if args.connector_action == "retry":
+        if args.name != "turn-final":
+            raise ValueError("retry requires --name turn-final")
+        final_identity = str(args.final_identity).strip()
+        if not final_identity:
+            raise ValueError("retry requires a final identity")
+        return {
+            "schema_version": 1,
+            "name": args.name,
+            "final_identity": final_identity,
+        }
     if args.connector_action == "poll":
         params["limit"] = args.limit
         if args.lease_seconds is not None:
@@ -1530,6 +1625,8 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
         payload = store_status(
             config.db_path,
             config.host_id,
+            acknowledged_final_retention_days=config.acknowledged_final_retention_days,
+            acknowledged_final_retention_count=config.acknowledged_final_retention_count,
             snapshot_retention_days=config.snapshot_retention_days,
             snapshot_retention_count=config.snapshot_retention_count,
             maintenance_batch_size=config.snapshot_maintenance_batch_size,
@@ -1547,6 +1644,16 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             max_outbox_attempts=args.max_outbox_attempts
             if args.max_outbox_attempts is not None
             else config.max_outbox_attempts,
+            acknowledged_final_retention_days=(
+                args.acknowledged_final_retention_days
+                if args.acknowledged_final_retention_days is not None
+                else config.acknowledged_final_retention_days
+            ),
+            acknowledged_final_retention_count=(
+                args.acknowledged_final_retention_count
+                if args.acknowledged_final_retention_count is not None
+                else config.acknowledged_final_retention_count
+            ),
             dry_run=args.dry_run,
             snapshot_retention_days=args.snapshot_retention_days
             if args.snapshot_retention_days is not None

@@ -153,6 +153,8 @@ REQUIRED_METHODS = frozenset(
         "connector.fail",
         "connector.defer",
         "connector.reclaim",
+        "connector.retry",
+        "connector.inspect",
     }
 )
 
@@ -556,7 +558,7 @@ class TendwireDaemonAPI:
                     )
                 connector_result = dict(self._connector_call(method, dict(params)))
                 response = success_response(connector_result, request_id=request_id)
-                if method == "connector.prepare":
+                if method.startswith("connector."):
                     _restore_plan_token(response, connector_result)
                 return response
         except Exception as exc:  # noqa: BLE001
@@ -642,13 +644,55 @@ def _restore_plan_token(
     result = response.get("result")
     if not isinstance(result, dict):
         return
-    for key in ("plan_token", "failed_plan_token"):
-        plan_token = original_result.get(key)
-        if (
-            isinstance(plan_token, str)
-            and re.fullmatch(r"twplan1\.[A-Za-z0-9_-]+", plan_token) is not None
+
+    def restore(target: dict[str, Any], original: Mapping[str, Any]) -> None:
+        for key in (
+            "plan_token",
+            "failed_plan_token",
+            "recovered_plan_token",
+            "replaces_plan_token",
+            "recovers_plan_token",
         ):
-            result[key] = plan_token
+            token = original.get(key)
+            if (
+                isinstance(token, str)
+                and re.fullmatch(r"twplan1\.[A-Za-z0-9_-]+", token) is not None
+            ):
+                target[key] = token
+        final_identity = original.get("final_identity")
+        if (
+            isinstance(final_identity, str)
+            and re.fullmatch(r"twfinal1\.[A-Za-z0-9_-]+", final_identity)
+            is not None
+        ):
+            target["final_identity"] = final_identity
+        delivery_key = original.get("key")
+        if (
+            isinstance(delivery_key, str)
+            and re.fullmatch(
+                r"turn-final:revision:twfinal1\.[A-Za-z0-9_-]+",
+                delivery_key,
+            )
+            is not None
+        ):
+            target["key"] = delivery_key
+        for nested_key in ("turn", "final"):
+            nested_original = original.get(nested_key)
+            nested_target = target.get(nested_key)
+            if isinstance(nested_original, Mapping) and isinstance(nested_target, dict):
+                restore(nested_target, nested_original)
+        original_items = original.get("items")
+        target_items = target.get("items")
+        if isinstance(original_items, list) and isinstance(target_items, list):
+            for target_item, original_item in zip(
+                target_items,
+                original_items,
+                strict=False,
+            ):
+                if isinstance(target_item, dict) and isinstance(original_item, Mapping):
+                    restore(target_item, original_item)
+
+    restore(result, original_result)
 
 
 def _serialized_response(response: Mapping[str, Any]) -> bytes:

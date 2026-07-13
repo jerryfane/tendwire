@@ -20,7 +20,7 @@ import pytest
 from tendwire.backends import herdr_cli
 from tendwire.cli import _build_parser, main, observe_public_snapshot
 from tendwire.config import Config
-from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker
+from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker, WorkerBinding
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
 from tendwire.store.sqlite import (
@@ -1852,6 +1852,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
         backend_health=[health],
     )
     captured: list[SnapshotObservationContext] = []
+    captured_atomic: list[tuple[list[WorkerBinding], str | None, bool, bool]] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_snapshot_observation",
@@ -1863,8 +1864,21 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
         _snapshot: Snapshot,
         *,
         observation: SnapshotObservationContext,
-    ) -> None:
+        worker_bindings: list[WorkerBinding],
+        binding_backend: str | None,
+        binding_observation_authoritative: bool,
+        binding_workers_present: bool,
+    ) -> bool:
         captured.append(observation)
+        captured_atomic.append(
+            (
+                worker_bindings,
+                binding_backend,
+                binding_observation_authoritative,
+                binding_workers_present,
+            )
+        )
+        return True
 
     monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
 
@@ -1873,6 +1887,145 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     assert len(captured) == 1
     assert captured[0].authority == expected_authority
     assert captured[0].observed_at == observed_at
+    assert captured_atomic == [
+        ([], "herdr", health.status == "healthy", bool(workers))
+    ]
+
+
+def test_rejected_stale_snapshot_does_not_persist_stale_worker_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "rejected-stale-binding.db"
+    init_store(db_path)
+    config = Config(host_id="cli-stale-binding", db_path=db_path)
+    worker = Worker(id="worker-stale", name="Worker Stale", status="active")
+    health = herdr_cli.herdr_backend_health(
+        "healthy_non_empty",
+        observed_at="2026-01-01T00:00:00+00:00",
+        workers=[worker],
+    )
+    observation = SimpleNamespace(
+        spaces=[],
+        workers=[worker],
+        bindings=[{"worker_id": worker.id, "turn_target_value": "stale-target"}],
+        backend_health=[health],
+    )
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_snapshot_observation",
+        lambda _config, *, stored_bindings: observation,
+    )
+    monkeypatch.setattr(
+        "tendwire.store.sqlite.save_snapshot",
+        lambda *_args, **_kwargs: False,
+    )
+
+    def _forbidden_binding_persistence(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("rejected snapshot must not update private bindings")
+
+    monkeypatch.setattr(
+        "tendwire.cli._persist_binding_observation",
+        _forbidden_binding_persistence,
+    )
+
+    observed = observe_public_snapshot(config, store_snapshot=True)
+    assert observed.host_id == config.host_id
+
+
+def test_cli_atomic_snapshot_binding_write_serializes_delayed_older_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "cli-atomic-binding-race.db"
+    config = Config(host_id="cli-atomic-binding", db_path=db_path)
+    init_store(db_path)
+    worker = Worker(id="worker-atomic", name="Worker Atomic", status="active")
+
+    def binding(target: str, observed_at: str) -> WorkerBinding:
+        return WorkerBinding(
+            host_id=config.host_id,
+            worker_id=worker.id,
+            worker_fingerprint=worker.fingerprint,
+            backend="herdr",
+            target_kind="terminal_id",
+            target_value=target,
+            sendable=True,
+            observed_at=observed_at,
+            private_fingerprint="same-private-owner",
+        )
+
+    observations = {
+        "older-observer": SimpleNamespace(
+            spaces=[],
+            workers=[worker],
+            bindings=[binding("older-private-target", "2026-01-01T00:00:00+00:00")],
+            backend_health=[
+                herdr_cli.herdr_backend_health(
+                    "healthy_non_empty",
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    workers=[worker],
+                )
+            ],
+        ),
+        "newer-observer": SimpleNamespace(
+            spaces=[],
+            workers=[worker],
+            bindings=[binding("newer-private-target", "2026-01-01T00:00:01+00:00")],
+            backend_health=[
+                herdr_cli.herdr_backend_health(
+                    "healthy_non_empty",
+                    observed_at="2026-01-01T00:00:01+00:00",
+                    workers=[worker],
+                )
+            ],
+        ),
+    }
+    monkeypatch.setattr(
+        "tendwire.cli.fetch_herdr_snapshot_observation",
+        lambda _config, *, stored_bindings: observations[threading.current_thread().name],
+    )
+    original_upsert = store_sqlite._upsert_worker_bindings_conn
+    older_inside_transaction = threading.Event()
+    release_older = threading.Event()
+
+    def delayed_upsert(conn: sqlite3.Connection, bindings: Any) -> int:
+        binding_list = list(bindings)
+        if binding_list and binding_list[0].target_value == "older-private-target":
+            older_inside_transaction.set()
+            assert release_older.wait(timeout=10)
+        return original_upsert(conn, binding_list)
+
+    monkeypatch.setattr(store_sqlite, "_upsert_worker_bindings_conn", delayed_upsert)
+    errors: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            observe_public_snapshot(config, store_snapshot=True)
+        except BaseException as exc:
+            errors.append(exc)
+
+    older = threading.Thread(target=observe, name="older-observer")
+    newer = threading.Thread(target=observe, name="newer-observer")
+    older.start()
+    assert older_inside_transaction.wait(timeout=10)
+    newer.start()
+    time.sleep(0.05)
+    release_older.set()
+    older.join(timeout=10)
+    newer.join(timeout=10)
+
+    assert not errors
+    assert not older.is_alive() and not newer.is_alive()
+    stored = list_worker_bindings(
+        db_path,
+        config.host_id,
+        backend="herdr",
+        include_expired=True,
+    )
+    assert len(stored) == 1
+    assert stored[0].target_value == "newer-private-target"
 
 
 def test_cli_legacy_observation_cannot_claim_complete_authority(
@@ -1884,6 +2037,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     config = Config(host_id="cli-legacy", db_path=db_path)
     worker = Worker(id="worker-1", name="Worker One", status="blocked")
     captured: list[SnapshotObservationContext] = []
+    captured_atomic: list[tuple[list[WorkerBinding], str | None]] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_state",
@@ -1895,8 +2049,14 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
         _snapshot: Snapshot,
         *,
         observation: SnapshotObservationContext,
-    ) -> None:
+        worker_bindings: list[WorkerBinding],
+        binding_backend: str | None,
+        binding_observation_authoritative: bool,
+        binding_workers_present: bool,
+    ) -> bool:
         captured.append(observation)
+        captured_atomic.append((worker_bindings, binding_backend))
+        return True
 
     monkeypatch.setattr("tendwire.store.sqlite.save_snapshot", _capture_save)
 
@@ -1904,6 +2064,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
 
     assert len(captured) == 1
     assert captured[0].authority == "none"
+    assert captured_atomic == [([], "herdr")]
 
 
 def test_cli_attention_json_reads_store_backed_lifecycle(
@@ -2580,6 +2741,10 @@ def test_cli_store_cleanup_passes_snapshot_policy_overrides(
             "--db-path",
             str(db_path),
             "--dry-run",
+            "--acknowledged-final-retention-days",
+            "17",
+            "--acknowledged-final-retention-count",
+            "29",
             "--snapshot-retention-days",
             "11",
             "--snapshot-retention-count",
@@ -2594,6 +2759,8 @@ def test_cli_store_cleanup_passes_snapshot_policy_overrides(
     assert captured.err == ""
     assert json.loads(captured.out)["ok"] is True
     assert captured_options["dry_run"] is True
+    assert captured_options["acknowledged_final_retention_days"] == 17
+    assert captured_options["acknowledged_final_retention_count"] == 29
     assert captured_options["snapshot_retention_days"] == 11
     assert captured_options["snapshot_retention_count"] == 23
     assert captured_options["snapshot_batch_size"] == 5
@@ -2610,6 +2777,8 @@ def test_cli_store_status_passes_configured_maintenance_policy(
     monkeypatch.setenv("TENDWIRE_SNAPSHOT_RETENTION_COUNT", "211")
     monkeypatch.setenv("TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE", "37")
     monkeypatch.setenv("TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS", "7200")
+    monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS", "31")
+    monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT", "422")
     received: dict[str, Any] = {}
 
     def capture_status(
@@ -2635,6 +2804,8 @@ def test_cli_store_status_passes_configured_maintenance_policy(
     assert captured.err == ""
     assert json.loads(captured.out)["ok"] is True
     assert received == {
+        "acknowledged_final_retention_days": 31,
+        "acknowledged_final_retention_count": 422,
         "snapshot_retention_days": 19,
         "snapshot_retention_count": 211,
         "maintenance_batch_size": 37,

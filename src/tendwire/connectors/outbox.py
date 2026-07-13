@@ -16,11 +16,13 @@ from ..store.sqlite import (
     defer_connector_delivery,
     fail_connector_delivery,
     poll_connector_outbox,
+    inspect_connector_outbox,
     prepare_connector_plan_begin,
     prepare_connector_plan_commit,
     prepare_connector_plan_recover,
     prepare_connector_plan_part,
     reclaim_expired_connector_leases,
+    retry_final_ready_delivery,
 )
 
 
@@ -45,6 +47,8 @@ _CONNECTOR_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS
 _PLAN_TOKEN_PREFIX = "twplan1."
 _REVISION_PREFIX = "twrev1."
 _PREPARE_NAME = "turn-final"
+_FINAL_ID_PREFIX = "twfinal1."
+_FINAL_KEY_PREFIX = "turn-final:revision:twfinal1."
 _PREPARE_MAX_PARTS = 10_000
 _PREPARE_MAX_SPANS = 64
 _PREPARE_FIELDS = frozenset({"user_text", "assistant_final_text"})
@@ -111,6 +115,29 @@ def _restore_plan_tokens(clean: dict[str, Any], original: Mapping[str, Any]) -> 
         token = _plan_token(value)
         if token:
             clean[key] = token
+    final_identity = _opaque_token(
+        original.get("final_identity"),
+        _FINAL_ID_PREFIX,
+    )
+    if final_identity:
+        clean["final_identity"] = final_identity
+    turn_id = _text(original.get("turn_id"))
+    if (
+        turn_id.startswith("turn-")
+        and len(turn_id) <= 128
+        and all(char in _CONNECTOR_NAME_CHARS for char in turn_id)
+    ):
+        clean["turn_id"] = turn_id
+    nested_turn = original.get("turn")
+    if isinstance(nested_turn, Mapping):
+        clean_nested = clean.get("turn")
+        if not isinstance(clean_nested, dict):
+            clean_nested = sanitize_public_mapping(
+                nested_turn,
+                backend_neutral=True,
+            )
+            clean["turn"] = clean_nested
+        _restore_plan_tokens(clean_nested, nested_turn)
     return clean
 
 
@@ -207,7 +234,7 @@ class ConnectorOutboxAPI:
         assert self.db_path is not None
 
         if action == "begin":
-            if set(data) != {
+            required = {
                 "schema_version",
                 "action",
                 "name",
@@ -215,12 +242,18 @@ class ConnectorOutboxAPI:
                 "content_revision",
                 "presentation_version",
                 "part_count",
-            }:
+            }
+            if set(data) != required and set(data) != {*required, "source_ref"}:
                 return _error("invalid_params", host_id=self.host_id, name=name)
             turn_id = _text(data.get("turn_id"))
             revision = _revision(data.get("content_revision"))
             version = _text(data.get("presentation_version"))
             part_count = data.get("part_count")
+            source_ref = (
+                _ref(data.get("source_ref"))
+                if "source_ref" in data
+                else None
+            )
             if (
                 not turn_id.startswith("turn-")
                 or len(turn_id) > 128
@@ -234,6 +267,7 @@ class ConnectorOutboxAPI:
                 or not isinstance(part_count, int)
                 or part_count < 1
                 or part_count > _PREPARE_MAX_PARTS
+                or ("source_ref" in data and not source_ref)
             ):
                 return _error("invalid_params", host_id=self.host_id, name=name)
             return prepare_connector_plan_begin(
@@ -244,6 +278,7 @@ class ConnectorOutboxAPI:
                 content_revision=revision,
                 presentation_version=version,
                 part_count=part_count,
+                source_ref=source_ref,
             )
 
         if action == "recover":
@@ -271,18 +306,27 @@ class ConnectorOutboxAPI:
         if not token:
             return _error("invalid_params", host_id=self.host_id, name=name)
         if action == "commit":
-            if set(data) != {
+            required = {
                 "schema_version",
                 "action",
                 "name",
                 "plan_token",
-            }:
+            }
+            if set(data) != required and set(data) != {*required, "source_ref"}:
                 return _error("invalid_params", host_id=self.host_id, name=name)
+            source_ref = (
+                _ref(data.get("source_ref"))
+                if "source_ref" in data
+                else None
+            )
+            if "source_ref" in data and not source_ref:
+                return _error("invalid_ref", host_id=self.host_id, name=name)
             return prepare_connector_plan_commit(
                 self.db_path,
                 self.host_id,
                 name=name,
                 plan_token=token,
+                source_ref=source_ref,
             )
 
         if set(data) != {
@@ -384,6 +428,9 @@ class ConnectorOutboxAPI:
                 }
             )
             if isinstance(clean_item, dict):
+                item_key = str(item.get("key") or "")
+                if item_key.startswith(_FINAL_KEY_PREFIX):
+                    clean_item["key"] = item_key
                 sanitized_payload = clean_item.get("payload")
                 if isinstance(sanitized_payload, dict):
                     _restore_plan_tokens(sanitized_payload, clean_payload)
@@ -465,6 +512,83 @@ class ConnectorOutboxAPI:
             return fail_connector_delivery(self.db_path, max_attempts=self.max_attempts, **kwargs)
         return defer_connector_delivery(self.db_path, **kwargs)
 
+    def inspect(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        data = dict(params or {})
+        if set(data) != {
+            "schema_version",
+            "name",
+            "status",
+            "limit",
+        }:
+            return _error("invalid_params", host_id=self.host_id)
+        name = _name(data.get("name"))
+        status = _text(data.get("status"))
+        limit = data.get("limit")
+        if (
+            data.get("schema_version") != 1
+            or isinstance(data.get("schema_version"), bool)
+            or name != _PREPARE_NAME
+            or status != "dead_letter"
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > 100
+        ):
+            return _error("invalid_params", host_id=self.host_id, name=name)
+        unavailable = self._require_store(name)
+        if unavailable is not None:
+            return unavailable
+        assert self.db_path is not None
+        return inspect_connector_outbox(
+            self.db_path,
+            self.host_id,
+            name=name,
+            status=status,
+            limit=limit,
+        )
+
+    def retry(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        data = dict(params or {})
+        if set(data) not in (
+            {"schema_version", "name", "key"},
+            {"schema_version", "name", "final_identity"},
+        ):
+            return _error("invalid_params", host_id=self.host_id)
+        name = _name(data.get("name"))
+        key = _text(data.get("key"))
+        final_identity = _opaque_token(
+            data.get("final_identity"),
+            _FINAL_ID_PREFIX,
+        )
+        if (
+            data.get("schema_version") != 1
+            or isinstance(data.get("schema_version"), bool)
+            or name != _PREPARE_NAME
+            or (
+                "key" in data
+                and (
+                    not key.startswith(_FINAL_KEY_PREFIX)
+                    or not _opaque_token(
+                        key[len("turn-final:revision:"):],
+                        _FINAL_ID_PREFIX,
+                    )
+                )
+            )
+            or ("final_identity" in data and not final_identity)
+        ):
+            return _error("invalid_params", host_id=self.host_id, name=name)
+        unavailable = self._require_store(name)
+        if unavailable is not None:
+            return unavailable
+        assert self.db_path is not None
+        return retry_final_ready_delivery(
+            self.db_path,
+            self.host_id,
+            key=key or None,
+            final_identity=final_identity or None,
+        )
+
+
     def dispatch(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if method == "connector.prepare":
             return self.prepare(params)
@@ -478,4 +602,8 @@ class ConnectorOutboxAPI:
             return self.defer(params)
         if method == "connector.reclaim":
             return self.reclaim(params)
+        if method == "connector.inspect":
+            return self.inspect(params)
+        if method == "connector.retry":
+            return self.retry(params)
         return _error("unknown_method", host_id=self.host_id)

@@ -11,6 +11,9 @@ import pytest
 from tendwire.config import (
     DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
     DEFAULT_TURN_REFRESH_WORKERS,
+    MAX_MAINTENANCE_CADENCE_SECONDS,
+    MAX_RETENTION_DAYS,
+    MAX_SQLITE_INTEGER,
     Config,
     load_config,
 )
@@ -89,6 +92,104 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
 )
 def test_pr16_runtime_knobs_reject_invalid_values(field: str, value: object, message: str) -> None:
     with pytest.raises(ValueError, match=message):
+        Config(**{field: value})
+
+
+ACKNOWLEDGED_FINAL_RETENTION_ENV_NAMES = (
+    "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS",
+    "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT",
+)
+
+
+def test_acknowledged_final_retention_has_conservative_documented_defaults(
+    monkeypatch,
+) -> None:
+    for name in ACKNOWLEDGED_FINAL_RETENTION_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_config()
+
+    assert config.acknowledged_final_retention_days == 30
+    assert config.acknowledged_final_retention_count == 4096
+
+
+def test_acknowledged_final_retention_uses_explicit_before_environment(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS", "45")
+    monkeypatch.setenv("TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT", "8192")
+
+    env_config = load_config()
+    explicit = load_config(
+        acknowledged_final_retention_days="14",
+        acknowledged_final_retention_count="1024",
+    )
+
+    assert env_config.acknowledged_final_retention_days == 45
+    assert env_config.acknowledged_final_retention_count == 8192
+    assert explicit.acknowledged_final_retention_days == 14
+    assert explicit.acknowledged_final_retention_count == 1024
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "acknowledged_final_retention_days",
+        "acknowledged_final_retention_count",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (True, "must be an integer >= 1"),
+        (0, "must be >= 1"),
+        (-1, "must be >= 1"),
+        ("malformed", "must be an integer >= 1"),
+        (1.5, "must be an integer >= 1"),
+    ],
+)
+def test_acknowledged_final_retention_rejects_invalid_values(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Config(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "maximum"),
+    [
+        ("event_retention_days", MAX_RETENTION_DAYS + 1, MAX_RETENTION_DAYS),
+        (
+            "acknowledged_final_retention_days",
+            MAX_RETENTION_DAYS + 1,
+            MAX_RETENTION_DAYS,
+        ),
+        (
+            "acknowledged_final_retention_count",
+            MAX_SQLITE_INTEGER + 1,
+            MAX_SQLITE_INTEGER,
+        ),
+        ("snapshot_retention_days", MAX_RETENTION_DAYS + 1, MAX_RETENTION_DAYS),
+        (
+            "snapshot_retention_count",
+            MAX_SQLITE_INTEGER + 1,
+            MAX_SQLITE_INTEGER,
+        ),
+        (
+            "store_maintenance_cadence_seconds",
+            MAX_MAINTENANCE_CADENCE_SECONDS + 1,
+            MAX_MAINTENANCE_CADENCE_SECONDS,
+        ),
+    ],
+)
+def test_retention_policies_reject_values_above_sqlite_time_bounds(
+    field: str,
+    value: int,
+    maximum: int,
+) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be <= {maximum}"):
         Config(**{field: value})
 
 

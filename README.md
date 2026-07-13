@@ -1,10 +1,11 @@
 # Tendwire
 
 Tendwire is a **local-first control plane for Herdr-managed terminal agents**.
-It observes a local Herdr session, stores neutral snapshots and command receipts,
-and exposes a public-safe Tendwire API for local clients. The public contract is
-intentionally narrow: Tendwire JSON does not contain connector delivery state,
-raw terminal controls, socket paths, or private Herdr identifiers.
+It observes a local Herdr session, stores neutral snapshots and command
+receipts, and exposes a public-safe Tendwire API for local clients. Neutral
+connector jobs, statuses, and aggregates are public-safe operational state;
+concrete-provider delivery bookkeeping, raw terminal controls, socket paths,
+and private Herdr identifiers are not part of public JSON.
 
 ## Relationship to Herdr, Herdres, and connectors
 
@@ -502,6 +503,8 @@ variables:
 | `max_workers` | `TENDWIRE_MAX_WORKERS` | `512` | integer >= 1 |
 | `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
 | `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
+| `acknowledged_final_retention_days` | `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS` | `30` | positive integer |
+| `acknowledged_final_retention_count` | `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT` | `4096` | positive integer; newest proven acknowledged finals per host |
 | `snapshot_retention_days` | `TENDWIRE_SNAPSHOT_RETENTION_DAYS` | `14` | positive integer |
 | `snapshot_retention_count` | `TENDWIRE_SNAPSHOT_RETENTION_COUNT` | `4096` | positive integer; includes each host's latest row |
 | `snapshot_maintenance_batch_size` | `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE` | `100` | integer from 1 through 1000 |
@@ -541,10 +544,18 @@ fields: daemon status and `started_at`; store status/counts and outbox counts;
 snapshot and last event/snapshot/reconcile timestamps when available; backend
 runtime readiness when the socket backend is active; backend health; and numeric
 `limits` for debounce, reconcile, event retention, output excerpt, worker cap,
-outbox attempt/claim TTL, and snapshot retention age/count/batch/cadence. Its
-`turn_ingestion` object is aggregate-only:
-`status`, `queue`, `active`, `refreshed`, `failed`, `timed_out`, `coalesced`,
-`queue_full`, `last_success`, `last_duration_ms`, `stale_age`, and
+outbox attempt/claim TTL, snapshot retention age/count/batch/cadence, and exact
+`acknowledged_final_retention_days` / `acknowledged_final_retention_count`
+values. `store.final_retention` is aggregate-only:
+`acknowledged`, `unresolved`, `queued`, `leased`, `deferred`, `retry`,
+`dead_letter`, `awaiting_ack`, `eligible`,
+`acknowledged_final_retention_days`,
+`acknowledged_final_retention_count`, and `storage_pressure`. Storage pressure
+degrades the public store and overall health status without exposing final
+content, turn/revision/final identities, private connector state, or source
+paths. The aggregate `turn_ingestion` object contains `status`, `queue`,
+`active`, `refreshed`, `failed`, `timed_out`, `coalesced`, `queue_full`,
+`last_success`, `last_duration_ms`, `stale_age`, and
 `bounds.{refresh_interval_seconds,max_workers,queue_capacity,adapter_timeout_seconds}`.
 It never identifies which worker or binding failed. Health output does not
 expose daemon socket paths, database paths, Herdr binary paths, backend targets,
@@ -815,18 +826,22 @@ view without observing Herdr. A timeout after transmission returns the fixed
 `daemon_timeout` error; other ambiguous/invalid exchanges return
 `daemon_protocol_error`. Neither case starts a second request or source read.
 
-Turn IDs/fingerprints are computed from sanitized public content and exclude
-volatile observation timestamps. Backend pending and choice handles also bind
-to a one-way digest of the exact private source binding and pane target, so
-byte-identical prompts observed on a replacement source mint different public
-handles without exposing either private value. Pending interactions are derived
-only from explicit human-actionable public attention signals or public
-suggested actions; generic waiting or pending worker status alone does not
-create a pending interaction.
+Canonical turn IDs are owner-aware sanitized public identities. Their input
+includes host, worker, space, kind, source, command/source-turn lineage, and
+either the exact version-1 stable-key pair or an explicit unavailable marker.
+The stable pair therefore participates in identity when authenticated, while
+`worker_fingerprint`, status, and content affect only the turn fingerprint and
+never final routing. Volatile observation timestamps affect neither value.
+Backend pending and choice handles separately bind to a one-way digest of the
+exact private source binding and pane target, so byte-identical prompts observed
+on a replacement source mint different public handles without exposing either
+private value. Pending interactions derive only from explicit human-actionable
+public attention signals or suggested actions; generic waiting or pending
+worker status alone does not create one.
 
 ## SQLite store
 
-The current store schema is version 10 (`PRAGMA user_version=10`). Migration is
+The current store schema is version 11 (`PRAGMA user_version=11`). Migration is
 idempotent and transactional. Schema v6 introduced immutable canonical turn
 content revisions and backfilled legacy rows, marking a legacy `[truncated]`
 value `known_incomplete` rather than claiming recovery. Schema v7 added
@@ -839,8 +854,40 @@ Schema v10 adds explicit pending observation/freshness state, private
 revision-bound choice routing, and durable two-phase answer claims. The
 v9-to-v10 migration preserves legacy public pending rows but leaves them
 unrouted until a fresh binding-scoped observation supplies authoritative
-revision and route data. Migrations do not reconstruct bytes absent from a
-legacy store or rewrite existing canonical turn history.
+revision and route data.
+
+Schema v11 adds typed durable final-delivery roots, acknowledged-history
+retention, and the private per-host `store_maintenance_cursors` table used for
+fair automatic service. A routable root copies the exact public `stable_key`
+and integer `stable_key_version=1` from persisted turn metadata into the root of
+its `schema_version=2` payload. Every materialized range job preserves that
+exact source route under `turn`. Neither `worker_id` nor `worker_fingerprint`
+is final-delivery routing authority.
+
+A missing, partial, malformed, boolean-valued, or unsupported owner pair creates
+a nonroutable `schema_version=1` `final_migration_hold`/`dead_letter`.
+Internally classified automation and known-incomplete finals are also
+nonpollable holds, even when a schema-v2 pair exists. These safety holds are
+permanently nonretryable for that canonical turn identity; a later
+owner-authenticated observation has a distinct owner-aware turn identity rather
+than converting or reposting the held one.
+
+The conservative v10-to-v11 migration marks a current final
+`final_ready`/`delivered` only when a completed lineage has exact canonical
+range coverage and exact host-bound all-part ACK proof. A linkable unresolved
+plan must additionally carry the authoritative schema-v2
+turn/revision/final-identity/stable-key route on every job before it can remain
+nonpollable `final_ready`/`awaiting_ack`; every unknown or mismatched case
+becomes a migration hold. A valid-owner hold whose only defect was unproven
+legacy delivery may be eligible for an exact current-identity retry, but safety
+holds are not. The migration never infers delivery from partial evidence or
+mass-reposts history.
+
+Migration creates the typed columns, root indexes, and maintenance-cursor table
+inside the v10-to-v11 transaction. A partial legacy final-table set, invalid
+recovery edge, descriptor failure, or any later error rolls back all table,
+column, root, and `PRAGMA user_version` changes. Migrations do not reconstruct
+absent bytes or rewrite canonical turn history.
 
 The optional SQLite store keeps canonical snapshot JSON blobs in the `snapshots`
 table and maintains Tendwire-local operational tables for attention lifecycle,
@@ -848,6 +895,14 @@ command receipts, connector outbox/deliveries, backend health, and private
 worker bindings. Schema initialization and migration are idempotent and preserve
 the existing `latest_snapshot` and `list_hosts` behavior. The store is an
 implementation detail behind public JSON, not a broad public schema expansion.
+
+Snapshot and private-binding projection is monotonic and atomic per host. The
+strict winner is the greatest `(updated_at, content_fingerprint)` pair; an exact
+replay is accepted without advancing state. An older or losing equal-time
+snapshot, even if different or empty, cannot replace history, regress/prune
+worker or turn projections, mutate/expire bindings, or duplicate/release a
+final root. A winning snapshot refreshes its public projection and upserts or
+expires only its same-scope private bindings in the same transaction.
 
 Private Herdr worker bindings are stored separately in the local
 `worker_bindings` table. These rows associate a stable public Tendwire
@@ -926,6 +981,8 @@ tendwire store status --db-path /path/to/tendwire.db
 tendwire store events-tail --limit 20 --db-path /path/to/tendwire.db
 tendwire store cleanup --dry-run --db-path /path/to/tendwire.db
 tendwire store cleanup --retention-days 14 --max-outbox-attempts 5 \
+  --acknowledged-final-retention-days 30 \
+  --acknowledged-final-retention-count 4096 \
   --snapshot-retention-days 14 --snapshot-retention-count 4096 \
   --snapshot-batch-size 100 --db-path /path/to/tendwire.db
 tendwire store compact --dry-run --db-path /path/to/tendwire.db
@@ -936,37 +993,64 @@ tendwire store compact --execute --acknowledge-offline \
 
 `store status` returns host-scoped table counts, last event/snapshot timestamps,
 and aggregate outbox `pending`, `leased`, `terminal`, and `by_status` counts.
-Its database-wide `maintenance` object reports `last_completed_at`, status,
-snapshot count, the snapshot age/count/batch/cadence policy, and whether a
-retention backlog remains. `store events-tail` returns only bounded event
-metadata such as row ID, event type, aggregate type, timestamp, and content
-fingerprint; it never returns `payload_json` or raw event payloads.
+Its `maintenance.snapshot_count`, snapshot backlog, and `final_retention`
+pressure are also computed for the requested host; only the persisted automatic
+maintenance cadence marker is database-wide. `store events-tail` returns only
+bounded event metadata such as row ID, event type, aggregate type, timestamp,
+and content fingerprint; it never returns `payload_json` or raw event payloads.
+The daemon accepts the retention aggregate only when its `host_id`, configured
+policy, nonnegative counts, component totals, eligibility, and pressure
+relationships validate. A wrong-host or malformed aggregate degrades health,
+as does valid `storage_pressure`. The public surface exposes counts and
+pressure only, never final content or turn, revision, final, provider, or
+private-state identity.
 
 `store cleanup` performs one bounded online batch and reports aggregate
-`retention`, database-wide `snapshots`, `outbox`, and `turn_content` objects.
-The event/outbox/turn-content policy defaults come from the normal configuration.
-The flags shown above override event age, retry count, snapshot age, snapshot
-count, and snapshot batch size for that invocation. Snapshot retention keeps
-the intersection of the configured age window and newest-per-host count window:
-a changed-history row is eligible when it falls outside either window. The
-newest row for every host is always exempt, even when it is old or the count is
-one. Cleanup does not remove current projections, command receipts, private
-worker bindings, live outbox work or leases, or current referenced turn content.
+`retention`, database-wide `snapshots`, `outbox`, `final_retention`, and
+`turn_content` objects. The event/outbox/final/turn-content policy defaults come
+from the normal configuration. Retention age/count/batch/cadence values must be
+positive integers. Day policies are capped at 365000, counts at
+9223372036854775807, maintenance batches at 1000, and cadence at 31536000000
+seconds; an affected cleanup class rejects an invalid override rather than
+applying that class. The flags shown above override event age, retry count,
+acknowledged-final age/count, snapshot age/count, and snapshot batch size for
+that invocation. Snapshot retention keeps the intersection of the configured
+age window and newest-per-host count window: a changed-history row is eligible
+when it falls outside either window. The newest row for every host
+is always exempt, even when it is old or the count is one. Final retention can
+reduce only a whole current turn graph whose completed/superseded plan lineage
+contains exactly every declared part, whose matching host/name/turn/revision
+part rows are delivered, and whose delivered attempts have durable ACK
+timestamps. Every root and plan for that turn must also be resolved; an
+unlinked part or any queued, leased, deferred, `retry`, `awaiting_ack`, or
+`dead_letter` work blocks cleanup and contributes to pressure. Only then is an
+acknowledged graph eligible when older than the 30-day age window or ranked
+beyond the newest 4096 per-host count window by default. Cleanup also does not
+remove current projections, command receipts, private worker bindings, live
+outbox work or leases, or current referenced turn content.
 With `--dry-run`, every maintenance transaction is rolled back; the aggregate
 candidate/action counts are predictions and no store row or maintenance marker
 is changed.
 
+Final-graph cleanup preserves one immutable delivered-attempt tombstone for the
+opaque final key before deleting its root, plans, jobs, canonical revisions, and
+turn. A repeated authoritative snapshot consults that tombstone and cannot
+recreate or repost the final. Tombstones are deduplicated per key and bounded
+per host by the acknowledged-final retention count (4096 by default).
+
 Automatic maintenance is deliberately coarse and bounded. After a stored
-snapshot, the daemon consults one persisted database-wide cadence marker
-(3600 seconds by default); when due, it removes at most one snapshot batch
-(100 rows by default) and reports whether backlog remains. It does not loop
-until the backlog is empty, compact pages, or invoke `VACUUM`. Page reclamation
-is never automatic or part of a request path.
+snapshot, the daemon consults one persisted database-wide cadence marker (3600
+seconds by default). When due, it removes at most 100 snapshot rows and a
+shared budget of 100 eligible acknowledged-final graphs across hosts. Private
+per-host service cursors order never-serviced hosts first and then the
+least-recently serviced, preventing a lexicographically early busy host from
+starving others. Later batches resume backlog; no batch loops to empty,
+compacts pages, or invokes `VACUUM`.
 
 `store compact` is an explicit CLI-only database operation, not a daemon API.
 Dry-run accepts optional `--snapshot-retention-days`,
 `--snapshot-retention-count`, and `--batch-size` overrides, but rejects
-`--acknowledge-offline` and `--backup-path`; it opens the current v9 store
+`--acknowledge-offline` and `--backup-path`; it opens the current v11 store
 read-only, runs `PRAGMA quick_check`, estimates eligible snapshots and disk
 headroom, and is strictly non-mutating. Execute requires all writers stopped,
 the literal `--acknowledge-offline` flag, and a new nonexistent private backup
@@ -982,24 +1066,44 @@ See `INSTALL.md` for the required maintenance and rollback order.
 
 Tendwire exposes a Tendwire-only connector delivery boundary above the SQLite
 store. The public daemon methods are `connector.prepare`, `connector.poll`,
-`connector.ack`, `connector.fail`, `connector.defer`, and the operational
-helper `connector.reclaim`. The matching JSON-only CLI hook is:
+`connector.ack`, `connector.fail`, `connector.defer`, `connector.inspect`,
+`connector.retry`, and the operational helper `connector.reclaim`. Matching
+JSON-only CLI hooks include:
 
 ```bash
 tendwire connector poll --name attention --limit 10 --lease-seconds 60 --db-path /path/to/tendwire.db
 tendwire connector ack --name attention --ref '<opaque-ref>' --response-json '{"delivered":true}' --db-path /path/to/tendwire.db
 tendwire connector fail --name attention --ref '<opaque-ref>' --reason temporary --delay-seconds 60 --db-path /path/to/tendwire.db
 tendwire connector defer --name attention --ref '<opaque-ref>' --reason scheduled --available-at 2026-01-01T00:10:00+00:00 --db-path /path/to/tendwire.db
+tendwire connector inspect --name turn-final --status dead_letter --limit 100 --db-path /path/to/tendwire.db
+tendwire connector retry --name turn-final --final-identity 'twfinal1.<opaque>' --db-path /path/to/tendwire.db
 ```
 
 The boundary is neutral and separate from concrete connector integrations.
 Public requests use `name`, `ref`, `limit`, `lease_seconds`, `available_at`,
-`delay_seconds`, `reason`, and optional sanitized `response`. `name` must be a
-neutral queue name: 1-64 ASCII letters, digits, `.`, `_`, or `-`, and not a
-concrete provider, delivery, backend, or terminal-routing token. Public
-responses use `schema_version`, `ok`, `status`, `host_id`, `name`, `items`,
-`ref`, `key`, `attempt`, `leased_until`, `available_at`, and sanitized
-`payload`. They do not expose `private_state_json`, backend routing,
+`delay_seconds`, `reason`, optional sanitized `response`, and the strictly
+scoped inspect/retry selectors shown above. Dead-letter inspection accepts only
+`name=turn-final`, `status=dead_letter`, and a limit from 1 through 100. It
+reserves room for a failed plan even when migration holds fill the limit.
+
+An exhausted-root item contains bounded `status`, `created_at`, `updated_at`,
+`attempt_count`, sanitized `final`, and an opaque `key` only when that key
+validates. A failed-plan item contains `kind=failed_plan`, `status`, opaque
+`plan_token`, `final_identity`, and `key`, plus public turn/revision, generation,
+`failed_job_count`, and cumulative `attempt_count`. It remains discoverable
+when its source link is absent. Retry accepts exactly one inspected
+`twfinal1.` identity (or exact key through the API) and returns either a
+bounded `requeued` result with `prior_attempt_count` or the existing bounded
+`recovered` result. It is never bulk.
+
+Missing/malformed-owner, internal-automation, and known-incomplete safety holds
+are inspection-only and exact retry fails closed. Eligible exhausted roots and
+unique failed plans can retry only after authoritative current-revision and
+route validation.
+
+`name` must otherwise be a neutral queue name: 1-64 ASCII letters, digits, `.`,
+`_`, or `-`, and not a concrete provider, delivery, backend, or terminal-routing
+token. Public responses never expose `private_state_json`, backend routing,
 pane/session/terminal identifiers, socket paths, target values,
 Telegram/chat/topic/message IDs, tokens, or connector-specific delivery
 internals.
@@ -1032,6 +1136,14 @@ selected complete canonical fields, then atomically materializes ordered
 neutral `upsert` jobs followed by any required reverse-order `retire` jobs.
 Consumers fetch text lazily through `turn.content.get` from each job's ranges;
 the plan itself contains no stored page or provider-specific message copy.
+
+A plan without a live source ref is not route-free. Begin and commit reconstruct
+and validate an immutable authoritative schema-v2
+turn/revision/final-identity/stable-key route from a delivered root or the
+current complete revision, reject internal automation and conflicting roots,
+and copy that route into every materialized job. Failed-plan recovery retains
+the same lineage; a source-less row can be inspected and recovered without
+inventing a worker or fingerprint route.
 
 `recover` is an explicit, one-shot operator action, not an automatic retry
 loop. It applies only to the latest failed generation for the still-current
@@ -1080,6 +1192,37 @@ unbounded retry loops. Once a failed job reaches the configured cap, Tendwire
 moves the outbox item to a neutral terminal `dead_letter` state and returns the
 public status `attempts_exhausted` without exposing private outbox or delivery
 state.
+
+### Delivery-aware final roots and acknowledged history
+
+Persisting an authoritative, owner-authenticated complete final atomically
+creates one neutral durable `final_ready` root before Herdres is available. Its
+`schema_version=2` payload binds the exact public opaque `stable_key` and integer
+`stable_key_version=1` at the root, copied from persisted turn metadata. A
+range plan preserves that route under every job's `turn`; no worker fingerprint
+is a fallback.
+
+Missing/malformed ownership creates a nonpollable `schema_version=1`
+`final_migration_hold`/`dead_letter`. Known-incomplete or internally classified
+automation finals are also nonpollable safety holds. All are permanently
+nonretryable for that canonical identity. Polling leases only a routable root so
+Herdres can materialize its ordered plan, and the root becomes delivered only
+after every part is durably ACKed. Omission, lease expiry, defer, failure,
+restart, and exhaustion never make unresolved work retention-eligible.
+
+`dead_letter` means unresolved, not discardable. Bounded inspect keeps roots and
+failed plans visible without content. Exact retry revalidates the current
+complete owner and route. A unique failed plan, including one with no source
+link, uses deterministic recovery that retains the contiguous ACKed prefix and
+materializes a fresh suffix. An eligible exhausted root preserves cumulative
+attempts and receives a fresh budget. Safety holds, stale/incomplete/resolved
+identities, and ambiguous plans fail closed. After acknowledged cleanup, a
+bounded immutable delivered tombstone prevents the same final key from being
+recreated or reposted. Operators use inspect/retry, never manual SQLite edits.
+
+These source-only contracts and their hermetic Tendwire/Herdres checks do not
+claim a live connector run, service restart, migration of live state, or
+production deployment.
 
 Connector payloads are generic Tendwire jobs such as `attention_created` and
 `attention_escalated`; the existing attention lifecycle writer continues to

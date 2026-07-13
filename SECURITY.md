@@ -22,6 +22,19 @@ the private installation key nor the validated raw workspace/public-pane
 identity used to derive it. Herdres receives only this public pair and never
 needs the secret or raw identity.
 
+Canonical turn identity includes the authenticated public stable-key pair (or
+an explicit unavailable-owner marker) but never uses a worker fingerprint as
+final routing authority. Final delivery binds the pair at the root of a
+`schema_version=2` `final_ready` payload copied from persisted turn metadata,
+and every range job preserves the exact turn/revision/final-identity/stable-key
+route under `turn`.
+
+A missing, partial, malformed, boolean-valued, or unknown-version owner pair
+fails closed as a nonpollable `schema_version=1`
+`final_migration_hold`/`dead_letter`. Known-incomplete content and internally
+classified automation are also held, even with a valid pair. These safety holds
+are permanently nonretryable for that canonical identity.
+
 Same-workspace moves that retain the authoritative pane identity, including tab
 moves, retain the handle; cross-workspace moves do not. Terminal and
 agent-session identifiers are not continuity inputs, so Herdr may recreate them
@@ -41,6 +54,27 @@ agent and pane probes observed different lifecycle instants.
 The connector outbox is a neutral boundary. It stores public connector jobs and
 public-safe delivery state; concrete Telegram delivery, topic routing, retries,
 and rate limits stay in Herdres or another connector process.
+
+Dead letters remain unresolved and retention-protected. Bounded
+`connector.inspect` exposes only public-safe opaque identities, timestamps, and
+aggregate attempt/failed-job metadata. Exact `connector.retry` first
+revalidates the current owner, revision, and full schema-v2 route; safety holds
+fail closed. A source-less failed plan can recover only from immutable
+authoritative route lineage, never from a worker or fingerprint guess.
+
+Acknowledged cleanup preserves a bounded immutable delivered tombstone for the
+opaque final key, preventing repeated snapshots from recreating or reposting
+the removed graph. Only durable ACK evidence proves delivery, and a provider
+may have accepted work whose receipt was lost, so neither Tendwire nor Herdres
+claims provider-perfect exactly-once effects.
+
+Store status and daemon health scope final-retention and snapshot pressure to
+the requested, validated host. They expose fixed aggregate counts, configured
+policies (defaulting to 30 days/4096 proven finals and 14 days/4096 changed
+snapshots per host), and `storage_pressure` only. They never identify a turn,
+final, revision, source, provider operation, private state, or worker
+fingerprint; a malformed or wrong-host aggregate fails closed and degrades
+health.
 
 ## Local-State Permissions and Socket Sharing
 

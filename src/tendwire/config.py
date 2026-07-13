@@ -24,11 +24,16 @@ DEFAULT_TURN_REFRESH_WORKERS = 4
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
+DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
+DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 DEFAULT_SNAPSHOT_RETENTION_DAYS = 14
 DEFAULT_SNAPSHOT_RETENTION_COUNT = 4096
 DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 100
 DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS = 3600
 MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
+MAX_RETENTION_DAYS = 365_000
+MAX_SQLITE_INTEGER = (1 << 63) - 1
+MAX_MAINTENANCE_CADENCE_SECONDS = MAX_RETENTION_DAYS * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,8 @@ class Config:
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
+    acknowledged_final_retention_days: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS
+    acknowledged_final_retention_count: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT
     snapshot_retention_days: int = DEFAULT_SNAPSHOT_RETENTION_DAYS
     snapshot_retention_count: int = DEFAULT_SNAPSHOT_RETENTION_COUNT
     snapshot_maintenance_batch_size: int = DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE
@@ -95,7 +102,11 @@ class Config:
         object.__setattr__(
             self,
             "event_retention_days",
-            _positive_int(self.event_retention_days, "event_retention_days", minimum=1),
+            _bounded_positive_int(
+                self.event_retention_days,
+                "event_retention_days",
+                maximum=MAX_RETENTION_DAYS,
+            ),
         )
         object.__setattr__(
             self,
@@ -150,10 +161,29 @@ class Config:
         )
         object.__setattr__(
             self,
+            "acknowledged_final_retention_days",
+            _bounded_positive_int(
+                self.acknowledged_final_retention_days,
+                "acknowledged_final_retention_days",
+                maximum=MAX_RETENTION_DAYS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "acknowledged_final_retention_count",
+            _bounded_positive_int(
+                self.acknowledged_final_retention_count,
+                "acknowledged_final_retention_count",
+                maximum=MAX_SQLITE_INTEGER,
+            ),
+        )
+        object.__setattr__(
+            self,
             "snapshot_retention_days",
             _bounded_positive_int(
                 self.snapshot_retention_days,
                 "snapshot_retention_days",
+                maximum=MAX_RETENTION_DAYS,
             ),
         )
         object.__setattr__(
@@ -162,6 +192,7 @@ class Config:
             _bounded_positive_int(
                 self.snapshot_retention_count,
                 "snapshot_retention_count",
+                maximum=MAX_SQLITE_INTEGER,
             ),
         )
         object.__setattr__(
@@ -179,6 +210,7 @@ class Config:
             _bounded_positive_int(
                 self.store_maintenance_cadence_seconds,
                 "store_maintenance_cadence_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
             ),
         )
 
@@ -276,6 +308,8 @@ def load_config(
     pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
+    acknowledged_final_retention_days: int | str | None = None,
+    acknowledged_final_retention_count: int | str | None = None,
     snapshot_retention_days: int | str | None = None,
     snapshot_retention_count: int | str | None = None,
     snapshot_maintenance_batch_size: int | str | None = None,
@@ -393,6 +427,16 @@ def load_config(
             connector_claim_ttl_seconds,
             "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
             DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
+        ),
+        acknowledged_final_retention_days=_resolve_value(
+            acknowledged_final_retention_days,
+            "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS",
+            DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS,
+        ),
+        acknowledged_final_retention_count=_resolve_value(
+            acknowledged_final_retention_count,
+            "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT",
+            DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT,
         ),
         snapshot_retention_days=_resolve_value(
             snapshot_retention_days,

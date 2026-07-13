@@ -1304,12 +1304,25 @@ def test_isolated_start_delay_times_out_then_reaps_with_bounded_grace(
     context = multiprocessing.get_context("spawn")
     process_type = type(context.Process())
     original_start = process_type.start
+    original_deadline_check = herdr_turns._check_ipc_deadline
+    start_entered = False
 
     def delayed_start(process):
+        nonlocal start_entered
+        start_entered = True
         time.sleep(0.08)
         return original_start(process)
 
+    def deadline_after_start(deadline, cancel_event):
+        if start_entered:
+            original_deadline_check(deadline, cancel_event)
+
     monkeypatch.setattr(process_type, "start", delayed_start)
+    monkeypatch.setattr(
+        herdr_turns,
+        "_check_ipc_deadline",
+        deadline_after_start,
+    )
     before_children = {child.pid for child in multiprocessing.active_children()}
     started = time.monotonic()
     try:
@@ -1581,7 +1594,10 @@ def test_stop_terminates_and_reaps_active_pane_adapter(tmp_path: Path, monkeypat
     )
     scheduler = TurnIngestionScheduler(config)
     scheduler.start()
-    _wait_until(pid_file.exists)
+    _wait_until(
+        lambda: pid_file.exists()
+        and bool(pid_file.read_text(encoding="utf-8").strip())
+    )
     pid = int(pid_file.read_text(encoding="utf-8"))
     started = time.monotonic()
     scheduler.stop(flush_timeout_seconds=1)

@@ -1273,6 +1273,8 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         max_workers=8,
         max_outbox_attempts=4,
         connector_claim_ttl_seconds=33,
+        acknowledged_final_retention_days=40,
+        acknowledged_final_retention_count=500,
         snapshot_retention_days=9,
         snapshot_retention_count=70,
         snapshot_maintenance_batch_size=6,
@@ -1350,6 +1352,20 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
     assert health["daemon"]["started_at"]
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["store"]["outbox"]["pending"] == 1
+    assert health["store"]["final_retention"] == {
+        "acknowledged": 0,
+        "unresolved": 0,
+        "queued": 0,
+        "leased": 0,
+        "deferred": 0,
+        "retry": 0,
+        "dead_letter": 0,
+        "awaiting_ack": 0,
+        "eligible": 0,
+        "acknowledged_final_retention_days": 40,
+        "acknowledged_final_retention_count": 500,
+        "storage_pressure": False,
+    }
     assert health["store"]["maintenance"] == {
         "last_completed_at": None,
         "status": "never",
@@ -1368,6 +1384,8 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "max_workers": 8,
         "max_outbox_attempts": 4,
         "outbox_claim_ttl_seconds": 33,
+        "acknowledged_final_retention_days": 40,
+        "acknowledged_final_retention_count": 500,
         "snapshot_retention_days": 9,
         "snapshot_retention_count": 70,
         "snapshot_maintenance_batch_size": 6,
@@ -1474,6 +1492,200 @@ def test_daemon_health_pending_aggregate_is_fail_closed_and_public_safe(
     }
 
 
+def test_daemon_health_degrades_on_public_safe_final_storage_pressure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "final-pressure.db"
+    config = Config(
+        host_id="pressure-host",
+        db_path=db_path,
+        acknowledged_final_retention_days=30,
+        acknowledged_final_retention_count=2,
+    )
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+
+    def pressured_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": config.host_id,
+            "counts": {
+                "snapshots": 1,
+                "events": 0,
+                "spaces": 0,
+                "workers": 0,
+                "turns": 0,
+                "pending_interactions": 0,
+                "attention_items": 0,
+                "commands": 0,
+                "command_receipts": 0,
+                "backend_health": 0,
+            },
+            "outbox": {
+                "pending": 0,
+                "leased": 0,
+                "completed": 0,
+                "by_status": {},
+            },
+            "maintenance": {
+                "last_completed_at": None,
+                "status": "never",
+                "snapshot_count": 1,
+                "snapshot_retention_days": config.snapshot_retention_days,
+                "snapshot_retention_count": config.snapshot_retention_count,
+                "maintenance_batch_size": config.snapshot_maintenance_batch_size,
+                "maintenance_cadence_seconds": config.store_maintenance_cadence_seconds,
+                "backlog": False,
+            },
+            "final_retention": {
+                "acknowledged": 4,
+                "unresolved": 3,
+                "queued": 1,
+                "leased": 0,
+                "deferred": 0,
+                "retry": 0,
+                "dead_letter": 1,
+                "awaiting_ack": 1,
+                "eligible": 2,
+                "acknowledged_final_retention_days": 30,
+                "acknowledged_final_retention_count": 2,
+                "storage_pressure": True,
+                "row_id": 987,
+                "private_state_json": "sentinel-private-state",
+                "source_path": str(tmp_path / "sentinel-private-source"),
+            },
+        }
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", pressured_status)
+
+    health = TendwireDaemon(config).get_health()
+    encoded = json.dumps(health, sort_keys=True)
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "degraded"
+    assert health["store"]["final_retention"] == {
+        "acknowledged": 4,
+        "unresolved": 3,
+        "queued": 1,
+        "leased": 0,
+        "deferred": 0,
+        "retry": 0,
+        "dead_letter": 1,
+        "awaiting_ack": 1,
+        "eligible": 2,
+        "acknowledged_final_retention_days": 30,
+        "acknowledged_final_retention_count": 2,
+        "storage_pressure": True,
+    }
+    assert "sentinel-private" not in encoded
+    assert str(tmp_path) not in encoded
+    assert "row_id" not in encoded
+    _assert_no_public_json_forbidden(health)
+
+
+def test_daemon_health_degrades_on_valid_snapshot_maintenance_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "snapshot-pressure.db"
+    config = Config(host_id="snapshot-pressure-host", db_path=db_path)
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+
+    def backlogged_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["maintenance"]["backlog"] = True
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", backlogged_status)
+    health = TendwireDaemon(config).get_health()
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "degraded"
+    assert health["store"]["maintenance"]["backlog"] is True
+
+
+def test_daemon_health_rejects_cross_host_store_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "cross-host-health.db"
+    config = Config(host_id="expected-host", db_path=db_path)
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+
+    def cross_host_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["host_id"] = "foreign-host"
+        payload["counts"]["snapshots"] = 999
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", cross_host_status)
+    health = TendwireDaemon(config).get_health()
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "unavailable"
+    assert set(health["store"]["counts"].values()) == {0}
+    assert health["store"]["maintenance"]["snapshot_count"] == 0
+
+
+def test_daemon_health_rejects_malformed_aggregate_fields_without_leaking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "malformed-health.db"
+    config = Config(host_id="malformed-host", db_path=db_path)
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    private_marker = "XYZZY-private-health-marker"
+    real_status = store_sqlite.store_status
+
+    def malformed_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["counts"]["diagnostic"] = private_marker
+        payload["outbox"] = {
+            "pending": -1,
+            "leased": 0,
+            "by_status": {},
+            "diagnostic": private_marker,
+        }
+        payload["maintenance"]["last_completed_at"] = private_marker
+        payload["final_retention"]["unresolved"] = 0
+        payload["final_retention"]["queued"] = 1
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", malformed_status)
+    health = TendwireDaemon(config).get_health()
+    encoded = json.dumps(health, sort_keys=True)
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "unavailable"
+    assert set(health["store"]["counts"].values()) == {0}
+    assert health["store"]["outbox"] == {
+        "pending": 0,
+        "leased": 0,
+        "completed": 0,
+        "by_status": {},
+    }
+    assert health["store"]["maintenance"]["last_completed_at"] is None
+    assert health["store"]["final_retention"]["queued"] == 0
+    assert private_marker not in encoded
+
+
 _UNIX_SOCKET_TEST = pytest.mark.skipif(
     os.name != "posix"
     or not sys.platform.startswith("linux")
@@ -1535,8 +1747,10 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         snapshot_retention_count=123,
         snapshot_maintenance_batch_size=17,
         store_maintenance_cadence_seconds=91,
+        acknowledged_final_retention_days=33,
+        acknowledged_final_retention_count=456,
     )
-    calls: list[tuple[Path, Any, int]] = []
+    calls: list[tuple[Path, Any, int, int, int]] = []
 
     def observe(_config: Config) -> Snapshot:
         snapshot = _public_snapshot()
@@ -1547,11 +1761,21 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         path: Path,
         *,
         policy: Any,
+        acknowledged_final_retention_days: int = 30,
+        acknowledged_final_retention_count: int = 4096,
         cadence_seconds: int = 3600,
         now: str | None = None,
     ) -> dict[str, Any]:
         assert now is None
-        calls.append((path, policy, cadence_seconds))
+        calls.append(
+            (
+                path,
+                policy,
+                acknowledged_final_retention_days,
+                acknowledged_final_retention_count,
+                cadence_seconds,
+            )
+        )
         return {
             "schema_version": 1,
             "ok": True,
@@ -1586,14 +1810,16 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         daemon.stop()
 
     assert len(calls) == 1
-    path, policy, cadence = calls[0]
+    path, policy, final_days, final_count, cadence = calls[0]
     assert path == db_path
     assert (
         policy.retention_days,
         policy.retention_count,
         policy.batch_size,
+        final_days,
+        final_count,
         cadence,
-    ) == (21, 123, 17, 91)
+    ) == (21, 123, 17, 33, 456, 91)
     assert health["store"]["maintenance"]["last_check"] == {
         "ok": True,
         "status": "not_due",
@@ -4549,6 +4775,7 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
         db_path=db_path,
         socket_path=socket_path,
         turn_refresh_interval_seconds=3600,
+        acknowledged_final_retention_days=36500,
     )
     worker = Worker(id="worker-race", name="Worker Race", status="active")
     snapshot = Snapshot(

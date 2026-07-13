@@ -32,7 +32,7 @@ from tendwire.local_state import (
 from tendwire.core.commands import STATUS_ACCEPTED
 from tendwire.config import Config
 from tendwire.core.models import WorkerBinding
-from tendwire.core.turns import content_cursor
+from tendwire.core.turns import content_cursor, turn_final_delivery_identity
 from tendwire.core.projector import project_empty, project_from_raw
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
@@ -42,6 +42,7 @@ from tendwire.store.sqlite import (
     append_event,
     attention_payload_from_store,
     cleanup_event_retention,
+    cleanup_acknowledged_final_retention,
     compact_store,
     defer_connector_delivery,
     exhaust_connector_retries,
@@ -1444,6 +1445,7 @@ def test_store_initializes_v8_schema_with_companion_attention_lifecycle(tmp_path
             "created_at",
             "activated_at",
             "completed_at",
+            "source_outbox_id",
         }
         assert {
             row[1]
@@ -4888,17 +4890,59 @@ def test_distinct_source_turns_mint_distinct_public_turn_ids(tmp_path: Path) -> 
     assert len([t for t in payload3["turns"] if t.get("source_turn_id")]) == 2
 
 
-def test_source_turn_history_is_capped(tmp_path: Path) -> None:
-    db_path = tmp_path / "source-turn-cap.db"
+def test_final_identity_is_stable_neutral_and_argument_bound() -> None:
+    identity = turn_final_delivery_identity(
+        "host-private-value",
+        "turn-public-a",
+        "twrev1.revisionA",
+    )
+
+    assert identity == turn_final_delivery_identity(
+        "host-private-value",
+        "turn-public-a",
+        "twrev1.revisionA",
+    )
+    assert identity.startswith("twfinal1.")
+    assert "host-private-value" not in identity
+    assert "turn-public-a" not in identity
+    assert identity != turn_final_delivery_identity(
+        "host-private-value",
+        "turn-public-a",
+        "twrev1.revisionB",
+    )
+    assert identity != turn_final_delivery_identity(
+        "other-host",
+        "turn-public-a",
+        "twrev1.revisionA",
+    )
+    with pytest.raises(ValueError, match="invalid_host_id"):
+        turn_final_delivery_identity("", "turn-public-a", "twrev1.revisionA")
+
+
+def test_twenty_offline_source_finals_are_retained_as_unique_ready_anchors(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "source-turn-retention.db"
     config = Config(host_id="turn-host", db_path=db_path)
     snapshot = project_from_raw(
         config,
-        workers=[{"id": "worker-1", "name": "claude", "status": "active", "space_id": "space-1"}],
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "active",
+                "space_id": "space-1",
+                "meta": {
+                    "stable_key": "wsk1_" + ("2" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
-    for index in range(10):
-        merge_turn_content(
+    for index in range(20):
+        assert merge_turn_content(
             db_path,
             "turn-host",
             "worker-1",
@@ -4908,11 +4952,34 @@ def test_source_turn_history_is_capped(tmp_path: Path) -> None:
                 "source_turn_id": f"uuid-{index}",
             },
             observed_at=f"2026-01-01T00:{index:02d}:00+00:00",
-        )
+        ) == 1
+
     payload = turns_payload_from_store(db_path, "turn-host", snapshot=snapshot)
-    source_rows = [t for t in payload["turns"] if t.get("source_turn_id")]
-    assert len(source_rows) == 6
-    assert source_rows[0]["assistant_final_text"] == "answer 9"
+    source_rows = [turn for turn in payload["turns"] if turn.get("source_turn_id")]
+    with sqlite3.connect(str(db_path)) as conn:
+        anchors = conn.execute(
+            """
+            SELECT delivery_key, payload_json
+            FROM connector_outbox
+            WHERE host_id = ?
+              AND delivery_kind = 'final_ready'
+              AND status = 'queued'
+            ORDER BY id
+            """,
+            ("turn-host",),
+        ).fetchall()
+
+    assert len(source_rows) == 20
+    assert len(anchors) == len({row[0] for row in anchors}) == 20
+    assert source_rows[0]["assistant_final_text"] == "answer 19"
+    assert all(
+        row[0].startswith("turn-final:revision:twfinal1.")
+        for row in anchors
+    )
+    encoded_anchors = "\n".join(row[1] for row in anchors)
+    assert "answer 0" not in encoded_anchors
+    assert "answer 19" not in encoded_anchors
+    assert "source_turn_id" not in encoded_anchors
 
 
 def _reset_store_to_v5_with_legacy_turn(
@@ -5977,11 +6044,22 @@ def _seed_superseded_content_revision(
     *,
     host_id: str,
     source_turn_id: str,
+    retain_source_anchor: bool = False,
 ) -> tuple[str, str, str]:
     config = Config(host_id=host_id, db_path=db_path)
     snapshot = project_from_raw(
         config,
-        workers=[{"id": "worker-1", "name": "claude", "status": "active"}],
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("3" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
@@ -6022,6 +6100,32 @@ def _seed_superseded_content_revision(
                 f"new-{source_turn_id}",
             ),
         ).fetchall()
+        if not retain_source_anchor:
+            source_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT id
+                    FROM connector_outbox
+                    WHERE host_id = ? AND connector = 'turn-final'
+                      AND delivery_kind = 'final_ready'
+                      AND content_revision = ? AND status = 'superseded'
+                    """,
+                    (host_id, str(rows[0][1])),
+                ).fetchall()
+            ]
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                conn.execute(
+                    f"DELETE FROM connector_deliveries "
+                    f"WHERE outbox_id IN ({placeholders})",
+                    source_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM connector_outbox "
+                    f"WHERE id IN ({placeholders})",
+                    source_ids,
+                )
     assert len(rows) == 2
     assert rows[0][2] == 0
     assert rows[1][2] == 1
@@ -6043,21 +6147,25 @@ def _insert_retention_plan(
     outbox_status: str | None = None,
     audit_status: str | None = None,
     audit_at: str | None = None,
+    part_count: int = 1,
+    source_outbox_id: int | None = None,
 ) -> tuple[int, int | None]:
     conn.execute(
         """
         INSERT INTO turn_presentation_plans (
             host_id, name, plan_token, turn_id, content_revision,
-            presentation_version, part_count, state, replaces_plan_token,
-            created_at, activated_at, completed_at
-        ) VALUES (?, 'turn-final', ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            source_outbox_id, presentation_version, part_count, state,
+            replaces_plan_token, created_at, activated_at, completed_at
+        ) VALUES (?, 'turn-final', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             host_id,
             token,
             turn_id,
             revision,
+            source_outbox_id,
             f"test-{token}",
+            int(part_count),
             state,
             replaces_plan_token,
             created_at,
@@ -6129,6 +6237,65 @@ def _insert_retention_plan(
     return plan_id, outbox_id
 
 
+def _insert_retention_source_anchor(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    revision: str,
+    key: str,
+    status: str = "superseded",
+    updated_at: str = "2026-01-01T00:00:00+00:00",
+    attempt_status: str | None = None,
+    attempt_at: str | None = None,
+) -> int:
+    payload_json = json.dumps(
+        {"schema_version": 1, "content_revision": revision},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO connector_outbox (
+            host_id, connector, delivery_key, delivery_kind, turn_id,
+            content_revision, status, payload_json, private_state_json,
+            created_at, updated_at
+        ) VALUES (?, 'turn-final', ?, 'final_ready', ?, ?, ?, ?, '{}', ?, ?)
+        """,
+        (
+            host_id,
+            key,
+            turn_id,
+            revision,
+            status,
+            payload_json,
+            updated_at,
+            updated_at,
+        ),
+    )
+    source_outbox_id = int(
+        conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    )
+    if attempt_status is not None:
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt,
+                status, created_at, delivered_at
+            ) VALUES (?, ?, 'turn-final', ?, 1, ?, ?, ?)
+            """,
+            (
+                source_outbox_id,
+                host_id,
+                key,
+                attempt_status,
+                attempt_at or updated_at,
+                attempt_at,
+            ),
+        )
+    return source_outbox_id
+
+
 def test_turn_content_maintenance_dry_run_batch_age_idempotence_and_integrity(
     tmp_path: Path,
 ) -> None:
@@ -6139,6 +6306,7 @@ def test_turn_content_maintenance_dry_run_batch_age_idempotence_and_integrity(
             db_path,
             host_id=host_id,
             source_turn_id=f"source-{index}",
+            retain_source_anchor=True,
         )[1]
         for index in range(3)
     ]
@@ -6161,30 +6329,19 @@ def test_turn_content_maintenance_dry_run_batch_age_idempotence_and_integrity(
             """,
             (host_id,),
         ).fetchone()[0]
-    first = run_store_maintenance(
-        db_path,
-        host_id,
-        retention_days=7,
-        max_outbox_attempts=99,
-        now="2026-01-10T00:00:00+00:00",
-        content_batch_size=2,
-    )
-    second = run_store_maintenance(
-        db_path,
-        host_id,
-        retention_days=7,
-        max_outbox_attempts=99,
-        now="2026-01-10T00:00:00+00:00",
-        content_batch_size=2,
-    )
-    third = run_store_maintenance(
-        db_path,
-        host_id,
-        retention_days=7,
-        max_outbox_attempts=99,
-        now="2026-01-10T00:00:00+00:00",
-        content_batch_size=2,
-    )
+    batches: list[dict[str, Any]] = []
+    for _ in range(8):
+        result = run_store_maintenance(
+            db_path,
+            host_id,
+            retention_days=7,
+            max_outbox_attempts=99,
+            now="2026-01-10T00:00:00+00:00",
+            content_batch_size=2,
+        )
+        batches.append(result["turn_content"])
+        if result["turn_content"]["examined"] == 0:
+            break
     with sqlite3.connect(str(db_path)) as conn:
         remaining = conn.execute(
             """
@@ -6194,6 +6351,16 @@ def test_turn_content_maintenance_dry_run_batch_age_idempotence_and_integrity(
             """,
             (host_id,),
         ).fetchall()
+        stale_sources = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM connector_outbox
+            WHERE host_id = ? AND delivery_kind = 'final_ready'
+              AND status = 'superseded'
+            """,
+            (host_id,),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
 
     assert len(revisions) == 3
@@ -6208,21 +6375,25 @@ def test_turn_content_maintenance_dry_run_batch_age_idempotence_and_integrity(
         "skipped_reference": 0,
         "deleted_rows": {
             "plans": 0,
+            "recoveries": 0,
             "jobs": 0,
-            "queue_anchors": 0,
+            "queue_anchors": 2,
             "attempts": 0,
-            "revisions": 2,
+            "revisions": 0,
         },
     }
     assert after_dry_run == 3
-    assert first["turn_content"]["examined"] == 2
-    assert first["turn_content"]["deleted_rows"]["revisions"] == 2
-    assert second["turn_content"]["examined"] == 1
-    assert second["turn_content"]["deleted_rows"]["revisions"] == 1
-    assert third["turn_content"]["examined"] == 0
-    assert third["turn_content"]["deleted"] == 0
+    assert batches[-1]["examined"] == 0
+    assert batches[-1]["deleted"] == 0
+    assert all(batch["examined"] <= 2 for batch in batches)
+    assert sum(
+        batch["deleted_rows"]["queue_anchors"] for batch in batches
+    ) == 3
+    assert sum(batch["deleted_rows"]["revisions"] for batch in batches) == 3
     assert len(remaining) == 4
     assert all(row[1] == 1 for row in remaining)
+    assert stale_sources == 0
+    assert foreign_keys == []
     assert integrity == "ok"
 
 
@@ -6304,8 +6475,8 @@ def test_turn_content_maintenance_removes_only_stale_preparing_plan(
     assert result["turn_content"]["skipped_reference"] == 0
     assert result["turn_content"]["deleted_rows"]["plans"] == 1
     assert result["turn_content"]["deleted_rows"]["jobs"] == 1
-    assert revision_cleanup["turn_content"]["examined"] == 1
-    assert revision_cleanup["turn_content"]["deleted_rows"]["revisions"] == 1
+    assert revision_cleanup["turn_content"]["examined"] == 0
+    assert result["turn_content"]["deleted_rows"]["revisions"] == 1
     assert plans == {"twplan1.recent"}
     assert old_exists == 0
     assert recent_exists == 1
@@ -6320,9 +6491,35 @@ def test_turn_content_maintenance_reaps_old_terminal_anchor_chain(
         db_path,
         host_id=host_id,
         source_turn_id="terminal",
+        retain_source_anchor=True,
     )
     with sqlite3.connect(str(db_path)) as conn:
-        _insert_retention_plan(
+        source_outbox_id = int(
+            conn.execute(
+                """
+                SELECT id
+                FROM connector_outbox
+                WHERE host_id = ? AND delivery_kind = 'final_ready'
+                  AND content_revision = ? AND status = 'superseded'
+                """,
+                (host_id, old_revision),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_deliveries (
+                outbox_id, host_id, connector, delivery_key, attempt,
+                status, created_at, delivered_at
+            ) VALUES (?, ?, 'turn-final', 'source-old', 1, 'superseded', ?, ?)
+            """,
+            (
+                source_outbox_id,
+                host_id,
+                "2026-01-02T00:00:00+00:00",
+                "2026-01-02T00:00:00+00:00",
+            ),
+        )
+        old_plan_id, _ = _insert_retention_plan(
             conn,
             host_id=host_id,
             turn_id=turn_id,
@@ -6333,8 +6530,9 @@ def test_turn_content_maintenance_reaps_old_terminal_anchor_chain(
             outbox_status="delivered",
             audit_status="delivered",
             audit_at="2026-01-01T00:01:00+00:00",
+            source_outbox_id=source_outbox_id,
         )
-        _insert_retention_plan(
+        current_plan_id, _ = _insert_retention_plan(
             conn,
             host_id=host_id,
             turn_id=turn_id,
@@ -6344,6 +6542,27 @@ def test_turn_content_maintenance_reaps_old_terminal_anchor_chain(
             created_at="2026-01-02T00:00:00+00:00",
             activated_at="2026-01-02T00:00:00+00:00",
             completed_at="2026-01-02T00:01:00+00:00",
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_presentation_recoveries (
+                host_id, name, request_id, failed_plan_id, recovered_plan_id,
+                failed_plan_token, recovered_plan_token, generation,
+                source_job_count, delivered_prefix_count, fresh_job_count,
+                retained_failed_job_count, prior_attempt_count, outcome,
+                created_at
+            ) VALUES (
+                ?, 'turn-final', 'retention-recovery', ?, ?,
+                'twplan1.old', 'twplan1.current', 2, 1, 0, 1, 1, 1,
+                'recovered', ?
+            )
+            """,
+            (
+                host_id,
+                old_plan_id,
+                current_plan_id,
+                "2026-01-02T00:01:00+00:00",
+            ),
         )
 
     result = run_store_maintenance(
@@ -6390,18 +6609,605 @@ def test_turn_content_maintenance_reaps_old_terminal_anchor_chain(
     assert result["turn_content"]["skipped_reference"] == 0
     assert result["turn_content"]["deleted_rows"] == {
         "plans": 1,
+        "recoveries": 1,
         "jobs": 1,
-        "queue_anchors": 1,
-        "attempts": 1,
-        "revisions": 0,
+        "queue_anchors": 2,
+        "attempts": 2,
+        "revisions": 1,
     }
-    assert revision_cleanup["turn_content"]["examined"] == 1
-    assert revision_cleanup["turn_content"]["deleted_rows"]["revisions"] == 1
+    assert revision_cleanup["turn_content"]["examined"] == 0
+    assert revision_cleanup["turn_content"]["deleted_rows"]["revisions"] == 0
     assert plans == [("twplan1.current",)]
     assert len(revisions) == 2
     assert (current_revision, 1) in revisions
     assert all(row[1] == 1 for row in revisions)
-    assert counts == (0, 0, 0)
+    assert counts == (0, 1, 0)
+    assert integrity == "ok"
+
+
+def test_turn_content_maintenance_collapses_terminal_unacked_footprints(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "content-maintenance-summary.db"
+    host_id = "retention-summary"
+    turn_id, old_revision, current_revision = _seed_superseded_content_revision(
+        db_path,
+        host_id=host_id,
+        source_turn_id="summary",
+    )
+    part_counts = [2, 5, 3, 4]
+    with sqlite3.connect(str(db_path)) as conn:
+        for index, part_count in enumerate(part_counts):
+            source_outbox_id = _insert_retention_source_anchor(
+                conn,
+                host_id=host_id,
+                turn_id=turn_id,
+                revision=old_revision,
+                key=f"summary-source-{index}",
+                attempt_status="superseded",
+                attempt_at="2026-01-01T00:30:00+00:00",
+            )
+            _insert_retention_plan(
+                conn,
+                host_id=host_id,
+                turn_id=turn_id,
+                revision=old_revision,
+                token=f"twplan1.summary-{index}",
+                state="superseded",
+                activated_at=f"2026-01-01T0{index}:00:00+00:00",
+                outbox_status="superseded",
+                audit_status="superseded",
+                audit_at="2026-01-01T00:30:00+00:00",
+                part_count=part_count,
+                source_outbox_id=source_outbox_id,
+            )
+
+    cleanup_batches: list[dict[str, Any]] = []
+    for _ in range(4):
+        cleanup = run_store_maintenance(
+            db_path,
+            host_id,
+            retention_days=7,
+            max_outbox_attempts=99,
+            now="2026-01-20T00:00:00+00:00",
+            content_batch_size=20,
+        )
+        cleanup_batches.append(cleanup["turn_content"])
+        if cleanup["turn_content"]["examined"] == 0:
+            break
+    with sqlite3.connect(str(db_path)) as conn:
+        summaries = conn.execute(
+            """
+            SELECT plan_token, part_count, source_outbox_id
+            FROM turn_presentation_plans
+            WHERE host_id = ? AND turn_id = ? AND state = 'superseded'
+            ORDER BY id
+            """,
+            (host_id, turn_id),
+        ).fetchall()
+        summary_jobs = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_presentation_jobs AS jobs
+            JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+            WHERE plans.host_id = ? AND plans.turn_id = ?
+              AND plans.state = 'superseded'
+            """,
+            (host_id, turn_id),
+        ).fetchone()[0]
+        stale_sources = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM connector_outbox
+            WHERE host_id = ? AND delivery_kind = 'final_ready'
+              AND status = 'superseded'
+            """,
+            (host_id,),
+        ).fetchone()[0]
+        revision_state = conn.execute(
+            """
+            SELECT user_state, final_state, user_char_length, final_char_length
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (host_id, turn_id, current_revision),
+        ).fetchone()
+
+    assert sum(batch["examined"] for batch in cleanup_batches) == len(part_counts)
+    assert sum(batch["deleted"] for batch in cleanup_batches) == len(part_counts)
+    assert sum(
+        batch["deleted_rows"]["plans"] for batch in cleanup_batches
+    ) == len(part_counts) - 1
+    assert sum(
+        batch["deleted_rows"]["recoveries"] for batch in cleanup_batches
+    ) == 0
+    assert sum(
+        batch["deleted_rows"]["jobs"] for batch in cleanup_batches
+    ) == len(part_counts)
+    assert sum(
+        batch["deleted_rows"]["queue_anchors"] for batch in cleanup_batches
+    ) == len(part_counts) * 2
+    assert sum(
+        batch["deleted_rows"]["attempts"] for batch in cleanup_batches
+    ) == len(part_counts) * 2
+    assert sum(
+        batch["deleted_rows"]["revisions"] for batch in cleanup_batches
+    ) == 0
+    assert summaries == [("twplan1.summary-3", max(part_counts), None)]
+    assert summary_jobs == 0
+    assert stale_sources == 0
+
+    source = store_sqlite.poll_connector_outbox(
+        db_path,
+        host_id,
+        "turn-final",
+        limit=1,
+        lease_seconds=600,
+        now="2026-01-21T00:00:00+00:00",
+    )["items"][0]
+    begin = store_sqlite.prepare_connector_plan_begin(
+        db_path,
+        host_id,
+        name="turn-final",
+        turn_id=turn_id,
+        content_revision=current_revision,
+        presentation_version="retention-smaller",
+        part_count=1,
+        source_ref=source["ref"],
+        now="2026-01-21T00:00:00+00:00",
+    )
+    assert begin["ok"] is True, (begin, source)
+    spans = []
+    if str(revision_state[0]) == "complete":
+        spans.append(
+            {
+                "field": "user_text",
+                "start_char": 0,
+                "end_char": int(revision_state[2]),
+            }
+        )
+    if str(revision_state[1]) == "complete":
+        spans.append(
+            {
+                "field": "assistant_final_text",
+                "start_char": 0,
+                "end_char": int(revision_state[3]),
+            }
+        )
+    part = store_sqlite.prepare_connector_plan_part(
+        db_path,
+        host_id,
+        name="turn-final",
+        plan_token=str(begin["plan_token"]),
+        ordinal=0,
+        spans=spans,
+        now="2026-01-21T00:01:00+00:00",
+    )
+    assert part["ok"] is True
+    commit = store_sqlite.prepare_connector_plan_commit(
+        db_path,
+        host_id,
+        name="turn-final",
+        plan_token=str(begin["plan_token"]),
+        source_ref=source["ref"],
+        now="2026-01-21T00:02:00+00:00",
+    )
+    assert commit["ok"] is True
+    with sqlite3.connect(str(db_path)) as conn:
+        operations = conn.execute(
+            """
+            SELECT operation, COUNT(*)
+            FROM turn_presentation_jobs AS jobs
+            JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+            WHERE plans.plan_token = ?
+            GROUP BY operation
+            ORDER BY operation
+            """,
+            (str(begin["plan_token"]),),
+        ).fetchall()
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+    assert commit["job_count"] == max(part_counts)
+    assert operations == [("retire", max(part_counts) - 1), ("upsert", 1)]
+    assert foreign_keys == []
+    assert integrity == "ok"
+
+
+def test_acknowledged_revision_count_bounds_one_frequently_revised_turn(
+    tmp_path: Path,
+) -> None:
+    from tendwire.connectors import ConnectorOutboxAPI
+
+    db_path = tmp_path / "acknowledged-revision-count.db"
+    host_id = "acknowledged-revision-count"
+    config = Config(host_id=host_id, db_path=db_path)
+    snapshot = project_from_raw(
+        config,
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "claude",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("4" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    api = ConnectorOutboxAPI(db_path, host_id)
+    revisions: list[str] = []
+    for index in range(4):
+        assert merge_turn_content(
+            db_path,
+            host_id,
+            "worker-1",
+            {
+                "assistant_final_text": f"revision-{index}",
+                "complete": True,
+                "source_turn_id": "frequently-revised",
+            },
+            observed_at=f"2026-07-13T00:0{index}:00+00:00",
+        ) == 1
+        ready = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+        revision = str(ready["payload"]["content_revision"])
+        revisions.append(revision)
+        final_length = int(
+            ready["payload"]["content"]["fields"]["assistant_final_text"][
+                "char_length"
+            ]
+        )
+        begun = api.prepare(
+            {
+                "schema_version": 1,
+                "action": "begin",
+                "name": "turn-final",
+                "turn_id": ready["payload"]["turn_id"],
+                "content_revision": revision,
+                "presentation_version": "retention-count-v1",
+                "part_count": 1,
+                "source_ref": ready["ref"],
+            }
+        )
+        assert begun["ok"] is True
+        assert api.prepare(
+            {
+                "schema_version": 1,
+                "action": "part",
+                "name": "turn-final",
+                "plan_token": begun["plan_token"],
+                "ordinal": 0,
+                "spans": [
+                    {
+                        "field": "assistant_final_text",
+                        "start_char": 0,
+                        "end_char": final_length,
+                    }
+                ],
+            }
+        )["ok"] is True
+        assert api.prepare(
+            {
+                "schema_version": 1,
+                "action": "commit",
+                "name": "turn-final",
+                "plan_token": begun["plan_token"],
+                "source_ref": ready["ref"],
+            }
+        )["ok"] is True
+        job = api.poll({"name": "turn-final", "limit": 1})["items"][0]
+        assert api.ack({"name": "turn-final", "ref": job["ref"]})["ok"] is True
+
+    turn_id = str(ready["payload"]["turn_id"])
+    maintenance_results: list[dict[str, Any]] = []
+    for _ in range(3):
+        maintenance_results.append(
+            run_store_maintenance(
+                db_path,
+                host_id,
+                retention_days=36500,
+                acknowledged_final_retention_days=36500,
+                acknowledged_final_retention_count=2,
+                max_outbox_attempts=99,
+                now="2026-07-14T00:00:00+00:00",
+                content_batch_size=20,
+            )
+        )
+    status = store_status(
+        db_path,
+        host_id,
+        acknowledged_final_retention_days=36500,
+        acknowledged_final_retention_count=2,
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        retained_roots = conn.execute(
+            """
+            SELECT content_revision
+            FROM connector_outbox
+            WHERE host_id = ? AND delivery_kind = 'final_ready'
+              AND status = 'delivered'
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+        retained_plans = conn.execute(
+            """
+            SELECT content_revision, state
+            FROM turn_presentation_plans
+            WHERE host_id = ?
+            ORDER BY id
+            """,
+            (host_id,),
+        ).fetchall()
+        retained_revisions = conn.execute(
+            """
+            SELECT content_revision, is_current
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ?
+            ORDER BY created_at
+            """,
+            (host_id, turn_id),
+        ).fetchall()
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ? AND turn_id = ?",
+            (host_id, turn_id),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert maintenance_results[0]["turn_content"]["deleted"] == 2
+    assert maintenance_results[0]["turn_content"]["deleted_rows"]["revisions"] == 2
+    expected = [(revisions[-2],), (revisions[-1],)]
+    assert retained_roots == expected, json.dumps(maintenance_results, sort_keys=True)
+    assert retained_plans == [
+        (revisions[-2], "superseded"),
+        (revisions[-1], "completed"),
+    ]
+    assert retained_revisions == [
+        (revisions[-2], 0),
+        (revisions[-1], 1),
+    ]
+    assert turn_count == 1
+    assert foreign_keys == []
+    assert status["final_retention"]["acknowledged"] == 2
+    assert status["final_retention"]["eligible"] == 0
+    assert status["final_retention"]["storage_pressure"] is False
+
+
+@pytest.mark.parametrize(
+    ("source_status", "attempt_status", "source_at", "attempt_at"),
+    [
+        ("queued", None, "2026-01-01T00:00:00+00:00", None),
+        ("leased", None, "2026-01-01T00:00:00+00:00", None),
+        ("deferred", None, "2026-01-01T00:00:00+00:00", None),
+        ("retry", None, "2026-01-01T00:00:00+00:00", None),
+        ("dead_letter", None, "2026-01-01T00:00:00+00:00", None),
+        ("awaiting_ack", None, "2026-01-01T00:00:00+00:00", None),
+        (
+            "superseded",
+            "awaiting_ack",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        ),
+        (
+            "superseded",
+            "delivered",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-19T00:00:00+00:00",
+        ),
+        ("superseded", None, "2026-01-19T00:00:00+00:00", None),
+    ],
+)
+def test_turn_content_maintenance_preserves_live_and_young_final_sources(
+    tmp_path: Path,
+    source_status: str,
+    attempt_status: str | None,
+    source_at: str,
+    attempt_at: str | None,
+) -> None:
+    case_name = f"{source_status}-{attempt_status or 'none'}-{source_at[8:10]}"
+    db_path = tmp_path / f"content-maintenance-source-{case_name}.db"
+    host_id = f"retention-source-{case_name}"
+    _, old_revision, _ = _seed_superseded_content_revision(
+        db_path,
+        host_id=host_id,
+        source_turn_id=case_name,
+        retain_source_anchor=True,
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        source = conn.execute(
+            """
+            SELECT id, turn_id
+            FROM connector_outbox
+            WHERE host_id = ? AND delivery_kind = 'final_ready'
+              AND content_revision = ? AND status = 'superseded'
+            """,
+            (host_id, old_revision),
+        ).fetchone()
+        source_outbox_id = int(source[0])
+        conn.execute(
+            "UPDATE connector_outbox SET status = ?, updated_at = ? WHERE id = ?",
+            (source_status, source_at, source_outbox_id),
+        )
+        if attempt_status is not None:
+            conn.execute(
+                """
+                INSERT INTO connector_deliveries (
+                    outbox_id, host_id, connector, delivery_key, attempt,
+                    status, created_at, delivered_at
+                ) VALUES (?, ?, 'turn-final', 'protected-source', 1, ?, ?, ?)
+                """,
+                (
+                    source_outbox_id,
+                    host_id,
+                    attempt_status,
+                    attempt_at,
+                    attempt_at if attempt_status == "delivered" else None,
+                ),
+            )
+
+    result = run_store_maintenance(
+        db_path,
+        host_id,
+        retention_days=7,
+        max_outbox_attempts=99,
+        now="2026-01-20T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        preserved = conn.execute(
+            "SELECT status FROM connector_outbox WHERE id = ?",
+            (source_outbox_id,),
+        ).fetchone()
+        attempt_count = conn.execute(
+            "SELECT COUNT(*) FROM connector_deliveries WHERE outbox_id = ?",
+            (source_outbox_id,),
+        ).fetchone()[0]
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+    assert result["turn_content"]["examined"] == 0
+    assert result["turn_content"]["deleted"] == 0
+    assert preserved == (source_status,)
+    assert attempt_count == int(attempt_status is not None)
+    assert integrity == "ok"
+
+
+def test_turn_content_maintenance_typed_malformed_final_reference_is_authoritative(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "content-maintenance-typed-reference.db"
+    host_id = "retention-typed-reference"
+    turn_id, old_revision, _ = _seed_superseded_content_revision(
+        db_path,
+        host_id=host_id,
+        source_turn_id="typed-reference",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            DELETE FROM connector_deliveries
+            WHERE outbox_id IN (
+                SELECT id
+                FROM connector_outbox
+                WHERE host_id = ? AND turn_id = ?
+            )
+            """,
+            (host_id, turn_id),
+        )
+        conn.execute(
+            "DELETE FROM connector_outbox WHERE host_id = ? AND turn_id = ?",
+            (host_id, turn_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM turn_content_page_boundaries
+            WHERE host_id = ? AND turn_id = ? AND content_revision != ?
+            """,
+            (host_id, turn_id, old_revision),
+        )
+        conn.execute(
+            """
+            DELETE FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision != ?
+            """,
+            (host_id, turn_id, old_revision),
+        )
+        conn.execute(
+            "UPDATE turns SET payload_json = '{}' WHERE host_id = ? AND turn_id = ?",
+            (host_id, turn_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id, connector, delivery_key, delivery_kind, turn_id,
+                content_revision, status, payload_json, private_state_json,
+                created_at, updated_at
+            ) VALUES (
+                ?, 'turn-final', 'typed-malformed', 'final_migration_hold',
+                ?, ?, 'dead_letter', '{malformed', '{}', ?, ?
+            )
+            """,
+            (
+                host_id,
+                turn_id,
+                old_revision,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        prune_deleted = store_sqlite._delete_turn_if_unreferenced_conn(
+            conn,
+            host_id,
+            turn_id,
+        )
+
+    protected_cleanup = run_store_maintenance(
+        db_path,
+        host_id,
+        retention_days=7,
+        max_outbox_attempts=99,
+        now="2026-01-20T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        protected_revision = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (host_id, turn_id, old_revision),
+        ).fetchone()[0]
+        protected_turn = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ? AND turn_id = ?",
+            (host_id, turn_id),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            DELETE FROM connector_outbox
+            WHERE host_id = ? AND turn_id = ?
+              AND delivery_kind GLOB 'final_*'
+            """,
+            (host_id, turn_id),
+        )
+
+    released_cleanup = run_store_maintenance(
+        db_path,
+        host_id,
+        retention_days=7,
+        max_outbox_attempts=99,
+        now="2026-01-20T00:00:00+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        released_revision = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (host_id, turn_id, old_revision),
+        ).fetchone()[0]
+        turn_deleted = store_sqlite._delete_turn_if_unreferenced_conn(
+            conn,
+            host_id,
+            turn_id,
+        )
+        released_turn = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ? AND turn_id = ?",
+            (host_id, turn_id),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+    assert prune_deleted is False
+    assert protected_cleanup["turn_content"]["examined"] == 0
+    assert protected_revision == 1
+    assert protected_turn == 1
+    assert released_cleanup["turn_content"]["deleted_rows"]["revisions"] == 1
+    assert released_revision == 0
+    assert turn_deleted is True
+    assert released_turn == 0
+    assert foreign_keys == []
     assert integrity == "ok"
 
 
@@ -6679,6 +7485,7 @@ def test_turn_content_maintenance_rechecks_references_under_immediate_lock(
         host_id: str,
         cutoff_at: str,
         batch_size: int,
+        retention_count: int,
     ) -> list[tuple[str, int]]:
         nonlocal inserted
         candidates = original_candidates(
@@ -6686,6 +7493,7 @@ def test_turn_content_maintenance_rechecks_references_under_immediate_lock(
             host_id=host_id,
             cutoff_at=cutoff_at,
             batch_size=batch_size,
+            retention_count=retention_count,
         )
         conn.commit()
         if not inserted:
@@ -6861,7 +7669,7 @@ def test_source_turn_history_pruning_retains_referenced_old_turn(
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     assert retained == 1
     assert retained_revision == 1
-    assert source_count == 7
+    assert source_count == 10
     assert integrity == "ok"
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(
@@ -6931,14 +7739,15 @@ def test_source_turn_history_pruning_retains_referenced_old_turn(
 
     assert cleanup["turn_content"]["deleted_rows"] == {
         "plans": 1,
+        "recoveries": 0,
         "jobs": 1,
         "queue_anchors": 1,
         "attempts": 1,
         "revisions": 0,
     }
-    assert eligible_turn == 0
-    assert eligible_revision == 0
-    assert bounded_source_count == 6
+    assert eligible_turn == 1
+    assert eligible_revision == 1
+    assert bounded_source_count == 11
     assert final_integrity == "ok"
 
 
@@ -10169,7 +10978,7 @@ def test_compact_store_cleans_vacuum_output_when_sqlite_raises_after_creation(
     _assert_compaction_logical_evidence(db_path)
 
 
-def test_v7_to_v9_retention_and_compaction_preserve_complete_logical_state(
+def test_v7_to_current_conservatively_classifies_legacy_final_and_preserves_state(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "complete-preservation.db"
@@ -10422,7 +11231,28 @@ def test_v7_to_v9_retention_and_compaction_preserve_complete_logical_state(
 
     init_store(db_path)
     after_migration = logical_evidence()
-    assert after_migration == before_migration
+    for table in preserved_tables:
+        if table != "connector_outbox":
+            assert after_migration["tables"][table] == before_migration["tables"][table]
+    assert after_migration["latest"] == before_migration["latest"]
+    assert after_migration["snapshot_count"] == before_migration["snapshot_count"]
+    with sqlite3.connect(str(db_path)) as conn:
+        legacy_final = conn.execute(
+            """
+            SELECT delivery_kind, status, payload_json
+            FROM connector_outbox
+            WHERE host_id = 'host-a' AND connector = 'turn-final'
+            """
+        ).fetchone()
+    assert legacy_final is not None
+    assert legacy_final[:2] == ("final_migration_hold", "dead_letter")
+    assert json.loads(legacy_final[2])["operation"] == "materialize"
+    assert poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        now="2026-01-31T00:04:00+00:00",
+    )["items"] == []
     with sqlite3.connect(str(db_path)) as conn:
         assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION
         assert conn.execute(
@@ -10440,8 +11270,8 @@ def test_v7_to_v9_retention_and_compaction_preserve_complete_logical_state(
         if not retention["remaining_candidates"]:
             break
     after_retention = logical_evidence()
-    assert after_retention["tables"] == before_migration["tables"]
-    assert after_retention["latest"] == before_migration["latest"]
+    assert after_retention["tables"] == after_migration["tables"]
+    assert after_retention["latest"] == after_migration["latest"]
     assert after_retention["snapshot_count"] == 2
     assert after_retention["integrity"] == "ok"
     assert after_retention["foreign_keys"] == []

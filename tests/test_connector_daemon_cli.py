@@ -392,3 +392,246 @@ def test_recover_rpc_is_forwarded_and_printed_with_exact_frozen_contract(
     assert captured.err == ""
     assert json.loads(captured.out) == result
     assert cli_calls == [("connector.prepare", params)]
+
+
+def test_daemon_routes_strict_neutral_inspect_and_retry_methods() -> None:
+    final_identity = "twfinal1.publicSafeIdentity"
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def connector_call(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        calls.append((method, dict(params)))
+        if method == "connector.inspect":
+            return {
+                "schema_version": 1,
+                "ok": True,
+                "status": "ok",
+                "name": "turn-final",
+                "items": [
+                    {
+                        "final_identity": final_identity,
+                        "status": "dead_letter",
+                    }
+                ],
+            }
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "status": "requeued",
+            "name": "turn-final",
+            "final_identity": final_identity,
+        }
+
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="host-a"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=connector_call,
+    )
+    inspect_params = {
+        "schema_version": 1,
+        "name": "turn-final",
+        "status": "dead_letter",
+        "limit": 25,
+    }
+    retry_params = {
+        "schema_version": 1,
+        "name": "turn-final",
+        "final_identity": final_identity,
+    }
+
+    inspected = api.dispatch(
+        {"method": "connector.inspect", "params": inspect_params}
+    )
+    retried = api.dispatch({"method": "connector.retry", "params": retry_params})
+
+    assert calls == [
+        ("connector.inspect", inspect_params),
+        ("connector.retry", retry_params),
+    ]
+    assert inspected["result"]["items"] == [
+        {"final_identity": final_identity, "status": "dead_letter"}
+    ]
+    assert retried["result"]["status"] == "requeued"
+    _assert_json_only_and_safe(inspected)
+    _assert_json_only_and_safe(retried)
+
+
+def test_cli_connector_inspect_then_retry_forwards_exact_neutral_contract(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    final_identity = "twfinal1.publicSafeIdentity"
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeDaemonAPIClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            call_params = dict(params or {})
+            calls.append((method, call_params))
+            if method == "connector.inspect":
+                result = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "ok",
+                    "name": "turn-final",
+                    "items": [
+                        {
+                            "final_identity": final_identity,
+                            "status": "dead_letter",
+                        }
+                    ],
+                }
+            else:
+                result = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "status": "requeued",
+                    "name": "turn-final",
+                    "final_identity": final_identity,
+                }
+            return {"ok": True, "result": result}
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", FakeDaemonAPIClient)
+    socket_path = str(tmp_path / "daemon.sock")
+    inspect_code = main(
+        [
+            "--socket-path",
+            socket_path,
+            "connector",
+            "inspect",
+            "--name",
+            "turn-final",
+            "--status",
+            "dead_letter",
+            "--limit",
+            "25",
+        ]
+    )
+    inspect_capture = capsys.readouterr()
+    retry_code = main(
+        [
+            "--socket-path",
+            socket_path,
+            "connector",
+            "retry",
+            "--name",
+            "turn-final",
+            "--final-identity",
+            final_identity,
+        ]
+    )
+    retry_capture = capsys.readouterr()
+
+    assert inspect_code == retry_code == 0
+    assert inspect_capture.err == retry_capture.err == ""
+    assert calls == [
+        (
+            "connector.inspect",
+            {
+                "schema_version": 1,
+                "name": "turn-final",
+                "status": "dead_letter",
+                "limit": 25,
+            },
+        ),
+        (
+            "connector.retry",
+            {
+                "schema_version": 1,
+                "name": "turn-final",
+                "final_identity": final_identity,
+            },
+        ),
+    ]
+    inspect_payload = json.loads(inspect_capture.out)
+    retry_payload = json.loads(retry_capture.out)
+    assert inspect_payload["items"][0]["final_identity"] == final_identity
+    assert retry_payload["status"] == "requeued"
+    _assert_json_only_and_safe(inspect_payload)
+    _assert_json_only_and_safe(retry_payload)
+
+
+@pytest.mark.parametrize("limit", ["0", "101"])
+def test_cli_connector_inspect_rejects_unbounded_limits(
+    limit: str,
+    capsys,
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "connector",
+                "inspect",
+                "--name",
+                "turn-final",
+                "--status",
+                "dead_letter",
+                "--limit",
+                limit,
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert caught.value.code == 2
+    assert captured.out == ""
+    assert "limit must be between 1 and 100" in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "connector",
+            "inspect",
+            "--name",
+            "attention",
+            "--status",
+            "dead_letter",
+        ],
+        [
+            "connector",
+            "retry",
+            "--name",
+            "attention",
+            "--final-identity",
+            "twfinal1.publicSafeIdentity",
+        ],
+        [
+            "connector",
+            "retry",
+            "--name",
+            "turn-final",
+            "--final-identity",
+            " ",
+        ],
+    ],
+)
+def test_cli_connector_inspect_and_retry_reject_nonfinal_selectors(
+    argv: list[str],
+    capsys,
+    monkeypatch,
+) -> None:
+    class ForbiddenDaemonAPIClient:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("invalid connector selector reached daemon")
+
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        ForbiddenDaemonAPIClient,
+    )
+
+    code = main(argv)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 2
+    assert captured.err == ""
+    assert payload["status"] == "invalid_request"
+    assert payload["error"]["code"] == "invalid_request"
+    _assert_json_only_and_safe(payload)

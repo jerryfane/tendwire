@@ -793,7 +793,16 @@ def _canonical_turn(
                 f"fingerprint-{worker_id}",
                 f"snapshot-{worker_id}",
                 created_at,
-                json.dumps({"source_turn_id": source_turn_id, "complete": True}),
+                json.dumps(
+                    {
+                        "source_turn_id": source_turn_id,
+                        "complete": True,
+                        "meta": {
+                            "stable_key": "wsk1_" + ("a" * 64),
+                            "stable_key_version": 1,
+                        },
+                    }
+                ),
                 host_id,
             ),
         )
@@ -1060,9 +1069,10 @@ def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
             ).fetchall()
         }
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 10
+    assert version == store_sqlite.STORE_SCHEMA_VERSION == 11
     assert plan_row == (plan["plan_token"], 1, None, "active")
-    assert job_count == outbox_count == 2
+    assert job_count == 2
+    assert outbox_count == 3
     assert {
         "request_id",
         "failed_plan_id",
@@ -1479,8 +1489,8 @@ def test_explicit_failed_plan_recovery_preserves_prefix_and_audits_generation(
             FROM turn_presentation_recoveries
             """
         ).fetchone()
-    assert source_state == "failed"
-    assert source_statuses == [("delivered",), ("dead_letter",), ("queued",)]
+    assert source_state == "superseded"
+    assert source_statuses == [("delivered",)]
     assert recovered_state == ("completed", 2, failed_plan["plan_token"])
     assert audit == (
         "recover-request-1",
@@ -1967,7 +1977,7 @@ def test_same_grow_shrink_materialization_and_range_only_storage(
         (3, "upsert", 3),
     ]
     assert sentinel not in stored_metadata
-    assert "user_text" not in stored_metadata
+    assert '"user_text":{"availability":"absent"' in stored_metadata
     assert "assistant_final_text" in stored_metadata
 
 

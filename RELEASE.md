@@ -85,15 +85,29 @@ automatically reused.
 
 ## 5. Goal 07/09 ingestion and pending verification
 
-The release contract uses store schema v10. Its transactional v8-to-v9
+The release contract uses store schema v11. Its transactional v8-to-v9
 migration backfills immutable positive `list_sequence` values independently per
 host and creates the uniqueness/paging state used by stable `turn.list`
 traversal. The v9-to-v10 migration preserves public pending rows while adding
 explicit freshness, binding-scoped revision routing, and durable two-phase
 answer claims; migrated rows remain unanswerable until refreshed from an
-authoritative binding.
-Validate a migration only on the access-restricted scratch copy from section 4;
-do not initialize or migrate the sole recovery copy.
+authoritative binding. The conservative v10-to-v11 migration adds typed final
+root columns/indexes and the private per-host fair-maintenance cursor table. A
+routable root payload has `schema_version=2` and the exact root-level public
+`stable_key` plus integer `stable_key_version=1` captured from persisted turn
+metadata; every plan job must preserve the exact
+turn/revision/final-identity/stable-key route. No worker-fingerprint fallback is
+permitted.
+
+Delivery requires exact canonical range coverage and host-bound all-part proof.
+Linkable unresolved work also requires the exact route on every job. Unknown or
+mismatched history, missing/malformed ownership, known-incomplete content, and
+internal automation become nonpollable migration holds, never a mass repost;
+missing-owner and automation safety holds are permanently nonretryable. A
+partial legacy final-table set, invalid recovery edge, descriptor/route failure,
+or later error rolls back every v11 table/column/root/cursor change and leaves
+`PRAGMA user_version=10`. Validate only an access-restricted scratch copy, never
+the sole recovery copy.
 
 The daemon owns short-cadence and event-signaled refresh, with coalescing,
 per-target serialization, a fixed worker/queue bound, adapter deadlines, and
@@ -371,7 +385,73 @@ shutdown and every frozen Boolean check passed. The evidence document is the
 authority for the compact JSON and recorded-host timings; those timings are
 observations, not portable CI gates or service-level claims.
 
-## 8. Local hygiene (optional, before building from a dirty tree)
+## 8. Goal 10 delivery-aware final retention gate
+
+Run the focused Tendwire gate from its isolated source checkout:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q \
+  tests/test_delivery_retention.py \
+  tests/test_delivery_retention_projection.py \
+  tests/test_delivery_retention_migration.py \
+  tests/test_delivery_retention_recovery.py \
+  tests/test_delivery_retention_hardening.py \
+  tests/test_connector_daemon_cli.py \
+  tests/test_config.py::test_acknowledged_final_retention_has_conservative_documented_defaults \
+  tests/test_daemon.py::test_daemon_health_degrades_on_public_safe_final_storage_pressure
+```
+
+Then, from the paired Herdres checkout, run only its hermetic connector tests:
+
+```sh
+PYTHONPATH=. python3 -m pytest -q \
+  tests/test_turn_final_delivery.py::test_twenty_same_worker_ready_anchors_drain_in_order_and_forced_syncs_noop \
+  tests/test_offlock_delivery.py::test_stable_job_key_resume_ignores_new_lease_ref_and_preserves_success
+```
+
+These commands use temporary SQLite stores and fake connector/Telegram
+transports; they require no live Telegram credentials, Herdr process, Tendwire
+daemon, or Herdres service. The gate is complete only when the named evidence
+remains observable:
+
+The policy defaults checked by this gate are distinct: acknowledged final
+history is 30 days and 4096 proven graphs per host, while changed snapshot
+history is 14 days and 4096 rows per host. Accepted ranges are positive, with
+365000 maximum days, 9223372036854775807 maximum count, 1000 maximum batch size,
+and 31536000000 maximum cadence seconds. Automatic maintenance uses a
+100-row/graph budget on a 3600-second cadence, services never/least-recently
+visited hosts first, and never runs `VACUUM`.
+
+- The outage/restart case preserves every distinct complete final while the
+  consumer is absent and reports no work after restart or repeated observation.
+  Cleanup's bounded immutable delivered tombstone must continue to suppress the
+  same final key after its graph is removed.
+- Paired Herdres cases apply ordered jobs, make repeated forced syncs no-ops,
+  and resume checkpointed work under a fresh transient lease ref.
+- Migration cases prove owner-aware schema-v2 routes, exact coverage and
+  all-part proof, nonpollable schema-v1 missing-owner holds, automation holds,
+  route-mismatch quarantine, fair-cursor table creation, full rollback at v10,
+  idempotence, and no historical repost.
+- Projection cases prove that only the winning
+  `(updated_at, content_fingerprint)` snapshot atomically refreshes projections
+  and same-scope bindings; stale or losing equal-time data changes neither.
+- Cleanup cases prove every unresolved root, plan, attempt, or unlinked part
+  blocks graph deletion, while one bounded delivered tombstone prevents
+  recreation after eligible cleanup.
+- Store-status and daemon cases prove validated host-scoped aggregate
+  pressure/health without content or identifiers and reject malformed,
+  wrong-host, or out-of-range policy data.
+- Inspect/retry cases prove fair bounded fields, permanently nonretryable
+  missing-owner/automation holds, exact eligible root retry, and source-less
+  failed-plan recovery with immutable route lineage, cumulative attempts, and
+  retained ACK prefix.
+- These contracts preserve Tendwire evidence but do not claim provider-perfect
+  exactly-once effects.
+
+Record the two command results; do not substitute a live connector smoke and do
+not claim production deployment from this hermetic gate.
+
+## 9. Local hygiene (optional, before building from a dirty tree)
 
 ```sh
 find . -type d -name __pycache__ -not -path './.git/*' -exec rm -rf {} +

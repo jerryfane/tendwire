@@ -149,6 +149,8 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         snapshot_retention_count=100,
         snapshot_maintenance_batch_size=5,
         store_maintenance_cadence_seconds=3600,
+        acknowledged_final_retention_days=36500,
+        acknowledged_final_retention_count=100,
     )
     init_store(db_path)
     snapshot = project_from_raw(
@@ -195,12 +197,20 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             retention_count=config.snapshot_retention_count,
             batch_size=config.snapshot_maintenance_batch_size,
         ),
+        acknowledged_final_retention_days=(
+            config.acknowledged_final_retention_days
+        ),
+        acknowledged_final_retention_count=(
+            config.acknowledged_final_retention_count
+        ),
         cadence_seconds=config.store_maintenance_cadence_seconds,
         now="2026-01-10T00:00:00+00:00",
     )
     status = store_status(
         db_path,
         config.host_id,
+        acknowledged_final_retention_days=config.acknowledged_final_retention_days,
+        acknowledged_final_retention_count=config.acknowledged_final_retention_count,
         snapshot_retention_days=config.snapshot_retention_days,
         snapshot_retention_count=config.snapshot_retention_count,
         maintenance_batch_size=config.snapshot_maintenance_batch_size,
@@ -211,6 +221,8 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         config.host_id,
         retention_days=36500,
         max_outbox_attempts=10,
+        acknowledged_final_retention_days=config.acknowledged_final_retention_days,
+        acknowledged_final_retention_count=config.acknowledged_final_retention_count,
         now="2026-01-10T00:00:00+00:00",
         dry_run=True,
         snapshot_retention_days=config.snapshot_retention_days,
@@ -261,13 +273,35 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "deleted": 0,
             "remaining_candidates": False,
         },
+        "final_retention": {
+            "examined": 0,
+            "deleted": 0,
+            "remaining_candidates": False,
+            "acknowledged_final_retention_days": 36500,
+            "acknowledged_final_retention_count": 100,
+        },
         "batch_size": 5,
     }
     assert status["counts"]["snapshots"] == 1
     assert status["outbox"] == {
         "pending": 1,
         "leased": 0,
+        "completed": 0,
         "by_status": {"queued": 1},
+    }
+    assert status["final_retention"] == {
+        "acknowledged": 0,
+        "unresolved": 0,
+        "queued": 0,
+        "leased": 0,
+        "deferred": 0,
+        "retry": 0,
+        "dead_letter": 0,
+        "awaiting_ack": 0,
+        "eligible": 0,
+        "acknowledged_final_retention_days": 36500,
+        "acknowledged_final_retention_count": 100,
+        "storage_pressure": False,
     }
     assert status["maintenance"] == {
         "last_completed_at": "2026-01-10T00:00:00+00:00",
@@ -284,8 +318,30 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert cleanup["snapshots"]["examined"] == 0
     assert cleanup["outbox"]["updated"] == 0
     assert cleanup["turn_content"]["examined"] == 0
+    assert cleanup["final_retention"] == {
+        "dry_run": True,
+        "acknowledged_final_retention_days": 36500,
+        "acknowledged_final_retention_count": 100,
+        "cutoff_at": "1926-02-04T00:00:00+00:00",
+        "batch_size": 100,
+        "examined": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+        "deleted_rows": {
+            "recoveries": 0,
+            "attempts": 0,
+            "jobs": 0,
+            "plans": 0,
+            "anchors": 0,
+            "revisions": 0,
+            "turns": 0,
+        },
+    }
     assert health["status"] == "ok"
     assert health["store"]["counts"]["snapshots"] == 1
+    assert health["limits"]["acknowledged_final_retention_days"] == 36500
+    assert health["limits"]["acknowledged_final_retention_count"] == 100
+    assert health["store"]["final_retention"] == status["final_retention"]
     maintenance_checks = [
         check for check in doctor["checks"] if check["name"] == "store_maintenance"
     ]

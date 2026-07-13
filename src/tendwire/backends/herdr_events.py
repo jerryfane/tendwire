@@ -694,8 +694,20 @@ class HerdrEventBackend:
         snapshot: Snapshot,
         *,
         observation: SnapshotObservationContext,
+        worker_bindings: Iterable[WorkerBinding] | None = None,
+        binding_observation_authoritative: bool = False,
+        binding_workers_present: bool = True,
     ) -> None:
-        save_snapshot(self.db_path, snapshot, observation=observation)
+        if not save_snapshot(
+            self.db_path,
+            snapshot,
+            observation=observation,
+            worker_bindings=worker_bindings,
+            binding_backend=BACKEND_NAME if worker_bindings is not None else None,
+            binding_observation_authoritative=binding_observation_authoritative,
+            binding_workers_present=binding_workers_present,
+        ):
+            raise RuntimeError("snapshot rejected by store ordering")
         policy = SnapshotRetentionPolicy(
             retention_days=self.config.snapshot_retention_days,
             retention_count=self.config.snapshot_retention_count,
@@ -705,6 +717,12 @@ class HerdrEventBackend:
             result = maybe_run_automatic_store_maintenance(
                 self.db_path,
                 policy=policy,
+                acknowledged_final_retention_days=(
+                    self.config.acknowledged_final_retention_days
+                ),
+                acknowledged_final_retention_count=(
+                    self.config.acknowledged_final_retention_count
+                ),
                 cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
             snapshot_result = result.get("snapshot")
@@ -949,19 +967,13 @@ class HerdrEventBackend:
                         authority="complete",
                         observed_at=health.observed_at or snapshot.updated_at,
                     ),
+                    worker_bindings=bindings,
+                    binding_observation_authoritative=True,
+                    binding_workers_present=bool(workers),
                 )
                 self._last_reconcile_at = snapshot.updated_at
                 self._last_snapshot_at = snapshot.updated_at
                 self._schedule_next_reconcile()
-                if bindings:
-                    upsert_worker_bindings(self.db_path, bindings)
-                expire_stale_worker_bindings(
-                    self.db_path,
-                    self.config.host_id,
-                    backend=BACKEND_NAME,
-                    current_private_fingerprints=[binding.private_fingerprint for binding in bindings],
-                    now=snapshot.updated_at,
-                )
                 self._spaces = {space.id: space for space in snapshot.spaces}
                 self._workers = {worker.id: worker for worker in snapshot.workers}
                 self._bindings = {binding.private_fingerprint: binding for binding in bindings}

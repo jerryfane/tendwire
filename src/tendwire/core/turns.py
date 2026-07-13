@@ -355,6 +355,32 @@ def content_revision(
     return f"twrev1.{digest}"
 
 
+def turn_final_delivery_identity(
+    host_id: str,
+    turn_id: str,
+    content_revision: str,
+) -> str:
+    """Return the stable neutral identity of one final revision delivery."""
+    clean_host_id = str(host_id)
+    clean_turn_id = str(turn_id)
+    clean_revision = str(content_revision)
+    if not clean_host_id:
+        raise ValueError("invalid_host_id")
+    if not clean_turn_id:
+        raise ValueError("invalid_turn_id")
+    if not clean_revision:
+        raise ValueError("invalid_content_revision")
+    digest = _domain_digest(
+        "tendwire.turn-final-delivery.v1",
+        {
+            "host_id": clean_host_id,
+            "turn_id": clean_turn_id,
+            "content_revision": clean_revision,
+        },
+    )
+    return f"twfinal1.{digest}"
+
+
 def content_segment_id(revision: str, field: str, index: int) -> str:
     """Return a stable opaque identity for a transport segment."""
     _validate_content_field(field)
@@ -1641,6 +1667,21 @@ class InteractionChoice:
         )
 
 
+def _turn_owner_identity(meta: Mapping[str, Any]) -> tuple[str, int] | None:
+    stable_key = meta.get("stable_key")
+    stable_key_version = meta.get("stable_key_version")
+    if (
+        isinstance(stable_key, str)
+        and stable_key.startswith("wsk1_")
+        and len(stable_key) == 69
+        and all(char in "0123456789abcdef" for char in stable_key[5:])
+        and type(stable_key_version) is int
+        and stable_key_version == 1
+    ):
+        return stable_key, 1
+    return None
+
+
 @dataclass(frozen=True)
 class Turn:
     """A public, neutral representation of a worker turn."""
@@ -1699,6 +1740,7 @@ class Turn:
             else None
         )
         meta = _clean_meta(self.meta)
+        owner_identity = _turn_owner_identity(meta)
         identity_payload = {
             "schema_version": TURN_SCHEMA_VERSION,
             "host_id": host_id,
@@ -1708,6 +1750,11 @@ class Turn:
             "source": source,
             "origin_command_id": origin_command_id,
         }
+        if owner_identity is not None:
+            identity_payload["stable_key"] = owner_identity[0]
+            identity_payload["stable_key_version"] = owner_identity[1]
+        else:
+            identity_payload["stable_key_status"] = "unavailable"
         if source_turn_id:
             # Distinct backend turns must mint distinct public turn ids;
             # omitted for legacy rows so their identities stay stable.

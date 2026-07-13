@@ -347,15 +347,45 @@ headroom. A historical row must remain inside both the age and count windows to
 be retained; falling outside either makes it eligible. The newest row for each
 host is exempt from both limits.
 
-The daemon checks a persisted database-wide maintenance cadence after a stored
-snapshot. By default, no more than 100 eligible snapshot rows are removed once
-per 3600 seconds. A backlog is resumed in later batches. This automatic path is
-coarse, bounded, and never runs `VACUUM`; it does not promise immediate
-enforcement, exactly-once maintenance, or offline completion. Override the
-defaults with `TENDWIRE_SNAPSHOT_RETENTION_DAYS`,
-`TENDWIRE_SNAPSHOT_RETENTION_COUNT`,
+Snapshot and binding acceptance is monotonic and atomic per host. The greatest
+`(updated_at, content_fingerprint)` pair wins; an exact replay is a no-op.
+A losing older/equal-time observation cannot replace history, regress/prune
+worker or turn projections, mutate/expire private bindings, or duplicate/release
+a final root. A winner publishes projections and same-scope binding freshness
+in one transaction.
+
+Final-turn retention is a separate per-host acknowledgment policy. An
+authoritative owner-authenticated complete final has a durable neutral root
+before any connector is available. Queued, leased, deferred, `retry`,
+`awaiting_ack`, and `dead_letter` roots are unresolved and never
+retention-deleted. A whole current graph enters acknowledged history only when
+a completed/superseded lineage has exact canonical range coverage, every
+declared host/name/turn/revision part is delivered with a durable delivered
+attempt, and no unresolved root, plan, attempt, or unlinked part remains.
+
+The defaults retain proven graphs for 30 days and the newest 4096 per host.
+Cleanup preserves one immutable delivered-attempt tombstone per opaque final key
+before deleting the graph; replay cannot recreate or repost it. Tombstones are
+deduplicated and bounded per host by the same count policy. Missing/malformed
+owners, known-incomplete content, and internal automation remain nonretryable
+safety holds and are never converted by cleanup or retry.
+
+The daemon checks a persisted database-wide cadence after a stored snapshot.
+By default, it removes at most 100 snapshot rows and shares a 100-graph final
+budget across hosts once per 3600 seconds. Persisted per-host service cursors
+choose never-serviced then least-recently-serviced hosts, so one busy host
+cannot starve another. Later batches resume backlog; automatic maintenance
+never runs `VACUUM` or promises immediate enforcement.
+
+Override defaults with `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS`,
+`TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT`,
+`TENDWIRE_SNAPSHOT_RETENTION_DAYS`, `TENDWIRE_SNAPSHOT_RETENTION_COUNT`,
 `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE`, and
-`TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS`.
+`TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS`. Values are positive integers:
+day policies are at most 365000, counts at most 9223372036854775807, maintenance
+batch size at most 1000, and cadence at most 31536000000 seconds. Invalid
+configured values fail closed; an affected cleanup class rejects an invalid
+per-invocation policy rather than applying that class.
 
 Use the JSON-only online hooks for aggregate inspection and bounded cleanup:
 
@@ -363,17 +393,50 @@ Use the JSON-only online hooks for aggregate inspection and bounded cleanup:
 tendwire store status --db-path /path/to/tendwire.db
 tendwire store cleanup --dry-run --db-path /path/to/tendwire.db
 tendwire store cleanup --retention-days 14 --max-outbox-attempts 10 \
+  --acknowledged-final-retention-days 30 \
+  --acknowledged-final-retention-count 4096 \
   --snapshot-retention-days 14 --snapshot-retention-count 4096 \
   --snapshot-batch-size 100 --db-path /path/to/tendwire.db
 ```
 
-`store status`'s `maintenance` object reports the last completed automatic
-batch and status,
-database-wide snapshot count, reported age/count/batch/cadence values, and a
-backlog boolean. `cleanup` reports aggregate event `retention`, database-wide
-`snapshots`, `outbox`, and `turn_content` results. Its flags are per-invocation
-policy overrides; they do not rewrite configuration. A cleanup dry-run rolls
-back every maintenance transaction and changes no rows or maintenance markers.
+Inspect exhausted roots and failed plans in a bounded public-safe view, then
+retry only the selected opaque final identity:
+
+```bash
+tendwire connector inspect --name turn-final --status dead_letter \
+  --limit 100 --db-path /path/to/tendwire.db
+tendwire connector retry --name turn-final \
+  --final-identity 'twfinal1.<opaque>' --db-path /path/to/tendwire.db
+```
+
+Copy the exact opaque `final_identity` from the inspect result only after
+confirming that one final should be retried. Root items expose only status,
+timestamps, cumulative attempt count, sanitized final descriptor, and an opaque
+key only when it validates. Failed-plan items add opaque plan/final identities,
+public turn/revision, generation, failed-job count, and cumulative attempt
+count, and remain visible when the original source link is absent. Inspection
+reserves room for one failed plan even when migration holds fill the limit.
+
+Retry revalidates the current complete owner and schema-v2 route. A unique
+failed plan uses deterministic recovery that retains the contiguous ACKed
+prefix and creates a fresh suffix; an eligible exhausted root receives a fresh
+budget while preserving cumulative attempts. Missing/malformed-owner,
+known-incomplete, internal-automation, stale, ambiguous, and resolved cases
+fail closed. Retry is never bulk and never justifies manual SQLite edits.
+
+`store status` reports the database-wide cadence timestamp, but its snapshot
+count/backlog and public-safe `final_retention` pressure are scoped to the
+requested host. The aggregate includes acknowledged, unresolved and per-status
+counts, the policy, eligibility, and `storage_pressure`. Daemon health validates
+the exact host, configured policy, nonnegative/component totals, eligibility,
+and pressure relationship; malformed/wrong-host data and valid pressure degrade
+health without exposing an identity.
+
+`cleanup` reports aggregate database-wide snapshots plus host-scoped outbox,
+final-retention, and turn-content results. Its flags override policy only for
+that invocation and do not rewrite configuration. A dry-run rolls back every
+maintenance transaction and changes neither rows nor maintenance/service
+cursors.
 
 Page reclamation is a separate, explicit `store compact` CLI operation. It is
 not exposed through the daemon API and must be run only in a controlled offline
@@ -381,7 +444,7 @@ window with all Tendwire, connector, and other SQLite writers stopped. The
 dry-run mode is strictly read-only: it does not initialize or migrate a store,
 repair permissions, checkpoint WAL, create a backup, prune rows, build a
 replacement, update a marker or timestamp, or change the database family. It
-requires current schema v10 and rejects both `--acknowledge-offline` and
+requires current schema v11 and rejects both `--acknowledge-offline` and
 `--backup-path`.
 
 Follow this order exactly:
@@ -391,7 +454,7 @@ Follow this order exactly:
 2. **Stop Tendwire.** Stop `tendwired.service` and every one-shot or alternate
    writer. Confirm all database writers are stopped.
 3. **Dry-run.** From the same installed release or source checkout that owns
-   the v9 store, run:
+   the current v11 store, run:
 
    ```bash
    tendwire store compact --dry-run \
@@ -468,20 +531,36 @@ offline.
 
 ## Compatible Tendwire/Herdres Pair and Copy-First Dry Check
 
-Goal 05B is a paired producer/consumer contract. Install or upgrade Tendwire
-with a Herdres revision that explicitly supports all of the following together:
+Goal 05B through Goal 10 are a paired producer/consumer contract. Install or
+upgrade Tendwire with a Herdres revision that explicitly supports all of the
+following together:
 
-- Tendwire SQLite store schema v10, including automatic transactional migration
-  of v8 turns to immutable per-host `list_sequence` values and v9 pending rows
-  to explicit freshness/revision state;
-- `turn.list` schema v2 with per-turn content descriptor schema v1, bounded
-  1,000-character previews, and insertion-stable cursor/since paging;
-- schema-v1 `turn.content.get` with linear opaque-cursor traversal and the
-  unchanged 49,152-byte (48 KiB) UTF-8 page ceiling;
-- range-only schema-v1 `connector.prepare` actions `begin`, `part`, `commit`,
-  and explicit `recover`, plus the existing lease/ACK boundary; and
-- failed-plan generation, retained contiguous ACKed prefix, fresh-suffix
-  recovery, request-ID idempotency, and recovery-audit semantics.
+- Tendwire SQLite store schema v11, including transactional migration of v8
+  turns, v9 pending rows, typed final-root columns/indexes, and the private
+  per-host fair-maintenance cursor table. A partial legacy final-table set,
+  invalid recovery edge, descriptor/route failure, or later migration error
+  rolls back every schema/root/cursor change and leaves `user_version` at 10;
+- owner-aware canonical turn identity, atomic monotonic snapshot plus
+  same-scope binding freshness, and schema-v2 root routes containing the exact
+  public stable-key pair captured from persisted turn metadata;
+- conservative v10-to-v11 classification: delivery requires exact canonical
+  range and host-bound all-part proof; a linkable unresolved plan also requires
+  every job's schema-v2 route to match authoritative
+  turn/revision/final-identity/stable-key values. Unknown/mismatched work,
+  missing owners, known-incomplete finals, and internal automation become
+  nonpollable `final_migration_hold`/`dead_letter` rather than a mass repost.
+  Missing-owner/automation safety holds are permanently nonretryable;
+- `turn.list` schema v2 with descriptor schema v1, 1,000-character previews and
+  insertion-stable paging; schema-v1 `turn.content.get` with a 49,152-byte
+  UTF-8 page ceiling;
+- range-only schema-v1 `connector.prepare` begin/part/commit/recover, root-wide
+  leases, independent part ACKs, and immutable schema-v2 source-less route
+  lineage. Cleanup retains bounded delivered tombstones so repeated snapshots
+  cannot recreate/repost removed acknowledged roots; and
+- fair dead-letter inspection, exact root/failed-plan retry including
+  source-less recovery, retained ACK prefix, cumulative attempts, request-ID
+  idempotency, immutable recovery audit, and no provider-perfect exactly-once
+  claim.
 
 Do not upgrade only one side and infer compatibility from short inline turns.
 An older schema-v1-only consumer receives `upgrade_required` as soon as a long

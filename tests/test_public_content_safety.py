@@ -1041,7 +1041,17 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     snapshot = Snapshot(
         host_id=host_id,
         updated_at="2026-07-11T00:00:00+00:00",
-        workers=[Worker(id=worker_id, name="Boundary worker", status="active")],
+        workers=[
+            Worker(
+                id=worker_id,
+                name="Boundary worker",
+                status="active",
+                meta={
+                    "stable_key": "wsk1_" + ("1" * 64),
+                    "stable_key_version": 1,
+                },
+            )
+        ],
     )
     init_store(db_path)
     save_snapshot(db_path, snapshot)
@@ -1097,6 +1107,11 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     assert turn["content"]["fields"]["assistant_final_text"]["page_count"] == len(pages)
 
     api = ConnectorOutboxAPI(db_path, host_id)
+    ready_poll = api.poll({"name": "turn-final", "limit": 1})
+    assert ready_poll["ok"] is True
+    assert len(ready_poll["items"]) == 1
+    ready_ref = ready_poll["items"][0]["ref"]
+    assert ready_poll["items"][0]["key"].startswith("turn-final:revision:twfinal1.")
     begun = api.prepare(
         {
             "schema_version": 1,
@@ -1106,6 +1121,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             "content_revision": revision,
             "presentation_version": "boundary-safety-v1",
             "part_count": len(pages),
+            "source_ref": ready_ref,
         }
     )
     assert begun["ok"] is True
@@ -1141,6 +1157,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
             "action": "commit",
             "name": "turn-final",
             "plan_token": plan_token,
+            "source_ref": ready_ref,
         }
     )
     assert committed["ok"] is True
@@ -1159,7 +1176,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
         item = polled["items"][0]
         job_items.append(item)
         acknowledged = api.ack({"name": "turn-final", "ref": item["ref"]})
-        assert acknowledged["ok"] is True
+        assert acknowledged["ok"] is True, acknowledged
         ack_surfaces.append(acknowledged)
     assert len(job_items) == len(pages)
     assert poll_surfaces[-1]["items"] == []
@@ -1216,7 +1233,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
     assert "assistant_final_text" not in stored_turn
     assert len(stored_plans) == 1
     assert len(stored_jobs) == len(pages)
-    assert len(stored_outbox) == len(pages)
+    assert len(stored_outbox) == len(pages) + 1
 
     clean_surfaces = (
         listed,

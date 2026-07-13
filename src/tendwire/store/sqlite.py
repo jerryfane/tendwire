@@ -95,6 +95,7 @@ from ..core.turns import (
     project_turn_content,
     recompute_pending_content_fingerprint,
     segment_canonical_text,
+    turn_final_delivery_identity,
     turn_list_cursor,
     turn_since_token,
     turns_from_snapshot,
@@ -103,7 +104,12 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 10
+STORE_SCHEMA_VERSION = 11
+ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
+ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
+_MAX_RETENTION_DAYS = 365_000
+_MAX_TIMEDELTA_SECONDS = _MAX_RETENTION_DAYS * 24 * 60 * 60
 ATTENTION_LIFECYCLE_OPEN = "open"
 ATTENTION_LIFECYCLE_RESOLVED = "resolved"
 ATTENTION_RESOLVED_REASON_GONE = "gone"
@@ -182,6 +188,12 @@ class SnapshotRetentionPolicy:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.retention_days > _MAX_RETENTION_DAYS:
+            raise ValueError("retention_days is too large")
+        if self.retention_count > _SQLITE_MAX_INTEGER:
+            raise ValueError("retention_count is too large")
+        if self.batch_size > _SQLITE_MAX_INTEGER:
+            raise ValueError("batch_size is too large")
 
 
 @dataclass(frozen=True)
@@ -306,6 +318,13 @@ CREATE TABLE IF NOT EXISTS store_maintenance_state (
     last_examined INTEGER NOT NULL DEFAULT 0 CHECK (last_examined >= 0),
     last_deleted INTEGER NOT NULL DEFAULT 0 CHECK (last_deleted >= 0),
     last_examined_id INTEGER
+);
+"""
+
+CREATE_STORE_MAINTENANCE_CURSORS_TABLE = """
+CREATE TABLE IF NOT EXISTS store_maintenance_cursors (
+    scope TEXT PRIMARY KEY,
+    last_completed_at TEXT NOT NULL
 );
 """
 
@@ -540,6 +559,22 @@ CREATE_TURN_CONTENT_REVISION_INDEXES = (
     ),
 )
 
+CREATE_FINAL_DELIVERY_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_connector_outbox_final_state "
+        "ON connector_outbox(host_id, connector, delivery_kind, status, id)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_connector_outbox_turn_revision "
+        "ON connector_outbox(host_id, turn_id, content_revision, delivery_kind)"
+    ),
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_presentation_plans_source "
+        "ON turn_presentation_plans(source_outbox_id)"
+    ),
+)
+
+
 CREATE_TURN_PRESENTATION_PLANS_TABLE = """
 CREATE TABLE IF NOT EXISTS turn_presentation_plans (
     id INTEGER PRIMARY KEY,
@@ -548,6 +583,7 @@ CREATE TABLE IF NOT EXISTS turn_presentation_plans (
     plan_token TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     content_revision TEXT NOT NULL,
+    source_outbox_id INTEGER,
     presentation_version TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
     part_count INTEGER NOT NULL CHECK (part_count > 0),
@@ -576,7 +612,9 @@ CREATE TABLE IF NOT EXISTS turn_presentation_plans (
     ),
     FOREIGN KEY (host_id, turn_id, content_revision)
         REFERENCES turn_content_revisions(host_id, turn_id, content_revision)
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+    FOREIGN KEY (source_outbox_id)
+        REFERENCES connector_outbox(id) ON DELETE RESTRICT
 );
 """
 
@@ -743,6 +781,9 @@ CREATE TABLE IF NOT EXISTS connector_outbox (
     host_id TEXT NOT NULL,
     connector TEXT NOT NULL,
     delivery_key TEXT NOT NULL,
+    delivery_kind TEXT NOT NULL DEFAULT 'generic',
+    turn_id TEXT,
+    content_revision TEXT,
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     private_state_json TEXT NOT NULL DEFAULT '{}',
@@ -1473,6 +1514,7 @@ def _canonical_json(data: Any) -> str:
     )
 
 _CONNECTOR_LEASE_STATUS = "leased"
+_CONNECTOR_AWAITING_ACK_STATUS = "awaiting_ack"
 _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
 _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
@@ -1480,6 +1522,7 @@ _CONNECTOR_SUPERSEDED_OUTBOX_STATUS = "superseded"
 _CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
     {
         _CONNECTOR_LEASE_STATUS,
+        _CONNECTOR_AWAITING_ACK_STATUS,
         _CONNECTOR_TERMINAL_OUTBOX_STATUS,
         _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
         _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
@@ -1526,12 +1569,14 @@ def _connector_now(value: str | None = None) -> str:
 
 
 def _connector_add_seconds(now: str, seconds: int) -> str:
-    return _connector_iso(_connector_datetime(now) + timedelta(seconds=max(0, int(seconds))))
+    bounded = max(0, min(int(seconds), _MAX_TIMEDELTA_SECONDS))
+    return _connector_iso(_connector_datetime(now) + timedelta(seconds=bounded))
 
 
 def _utc_cutoff(*, retention_days: int, now: str | None = None) -> str:
     current = _connector_datetime(now or utc_timestamp())
-    cutoff = current - timedelta(days=max(1, int(retention_days)))
+    bounded_days = max(1, min(int(retention_days), _MAX_RETENTION_DAYS))
+    cutoff = current - timedelta(days=bounded_days)
     return _connector_iso(cutoff)
 
 
@@ -1658,12 +1703,9 @@ def _connector_reclaim_expired_leases_conn(
     name: str | None,
     now: str,
 ) -> int:
-    clauses = ["d.status = ?"]
-    params: list[Any] = [_CONNECTOR_LEASE_STATUS]
-    if host_id:
-        clauses.append("d.host_id = ?")
-        params.append(str(host_id))
-    if name:
+    clauses = ["d.status = ?", "d.host_id = ?"]
+    params: list[Any] = [_CONNECTOR_LEASE_STATUS, str(host_id)]
+    if name is not None:
         clauses.append("d.connector = ?")
         params.append(str(name))
     rows = conn.execute(
@@ -1916,6 +1958,7 @@ _PRESENTATION_SCHEMA_VERSION = 1
 _PRESENTATION_MAX_PARTS = 10_000
 _PRESENTATION_MAX_SPANS_PER_PART = 64
 _PRESENTATION_SEQUENCE_WIDTH = 6
+_PRESENTATION_RECOVERY_HISTORY_LIMIT = 4
 _PRESENTATION_FIELDS = ("user_text", "assistant_final_text")
 _PRESENTATION_FIELD_RANK = {
     field: index for index, field in enumerate(_PRESENTATION_FIELDS)
@@ -1926,6 +1969,762 @@ _PRESENTATION_TOKEN_CHARS = frozenset(
 _PRESENTATION_LABEL_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 )
+
+
+def _valid_final_stable_key(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("wsk1_")
+        and len(value) == 69
+        and all(char in "0123456789abcdef" for char in value[5:])
+    )
+
+
+def _final_content_field_descriptor(
+    *,
+    revision: str,
+    field: str,
+    availability: str,
+    char_length: int,
+    byte_length: int,
+    page_count: int,
+) -> dict[str, Any]:
+    complete = str(availability) == "complete"
+    pageable = complete and int(char_length) > 0 and int(page_count) > 0
+    return {
+        "availability": str(availability),
+        "inline": False,
+        "char_length": int(char_length),
+        "byte_length": int(byte_length),
+        "page_count": int(page_count) if complete else 0,
+        "first_cursor": (
+            content_cursor(
+                str(revision),
+                str(field),
+                0,
+                start_char=0,
+                start_byte=0,
+            )
+            if pageable
+            else None
+        ),
+    }
+
+
+def _final_ready_payload_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    allow_unroutable: bool = False,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT
+            turns.worker_id,
+            turns.space_id,
+            turns.payload_json,
+            revisions.user_state,
+            revisions.final_state,
+            revisions.user_char_length,
+            revisions.user_byte_length,
+            revisions.final_char_length,
+            revisions.final_byte_length,
+            revisions.user_page_count,
+            revisions.final_page_count,
+            revisions.is_current
+        FROM turns
+        JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.content_revision = ?
+        WHERE turns.host_id = ?
+          AND turns.turn_id = ?
+        """,
+        (
+            str(content_revision_value),
+            str(host_id),
+            str(turn_id),
+        ),
+    ).fetchone()
+    if (
+        row is None
+        or int(row[11] or 0) != 1
+        or str(row[4]) != "complete"
+    ):
+        return None
+    turn_payload = _json_object(row[2])
+    turn_meta = _json_object(turn_payload.get("meta"))
+    stable_key = turn_meta.get("stable_key")
+    stable_key_version = turn_meta.get("stable_key_version")
+    routable = (
+        _valid_final_stable_key(stable_key)
+        and type(stable_key_version) is int
+        and stable_key_version == 1
+    )
+    if not routable and not allow_unroutable:
+        return None
+    final_identity = turn_final_delivery_identity(
+        str(host_id),
+        str(turn_id),
+        str(content_revision_value),
+    )
+    content = {
+        "schema_version": 1,
+        "content_revision": str(content_revision_value),
+        "known_incomplete": str(row[3]) == "known_incomplete",
+        "fields": {
+            "user_text": _final_content_field_descriptor(
+                revision=str(content_revision_value),
+                field="user_text",
+                availability=str(row[3]),
+                char_length=int(row[5] or 0),
+                byte_length=int(row[6] or 0),
+                page_count=int(row[9] or 0),
+            ),
+            "assistant_final_text": _final_content_field_descriptor(
+                revision=str(content_revision_value),
+                field="assistant_final_text",
+                availability=str(row[4]),
+                char_length=int(row[7] or 0),
+                byte_length=int(row[8] or 0),
+                page_count=int(row[10] or 0),
+            ),
+        },
+    }
+    payload = {
+        "schema_version": 2 if routable else 1,
+        "operation": "materialize",
+        "final_identity": final_identity,
+        "turn_id": str(turn_id),
+        "worker_id": str(row[0]),
+        "space_id": str(row[1]) if row[1] is not None else None,
+        "content_revision": str(content_revision_value),
+        "content": content,
+    }
+    if routable:
+        payload["stable_key"] = str(stable_key)
+        payload["stable_key_version"] = 1
+    return payload
+
+
+def _final_revision_is_internal_automation_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT turns.payload_json,
+               revisions.user_text,
+               revisions.assistant_final_text
+        FROM turns
+        JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+        WHERE turns.host_id = ?
+          AND turns.turn_id = ?
+          AND revisions.content_revision = ?
+        """,
+        (str(host_id), str(turn_id), str(content_revision_value)),
+    ).fetchone()
+    if row is None:
+        return True
+    payload = _json_object(row[0])
+    payload["user_text"] = row[1]
+    payload["assistant_final_text"] = row[2]
+    return is_internal_automation_turn_payload(payload)
+
+
+def _source_less_authoritative_route_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+) -> dict[str, Any] | None:
+    existing = conn.execute(
+        """
+        SELECT delivery_kind, status, payload_json
+        FROM connector_outbox
+        WHERE host_id = ?
+          AND connector = ?
+          AND turn_id = ?
+          AND content_revision = ?
+          AND delivery_kind IN ('final_ready', 'final_migration_hold')
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            str(host_id),
+            _TURN_FINAL_NAME,
+            str(turn_id),
+            str(content_revision_value),
+        ),
+    ).fetchone()
+    if existing is not None:
+        if str(existing[0]) != "final_ready" or str(existing[1]) != "delivered":
+            return None
+        route = _json_object(existing[2])
+    else:
+        candidate = _final_ready_payload_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            content_revision_value=str(content_revision_value),
+        )
+        route = dict(candidate) if candidate is not None else {}
+    expected_identity = turn_final_delivery_identity(
+        str(host_id),
+        str(turn_id),
+        str(content_revision_value),
+    )
+    if (
+        route.get("schema_version") != 2
+        or str(route.get("turn_id") or "") != str(turn_id)
+        or str(route.get("content_revision") or "") != str(content_revision_value)
+        or str(route.get("final_identity") or "") != expected_identity
+        or not _valid_final_stable_key(route.get("stable_key"))
+        or type(route.get("stable_key_version")) is not int
+        or route.get("stable_key_version") != 1
+        or _final_revision_is_internal_automation_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            content_revision_value=str(content_revision_value),
+        )
+    ):
+        return None
+    return route
+
+
+def _supersede_stale_final_work_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    now: str,
+) -> None:
+    stale_outbox_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM connector_outbox
+            WHERE host_id = ?
+              AND connector = ?
+              AND turn_id = ?
+              AND delivery_kind IN ('final_ready', 'final_migration_hold')
+              AND content_revision != ?
+              AND status NOT IN ('delivered', 'superseded')
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(content_revision_value),
+            ),
+        ).fetchall()
+    ]
+    stale_plan_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM turn_presentation_plans
+            WHERE host_id = ?
+              AND name = ?
+              AND turn_id = ?
+              AND content_revision != ?
+              AND state IN (
+                  'preparing',
+                  'waiting_predecessor',
+                  'active',
+                  'failed'
+              )
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(content_revision_value),
+            ),
+        ).fetchall()
+    ]
+    if stale_plan_ids:
+        placeholders = ",".join("?" for _ in stale_plan_ids)
+        conn.execute(
+            f"UPDATE turn_presentation_plans SET state = 'superseded' "
+            f"WHERE id IN ({placeholders})",
+            stale_plan_ids,
+        )
+        stale_outbox_ids.extend(
+            int(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT outbox_id
+                FROM turn_presentation_jobs
+                WHERE plan_id IN ({placeholders})
+                  AND outbox_id IS NOT NULL
+                """,
+                stale_plan_ids,
+            ).fetchall()
+        )
+    stale_outbox_ids = sorted(set(stale_outbox_ids))
+    if not stale_outbox_ids:
+        return
+    placeholders = ",".join("?" for _ in stale_outbox_ids)
+    conn.execute(
+        f"""
+        UPDATE connector_deliveries
+        SET status = 'superseded',
+            response_json = ?,
+            delivered_at = COALESCE(delivered_at, ?)
+        WHERE outbox_id IN ({placeholders}) AND status != 'delivered'
+        """,
+        (
+            _canonical_json(
+                {
+                    "schema_version": 1,
+                    "status": "superseded",
+                }
+            ),
+            str(now),
+            *stale_outbox_ids,
+        ),
+    )
+    for outbox_id, private_state_json in conn.execute(
+        f"""
+        SELECT id, private_state_json
+        FROM connector_outbox
+        WHERE id IN ({placeholders})
+          AND status NOT IN ('delivered', 'superseded')
+        """,
+        stale_outbox_ids,
+    ).fetchall():
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET status = 'superseded',
+                next_attempt_at = NULL,
+                updated_at = ?,
+                private_state_json = ?
+            WHERE id = ?
+            """,
+            (
+                str(now),
+                _connector_private_clear_current(private_state_json),
+                int(outbox_id),
+            ),
+        )
+
+
+def _reactivate_final_root_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    outbox_id: int,
+    private_state_json: Any,
+    latest_activated_plan_id: int | None,
+    delivery_kind: str,
+    initial_status: str,
+    payload_json: str,
+    now: str,
+) -> None:
+    plan_rows = conn.execute(
+        """
+        SELECT id, generation, part_count
+        FROM turn_presentation_plans
+        WHERE host_id = ?
+          AND name = ?
+          AND turn_id = ?
+          AND content_revision = ?
+        """,
+        (
+            str(host_id),
+            _TURN_FINAL_NAME,
+            str(turn_id),
+            str(content_revision_value),
+        ),
+    ).fetchall()
+    plan_ids = [int(row[0]) for row in plan_rows]
+    max_generation = max(
+        (int(row[1] or 0) for row in plan_rows),
+        default=0,
+    )
+    max_part_count = max(
+        (int(row[2] or 0) for row in plan_rows),
+        default=0,
+    )
+    state = _json_object(private_state_json)
+    root_generation = max(
+        1,
+        int(state.get("presentation_generation") or 1),
+        max_generation,
+    ) + 1
+    retained_footprint = max(
+        int(state.get("presentation_max_part_count") or 0),
+        max_part_count,
+    )
+    prior_attempt_count = int(state.get("prior_attempt_count") or 0) + int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM connector_deliveries
+            WHERE outbox_id = ?
+            """,
+            (int(outbox_id),),
+        ).fetchone()[0]
+        or 0
+    )
+    if plan_ids:
+        placeholders = ",".join("?" for _ in plan_ids)
+        conn.execute(
+            f"""
+            UPDATE turn_presentation_plans
+            SET state = 'superseded'
+            WHERE id IN ({placeholders})
+              AND state IN (
+                  'preparing',
+                  'waiting_predecessor',
+                  'active',
+                  'failed'
+              )
+            """,
+            plan_ids,
+        )
+        job_outbox_ids = [
+            int(row[0])
+            for row in conn.execute(
+                f"""
+                SELECT outbox_id
+                FROM turn_presentation_jobs
+                WHERE plan_id IN ({placeholders})
+                  AND outbox_id IS NOT NULL
+                """,
+                plan_ids,
+            ).fetchall()
+        ]
+        conn.execute(
+            f"""
+            DELETE FROM turn_presentation_recoveries
+            WHERE failed_plan_id IN ({placeholders})
+               OR recovered_plan_id IN ({placeholders})
+            """,
+            (*plan_ids, *plan_ids),
+        )
+        conn.execute(
+            f"""
+            DELETE FROM turn_presentation_plans
+            WHERE id IN ({placeholders})
+              AND state IN ('completed', 'superseded')
+            """,
+            plan_ids,
+        )
+        if job_outbox_ids:
+            outbox_placeholders = ",".join("?" for _ in job_outbox_ids)
+            conn.execute(
+                f"""
+                DELETE FROM connector_deliveries
+                WHERE outbox_id IN ({outbox_placeholders})
+                """,
+                job_outbox_ids,
+            )
+            conn.execute(
+                f"""
+                DELETE FROM connector_outbox
+                WHERE id IN ({outbox_placeholders})
+                """,
+                job_outbox_ids,
+            )
+    conn.execute(
+        "DELETE FROM connector_deliveries WHERE outbox_id = ?",
+        (int(outbox_id),),
+    )
+    state = _json_object(_connector_private_clear_current(state))
+    state["presentation_generation"] = root_generation
+    state["presentation_max_part_count"] = retained_footprint
+    state["prior_attempt_count"] = prior_attempt_count
+    if latest_activated_plan_id is not None:
+        state["reactivated_after_plan_id"] = int(latest_activated_plan_id)
+    conn.execute(
+        """
+        UPDATE connector_outbox
+        SET delivery_kind = ?,
+            status = ?,
+            payload_json = ?,
+            private_state_json = ?,
+            updated_at = ?,
+            next_attempt_at = NULL
+        WHERE id = ?
+        """,
+        (
+            str(delivery_kind),
+            str(initial_status),
+            str(payload_json),
+            _canonical_json(state),
+            str(now),
+            int(outbox_id),
+        ),
+    )
+
+
+def _discard_acknowledged_final_replay_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+) -> None:
+    live_graph = conn.execute(
+        """
+        SELECT 1
+        WHERE EXISTS (
+            SELECT 1
+            FROM connector_outbox
+            WHERE host_id = ? AND turn_id = ?
+        )
+           OR EXISTS (
+            SELECT 1
+            FROM turn_presentation_plans
+            WHERE host_id = ? AND turn_id = ?
+        )
+        """,
+        (str(host_id), str(turn_id), str(host_id), str(turn_id)),
+    ).fetchone()
+    if live_graph is not None:
+        return
+    conn.execute(
+        """
+        DELETE FROM turn_content_page_boundaries
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (str(host_id), str(turn_id), str(content_revision_value)),
+    )
+    conn.execute(
+        """
+        DELETE FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (str(host_id), str(turn_id), str(content_revision_value)),
+    )
+    deleted = conn.execute(
+        """
+        DELETE FROM turns
+        WHERE host_id = ? AND turn_id = ?
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turn_content_revisions
+              WHERE host_id = ? AND turn_id = ?
+          )
+        """,
+        (str(host_id), str(turn_id), str(host_id), str(turn_id)),
+    )
+    if deleted.rowcount:
+        _increment_turn_list_generation_conn(conn, str(host_id))
+
+
+def _ensure_final_ready_anchor_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    now: str,
+) -> int | None:
+    payload = _final_ready_payload_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=str(content_revision_value),
+        allow_unroutable=True,
+    )
+    if payload is None:
+        return None
+    final_identity = str(payload["final_identity"])
+    delivery_key = f"{_TURN_FINAL_NAME}:revision:{final_identity}"
+    existing = conn.execute(
+        """
+        SELECT id, status, private_state_json, payload_json
+        FROM connector_outbox
+        WHERE host_id = ? AND connector = ? AND delivery_key = ?
+        """,
+        (str(host_id), _TURN_FINAL_NAME, delivery_key),
+    ).fetchone()
+    if existing is None:
+        source_less_delivery = conn.execute(
+            """
+            SELECT 1
+            FROM turn_presentation_plans AS plan
+            WHERE plan.host_id = ?
+              AND plan.name = ?
+              AND plan.turn_id = ?
+              AND plan.content_revision = ?
+              AND plan.source_outbox_id IS NULL
+              AND plan.state IN ('waiting_predecessor', 'active', 'completed')
+              AND EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_jobs AS job
+                  WHERE job.plan_id = plan.id
+                    AND job.outbox_id IS NOT NULL
+              )
+            LIMIT 1
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(content_revision_value),
+            ),
+        ).fetchone()
+        if source_less_delivery is not None:
+            return None
+        acknowledged_tombstone = conn.execute(
+            """
+            SELECT 1
+            FROM connector_deliveries
+            WHERE outbox_id IS NULL
+              AND host_id = ?
+              AND connector = ?
+              AND delivery_key = ?
+              AND status = 'delivered'
+              AND delivered_at IS NOT NULL
+            LIMIT 1
+            """,
+            (str(host_id), _TURN_FINAL_NAME, delivery_key),
+        ).fetchone()
+        if acknowledged_tombstone is not None:
+            _discard_acknowledged_final_replay_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                content_revision_value=str(content_revision_value),
+            )
+            return None
+    latest_activated = conn.execute(
+        """
+        SELECT plans.id, plans.content_revision
+        FROM turn_presentation_plans AS plans
+        WHERE plans.host_id = ?
+          AND plans.name = ?
+          AND plans.turn_id = ?
+          AND plans.activated_at IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM turn_presentation_jobs AS jobs
+              JOIN connector_deliveries AS attempts
+                ON attempts.outbox_id = jobs.outbox_id
+              WHERE jobs.plan_id = plans.id
+          )
+        ORDER BY plans.id DESC
+        LIMIT 1
+        """,
+        (str(host_id), _TURN_FINAL_NAME, str(turn_id)),
+    ).fetchone()
+    known_incomplete = bool(payload["content"]["known_incomplete"])
+    unroutable = payload.get("schema_version") != 2
+    internal_automation = _final_revision_is_internal_automation_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=str(content_revision_value),
+    )
+    delivery_kind = (
+        "final_migration_hold"
+        if known_incomplete or unroutable or internal_automation
+        else "final_ready"
+    )
+    initial_status = (
+        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+        if known_incomplete or unroutable or internal_automation
+        else "queued"
+    )
+    payload_json = _canonical_json(payload)
+    if existing is not None:
+        existing_state = _json_object(existing[2])
+        activated_after = (
+            int(latest_activated[0]) if latest_activated is not None else None
+        )
+        different_activated_revision = bool(
+            latest_activated is not None
+            and str(latest_activated[1]) != str(content_revision_value)
+            and int(existing_state.get("reactivated_after_plan_id") or 0)
+            != int(latest_activated[0])
+        )
+        reactivate = (
+            str(existing[1]) == _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+            or (
+                str(existing[1]) == _CONNECTOR_TERMINAL_OUTBOX_STATUS
+                and different_activated_revision
+            )
+        )
+        if reactivate and str(existing[3]) == payload_json:
+            _reactivate_final_root_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                content_revision_value=str(content_revision_value),
+                outbox_id=int(existing[0]),
+                private_state_json=existing[2],
+                latest_activated_plan_id=activated_after,
+                delivery_kind=delivery_kind,
+                initial_status=initial_status,
+                payload_json=payload_json,
+                now=str(now),
+            )
+    _supersede_stale_final_work_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=str(content_revision_value),
+        now=str(now),
+    )
+    conn.execute(
+        """
+        INSERT INTO connector_outbox (
+            host_id,
+            connector,
+            delivery_key,
+            delivery_kind,
+            turn_id,
+            content_revision,
+            status,
+            payload_json,
+            private_state_json,
+            created_at,
+            updated_at,
+            next_attempt_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
+        ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
+        """,
+        (
+            str(host_id),
+            _TURN_FINAL_NAME,
+            delivery_key,
+            delivery_kind,
+            str(turn_id),
+            str(content_revision_value),
+            initial_status,
+            payload_json,
+            str(now),
+            str(now),
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT id
+        FROM connector_outbox
+        WHERE host_id = ? AND connector = ? AND delivery_key = ?
+        """,
+        (str(host_id), _TURN_FINAL_NAME, delivery_key),
+    ).fetchone()
+    return int(row[0]) if row is not None else None
 
 
 def _valid_presentation_opaque(value: Any, prefix: str) -> bool:
@@ -1955,19 +2754,20 @@ def _presentation_plan_token(
     content_revision_value: str,
     presentation_version: str,
     part_count: int,
+    generation: int = 1,
 ) -> str:
-    digest = stable_fingerprint(
-        {
-            "domain": "tendwire.connector.prepare.v1",
-            "host_id": str(host_id),
-            "name": str(name),
-            "turn_id": str(turn_id),
-            "content_revision": str(content_revision_value),
-            "presentation_version": str(presentation_version),
-            "part_count": int(part_count),
-        },
-        length=64,
-    )
+    identity: dict[str, Any] = {
+        "domain": "tendwire.connector.prepare.v1",
+        "host_id": str(host_id),
+        "name": str(name),
+        "turn_id": str(turn_id),
+        "content_revision": str(content_revision_value),
+        "presentation_version": str(presentation_version),
+        "part_count": int(part_count),
+    }
+    if int(generation) > 1:
+        identity["generation"] = int(generation)
+    digest = stable_fingerprint(identity, length=64)
     return f"twplan1.{digest}"
 
 
@@ -2014,6 +2814,24 @@ def _restore_presentation_tokens(
             and all(char.isalnum() or char in "-_" for char in value[8:])
         ):
             sanitized[key] = value
+    final_identity = original.get("final_identity")
+    if _valid_presentation_opaque(final_identity, "twfinal1."):
+        sanitized["final_identity"] = str(final_identity)
+    turn_id = original.get("turn_id")
+    if _valid_presentation_label(turn_id, prefix="turn-"):
+        sanitized["turn_id"] = str(turn_id)
+    nested_turn = original.get("turn")
+    if isinstance(nested_turn, Mapping):
+        clean_nested = sanitized.get("turn")
+        if not isinstance(clean_nested, dict):
+            clean_nested = dict(
+                sanitize_public_mapping(
+                    nested_turn,
+                    backend_neutral=True,
+                )
+            )
+            sanitized["turn"] = clean_nested
+        _restore_presentation_tokens(clean_nested, nested_turn)
     return sanitized
 
 
@@ -2075,7 +2893,7 @@ def _current_presentation_revision_conn(
     if int(row[4] or 0) != 1:
         return row, "revision_conflict"
     states = (str(row[0]), str(row[1]))
-    if "known_incomplete" in states or "complete" not in states:
+    if states[1] != "complete" or states[0] not in {"absent", "complete"}:
         return row, "content_known_incomplete"
     return row, None
 
@@ -2098,7 +2916,8 @@ def _presentation_plan_row_conn(
             state,
             replaces_plan_token,
             generation,
-            recovers_plan_token
+            recovers_plan_token,
+            source_outbox_id
         FROM turn_presentation_plans
         WHERE host_id = ? AND name = ? AND plan_token = ?
         """,
@@ -2130,6 +2949,7 @@ def prepare_connector_plan_begin(
     content_revision: str,
     presentation_version: str,
     part_count: int,
+    source_ref: str | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Idempotently begin one bounded range-only presentation plan."""
@@ -2148,17 +2968,13 @@ def prepare_connector_plan_begin(
         or not _valid_presentation_label(turn_id, prefix="turn-")
         or not _valid_presentation_opaque(content_revision, "twrev1.")
         or not _valid_presentation_label(presentation_version)
+        or (
+            source_ref is not None
+            and not _valid_presentation_opaque(source_ref, _CONNECTOR_REF_PREFIX)
+        )
     ):
         return _presentation_error("invalid_params", host_id=host_id, name=name)
     count = part_count
-    token = _presentation_plan_token(
-        host_id=str(host_id),
-        name=str(name),
-        turn_id=str(turn_id),
-        content_revision_value=str(content_revision),
-        presentation_version=str(presentation_version),
-        part_count=count,
-    )
     created_at = _connector_now(now)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -2177,6 +2993,63 @@ def prepare_connector_plan_begin(
                     host_id=host_id,
                     name=name,
                 )
+            source_outbox_id: int | None = None
+            generation = 1
+            if source_ref is None:
+                authoritative_route = _source_less_authoritative_route_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(turn_id),
+                    content_revision_value=str(content_revision),
+                )
+                if authoritative_route is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        "invalid_ref",
+                        host_id=host_id,
+                        name=name,
+                    )
+            if source_ref is not None:
+                source_row, source_error = _connector_validate_live_ref_conn(
+                    conn,
+                    host_id=str(host_id),
+                    name=str(name),
+                    ref=str(source_ref),
+                    now=created_at,
+                )
+                if source_error is not None or source_row is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        source_error or "invalid_ref",
+                        host_id=host_id,
+                        name=name,
+                    )
+                if (
+                    str(source_row[10]) != "final_ready"
+                    or str(source_row[11]) != str(turn_id)
+                    or str(source_row[12]) != str(content_revision)
+                ):
+                    conn.rollback()
+                    return _presentation_error(
+                        "stale_ref",
+                        host_id=host_id,
+                        name=name,
+                    )
+                source_outbox_id = int(source_row[1])
+                source_state = _json_object(source_row[9])
+                generation = max(
+                    1,
+                    int(source_state.get("presentation_generation") or 1),
+                )
+            token = _presentation_plan_token(
+                host_id=str(host_id),
+                name=str(name),
+                turn_id=str(turn_id),
+                content_revision_value=str(content_revision),
+                presentation_version=str(presentation_version),
+                part_count=count,
+                generation=generation,
+            )
             existing = conn.execute(
                 """
                 SELECT
@@ -2186,14 +3059,15 @@ def prepare_connector_plan_begin(
                     state,
                     turn_id,
                     content_revision,
-                    presentation_version
+                    presentation_version,
+                    source_outbox_id
                 FROM turn_presentation_plans
                 WHERE host_id = ?
                   AND name = ?
                   AND turn_id = ?
                   AND content_revision = ?
                   AND presentation_version = ?
-                  AND generation = 1
+                  AND generation = ?
                 """,
                 (
                     str(host_id),
@@ -2201,6 +3075,7 @@ def prepare_connector_plan_begin(
                     str(turn_id),
                     str(content_revision),
                     str(presentation_version),
+                    generation,
                 ),
             ).fetchone()
             if existing is not None:
@@ -2217,6 +3092,35 @@ def prepare_connector_plan_begin(
                         host_id=host_id,
                         name=name,
                     )
+                existing_source_outbox_id = (
+                    int(existing[7]) if existing[7] is not None else None
+                )
+                if (
+                    source_outbox_id is not None
+                    and existing_source_outbox_id not in {
+                        None,
+                        source_outbox_id,
+                    }
+                ):
+                    conn.rollback()
+                    return _presentation_error(
+                        "stale_ref",
+                        host_id=host_id,
+                        name=name,
+                    )
+                if (
+                    source_outbox_id is not None
+                    and existing_source_outbox_id is None
+                    and str(existing[3]) == "preparing"
+                ):
+                    conn.execute(
+                        """
+                        UPDATE turn_presentation_plans
+                        SET source_outbox_id = ?
+                        WHERE id = ? AND source_outbox_id IS NULL
+                        """,
+                        (source_outbox_id, int(existing[0])),
+                    )
                 accepted = _presentation_accepted_parts_conn(conn, int(existing[0]))
                 conn.commit()
                 return _presentation_response(
@@ -2230,7 +3134,7 @@ def prepare_connector_plan_begin(
                         "state": str(existing[3]),
                         "part_count": count,
                         "accepted_parts": accepted,
-                        "generation": 1,
+                        "generation": generation,
                     }
                 )
             cursor = conn.execute(
@@ -2241,12 +3145,13 @@ def prepare_connector_plan_begin(
                     plan_token,
                     turn_id,
                     content_revision,
+                    source_outbox_id,
                     presentation_version,
                     generation,
                     part_count,
                     state,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'preparing', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?)
                 """,
                 (
                     str(host_id),
@@ -2254,7 +3159,9 @@ def prepare_connector_plan_begin(
                     token,
                     str(turn_id),
                     str(content_revision),
+                    source_outbox_id,
                     str(presentation_version),
+                    generation,
                     count,
                     created_at,
                 ),
@@ -2272,7 +3179,7 @@ def prepare_connector_plan_begin(
                     "state": "preparing",
                     "part_count": count,
                     "accepted_parts": 0,
-                    "generation": 1,
+                    "generation": generation,
                 }
             )
         except Exception:
@@ -2392,23 +3299,16 @@ def prepare_connector_plan_part(
                     name=name,
                     plan_token=plan_token,
                 )
-            revision_row = conn.execute(
-                """
-                SELECT
-                    user_state,
-                    final_state,
-                    user_char_length,
-                    final_char_length,
-                    is_current
-                FROM turn_content_revisions
-                WHERE host_id = ? AND turn_id = ? AND content_revision = ?
-                """,
-                (str(host_id), str(plan[1]), str(plan[2])),
-            ).fetchone()
-            if revision_row is None:
+            revision_row, revision_error = _current_presentation_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(plan[1]),
+                content_revision_value=str(plan[2]),
+            )
+            if revision_error is not None or revision_row is None:
                 conn.rollback()
                 return _presentation_error(
-                    "content_revision_not_found",
+                    revision_error or "content_revision_not_found",
                     host_id=host_id,
                     name=name,
                     plan_token=plan_token,
@@ -2501,27 +3401,21 @@ def _presentation_exact_coverage(
         "assistant_final_text": int(revision_row[3] or 0),
     }
     cursors: dict[str, int] = {}
-    last_rank = -1
     for row in staged_rows:
         spans = json.loads(str(row[2]))
         for span in spans:
             field = str(span["field"])
             start = int(span["start_char"])
             end = int(span["end_char"])
-            rank = _PRESENTATION_FIELD_RANK[field]
-            if rank < last_rank:
-                return False
-            if rank > last_rank and last_rank >= 0:
-                prior_field = _PRESENTATION_FIELDS[last_rank]
-                if cursors.get(prior_field, 0) != lengths[prior_field]:
-                    return False
             if states[field] != "complete" or start != cursors.get(field, 0):
                 return False
             cursors[field] = end
-            last_rank = rank
-    return bool(cursors) and all(
-        end == lengths[field] for field, end in cursors.items()
-    )
+    required = {
+        field: lengths[field]
+        for field in _PRESENTATION_FIELDS
+        if states[field] == "complete" and lengths[field] > 0
+    }
+    return cursors == required
 
 
 def _materialize_connector_plan_job_conn(
@@ -2535,24 +3429,39 @@ def _materialize_connector_plan_job_conn(
     payload: Mapping[str, Any],
     created_at: str,
 ) -> int:
+    plan_identity = conn.execute(
+        """
+        SELECT turn_id, content_revision
+        FROM turn_presentation_plans
+        WHERE id = ?
+        """,
+        (int(plan_id),),
+    ).fetchone()
+    if plan_identity is None:
+        raise StoreSchemaError("presentation_plan_not_found")
     cursor = conn.execute(
         """
         INSERT INTO connector_outbox (
             host_id,
             connector,
             delivery_key,
+            delivery_kind,
+            turn_id,
+            content_revision,
             status,
             payload_json,
             private_state_json,
             created_at,
             updated_at,
             next_attempt_at
-        ) VALUES (?, ?, ?, 'queued', ?, '{}', ?, ?, NULL)
+        ) VALUES (?, ?, ?, 'final_part', ?, ?, 'queued', ?, '{}', ?, ?, NULL)
         """,
         (
             str(host_id),
             str(name),
             str(delivery_key),
+            str(plan_identity[0]),
+            str(plan_identity[1]),
             _canonical_json(dict(payload)),
             str(created_at),
             str(created_at),
@@ -2568,6 +3477,205 @@ def _materialize_connector_plan_job_conn(
         (outbox_id, int(job_id), int(plan_id)),
     )
     return outbox_id
+
+
+def _finalize_recovered_plan_materialization_conn(
+    conn: sqlite3.Connection,
+    *,
+    failed_plan_id: int,
+    recovered_plan_id: int,
+    now: str,
+) -> None:
+    recovered = conn.execute(
+        """
+        SELECT host_id, name, turn_id, content_revision, presentation_version
+        FROM turn_presentation_plans
+        WHERE id = ?
+        """,
+        (int(recovered_plan_id),),
+    ).fetchone()
+    if recovered is None:
+        return
+    lineage_ids = [
+        int(row[0])
+        for row in conn.execute(
+            """
+            WITH RECURSIVE lineage (
+                id,
+                host_id,
+                name,
+                recovers_plan_token
+            ) AS (
+                SELECT id, host_id, name, recovers_plan_token
+                FROM turn_presentation_plans
+                WHERE id = ?
+                UNION
+                SELECT
+                    predecessor.id,
+                    predecessor.host_id,
+                    predecessor.name,
+                    predecessor.recovers_plan_token
+                FROM turn_presentation_plans AS predecessor
+                JOIN lineage AS successor
+                  ON predecessor.host_id = successor.host_id
+                 AND predecessor.name = successor.name
+                 AND predecessor.plan_token = successor.recovers_plan_token
+            )
+            SELECT id
+            FROM lineage
+            """,
+            (int(failed_plan_id),),
+        ).fetchall()
+    ]
+    if not lineage_ids:
+        raise StoreSchemaError("presentation_recovery_lineage_missing")
+    placeholders = ",".join("?" for _ in lineage_ids)
+    conn.execute(
+        f"""
+        UPDATE turn_presentation_plans
+        SET state = 'superseded'
+        WHERE id IN ({placeholders}) AND state = 'failed'
+        """,
+        lineage_ids,
+    )
+    obsolete_outbox_ids = [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            SELECT DISTINCT outbox.id
+            FROM turn_presentation_jobs AS jobs
+            JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+            WHERE jobs.plan_id IN ({placeholders})
+              AND outbox.status != 'delivered'
+            """,
+            lineage_ids,
+        ).fetchall()
+    ]
+    if obsolete_outbox_ids:
+        outbox_placeholders = ",".join("?" for _ in obsolete_outbox_ids)
+        conn.execute(
+            f"""
+            UPDATE connector_deliveries
+            SET status = 'superseded',
+                delivered_at = COALESCE(delivered_at, ?)
+            WHERE outbox_id IN ({outbox_placeholders})
+              AND status != 'delivered'
+            """,
+            (str(now), *obsolete_outbox_ids),
+        )
+        for outbox_id, private_state_json in conn.execute(
+            f"""
+            SELECT id, private_state_json
+            FROM connector_outbox
+            WHERE id IN ({outbox_placeholders})
+              AND status NOT IN ('delivered', 'superseded')
+            """,
+            obsolete_outbox_ids,
+        ).fetchall():
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = 'superseded',
+                    next_attempt_at = NULL,
+                    updated_at = ?,
+                    private_state_json = ?
+                WHERE id = ?
+                """,
+                (
+                    str(now),
+                    _connector_private_clear_current(private_state_json),
+                    int(outbox_id),
+                ),
+            )
+        conn.execute(
+            f"""
+            DELETE FROM connector_deliveries
+            WHERE outbox_id IN ({outbox_placeholders})
+            """,
+            obsolete_outbox_ids,
+        )
+        conn.execute(
+            f"""
+            DELETE FROM turn_presentation_jobs
+            WHERE outbox_id IN ({outbox_placeholders})
+            """,
+            obsolete_outbox_ids,
+        )
+        conn.execute(
+            f"""
+            DELETE FROM connector_outbox
+            WHERE id IN ({outbox_placeholders})
+            """,
+            obsolete_outbox_ids,
+        )
+
+    audits = conn.execute(
+        """
+        SELECT
+            audit.id,
+            audit.failed_plan_id,
+            audit.recovered_plan_id
+        FROM turn_presentation_recoveries AS audit
+        JOIN turn_presentation_plans AS plan
+          ON plan.id = audit.recovered_plan_id
+        WHERE audit.host_id = ?
+          AND audit.name = ?
+          AND plan.turn_id = ?
+          AND plan.content_revision = ?
+          AND plan.presentation_version = ?
+        ORDER BY audit.generation DESC, audit.id DESC
+        """,
+        (
+            str(recovered[0]),
+            str(recovered[1]),
+            str(recovered[2]),
+            str(recovered[3]),
+            str(recovered[4]),
+        ),
+    ).fetchall()
+    retained_audits = audits[:_PRESENTATION_RECOVERY_HISTORY_LIMIT]
+    obsolete_audit_ids = [
+        int(row[0])
+        for row in audits[_PRESENTATION_RECOVERY_HISTORY_LIMIT:]
+    ]
+    if obsolete_audit_ids:
+        audit_placeholders = ",".join("?" for _ in obsolete_audit_ids)
+        conn.execute(
+            f"""
+            DELETE FROM turn_presentation_recoveries
+            WHERE id IN ({audit_placeholders})
+            """,
+            obsolete_audit_ids,
+        )
+    retained_plan_ids = sorted(
+        {
+            int(plan_id)
+            for row in retained_audits
+            for plan_id in (row[1], row[2])
+        }
+    )
+    if retained_plan_ids:
+        plan_placeholders = ",".join("?" for _ in retained_plan_ids)
+        conn.execute(
+            f"""
+            DELETE FROM turn_presentation_plans
+            WHERE host_id = ?
+              AND name = ?
+              AND turn_id = ?
+              AND content_revision = ?
+              AND presentation_version = ?
+              AND state = 'superseded'
+              AND id NOT IN ({plan_placeholders})
+            """,
+            (
+                str(recovered[0]),
+                str(recovered[1]),
+                str(recovered[2]),
+                str(recovered[3]),
+                str(recovered[4]),
+                *retained_plan_ids,
+            ),
+        )
 
 
 def _mark_obsolete_presentation_plans_conn(
@@ -2677,7 +3785,14 @@ def _update_presentation_plan_after_outbox_conn(
 ) -> None:
     plan = conn.execute(
         """
-        SELECT plans.id, plans.host_id, plans.name, plans.state
+        SELECT
+            plans.id,
+            plans.host_id,
+            plans.name,
+            plans.state,
+            plans.source_outbox_id,
+            plans.turn_id,
+            plans.content_revision
         FROM turn_presentation_jobs AS jobs
         JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
         WHERE jobs.outbox_id = ?
@@ -2717,6 +3832,81 @@ def _update_presentation_plan_after_outbox_conn(
                     """,
                     (str(now), plan_id),
                 )
+                source_outbox_id = (
+                    int(plan[4]) if plan[4] is not None else None
+                )
+                if source_outbox_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE connector_deliveries
+                        SET status = 'delivered', delivered_at = ?
+                        WHERE outbox_id = ? AND status = 'awaiting_ack'
+                        """,
+                        (str(now), source_outbox_id),
+                    )
+                    source_row = conn.execute(
+                        """
+                        SELECT private_state_json
+                        FROM connector_outbox
+                        WHERE id = ?
+                        """,
+                        (source_outbox_id,),
+                    ).fetchone()
+                    if source_row is not None:
+                        conn.execute(
+                            """
+                            UPDATE connector_outbox
+                            SET status = 'delivered',
+                                next_attempt_at = NULL,
+                                updated_at = ?,
+                                private_state_json = ?
+                            WHERE id = ? AND status = 'awaiting_ack'
+                            """,
+                            (
+                                str(now),
+                                _connector_private_clear_current(source_row[0]),
+                                source_outbox_id,
+                            ),
+                        )
+                else:
+                    final_identity = turn_final_delivery_identity(
+                        str(plan[1]),
+                        str(plan[5]),
+                        str(plan[6]),
+                    )
+                    delivery_key = (
+                        f"{_TURN_FINAL_NAME}:revision:{final_identity}"
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO connector_deliveries (
+                            outbox_id, host_id, connector, delivery_key,
+                            attempt, status, response_json, private_state_json,
+                            created_at, delivered_at
+                        )
+                        SELECT NULL, ?, ?, ?, 0, 'delivered', '{}', '{}', ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM connector_deliveries
+                            WHERE outbox_id IS NULL
+                              AND host_id = ?
+                              AND connector = ?
+                              AND delivery_key = ?
+                              AND status = 'delivered'
+                              AND delivered_at IS NOT NULL
+                        )
+                        """,
+                        (
+                            str(plan[1]),
+                            str(plan[2]),
+                            delivery_key,
+                            str(now),
+                            str(now),
+                            str(plan[1]),
+                            str(plan[2]),
+                            delivery_key,
+                        ),
+                    )
         _activate_waiting_presentation_plans_conn(
             conn,
             host_id=str(plan[1]),
@@ -2755,12 +3945,78 @@ def _mark_exhausted_presentation_plans_conn(
     )
 
 
+def _validate_plan_source_ref_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str,
+    source_outbox_id: int,
+    turn_id: str,
+    content_revision_value: str,
+    source_ref: str,
+    now: str,
+    require_live: bool,
+) -> tuple[Any | None, str | None]:
+    if require_live:
+        row, error = _connector_validate_live_ref_conn(
+            conn,
+            host_id=str(host_id),
+            name=str(name),
+            ref=str(source_ref),
+            now=str(now),
+        )
+        if error is not None or row is None:
+            return row, error or "invalid_ref"
+        if (
+            int(row[1] or 0) != int(source_outbox_id)
+            or str(row[10]) != "final_ready"
+            or str(row[11]) != str(turn_id)
+            or str(row[12]) != str(content_revision_value)
+        ):
+            return row, "stale_ref"
+        return row, None
+    rows = conn.execute(
+        """
+        SELECT
+            deliveries.id,
+            deliveries.private_state_json,
+            deliveries.status,
+            outbox.status,
+            outbox.delivery_kind,
+            outbox.turn_id,
+            outbox.content_revision
+        FROM connector_deliveries AS deliveries
+        JOIN connector_outbox AS outbox ON outbox.id = deliveries.outbox_id
+        WHERE deliveries.outbox_id = ?
+          AND deliveries.host_id = ?
+          AND deliveries.connector = ?
+        ORDER BY deliveries.id DESC
+        """,
+        (int(source_outbox_id), str(host_id), str(name)),
+    ).fetchall()
+    for row in rows:
+        state = _json_object(row[1])
+        if str(state.get("public_ref") or "") != str(source_ref):
+            continue
+        if (
+            str(row[2]) not in {"awaiting_ack", "delivered"}
+            or str(row[3]) not in {"awaiting_ack", "delivered"}
+            or str(row[4]) != "final_ready"
+            or str(row[5]) != str(turn_id)
+            or str(row[6]) != str(content_revision_value)
+        ):
+            return row, "stale_ref"
+        return row, None
+    return None, "invalid_ref"
+
+
 def prepare_connector_plan_commit(
     db_path: Path,
     host_id: str,
     *,
     name: str,
     plan_token: str,
+    source_ref: str | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Atomically validate exact coverage and materialize one plan's ordered jobs."""
@@ -2774,6 +4030,10 @@ def prepare_connector_plan_commit(
     if (
         str(name) != _TURN_FINAL_NAME
         or not _valid_presentation_opaque(plan_token, "twplan1.")
+        or (
+            source_ref is not None
+            and not _valid_presentation_opaque(source_ref, _CONNECTOR_REF_PREFIX)
+        )
     ):
         return _presentation_error(
             "invalid_params",
@@ -2824,6 +4084,75 @@ def prepare_connector_plan_commit(
                         "job_count": materialized_job_count,
                         "generation": int(plan[7]),
                     }
+                )
+            _, early_revision_error = _current_presentation_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(plan[1]),
+                content_revision_value=str(plan[2]),
+            )
+            if early_revision_error is not None:
+                conn.rollback()
+                return _presentation_error(
+                    early_revision_error,
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
+                )
+            source_outbox_id = int(plan[9]) if plan[9] is not None else None
+            source_delivery: Any | None = None
+            if source_outbox_id is not None:
+                if source_ref is None:
+                    if materialized_job_count == 0:
+                        conn.rollback()
+                        return _presentation_error(
+                            "invalid_ref",
+                            host_id=host_id,
+                            name=name,
+                            plan_token=plan_token,
+                        )
+                else:
+                    source_delivery, source_error = _validate_plan_source_ref_conn(
+                        conn,
+                        host_id=str(host_id),
+                        name=str(name),
+                        source_outbox_id=source_outbox_id,
+                        turn_id=str(plan[1]),
+                        content_revision_value=str(plan[2]),
+                        source_ref=str(source_ref),
+                        now=current_time,
+                        require_live=materialized_job_count == 0,
+                    )
+                    if source_error is not None or source_delivery is None:
+                        conn.rollback()
+                        return _presentation_error(
+                            source_error or "invalid_ref",
+                            host_id=host_id,
+                            name=name,
+                            plan_token=plan_token,
+                        )
+            if source_outbox_id is None:
+                authoritative_route = _source_less_authoritative_route_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=str(plan[1]),
+                    content_revision_value=str(plan[2]),
+                )
+                if authoritative_route is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        "invalid_ref",
+                        host_id=host_id,
+                        name=name,
+                        plan_token=plan_token,
+                    )
+            if source_outbox_id is None and source_ref is not None:
+                conn.rollback()
+                return _presentation_error(
+                    "stale_ref",
+                    host_id=host_id,
+                    name=name,
+                    plan_token=plan_token,
                 )
             if plan_state != "preparing":
                 conn.rollback()
@@ -2925,6 +4254,45 @@ def prepare_connector_plan_commit(
                 "part_count": expected_count,
                 "replaces_plan_token": replaces_token,
             }
+            if source_outbox_id is None:
+                if authoritative_route is None:
+                    raise StoreSchemaError("presentation_route_unavailable")
+                common["turn"] = authoritative_route
+            if source_outbox_id is not None:
+                source_payload_row = conn.execute(
+                    """
+                    SELECT payload_json, private_state_json
+                    FROM connector_outbox
+                    WHERE id = ?
+                      AND delivery_kind = 'final_ready'
+                      AND turn_id = ?
+                      AND content_revision = ?
+                    """,
+                    (
+                        source_outbox_id,
+                        str(plan[1]),
+                        str(plan[2]),
+                    ),
+                ).fetchone()
+                if source_payload_row is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        "stale_ref",
+                        host_id=host_id,
+                        name=name,
+                        plan_token=plan_token,
+                    )
+                source_plan_state = _json_object(source_payload_row[1])
+                prior_part_count = max(
+                    prior_part_count,
+                    int(
+                        source_plan_state.get(
+                            "presentation_max_part_count"
+                        )
+                        or 0
+                    ),
+                )
+                common["turn"] = _json_object(source_payload_row[0])
             for job_id, part_ordinal, spans_json in staged:
                 sequence = int(part_ordinal)
                 payload = {
@@ -3008,6 +4376,69 @@ def prepare_connector_plan_commit(
                     plan_id,
                 ),
             )
+            if source_outbox_id is not None:
+                if source_delivery is None:
+                    raise StoreSchemaError("presentation_source_not_live")
+                source_private = conn.execute(
+                    """
+                    SELECT private_state_json
+                    FROM connector_outbox
+                    WHERE id = ? AND status = 'leased'
+                    """,
+                    (source_outbox_id,),
+                ).fetchone()
+                if source_private is None:
+                    raise StoreSchemaError("presentation_source_not_live")
+                delivery_cursor = conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET status = 'awaiting_ack',
+                        response_json = ?,
+                        delivered_at = NULL
+                    WHERE id = ? AND outbox_id = ? AND status = 'leased'
+                    """,
+                    (
+                        _canonical_json(
+                            {
+                                "schema_version": 1,
+                                "status": "prepared",
+                            }
+                        ),
+                        int(source_delivery[0]),
+                        source_outbox_id,
+                    ),
+                )
+                next_source_state = _json_object(
+                    _connector_private_clear_current(source_private[0])
+                )
+                next_source_state["presentation_generation"] = int(plan[7])
+                next_source_state["presentation_max_part_count"] = max(
+                    int(
+                        next_source_state.get(
+                            "presentation_max_part_count"
+                        )
+                        or 0
+                    ),
+                    prior_part_count,
+                    expected_count,
+                )
+                source_cursor = conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET status = 'awaiting_ack',
+                        next_attempt_at = NULL,
+                        updated_at = ?,
+                        private_state_json = ?
+                    WHERE id = ? AND status = 'leased'
+                    """,
+                    (
+                        current_time,
+                        _canonical_json(next_source_state),
+                        source_outbox_id,
+                    ),
+                )
+                if not delivery_cursor.rowcount or not source_cursor.rowcount:
+                    raise StoreSchemaError("presentation_source_not_live")
             conn.commit()
             return _presentation_response(
                 {
@@ -3140,7 +4571,8 @@ def prepare_connector_plan_recover(
                     presentation_version,
                     generation,
                     part_count,
-                    state
+                    state,
+                    source_outbox_id
                 FROM turn_presentation_plans
                 WHERE host_id = ? AND name = ? AND plan_token = ?
                 """,
@@ -3150,6 +4582,22 @@ def prepare_connector_plan_recover(
                 conn.rollback()
                 return _presentation_error(
                     "plan_not_found",
+                    host_id=host_id,
+                    name=name,
+                    failed_plan_token=failed_plan_token,
+                )
+            prior_recovery = conn.execute(
+                """
+                SELECT 1
+                FROM turn_presentation_recoveries
+                WHERE failed_plan_id = ?
+                """,
+                (int(failed[0]),),
+            ).fetchone()
+            if prior_recovery is not None:
+                conn.rollback()
+                return _presentation_error(
+                    "plan_conflict",
                     host_id=host_id,
                     name=name,
                     failed_plan_token=failed_plan_token,
@@ -3318,6 +4766,7 @@ def prepare_connector_plan_recover(
                     plan_token,
                     turn_id,
                     content_revision,
+                    source_outbox_id,
                     presentation_version,
                     generation,
                     part_count,
@@ -3326,7 +4775,7 @@ def prepare_connector_plan_recover(
                     recovers_plan_token,
                     created_at,
                     activated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
                 """,
                 (
                     str(host_id),
@@ -3334,6 +4783,7 @@ def prepare_connector_plan_recover(
                     recovered_token,
                     str(failed[1]),
                     str(failed[2]),
+                    failed[7],
                     str(failed[3]),
                     generation,
                     int(failed[5]),
@@ -3352,6 +4802,60 @@ def prepare_connector_plan_recover(
                 "part_count": int(failed[5]),
                 "replaces_plan_token": str(failed_plan_token),
             }
+            if failed[7] is not None:
+                source_payload = conn.execute(
+                    """
+                    SELECT payload_json
+                    FROM connector_outbox
+                    WHERE id = ? AND delivery_kind = 'final_ready'
+                    """,
+                    (int(failed[7]),),
+                ).fetchone()
+                if source_payload is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        "plan_conflict",
+                        host_id=host_id,
+                        name=name,
+                        failed_plan_token=failed_plan_token,
+                    )
+                common["turn"] = _json_object(source_payload[0])
+            else:
+                route_payloads: dict[str, dict[str, Any]] = {}
+                for source_job in source_jobs:
+                    job_payload = _json_object(source_job[6])
+                    route = job_payload.get("turn")
+                    if not isinstance(route, Mapping):
+                        continue
+                    route_data = dict(route)
+                    if (
+                        route_data.get("schema_version") != 2
+                        or str(route_data.get("turn_id") or "") != str(failed[1])
+                        or str(route_data.get("content_revision") or "")
+                        != str(failed[2])
+                        or not _valid_final_stable_key(route_data.get("stable_key"))
+                        or type(route_data.get("stable_key_version")) is not int
+                        or route_data.get("stable_key_version") != 1
+                    ):
+                        continue
+                    route_payloads[_canonical_json(route_data)] = route_data
+                if (
+                    len(route_payloads) != 1
+                    or _final_revision_is_internal_automation_conn(
+                        conn,
+                        host_id=str(host_id),
+                        turn_id=str(failed[1]),
+                        content_revision_value=str(failed[2]),
+                    )
+                ):
+                    conn.rollback()
+                    return _presentation_error(
+                        "plan_conflict",
+                        host_id=host_id,
+                        name=name,
+                        failed_plan_token=failed_plan_token,
+                    )
+                common["turn"] = next(iter(route_payloads.values()))
             if local_acknowledged_count:
                 common["predecessor_job_key"] = str(
                     source_jobs[local_acknowledged_count - 1][4]
@@ -3456,6 +4960,12 @@ def prepare_connector_plan_recover(
                     current_time,
                 ),
             )
+            _finalize_recovered_plan_materialization_conn(
+                conn,
+                failed_plan_id=int(failed[0]),
+                recovered_plan_id=recovered_plan_id,
+                now=current_time,
+            )
             conn.commit()
             return _presentation_recovery_result(
                 failed_plan_token=str(failed_plan_token),
@@ -3532,10 +5042,45 @@ def poll_connector_outbox(
                 WHERE outbox.host_id = ?
                   AND outbox.connector = ?
                   AND outbox.status IN ('queued', 'deferred', 'retry')
+                  AND outbox.delivery_kind != 'final_migration_hold'
                   AND (
                       outbox.next_attempt_at IS NULL
                       OR outbox.next_attempt_at = ''
                       OR outbox.next_attempt_at <= ?
+                  )
+                  AND (
+                      outbox.delivery_kind != 'final_ready'
+                      OR (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM connector_outbox AS earlier_final
+                              WHERE earlier_final.host_id = outbox.host_id
+                                AND earlier_final.connector = outbox.connector
+                                AND earlier_final.delivery_kind = 'final_ready'
+                                AND earlier_final.id < outbox.id
+                                AND earlier_final.status NOT IN (
+                                    'delivered',
+                                    'superseded'
+                                )
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM turn_presentation_plans AS active_plan
+                              JOIN turn_presentation_jobs AS active_job
+                                ON active_job.plan_id = active_plan.id
+                              LEFT JOIN connector_outbox AS active_outbox
+                                ON active_outbox.id = active_job.outbox_id
+                              WHERE active_plan.host_id = outbox.host_id
+                                AND active_plan.name = outbox.connector
+                                AND active_plan.turn_id = outbox.turn_id
+                                AND active_plan.content_revision = outbox.content_revision
+                                AND active_plan.state = 'active'
+                                AND (
+                                    active_outbox.id IS NULL
+                                    OR active_outbox.status != 'delivered'
+                                )
+                          )
+                      )
                   )
                   AND (
                       NOT EXISTS (
@@ -3562,7 +5107,19 @@ def poll_connector_outbox(
                             )
                       )
                   )
-                ORDER BY outbox.id
+                ORDER BY
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM turn_presentation_jobs AS priority_job
+                            JOIN turn_presentation_plans AS priority_plan
+                              ON priority_plan.id = priority_job.plan_id
+                            WHERE priority_job.outbox_id = outbox.id
+                              AND priority_plan.state = 'active'
+                        ) THEN 0
+                        ELSE 1
+                    END,
+                    outbox.id
                 LIMIT ?
                 """,
                 (str(host_id), str(name), current_time, row_limit),
@@ -3692,6 +5249,9 @@ def poll_connector_outbox(
         for sanitized_item, original_item in zip(sanitized_items, items, strict=True):
             if not isinstance(sanitized_item, dict):
                 continue
+            original_key = original_item.get("key")
+            if _valid_final_ready_key(original_key):
+                sanitized_item["key"] = str(original_key)
             sanitized_payload = sanitized_item.get("payload")
             original_payload = original_item.get("payload")
             if isinstance(sanitized_payload, dict) and isinstance(original_payload, Mapping):
@@ -3719,7 +5279,10 @@ def _connector_validate_live_ref_conn(
             d.status,
             d.private_state_json,
             o.status,
-            o.private_state_json
+            o.private_state_json,
+            o.delivery_kind,
+            o.turn_id,
+            o.content_revision
         FROM connector_deliveries d
         LEFT JOIN connector_outbox o ON o.id = d.outbox_id
         WHERE d.host_id = ? AND d.connector = ? AND d.status = ?
@@ -3763,7 +5326,21 @@ def _connector_update_ref(
         return _connector_error_response(status="store_unavailable", host_id=host_id, name=name, ref=ref)
     current_time = _connector_now(now)
     sanitized_response = sanitize_public_mapping(response or {}, backend_neutral=True)
-    sanitized_reason = _connector_public_reason(reason)
+    sanitized_reason = (
+        _store_public_label(
+            reason,
+            allowed={
+                "backpressure",
+                "rate_limited",
+                "rejected",
+                "temporary",
+                "timeout",
+                "unavailable",
+            },
+        )
+        if str(name) == _TURN_FINAL_NAME
+        else _connector_public_reason(reason)
+    )
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -3789,6 +5366,14 @@ def _connector_update_ref(
             outbox_id = int(row[1] or 0)
             delivery_key = str(row[4])
             attempt = int(row[5] or 0)
+            if action == "ack" and str(row[10]) == "final_ready":
+                conn.rollback()
+                return _connector_error_response(
+                    status="prepare_required",
+                    host_id=host_id,
+                    name=name,
+                    ref=ref,
+                )
             if action == "ack":
                 response_json = _canonical_json(
                     sanitize_public_value({
@@ -4031,6 +5616,685 @@ def defer_connector_delivery(
         delay_seconds=delay_seconds,
         now=now,
     )
+
+
+def _valid_final_ready_key(value: Any) -> bool:
+    prefix = f"{_TURN_FINAL_NAME}:revision:twfinal1."
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and _valid_presentation_opaque(value[len(f"{_TURN_FINAL_NAME}:revision:"):], "twfinal1.")
+    )
+
+
+def retry_final_ready_delivery(
+    db_path: Path,
+    host_id: str,
+    *,
+    key: str | None = None,
+    final_identity: str | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Explicitly requeue one exact dead-letter final anchor with a fresh budget."""
+    if (key is None) == (final_identity is None):
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "invalid_params",
+                "host_id": str(host_id),
+                "name": _TURN_FINAL_NAME,
+            }
+        )
+    if final_identity is not None:
+        if not _valid_presentation_opaque(final_identity, "twfinal1."):
+            return sanitize_public_value(
+                {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "invalid_params",
+                    "host_id": str(host_id),
+                    "name": _TURN_FINAL_NAME,
+                }
+            )
+        key = f"{_TURN_FINAL_NAME}:revision:{final_identity}"
+    assert key is not None
+    if not _valid_final_ready_key(key):
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "invalid_params",
+                "host_id": str(host_id),
+                "name": _TURN_FINAL_NAME,
+            }
+        )
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "store_unavailable",
+                "host_id": str(host_id),
+                "name": _TURN_FINAL_NAME,
+                "key": str(key),
+            }
+        )
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    delivery_kind,
+                    status,
+                    payload_json,
+                    private_state_json,
+                    turn_id,
+                    content_revision
+                FROM connector_outbox
+                WHERE host_id = ? AND connector = ? AND delivery_key = ?
+                """,
+                (str(host_id), _TURN_FINAL_NAME, str(key)),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "not_found",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            if str(row[1]) not in {"final_ready", "final_migration_hold"}:
+                conn.rollback()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "not_retryable",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            typed_turn_id = str(row[5] or "")
+            typed_revision = str(row[6] or "")
+            authoritative = (
+                _final_ready_payload_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=typed_turn_id,
+                    content_revision_value=typed_revision,
+                )
+                if typed_turn_id and typed_revision
+                else None
+            )
+            expected_key = (
+                f"{_TURN_FINAL_NAME}:revision:{authoritative['final_identity']}"
+                if authoritative is not None
+                else None
+            )
+            if authoritative is None or expected_key != str(key):
+                outbox_id = int(row[0])
+                conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET status = 'superseded',
+                        delivered_at = COALESCE(delivered_at, ?)
+                    WHERE outbox_id = ? AND status != 'delivered'
+                    """,
+                    (current_time, outbox_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET status = 'superseded',
+                        next_attempt_at = NULL,
+                        updated_at = ?,
+                        private_state_json = ?
+                    WHERE id = ? AND status != 'delivered'
+                    """,
+                    (
+                        current_time,
+                        _connector_private_clear_current(row[4]),
+                        outbox_id,
+                    ),
+                )
+                conn.commit()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "stale_revision",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            if (
+                bool(authoritative["content"]["known_incomplete"])
+                or _final_revision_is_internal_automation_conn(
+                    conn,
+                    host_id=str(host_id),
+                    turn_id=typed_turn_id,
+                    content_revision_value=typed_revision,
+                )
+            ):
+                conn.rollback()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "not_retryable",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            failed_plans = conn.execute(
+                """
+                SELECT plans.plan_token
+                FROM turn_presentation_plans AS plans
+                WHERE plans.host_id = ?
+                  AND plans.name = ?
+                  AND plans.turn_id = ?
+                  AND plans.content_revision = ?
+                  AND (
+                      plans.source_outbox_id = ?
+                      OR plans.source_outbox_id IS NULL
+                  )
+                  AND (
+                      plans.source_outbox_id IS NULL
+                      OR ? = 'awaiting_ack'
+                  )
+                  AND plans.state = 'failed'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_recoveries AS recovery
+                      WHERE recovery.failed_plan_id = plans.id
+                  )
+                ORDER BY plans.generation DESC, plans.id DESC
+                LIMIT 2
+                """,
+                (
+                    str(host_id),
+                    _TURN_FINAL_NAME,
+                    typed_turn_id,
+                    typed_revision,
+                    int(row[0]),
+                    str(row[2]),
+                ),
+            ).fetchall()
+            if (
+                len(failed_plans) == 1
+                and _valid_presentation_opaque(
+                    failed_plans[0][0],
+                    "twplan1.",
+                )
+            ):
+                failed_plan_token = str(failed_plans[0][0])
+                request_id = (
+                    "recover-request-"
+                    + stable_fingerprint(
+                        {
+                            "domain": (
+                                "tendwire.connector.final-retry-recovery.v1"
+                            ),
+                            "host_id": str(host_id),
+                            "failed_plan_token": failed_plan_token,
+                        },
+                        length=64,
+                    )
+                )
+                conn.rollback()
+                return prepare_connector_plan_recover(
+                    db_path,
+                    str(host_id),
+                    name=_TURN_FINAL_NAME,
+                    failed_plan_token=failed_plan_token,
+                    request_id=request_id,
+                    now=current_time,
+                )
+            if str(row[2]) != _CONNECTOR_EXHAUSTED_OUTBOX_STATUS:
+                conn.rollback()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "not_retryable",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            outbox_id = int(row[0])
+            prior_state = _json_object(row[4])
+            prior_attempts = int(prior_state.get("prior_attempt_count") or 0)
+            local_attempts = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM connector_deliveries
+                    WHERE outbox_id = ?
+                    """,
+                    (outbox_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            if str(row[1]) == "final_migration_hold" and local_attempts:
+                conn.rollback()
+                return sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "not_retryable",
+                        "host_id": str(host_id),
+                        "name": _TURN_FINAL_NAME,
+                        "key": str(key),
+                    }
+                )
+            total_attempts = prior_attempts + local_attempts
+            next_private_state = _json_object(
+                _connector_private_clear_current(prior_state)
+            )
+            next_private_state["prior_attempt_count"] = total_attempts
+            conn.execute(
+                "DELETE FROM connector_deliveries WHERE outbox_id = ?",
+                (outbox_id,),
+            )
+            final_identity = str(authoritative["final_identity"])
+            cursor = conn.execute(
+                """
+                UPDATE connector_outbox
+                SET delivery_kind = 'final_ready',
+                    status = 'queued',
+                    payload_json = CASE
+                        WHEN delivery_kind = 'final_migration_hold' THEN ?
+                        ELSE payload_json
+                    END,
+                    next_attempt_at = NULL,
+                    updated_at = ?,
+                    private_state_json = ?
+                WHERE id = ? AND status = 'dead_letter'
+                """,
+                (
+                    _canonical_json(authoritative),
+                    current_time,
+                    _canonical_json(next_private_state),
+                    outbox_id,
+                ),
+            )
+            if not cursor.rowcount:
+                raise StoreSchemaError("final_retry_conflict")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    result = dict(
+        sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "status": "requeued",
+                "host_id": str(host_id),
+                "name": _TURN_FINAL_NAME,
+                "key": str(key),
+                "final_identity": final_identity,
+                "prior_attempt_count": total_attempts,
+            }
+        )
+    )
+    result["key"] = str(key)
+    if _valid_presentation_opaque(final_identity, "twfinal1."):
+        result["final_identity"] = final_identity
+    return result
+
+
+def _bounded_connector_attempt_count(*values: Any) -> int:
+    """Return a fail-closed SQLite-sized sum of nonnegative attempt counters."""
+    maximum = (1 << 63) - 1
+    total = 0
+    for value in values:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > maximum
+        ):
+            continue
+        total = min(maximum, total + value)
+    return total
+
+
+def inspect_connector_outbox(
+    db_path: Path,
+    host_id: str,
+    *,
+    name: str,
+    status: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Return one bounded public-safe view of neutral final outbox pressure."""
+    bounded_limit = max(1, min(int(limit), 100))
+    if str(name) != _TURN_FINAL_NAME or str(status) != "dead_letter":
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "invalid_params",
+                "host_id": str(host_id),
+                "name": str(name),
+                "items": [],
+            }
+        )
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "store_unavailable",
+                "host_id": str(host_id),
+                "name": str(name),
+                "items": [],
+            }
+        )
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        anchor_total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND connector = ?
+                  AND status = ?
+                  AND delivery_kind IN (
+                      'final_ready',
+                      'final_migration_hold'
+                  )
+                """,
+                (str(host_id), str(name), str(status)),
+            ).fetchone()[0]
+            or 0
+        )
+        rows = conn.execute(
+            """
+            SELECT
+                outbox.delivery_key,
+                outbox.status,
+                outbox.created_at,
+                outbox.updated_at,
+                outbox.payload_json,
+                outbox.private_state_json,
+                (
+                    SELECT COUNT(*)
+                    FROM connector_deliveries AS attempts
+                    WHERE attempts.outbox_id = outbox.id
+                )
+            FROM connector_outbox AS outbox
+            WHERE outbox.host_id = ?
+              AND outbox.connector = ?
+              AND outbox.status = ?
+              AND outbox.delivery_kind IN (
+                  'final_ready',
+                  'final_migration_hold'
+              )
+            ORDER BY outbox.id
+            LIMIT ?
+            """,
+            (
+                str(host_id),
+                str(name),
+                str(status),
+                bounded_limit,
+            ),
+        ).fetchall()
+        failed_total = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM turn_presentation_plans AS plans
+                JOIN connector_outbox AS source
+                  ON source.host_id = plans.host_id
+                 AND source.connector = plans.name
+                 AND source.turn_id = plans.turn_id
+                 AND source.content_revision = plans.content_revision
+                 AND source.delivery_kind = 'final_ready'
+                 AND (
+                     source.id = plans.source_outbox_id
+                     OR plans.source_outbox_id IS NULL
+                 )
+                JOIN turn_content_revisions AS revisions
+                  ON revisions.host_id = plans.host_id
+                 AND revisions.turn_id = plans.turn_id
+                 AND revisions.content_revision = plans.content_revision
+                WHERE plans.host_id = ?
+                  AND plans.name = ?
+                  AND plans.state = 'failed'
+                  AND (
+                      (
+                          plans.source_outbox_id IS NOT NULL
+                          AND source.status = 'awaiting_ack'
+                      )
+                      OR (
+                          plans.source_outbox_id IS NULL
+                          AND source.status != 'superseded'
+                      )
+                  )
+                  AND revisions.is_current = 1
+                  AND revisions.final_state = 'complete'
+                  AND revisions.user_state IN ('absent', 'complete')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_recoveries AS recovery
+                      WHERE recovery.failed_plan_id = plans.id
+                  )
+                """,
+                (str(host_id), str(name)),
+            ).fetchone()[0]
+            or 0
+        )
+        if failed_total and len(rows) >= bounded_limit:
+            rows = rows[: max(0, bounded_limit - 1)]
+        failed_rows = conn.execute(
+            """
+            SELECT
+                plans.plan_token,
+                source.delivery_key,
+                source.payload_json,
+                plans.turn_id,
+                plans.content_revision,
+                plans.generation,
+                (
+                    SELECT COUNT(*)
+                    FROM turn_presentation_jobs AS failed_jobs
+                    JOIN connector_outbox AS failed_outbox
+                      ON failed_outbox.id = failed_jobs.outbox_id
+                    WHERE failed_jobs.plan_id = plans.id
+                      AND failed_outbox.status = 'dead_letter'
+                ),
+                COALESCE(
+                    (
+                        SELECT recovery.prior_attempt_count
+                        FROM turn_presentation_recoveries AS recovery
+                        WHERE recovery.recovered_plan_id = plans.id
+                    ),
+                    0
+                ) + (
+                    SELECT COUNT(*)
+                    FROM turn_presentation_jobs AS attempt_jobs
+                    JOIN connector_deliveries AS attempts
+                      ON attempts.outbox_id = attempt_jobs.outbox_id
+                    WHERE attempt_jobs.plan_id = plans.id
+                )
+            FROM turn_presentation_plans AS plans
+            JOIN connector_outbox AS source
+              ON source.host_id = plans.host_id
+             AND source.connector = plans.name
+             AND source.turn_id = plans.turn_id
+             AND source.content_revision = plans.content_revision
+             AND source.delivery_kind = 'final_ready'
+             AND (
+                 source.id = plans.source_outbox_id
+                 OR plans.source_outbox_id IS NULL
+             )
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = plans.host_id
+             AND revisions.turn_id = plans.turn_id
+             AND revisions.content_revision = plans.content_revision
+            WHERE plans.host_id = ?
+              AND plans.name = ?
+              AND plans.state = 'failed'
+              AND (
+                  (
+                      plans.source_outbox_id IS NOT NULL
+                      AND source.status = 'awaiting_ack'
+                  )
+                  OR (
+                      plans.source_outbox_id IS NULL
+                      AND source.status != 'superseded'
+                  )
+              )
+              AND revisions.is_current = 1
+              AND revisions.final_state = 'complete'
+              AND revisions.user_state IN ('absent', 'complete')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_recoveries AS recovery
+                  WHERE recovery.failed_plan_id = plans.id
+              )
+            ORDER BY plans.generation DESC, plans.id DESC
+            LIMIT ?
+            """,
+            (
+                str(host_id),
+                str(name),
+                max(0, bounded_limit - len(rows)),
+            ),
+        ).fetchall()
+        total = anchor_total + failed_total
+    items: list[dict[str, Any]] = []
+    for (
+        key_value,
+        status_value,
+        created_at,
+        updated_at,
+        payload_json,
+        private_json,
+        attempts,
+    ) in rows:
+        original_payload = _json_object(payload_json)
+        payload = _restore_presentation_tokens(
+            dict(
+                sanitize_public_mapping(
+                    original_payload,
+                    backend_neutral=True,
+                )
+            ),
+            original_payload,
+        )
+        prior_attempts = _bounded_connector_attempt_count(
+            _json_object(private_json).get("prior_attempt_count")
+        )
+        item = {
+            "status": _store_public_label(
+                status_value,
+                allowed={_CONNECTOR_EXHAUSTED_OUTBOX_STATUS},
+            ),
+            "created_at": str(created_at),
+            "updated_at": str(updated_at),
+            "attempt_count": _bounded_connector_attempt_count(prior_attempts, attempts),
+            "final": payload,
+        }
+        if _valid_final_ready_key(key_value):
+            item["key"] = str(key_value)
+        items.append(item)
+    for (
+        plan_token,
+        key_value,
+        payload_json,
+        turn_id,
+        content_revision_value,
+        generation,
+        failed_job_count,
+        attempt_count,
+    ) in failed_rows:
+        payload = _json_object(payload_json)
+        final_identity_value = payload.get("final_identity")
+        if (
+            not _valid_presentation_opaque(plan_token, "twplan1.")
+            or not _valid_final_ready_key(key_value)
+            or not _valid_presentation_opaque(
+                final_identity_value,
+                "twfinal1.",
+            )
+            or not _valid_presentation_label(turn_id, prefix="turn-")
+            or not _valid_presentation_opaque(
+                content_revision_value,
+                "twrev1.",
+            )
+        ):
+            continue
+        items.append(
+            {
+                "kind": "failed_plan",
+                "status": _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
+                "plan_token": str(plan_token),
+                "final_identity": str(final_identity_value),
+                "key": str(key_value),
+                "turn_id": str(turn_id),
+                "content_revision": str(content_revision_value),
+                "generation": int(generation),
+                "failed_job_count": int(failed_job_count or 0),
+                "attempt_count": _bounded_connector_attempt_count(attempt_count),
+            }
+        )
+    result = dict(
+        sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": True,
+                "status": "ok",
+                "host_id": str(host_id),
+                "name": str(name),
+                "filter_status": str(status),
+                "total": total,
+                "items": items,
+            }
+        )
+    )
+    clean_items = result.get("items")
+    if isinstance(clean_items, list):
+        for clean_item, original_item in zip(clean_items, items, strict=True):
+            if not isinstance(clean_item, dict):
+                continue
+            original_key = original_item.get("key")
+            if _valid_final_ready_key(original_key):
+                clean_item["key"] = str(original_key)
+            original_plan_token = original_item.get("plan_token")
+            if _valid_presentation_opaque(original_plan_token, "twplan1."):
+                clean_item["plan_token"] = str(original_plan_token)
+            original_final_identity = original_item.get("final_identity")
+            if _valid_presentation_opaque(
+                original_final_identity,
+                "twfinal1.",
+            ):
+                clean_item["final_identity"] = str(original_final_identity)
+            original_turn_id = original_item.get("turn_id")
+            if _valid_presentation_label(original_turn_id, prefix="turn-"):
+                clean_item["turn_id"] = str(original_turn_id)
+            clean_final = clean_item.get("final")
+            original_final = original_item.get("final")
+            if isinstance(clean_final, dict) and isinstance(original_final, Mapping):
+                _restore_presentation_tokens(clean_final, original_final)
+    return result
 
 
 def _snapshot_dict(snapshot: Snapshot) -> dict[str, Any]:
@@ -4551,12 +6815,48 @@ def _turn_payload_is_prune_protected(payload_json: Any) -> bool:
     )
 
 
+def _typed_final_reference_exists_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str | None = None,
+) -> bool:
+    revision_clause = (
+        "AND content_revision = ?"
+        if content_revision_value is not None
+        else "AND content_revision IS NOT NULL"
+    )
+    params: list[Any] = [str(host_id), str(turn_id)]
+    if content_revision_value is not None:
+        params.append(str(content_revision_value))
+    return bool(
+        conn.execute(
+            f"""
+            SELECT 1
+            FROM connector_outbox
+            WHERE host_id = ? AND turn_id = ?
+              AND delivery_kind GLOB 'final_*'
+              {revision_clause}
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+    )
+
+
 def _delete_turn_if_unreferenced_conn(
     conn: sqlite3.Connection,
     host_id: str,
     turn_id: str,
 ) -> bool:
     """Delete one historical turn and invalidate active list traversals."""
+    if _typed_final_reference_exists_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+    ):
+        return False
     protected = conn.execute(
         """
         SELECT 1
@@ -5497,6 +7797,21 @@ def _refresh_snapshot_projections_conn(
     for turn in turns_from_snapshot(snapshot):
         item = sanitize_public_mapping(turn.to_dict())
         turn_id = str(item.get("id") or "unknown")
+        existing_turn = conn.execute(
+            """
+            SELECT payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (host_id, turn_id),
+        ).fetchone()
+        if existing_turn is not None:
+            existing_payload = _json_object(existing_turn[0])
+            for provenance_key in ("origin_command_id", "source_turn_id"):
+                if not str(item.get(provenance_key) or "").strip():
+                    retained = existing_payload.get(provenance_key)
+                    if str(retained or "").strip():
+                        item[provenance_key] = retained
         turn_ids.add(turn_id)
         list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
         conn.execute(
@@ -5551,6 +7866,22 @@ def _refresh_snapshot_projections_conn(
             payload=item,
             observed_at=str(observed_at) if observed_at else None,
         )
+        current_revision = conn.execute(
+            """
+            SELECT content_revision
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (host_id, turn_id),
+        ).fetchone()
+        if current_revision is not None:
+            _ensure_final_ready_anchor_conn(
+                conn,
+                host_id=host_id,
+                turn_id=turn_id,
+                content_revision_value=str(current_revision[0]),
+                now=observed_at,
+            )
     _prune_turn_projection(conn, host_id, turn_ids)
 
     pending_ids: set[str] = set()
@@ -7197,6 +9528,565 @@ def _migrate_v9_to_v10_conn(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_BACKEND_PENDING_CLAIMS_TABLE)
 
 
+def _migration_plan_has_exact_coverage_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+) -> bool:
+    plan = conn.execute(
+        """
+        SELECT
+            host_id, name, turn_id, content_revision,
+            presentation_version, generation, part_count
+        FROM turn_presentation_plans
+        WHERE id = ?
+        """,
+        (int(plan_id),),
+    ).fetchone()
+    if plan is None:
+        return False
+    revision_row, revision_error = _current_presentation_revision_conn(
+        conn,
+        host_id=str(plan[0]),
+        turn_id=str(plan[2]),
+        content_revision_value=str(plan[3]),
+    )
+    if revision_error is not None or revision_row is None:
+        return False
+    staged = conn.execute(
+        """
+        WITH effective AS (
+            SELECT
+                jobs.id,
+                jobs.part_ordinal,
+                jobs.spans_json,
+                ROW_NUMBER() OVER (
+                    PARTITION BY jobs.part_ordinal
+                    ORDER BY lineage.generation DESC, lineage.id DESC, jobs.id DESC
+                ) AS effective_rank
+            FROM turn_presentation_plans AS lineage
+            JOIN turn_presentation_jobs AS jobs
+              ON jobs.plan_id = lineage.id
+            WHERE lineage.host_id = ?
+              AND lineage.name = ?
+              AND lineage.turn_id = ?
+              AND lineage.content_revision = ?
+              AND lineage.presentation_version = ?
+              AND lineage.generation <= ?
+              AND lineage.state IN ('completed', 'superseded')
+              AND jobs.operation = 'upsert'
+        )
+        SELECT id, part_ordinal, spans_json
+        FROM effective
+        WHERE effective_rank = 1
+        ORDER BY part_ordinal
+        """,
+        (
+            str(plan[0]),
+            str(plan[1]),
+            str(plan[2]),
+            str(plan[3]),
+            str(plan[4]),
+            int(plan[5]),
+        ),
+    ).fetchall()
+    if (
+        len(staged) != int(plan[6])
+        or [int(row[1]) for row in staged] != list(range(int(plan[6])))
+    ):
+        return False
+    try:
+        for row in staged:
+            spans = json.loads(str(row[2]))
+            if (
+                not isinstance(spans, list)
+                or _validate_presentation_spans(
+                    spans,
+                    revision_row=revision_row,
+                )
+                is None
+            ):
+                return False
+        return _presentation_exact_coverage(staged, revision_row=revision_row)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _migration_plan_route_matches_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+    authoritative: Mapping[str, Any],
+) -> bool:
+    rows = conn.execute(
+        """
+        SELECT jobs.outbox_id, outbox.payload_json
+        FROM turn_presentation_jobs AS jobs
+        LEFT JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+        WHERE jobs.plan_id = ?
+        ORDER BY jobs.id
+        """,
+        (int(plan_id),),
+    ).fetchall()
+    if not rows:
+        return False
+    expected = {
+        "schema_version": 2,
+        "turn_id": str(authoritative.get("turn_id") or ""),
+        "content_revision": str(authoritative.get("content_revision") or ""),
+        "final_identity": str(authoritative.get("final_identity") or ""),
+        "stable_key": str(authoritative.get("stable_key") or ""),
+        "stable_key_version": 1,
+    }
+    for outbox_id, payload_json in rows:
+        if outbox_id is None:
+            return False
+        payload = _json_object(payload_json)
+        route = payload.get("turn")
+        if not isinstance(route, Mapping):
+            return False
+        actual = {
+            "schema_version": route.get("schema_version"),
+            "turn_id": str(route.get("turn_id") or ""),
+            "content_revision": str(route.get("content_revision") or ""),
+            "final_identity": str(route.get("final_identity") or ""),
+            "stable_key": str(route.get("stable_key") or ""),
+            "stable_key_version": route.get("stable_key_version"),
+        }
+        if actual != expected:
+            return False
+    return True
+
+
+def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
+    """Add typed final anchors and conservatively classify legacy finals."""
+    required_legacy_tables = {
+        "connector_outbox",
+        "turn_presentation_plans",
+        "turn_presentation_jobs",
+        "turn_presentation_recoveries",
+        "turn_content_revisions",
+    }
+    present_legacy_tables = {
+        table for table in required_legacy_tables if _table_columns(conn, table)
+    }
+    if not present_legacy_tables:
+        conn.execute(CREATE_SNAPSHOTS_TABLE)
+        conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+        conn.execute(CREATE_WORKER_BINDINGS_TABLE)
+        for statement in CREATE_PR6_TABLES:
+            conn.execute(statement)
+        conn.execute(CREATE_ATTENTION_LIFECYCLES_TABLE)
+        conn.execute(CREATE_TURN_CONTENT_REVISIONS_TABLE)
+        conn.execute(CREATE_TURN_CONTENT_PAGE_BOUNDARIES_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_PLANS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
+        conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
+        conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
+        conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
+        conn.execute(CREATE_TURN_LIST_STATE_TABLE)
+        conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
+        for statements in (
+            CREATE_COMMAND_RECEIPT_INDEXES,
+            CREATE_WORKER_BINDING_INDEXES,
+            CREATE_PR6_INDEXES,
+            CREATE_TURN_LIST_INDEXES,
+            CREATE_ATTENTION_LIFECYCLE_INDEXES,
+            CREATE_TURN_CONTENT_REVISION_INDEXES,
+            CREATE_TURN_PRESENTATION_INDEXES,
+            CREATE_FINAL_DELIVERY_INDEXES,
+            CREATE_SNAPSHOT_INDEXES,
+        ):
+            for statement in statements:
+                conn.execute(statement)
+        conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
+        conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
+        conn.execute(INSERT_STORE_MAINTENANCE_STATE)
+        _ensure_turn_list_state_conn(conn)
+        return
+    if present_legacy_tables != required_legacy_tables:
+        raise StoreSchemaError("legacy_final_schema_incomplete")
+    conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
+    _ensure_columns(
+        conn,
+        "connector_outbox",
+        {
+            "delivery_kind": "TEXT NOT NULL DEFAULT 'generic'",
+            "turn_id": "TEXT",
+            "content_revision": "TEXT",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "turn_presentation_plans",
+        {
+            "source_outbox_id": (
+                "INTEGER REFERENCES connector_outbox(id) ON DELETE RESTRICT"
+            ),
+        },
+    )
+    conn.execute(
+        """
+        UPDATE connector_outbox AS outbox
+        SET delivery_kind = 'final_part',
+            turn_id = (
+                SELECT plans.turn_id
+                FROM turn_presentation_jobs AS jobs
+                JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+                WHERE jobs.outbox_id = outbox.id
+                  AND plans.host_id = outbox.host_id
+                  AND plans.name = outbox.connector
+            ),
+            content_revision = (
+                SELECT plans.content_revision
+                FROM turn_presentation_jobs AS jobs
+                JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+                WHERE jobs.outbox_id = outbox.id
+                  AND plans.host_id = outbox.host_id
+                  AND plans.name = outbox.connector
+            )
+        WHERE EXISTS (
+            SELECT 1
+            FROM turn_presentation_jobs AS jobs
+            JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
+            WHERE jobs.outbox_id = outbox.id
+              AND plans.host_id = outbox.host_id
+              AND plans.name = outbox.connector
+        )
+        """
+    )
+    dangling_recovery = conn.execute(
+        """
+        SELECT 1
+        FROM turn_presentation_recoveries AS recovery
+        LEFT JOIN turn_presentation_plans AS failed
+          ON failed.id = recovery.failed_plan_id
+        LEFT JOIN turn_presentation_plans AS recovered
+          ON recovered.id = recovery.recovered_plan_id
+        WHERE failed.id IS NULL
+           OR recovered.id IS NULL
+           OR failed.id = recovered.id
+           OR failed.host_id != recovered.host_id
+           OR failed.name != recovered.name
+           OR failed.turn_id != recovered.turn_id
+           OR failed.content_revision != recovered.content_revision
+           OR failed.presentation_version != recovered.presentation_version
+           OR recovered.generation <= failed.generation
+        LIMIT 1
+        """
+    ).fetchone()
+    if dangling_recovery is not None:
+        raise StoreSchemaError("legacy_final_recovery_invalid")
+    recovery_edges = conn.execute(
+        """
+        SELECT failed_plan_id, recovered_plan_id, created_at
+        FROM turn_presentation_recoveries
+        ORDER BY generation DESC, id DESC
+        """
+    ).fetchall()
+    for failed_plan_id, recovered_plan_id, recovered_at in recovery_edges:
+        _finalize_recovered_plan_materialization_conn(
+            conn,
+            failed_plan_id=int(failed_plan_id),
+            recovered_plan_id=int(recovered_plan_id),
+            now=str(recovered_at),
+        )
+    current_finals = conn.execute(
+        """
+        SELECT
+            revisions.host_id,
+            revisions.turn_id,
+            revisions.content_revision,
+            revisions.created_at,
+            turns.payload_json,
+            revisions.user_text,
+            revisions.assistant_final_text
+        FROM turn_content_revisions AS revisions
+        JOIN turns
+          ON turns.host_id = revisions.host_id
+         AND turns.turn_id = revisions.turn_id
+        WHERE revisions.is_current = 1
+          AND revisions.final_state = 'complete'
+        ORDER BY revisions.host_id, revisions.turn_id
+        """
+    ).fetchall()
+    for (
+        host_id,
+        turn_id,
+        revision,
+        revision_created_at,
+        turn_payload_json,
+        revision_user_text,
+        revision_final_text,
+    ) in current_finals:
+        payload = _final_ready_payload_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            content_revision_value=str(revision),
+            allow_unroutable=True,
+        )
+        if payload is None:
+            raise StoreSchemaError("legacy_final_descriptor_unavailable")
+        automation_payload = _json_object(turn_payload_json)
+        automation_payload["user_text"] = revision_user_text
+        automation_payload["assistant_final_text"] = revision_final_text
+        internal_automation = is_internal_automation_turn_payload(
+            automation_payload
+        )
+        if internal_automation:
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET delivery_kind = 'final_migration_hold',
+                    status = 'dead_letter',
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT jobs.outbox_id
+                    FROM turn_presentation_jobs AS jobs
+                    JOIN turn_presentation_plans AS plans
+                      ON plans.id = jobs.plan_id
+                    WHERE plans.host_id = ?
+                      AND plans.name = ?
+                      AND plans.turn_id = ?
+                      AND plans.content_revision = ?
+                      AND jobs.outbox_id IS NOT NULL
+                )
+                """,
+                (
+                    str(revision_created_at),
+                    str(host_id),
+                    _TURN_FINAL_NAME,
+                    str(turn_id),
+                    str(revision),
+                ),
+            )
+        routable = (
+            payload.get("schema_version") == 2
+            and not bool(payload["content"]["known_incomplete"])
+            and not internal_automation
+        )
+        unresolved = conn.execute(
+            """
+            SELECT id, state
+            FROM turn_presentation_plans
+            WHERE host_id = ?
+              AND name = ?
+              AND turn_id = ?
+              AND content_revision = ?
+              AND state IN (
+                  'preparing',
+                  'waiting_predecessor',
+                  'active',
+                  'failed'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_recoveries AS recovery
+                  WHERE recovery.failed_plan_id = turn_presentation_plans.id
+              )
+            ORDER BY id DESC
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(revision),
+            ),
+        ).fetchall()
+        proven = conn.execute(
+            """
+            SELECT plans.id, plans.completed_at
+            FROM turn_presentation_plans AS plans
+            WHERE plans.host_id = ?
+              AND plans.name = ?
+              AND plans.turn_id = ?
+              AND plans.content_revision = ?
+              AND plans.state = 'completed'
+              AND plans.completed_at IS NOT NULL
+              AND (
+                  SELECT COUNT(DISTINCT jobs.part_ordinal)
+                  FROM turn_presentation_plans AS lineage
+                  JOIN turn_presentation_jobs AS jobs
+                    ON jobs.plan_id = lineage.id
+                  WHERE lineage.host_id = plans.host_id
+                    AND lineage.name = plans.name
+                    AND lineage.turn_id = plans.turn_id
+                    AND lineage.content_revision = plans.content_revision
+                    AND lineage.presentation_version = plans.presentation_version
+                    AND lineage.generation <= plans.generation
+                    AND lineage.state IN ('completed', 'superseded')
+                    AND jobs.operation = 'upsert'
+              ) = plans.part_count
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS lineage
+                  JOIN turn_presentation_jobs AS jobs
+                    ON jobs.plan_id = lineage.id
+                  WHERE lineage.host_id = plans.host_id
+                    AND lineage.name = plans.name
+                    AND lineage.turn_id = plans.turn_id
+                    AND lineage.content_revision = plans.content_revision
+                    AND lineage.presentation_version = plans.presentation_version
+                    AND lineage.generation <= plans.generation
+                    AND lineage.state IN ('completed', 'superseded')
+                    AND jobs.operation = 'upsert'
+                    AND jobs.part_ordinal >= plans.part_count
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS lineage
+                  JOIN turn_presentation_jobs AS jobs
+                    ON jobs.plan_id = lineage.id
+                  LEFT JOIN connector_outbox AS outbox
+                    ON outbox.id = jobs.outbox_id
+                  WHERE lineage.host_id = plans.host_id
+                    AND lineage.name = plans.name
+                    AND lineage.turn_id = plans.turn_id
+                    AND lineage.content_revision = plans.content_revision
+                    AND lineage.presentation_version = plans.presentation_version
+                    AND lineage.generation <= plans.generation
+                    AND lineage.state IN ('completed', 'superseded')
+                    AND (
+                        outbox.id IS NULL
+                        OR outbox.host_id != plans.host_id
+                        OR outbox.connector != plans.name
+                        OR outbox.turn_id != plans.turn_id
+                        OR outbox.content_revision != plans.content_revision
+                        OR outbox.delivery_kind != 'final_part'
+                        OR outbox.status != 'delivered'
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM connector_deliveries AS delivered_attempt
+                            WHERE delivered_attempt.outbox_id = outbox.id
+                              AND delivered_attempt.host_id = outbox.host_id
+                              AND delivered_attempt.connector = outbox.connector
+                              AND delivered_attempt.delivery_key = outbox.delivery_key
+                              AND delivered_attempt.status = 'delivered'
+                              AND delivered_attempt.delivered_at IS NOT NULL
+                        )
+                    )
+              )
+            ORDER BY plans.id DESC
+            LIMIT 1
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(revision),
+            ),
+        ).fetchone()
+        if (
+            proven is not None
+            and not _migration_plan_has_exact_coverage_conn(
+                conn,
+                plan_id=int(proven[0]),
+            )
+        ):
+            proven = None
+        linkable = [
+            int(row[0])
+            for row in unresolved
+            if str(row[1]) in {"waiting_predecessor", "active", "failed"}
+            and _migration_plan_route_matches_conn(
+                conn,
+                plan_id=int(row[0]),
+                authoritative=payload,
+            )
+        ]
+        if not routable:
+            linkable = []
+            delivery_kind = "final_migration_hold"
+            status = "dead_letter"
+            classified_at = str(revision_created_at)
+        elif unresolved:
+            delivery_kind = "final_ready" if linkable else "final_migration_hold"
+            status = "awaiting_ack" if linkable else "dead_letter"
+            classified_at = str(revision_created_at)
+        elif proven is not None:
+            delivery_kind = "final_ready"
+            status = "delivered"
+            classified_at = str(proven[1])
+        else:
+            delivery_kind = "final_migration_hold"
+            status = "dead_letter"
+            classified_at = str(revision_created_at)
+        final_identity = str(payload["final_identity"])
+        delivery_key = f"{_TURN_FINAL_NAME}:revision:{final_identity}"
+        conn.execute(
+            """
+            INSERT INTO connector_outbox (
+                host_id,
+                connector,
+                delivery_key,
+                delivery_kind,
+                turn_id,
+                content_revision,
+                status,
+                payload_json,
+                private_state_json,
+                created_at,
+                updated_at,
+                next_attempt_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
+            ON CONFLICT(host_id, connector, delivery_key) DO UPDATE SET
+                delivery_kind = excluded.delivery_kind,
+                turn_id = excluded.turn_id,
+                content_revision = excluded.content_revision,
+                status = excluded.status,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at,
+                next_attempt_at = NULL
+            """,
+            (
+                str(host_id),
+                _TURN_FINAL_NAME,
+                delivery_key,
+                delivery_kind,
+                str(turn_id),
+                str(revision),
+                status,
+                _canonical_json(payload),
+                str(revision_created_at),
+                classified_at,
+            ),
+        )
+        source_row = conn.execute(
+            """
+            SELECT id
+            FROM connector_outbox
+            WHERE host_id = ? AND connector = ? AND delivery_key = ?
+            """,
+            (str(host_id), _TURN_FINAL_NAME, delivery_key),
+        ).fetchone()
+        if source_row is None:
+            raise StoreSchemaError("legacy_final_anchor_unavailable")
+        source_outbox_id = int(source_row[0])
+        if linkable:
+            placeholders = ",".join("?" for _ in linkable)
+            conn.execute(
+                f"""
+                UPDATE turn_presentation_plans
+                SET source_outbox_id = ?
+                WHERE id IN ({placeholders})
+                """,
+                (source_outbox_id, *linkable),
+            )
+        elif routable and proven is not None:
+            conn.execute(
+                """
+                UPDATE turn_presentation_plans
+                SET source_outbox_id = ?
+                WHERE id = ?
+                """,
+                (source_outbox_id, int(proven[0])),
+            )
+    for statement in CREATE_FINAL_DELIVERY_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -7208,6 +10098,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(7, 8, _migrate_v7_to_v8_conn),
     Migration(8, 9, _migrate_v8_to_v9_conn),
     Migration(9, 10, _migrate_v9_to_v10_conn),
+    Migration(10, 11, _migrate_v10_to_v11_conn),
 )
 
 
@@ -7251,6 +10142,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_PRESENTATION_JOBS_TABLE)
         conn.execute(CREATE_TURN_PRESENTATION_RECOVERIES_TABLE)
         conn.execute(CREATE_STORE_MAINTENANCE_STATE_TABLE)
+        conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
         conn.execute(CREATE_TURN_LIST_STATE_TABLE)
         conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
@@ -7268,6 +10160,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_CONTENT_REVISION_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_PRESENTATION_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_FINAL_DELIVERY_INDEXES:
             conn.execute(statement)
         for statement in CREATE_SNAPSHOT_INDEXES:
             conn.execute(statement)
@@ -7366,11 +10260,27 @@ def store_status(
     *,
     snapshot_retention_days: int = 14,
     snapshot_retention_count: int = 4096,
+    acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
+    acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     maintenance_batch_size: int = 100,
     maintenance_cadence_seconds: int = 3600,
     require_current_schema: bool = False,
 ) -> dict[str, Any]:
     """Return bounded public-safe host state and database maintenance aggregates."""
+    if (
+        isinstance(acknowledged_final_retention_days, bool)
+        or not isinstance(acknowledged_final_retention_days, int)
+        or acknowledged_final_retention_days <= 0
+        or acknowledged_final_retention_days > _MAX_RETENTION_DAYS
+    ):
+        acknowledged_final_retention_days = ACKNOWLEDGED_FINAL_RETENTION_DAYS
+    if (
+        isinstance(acknowledged_final_retention_count, bool)
+        or not isinstance(acknowledged_final_retention_count, int)
+        or acknowledged_final_retention_count <= 0
+        or acknowledged_final_retention_count > _SQLITE_MAX_INTEGER
+    ):
+        acknowledged_final_retention_count = ACKNOWLEDGED_FINAL_RETENTION_COUNT
     policy = SnapshotRetentionPolicy(
         retention_days=snapshot_retention_days,
         retention_count=snapshot_retention_count,
@@ -7386,6 +10296,24 @@ def store_status(
         "maintenance_cadence_seconds": int(maintenance_cadence_seconds),
         "backlog": False,
     }
+    final_retention_empty = {
+        "acknowledged": 0,
+        "unresolved": 0,
+        "queued": 0,
+        "leased": 0,
+        "deferred": 0,
+        "retry": 0,
+        "dead_letter": 0,
+        "awaiting_ack": 0,
+        "eligible": 0,
+        "acknowledged_final_retention_days": int(
+            acknowledged_final_retention_days
+        ),
+        "acknowledged_final_retention_count": int(
+            acknowledged_final_retention_count
+        ),
+        "storage_pressure": False,
+    }
     def unavailable(status: str) -> dict[str, Any]:
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -7396,9 +10324,10 @@ def store_status(
             "outbox": {
                 "pending": 0,
                 "leased": 0,
-                "terminal": 0,
+                "completed": 0,
                 "by_status": {},
             },
+            "final_retention": final_retention_empty,
             "maintenance": maintenance_empty,
         }))
 
@@ -7471,14 +10400,34 @@ def store_status(
                 """
             ).fetchone()
             snapshot_count = int(
-                conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+                conn.execute(
+                    "SELECT COUNT(*) FROM snapshots WHERE host_id = ?",
+                    (str(host_id),),
+                ).fetchone()[0]
             )
             backlog_ids, _ = _snapshot_retention_candidates_conn(
                 conn,
                 cutoff_at=_utc_cutoff(retention_days=policy.retention_days),
                 retention_count=policy.retention_count,
                 batch_size=1,
+                host_id=str(host_id),
             )
+            final_retention = {
+                **_acknowledged_final_retention_metrics_conn(
+                    conn,
+                    host_id=str(host_id),
+                    cutoff_at=_utc_cutoff(
+                        retention_days=acknowledged_final_retention_days
+                    ),
+                    retention_count=acknowledged_final_retention_count,
+                ),
+                "acknowledged_final_retention_days": int(
+                    acknowledged_final_retention_days
+                ),
+                "acknowledged_final_retention_count": int(
+                    acknowledged_final_retention_count
+                ),
+            }
     except (LocalStateError, StoreSchemaError, sqlite3.Error):
         if require_current_schema:
             return unavailable("store_unavailable")
@@ -7490,7 +10439,6 @@ def store_status(
     pending_statuses = _CONNECTOR_POLLABLE_STATUSES
     terminal_statuses = {
         _CONNECTOR_TERMINAL_OUTBOX_STATUS,
-        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
         _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
     }
     outbox = {
@@ -7498,7 +10446,7 @@ def store_status(
             count for status, count in by_status.items() if status in pending_statuses
         ),
         "leased": int(by_status.get(_CONNECTOR_LEASE_STATUS, 0)),
-        "terminal": sum(
+        "completed": sum(
             count for status, count in by_status.items() if status in terminal_statuses
         ),
         "by_status": by_status,
@@ -7506,7 +10454,9 @@ def store_status(
     maintenance = {
         **maintenance_empty,
         "last_completed_at": (
-            maintenance_row[0] if maintenance_row is not None else None
+            _strict_utc_timestamp(maintenance_row[0])
+            if maintenance_row is not None
+            else None
         ),
         "status": (
             _store_public_label(
@@ -7517,7 +10467,7 @@ def store_status(
             else "not_initialized"
         ),
         "snapshot_count": snapshot_count,
-        "backlog": bool(backlog_ids),
+        "backlog": bool(backlog_ids) or bool(final_retention["storage_pressure"]),
     }
     return sanitize_public_value({
         "schema_version": 1,
@@ -7528,6 +10478,7 @@ def store_status(
         "outbox": outbox,
         "last_event_at": last_event_row[0] if last_event_row is not None else None,
         "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
+        "final_retention": final_retention,
         "maintenance": maintenance,
     })
 
@@ -7584,15 +10535,670 @@ def tail_event_metadata(
 _TURN_CONTENT_MAINTENANCE_BATCH = 100
 _TURN_CONTENT_MAINTENANCE_BATCH_MAX = 1_000
 _TURN_CONTENT_TERMINAL_PLAN_STATES = frozenset(
-    {"completed", "superseded", "failed"}
+    {"completed", "superseded"}
 )
 _TURN_CONTENT_TERMINAL_OUTBOX_STATES = frozenset(
     {
         _CONNECTOR_TERMINAL_OUTBOX_STATUS,
-        _CONNECTOR_EXHAUSTED_OUTBOX_STATUS,
         _CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
     }
 )
+_TURN_CONTENT_TERMINAL_ATTEMPT_STATES = frozenset(
+    {"delivered", "superseded", "failed", "deferred", "expired"}
+)
+
+
+
+
+_ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE = """
+WITH proven AS (
+    SELECT
+        source.id AS source_outbox_id,
+        source.host_id,
+        source.turn_id,
+        source.content_revision,
+        source.updated_at AS acknowledged_at,
+        revisions.is_current,
+        (
+            NOT EXISTS (
+                SELECT 1
+                FROM connector_outbox AS unresolved_outbox
+                WHERE unresolved_outbox.host_id = source.host_id
+                  AND unresolved_outbox.connector = source.connector
+                  AND unresolved_outbox.turn_id = source.turn_id
+                  AND unresolved_outbox.status NOT IN (
+                      'delivered',
+                      'superseded'
+                  )
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM turn_presentation_plans AS unresolved_plan
+                WHERE unresolved_plan.host_id = source.host_id
+                  AND unresolved_plan.name = source.connector
+                  AND unresolved_plan.turn_id = source.turn_id
+                  AND unresolved_plan.state IN (
+                      'preparing',
+                      'waiting_predecessor',
+                      'active',
+                      'failed'
+                  )
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM connector_deliveries AS unsafe_attempt
+                WHERE unsafe_attempt.host_id = source.host_id
+                  AND unsafe_attempt.connector = source.connector
+                  AND unsafe_attempt.delivery_key IN (
+                      SELECT tracked_outbox.delivery_key
+                      FROM connector_outbox AS tracked_outbox
+                      WHERE tracked_outbox.host_id = source.host_id
+                        AND tracked_outbox.connector = source.connector
+                        AND tracked_outbox.turn_id = source.turn_id
+                  )
+                  AND unsafe_attempt.status NOT IN (
+                      'delivered',
+                      'superseded',
+                      'failed',
+                      'deferred',
+                      'expired'
+                  )
+            )
+        ) AS whole_turn_resolved
+    FROM connector_outbox AS source
+    JOIN turn_content_revisions AS revisions
+      ON revisions.host_id = source.host_id
+     AND revisions.turn_id = source.turn_id
+     AND revisions.content_revision = source.content_revision
+     AND revisions.final_state = 'complete'
+    JOIN turns
+      ON turns.host_id = source.host_id
+     AND turns.turn_id = source.turn_id
+    WHERE source.host_id = :host_id
+      AND source.connector = 'turn-final'
+      AND source.delivery_kind = 'final_ready'
+      AND source.status = 'delivered'
+      AND source.updated_at IS NOT NULL
+      AND EXISTS (
+          SELECT 1
+          FROM turn_presentation_plans AS proof_plan
+          WHERE proof_plan.source_outbox_id = source.id
+            AND proof_plan.state IN ('completed', 'superseded')
+            AND proof_plan.completed_at IS NOT NULL
+            AND (
+                SELECT COUNT(DISTINCT proof_job.part_ordinal)
+                FROM turn_presentation_plans AS proof_lineage
+                JOIN turn_presentation_jobs AS proof_job
+                  ON proof_job.plan_id = proof_lineage.id
+                WHERE proof_lineage.host_id = source.host_id
+                  AND proof_lineage.name = source.connector
+                  AND proof_lineage.turn_id = source.turn_id
+                  AND proof_lineage.content_revision = source.content_revision
+                  AND proof_lineage.presentation_version
+                      = proof_plan.presentation_version
+                  AND proof_lineage.generation <= proof_plan.generation
+                  AND proof_lineage.state IN ('completed', 'superseded')
+                  AND proof_job.operation = 'upsert'
+            ) = proof_plan.part_count
+            AND NOT EXISTS (
+                SELECT 1
+                FROM turn_presentation_plans AS proof_lineage
+                JOIN turn_presentation_jobs AS proof_job
+                  ON proof_job.plan_id = proof_lineage.id
+                WHERE proof_lineage.host_id = source.host_id
+                  AND proof_lineage.name = source.connector
+                  AND proof_lineage.turn_id = source.turn_id
+                  AND proof_lineage.content_revision = source.content_revision
+                  AND proof_lineage.presentation_version
+                      = proof_plan.presentation_version
+                  AND proof_lineage.generation <= proof_plan.generation
+                  AND proof_lineage.state IN ('completed', 'superseded')
+                  AND proof_job.operation = 'upsert'
+                  AND proof_job.part_ordinal >= proof_plan.part_count
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM turn_presentation_plans AS proof_lineage
+                JOIN turn_presentation_jobs AS proof_job
+                  ON proof_job.plan_id = proof_lineage.id
+                LEFT JOIN connector_outbox AS proof_outbox
+                  ON proof_outbox.id = proof_job.outbox_id
+                WHERE proof_lineage.host_id = source.host_id
+                  AND proof_lineage.name = source.connector
+                  AND proof_lineage.turn_id = source.turn_id
+                  AND proof_lineage.content_revision = source.content_revision
+                  AND proof_lineage.presentation_version
+                      = proof_plan.presentation_version
+                  AND proof_lineage.generation <= proof_plan.generation
+                  AND proof_lineage.state IN ('completed', 'superseded')
+                  AND (
+                      proof_outbox.id IS NULL
+                      OR proof_outbox.host_id != source.host_id
+                      OR proof_outbox.connector != source.connector
+                      OR proof_outbox.turn_id != source.turn_id
+                      OR proof_outbox.content_revision != source.content_revision
+                      OR proof_outbox.delivery_kind != 'final_part'
+                      OR proof_outbox.status != 'delivered'
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM connector_deliveries AS delivered_attempt
+                          WHERE delivered_attempt.outbox_id = proof_outbox.id
+                            AND delivered_attempt.host_id = proof_outbox.host_id
+                            AND delivered_attempt.connector
+                                = proof_outbox.connector
+                            AND delivered_attempt.delivery_key
+                                = proof_outbox.delivery_key
+                            AND delivered_attempt.status = 'delivered'
+                            AND delivered_attempt.delivered_at IS NOT NULL
+                      )
+                  )
+            )
+      )
+),
+ranked AS (
+    SELECT
+        proven.*,
+        ROW_NUMBER() OVER (
+            ORDER BY acknowledged_at DESC, source_outbox_id DESC
+        ) AS acknowledged_rank,
+        ROW_NUMBER() OVER (
+            PARTITION BY host_id, turn_id, is_current
+            ORDER BY acknowledged_at DESC, source_outbox_id DESC
+        ) AS turn_revision_rank
+    FROM proven
+),
+candidate_ranked AS (
+    SELECT
+        ranked.*,
+        ROW_NUMBER() OVER (
+            ORDER BY acknowledged_at DESC, source_outbox_id DESC
+        ) AS retention_rank
+    FROM ranked
+    WHERE is_current = 1
+      AND whole_turn_resolved = 1
+      AND turn_revision_rank = 1
+)
+"""
+
+
+def _acknowledged_final_retention_candidates_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    cutoff_at: str,
+    retention_count: int,
+    batch_size: int,
+) -> list[tuple[int, str]]:
+    rows = conn.execute(
+        _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+        + """
+        SELECT source_outbox_id, turn_id
+        FROM candidate_ranked
+        WHERE acknowledged_at < :cutoff_at
+           OR retention_rank > :retention_count
+        ORDER BY acknowledged_at, source_outbox_id
+        LIMIT :batch_size
+        """,
+        {
+            "host_id": str(host_id),
+            "cutoff_at": str(cutoff_at),
+            "retention_count": int(retention_count),
+            "batch_size": int(batch_size),
+        },
+    ).fetchall()
+    return [(int(row[0]), str(row[1])) for row in rows]
+
+
+def _acknowledged_final_retention_metrics_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    cutoff_at: str,
+    retention_count: int,
+) -> dict[str, Any]:
+    status_rows = conn.execute(
+        """
+        SELECT status, COUNT(*), MIN(updated_at)
+        FROM connector_outbox
+        WHERE host_id = ?
+          AND connector = 'turn-final'
+          AND delivery_kind IN (
+              'final_ready',
+              'final_migration_hold',
+              'final_part'
+          )
+        GROUP BY status
+        """,
+        (str(host_id),),
+    ).fetchall()
+    by_status = {
+        str(row[0]): int(row[1] or 0)
+        for row in status_rows
+    }
+    acknowledged = int(
+        conn.execute(
+            _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+            + "SELECT COUNT(*) FROM proven",
+            {"host_id": str(host_id)},
+        ).fetchone()[0]
+        or 0
+    )
+    unproven_delivered_row = conn.execute(
+        _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+        + """
+        SELECT COUNT(*), MIN(anchor.updated_at)
+        FROM connector_outbox AS anchor
+        WHERE anchor.host_id = :host_id
+          AND anchor.connector = 'turn-final'
+          AND anchor.delivery_kind IN ('final_ready', 'final_migration_hold')
+          AND anchor.status = 'delivered'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM proven
+              WHERE proven.source_outbox_id = anchor.id
+          )
+        """,
+        {"host_id": str(host_id)},
+    ).fetchone()
+    unproven_delivered = int(unproven_delivered_row[0] or 0)
+    unresolved = unproven_delivered + sum(
+        count
+        for status, count in by_status.items()
+        if status not in {"delivered", "superseded"}
+    )
+    unresolved_times = [
+        str(row[2])
+        for row in status_rows
+        if str(row[0]) not in {"delivered", "superseded"}
+        and row[2] is not None
+    ]
+    if unproven_delivered_row[1] is not None:
+        unresolved_times.append(str(unproven_delivered_row[1]))
+    oldest_unresolved = min(unresolved_times, default=None)
+    eligible = int(
+        conn.execute(
+            _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+            + """
+            SELECT COUNT(*)
+            FROM candidate_ranked
+            WHERE acknowledged_at < :cutoff_at
+               OR retention_rank > :retention_count
+            """,
+            {
+                "host_id": str(host_id),
+                "cutoff_at": str(cutoff_at),
+                "retention_count": int(retention_count),
+            },
+        ).fetchone()[0]
+        or 0
+    )
+    return {
+        "acknowledged": acknowledged,
+        "unresolved": unresolved,
+        "queued": int(by_status.get("queued", 0)),
+        "leased": int(by_status.get("leased", 0)),
+        "deferred": int(by_status.get("deferred", 0)),
+        "retry": int(by_status.get("retry", 0)),
+        "dead_letter": int(by_status.get("dead_letter", 0)),
+        "awaiting_ack": int(by_status.get("awaiting_ack", 0)),
+        "eligible": eligible,
+        "storage_pressure": bool(
+            eligible > 0
+            or unresolved > int(retention_count)
+            or (
+                oldest_unresolved is not None
+                and oldest_unresolved < str(cutoff_at)
+            )
+        ),
+    }
+
+
+def _delete_acknowledged_final_turn_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+    tombstone_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+) -> dict[str, int]:
+    graph_params = (str(host_id), str(turn_id))
+    recoveries_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM turn_presentation_recoveries
+            WHERE failed_plan_id IN (
+                    SELECT id
+                    FROM turn_presentation_plans
+                    WHERE host_id = ? AND turn_id = ?
+                )
+               OR recovered_plan_id IN (
+                    SELECT id
+                    FROM turn_presentation_plans
+                    WHERE host_id = ? AND turn_id = ?
+                )
+            """,
+            (*graph_params, *graph_params),
+        ).rowcount
+        or 0
+    )
+    attempts_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM connector_deliveries AS attempt
+            WHERE attempt.host_id = ?
+              AND attempt.connector = 'turn-final'
+              AND (
+                  attempt.outbox_id IN (
+                      SELECT id
+                      FROM connector_outbox
+                      WHERE host_id = ?
+                        AND connector = 'turn-final'
+                        AND turn_id = ?
+                  )
+                  OR (
+                      attempt.outbox_id IS NULL
+                      AND attempt.delivery_key IN (
+                          SELECT delivery_key
+                          FROM connector_outbox
+                          WHERE host_id = ?
+                            AND connector = 'turn-final'
+                            AND turn_id = ?
+                      )
+                  )
+              )
+              AND NOT (
+                  attempt.status = 'delivered'
+                  AND attempt.delivered_at IS NOT NULL
+                  AND attempt.delivery_key IN (
+                      SELECT delivery_key
+                      FROM connector_outbox
+                      WHERE host_id = ?
+                        AND connector = 'turn-final'
+                        AND turn_id = ?
+                        AND delivery_kind = 'final_ready'
+                        AND status = 'delivered'
+                  )
+              )
+            """,
+            (
+                str(host_id),
+                str(host_id),
+                str(turn_id),
+                str(host_id),
+                str(turn_id),
+                str(host_id),
+                str(turn_id),
+            ),
+        ).rowcount
+        or 0
+    )
+    jobs_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM turn_presentation_jobs
+            WHERE plan_id IN (
+                SELECT id
+                FROM turn_presentation_plans
+                WHERE host_id = ? AND turn_id = ?
+            )
+            """,
+            graph_params,
+        ).rowcount
+        or 0
+    )
+    plans_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM turn_presentation_plans
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            graph_params,
+        ).rowcount
+        or 0
+    )
+    anchors_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM connector_outbox
+            WHERE host_id = ?
+              AND connector = 'turn-final'
+              AND turn_id = ?
+            """,
+            graph_params,
+        ).rowcount
+        or 0
+    )
+    attempts_deleted += int(
+        conn.execute(
+            f"""
+            DELETE FROM connector_deliveries
+            WHERE id IN (
+                SELECT id
+                FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY delivery_key
+                            ORDER BY delivered_at DESC, id DESC
+                        ) AS delivery_rank
+                    FROM connector_deliveries
+                    WHERE outbox_id IS NULL
+                      AND host_id = ?
+                      AND connector = 'turn-final'
+                      AND delivery_key LIKE ?
+                      AND status = 'delivered'
+                      AND delivered_at IS NOT NULL
+                )
+                WHERE delivery_rank > 1
+            )
+            """,
+            (str(host_id), f"{_TURN_FINAL_NAME}:revision:twfinal1.%"),
+        ).rowcount
+        or 0
+    )
+    attempts_deleted += int(
+        conn.execute(
+            """
+            DELETE FROM connector_deliveries
+            WHERE id IN (
+                SELECT id
+                FROM connector_deliveries
+                WHERE outbox_id IS NULL
+                  AND host_id = ?
+                  AND connector = 'turn-final'
+                  AND delivery_key LIKE ?
+                  AND status = 'delivered'
+                  AND delivered_at IS NOT NULL
+                ORDER BY delivered_at DESC, id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (
+                str(host_id),
+                f"{_TURN_FINAL_NAME}:revision:twfinal1.%",
+                max(1, int(tombstone_retention_count)),
+            ),
+        ).rowcount
+        or 0
+    )
+    revisions_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            graph_params,
+        ).rowcount
+        or 0
+    )
+    turns_deleted = int(
+        conn.execute(
+            "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
+            graph_params,
+        ).rowcount
+        or 0
+    )
+    if turns_deleted:
+        _increment_turn_list_generation_conn(conn, str(host_id))
+    return {
+        "recoveries": recoveries_deleted,
+        "attempts": attempts_deleted,
+        "jobs": jobs_deleted,
+        "plans": plans_deleted,
+        "anchors": anchors_deleted,
+        "revisions": revisions_deleted,
+        "turns": turns_deleted,
+    }
+
+
+def cleanup_acknowledged_final_retention(
+    db_path: Path,
+    host_id: str,
+    *,
+    acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
+    acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+    now: str | None = None,
+    dry_run: bool = False,
+    batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
+) -> dict[str, Any]:
+    """Delete only bounded final-turn graphs with exact all-part ACK proof."""
+    valid_policy = not any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (
+            acknowledged_final_retention_days,
+            acknowledged_final_retention_count,
+            batch_size,
+        )
+    )
+    valid_policy = (
+        valid_policy
+        and acknowledged_final_retention_days <= _MAX_RETENTION_DAYS
+        and acknowledged_final_retention_count <= _SQLITE_MAX_INTEGER
+        and batch_size <= _SQLITE_MAX_INTEGER
+    )
+    bounded_batch = max(
+        1,
+        min(
+            int(batch_size) if valid_policy else _TURN_CONTENT_MAINTENANCE_BATCH,
+            _TURN_CONTENT_MAINTENANCE_BATCH_MAX,
+        ),
+    )
+    days = (
+        int(acknowledged_final_retention_days)
+        if valid_policy
+        else ACKNOWLEDGED_FINAL_RETENTION_DAYS
+    )
+    count = (
+        int(acknowledged_final_retention_count)
+        if valid_policy
+        else ACKNOWLEDGED_FINAL_RETENTION_COUNT
+    )
+    cutoff_at = _utc_cutoff(retention_days=days, now=now)
+    empty_rows = {
+        "recoveries": 0,
+        "attempts": 0,
+        "jobs": 0,
+        "plans": 0,
+        "anchors": 0,
+        "revisions": 0,
+        "turns": 0,
+    }
+    if not valid_policy:
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "invalid_policy",
+                "host_id": str(host_id),
+                "dry_run": bool(dry_run),
+                "acknowledged_final_retention_days": days,
+                "acknowledged_final_retention_count": count,
+                "cutoff_at": cutoff_at,
+                "batch_size": bounded_batch,
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+                "deleted_rows": empty_rows,
+            }
+        )
+    if not _sqlite_store_exists(db_path):
+        return sanitize_public_value(
+            {
+                "schema_version": 1,
+                "ok": False,
+                "status": "store_unavailable",
+                "host_id": str(host_id),
+                "dry_run": bool(dry_run),
+                "acknowledged_final_retention_days": days,
+                "acknowledged_final_retention_count": count,
+                "cutoff_at": cutoff_at,
+                "batch_size": bounded_batch,
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+                "deleted_rows": empty_rows,
+            }
+        )
+    deleted_rows = dict(empty_rows)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            scanned = _acknowledged_final_retention_candidates_conn(
+                conn,
+                host_id=str(host_id),
+                cutoff_at=cutoff_at,
+                retention_count=count,
+                batch_size=bounded_batch + 1,
+            )
+            candidates = scanned[:bounded_batch]
+            remaining = len(scanned) > bounded_batch
+            if not dry_run:
+                for _source_outbox_id, turn_id in candidates:
+                    counts = _delete_acknowledged_final_turn_conn(
+                        conn,
+                        host_id=str(host_id),
+                        turn_id=str(turn_id),
+                        tombstone_retention_count=count,
+                    )
+                    for key, value in counts.items():
+                        deleted_rows[key] += int(value)
+                if not remaining:
+                    remaining = bool(
+                        _acknowledged_final_retention_candidates_conn(
+                            conn,
+                            host_id=str(host_id),
+                            cutoff_at=cutoff_at,
+                            retention_count=count,
+                            batch_size=1,
+                        )
+                    )
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+    return sanitize_public_value(
+        {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "host_id": str(host_id),
+            "dry_run": bool(dry_run),
+            "acknowledged_final_retention_days": days,
+            "acknowledged_final_retention_count": count,
+            "cutoff_at": cutoff_at,
+            "batch_size": bounded_batch,
+            "examined": len(candidates),
+            "deleted": (
+                len(candidates)
+                if dry_run
+                else int(deleted_rows["turns"])
+            ),
+            "remaining_candidates": bool(remaining),
+            "deleted_rows": deleted_rows,
+        }
+    )
 
 
 _SNAPSHOT_AGE_CANDIDATE_SQL = """
@@ -7653,29 +11259,69 @@ def _snapshot_retention_candidates_conn(
     cutoff_at: str,
     retention_count: int,
     batch_size: int,
+    host_id: str | None = None,
 ) -> tuple[list[int], bool]:
     candidate_limit = int(batch_size) + 1
+    if host_id is None:
+        age_sql = _SNAPSHOT_AGE_CANDIDATE_SQL
+        age_params = {
+            "cutoff_at": str(cutoff_at),
+            "candidate_limit": candidate_limit,
+        }
+        count_sql = _SNAPSHOT_COUNT_CANDIDATE_SQL
+        count_params = {
+            "retention_offset": int(retention_count) - 1,
+            "candidate_limit": candidate_limit,
+        }
+    else:
+        age_sql = """
+            SELECT candidate.id
+            FROM snapshots AS candidate
+            WHERE candidate.host_id = :host_id
+              AND candidate.created_at < :cutoff_at
+              AND candidate.id <> (
+                  SELECT newest.id
+                  FROM snapshots AS newest
+                  WHERE newest.host_id = :host_id
+                  ORDER BY newest.id DESC
+                  LIMIT 1
+              )
+            ORDER BY candidate.created_at, candidate.id
+            LIMIT :candidate_limit
+        """
+        age_params = {
+            "host_id": str(host_id),
+            "cutoff_at": str(cutoff_at),
+            "candidate_limit": candidate_limit,
+        }
+        count_sql = """
+            SELECT candidate.id
+            FROM snapshots AS candidate
+            WHERE candidate.host_id = :host_id
+              AND candidate.id < (
+                  SELECT boundary.id
+                  FROM snapshots AS boundary
+                  WHERE boundary.host_id = :host_id
+                  ORDER BY boundary.id DESC
+                  LIMIT 1 OFFSET :retention_offset
+              )
+            ORDER BY candidate.id
+            LIMIT :candidate_limit
+        """
+        count_params = {
+            "host_id": str(host_id),
+            "retention_offset": int(retention_count) - 1,
+            "candidate_limit": candidate_limit,
+        }
     age_ids = [
         int(row[0])
-        for row in conn.execute(
-            _SNAPSHOT_AGE_CANDIDATE_SQL,
-            {
-                "cutoff_at": str(cutoff_at),
-                "candidate_limit": candidate_limit,
-            },
-        ).fetchall()
+        for row in conn.execute(age_sql, age_params).fetchall()
     ]
     if len(age_ids) == candidate_limit:
         return sorted(set(age_ids))[: int(batch_size)], True
     count_ids = [
         int(row[0])
-        for row in conn.execute(
-            _SNAPSHOT_COUNT_CANDIDATE_SQL,
-            {
-                "retention_offset": int(retention_count) - 1,
-                "candidate_limit": candidate_limit,
-            },
-        ).fetchall()
+        for row in conn.execute(count_sql, count_params).fetchall()
     ]
     merged = sorted(set(age_ids).union(count_ids))
     candidates = merged[: int(batch_size)]
@@ -8966,6 +12612,8 @@ def maybe_run_automatic_store_maintenance(
     db_path: Path,
     *,
     policy: SnapshotRetentionPolicy,
+    acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
+    acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     cadence_seconds: int = 3600,
     now: str | None = None,
 ) -> dict[str, Any]:
@@ -8974,8 +12622,24 @@ def maybe_run_automatic_store_maintenance(
         isinstance(cadence_seconds, bool)
         or not isinstance(cadence_seconds, int)
         or cadence_seconds <= 0
+        or cadence_seconds > _MAX_TIMEDELTA_SECONDS
     ):
         raise ValueError("cadence_seconds must be a positive integer")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in (
+            acknowledged_final_retention_days,
+            acknowledged_final_retention_count,
+        )
+    ):
+        raise ValueError(
+            "acknowledged final retention values must be positive integers"
+        )
+    if (
+        acknowledged_final_retention_days > _MAX_RETENTION_DAYS
+        or acknowledged_final_retention_count > _SQLITE_MAX_INTEGER
+    ):
+        raise ValueError("acknowledged final retention values are too large")
     current_at = _connector_now(now)
     if not _sqlite_store_exists(db_path):
         return dict(sanitize_public_value({
@@ -8990,9 +12654,24 @@ def maybe_run_automatic_store_maintenance(
                 "deleted": 0,
                 "remaining_candidates": False,
             },
+            "final_retention": {
+                "examined": 0,
+                "deleted": 0,
+                "remaining_candidates": False,
+                "acknowledged_final_retention_days": int(
+                    acknowledged_final_retention_days
+                ),
+                "acknowledged_final_retention_count": int(
+                    acknowledged_final_retention_count
+                ),
+            },
             "batch_size": policy.batch_size,
         }))
     cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
+    final_cutoff_at = _utc_cutoff(
+        retention_days=acknowledged_final_retention_days,
+        now=current_at,
+    )
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -9030,6 +12709,17 @@ def maybe_run_automatic_store_maintenance(
                         "deleted": 0,
                         "remaining_candidates": False,
                     },
+                    "final_retention": {
+                        "examined": 0,
+                        "deleted": 0,
+                        "remaining_candidates": False,
+                        "acknowledged_final_retention_days": int(
+                            acknowledged_final_retention_days
+                        ),
+                        "acknowledged_final_retention_count": int(
+                            acknowledged_final_retention_count
+                        ),
+                    },
                     "batch_size": policy.batch_size,
                 }))
             candidates, _ = _snapshot_retention_candidates_conn(
@@ -9045,6 +12735,76 @@ def maybe_run_automatic_store_maintenance(
                 retention_count=policy.retention_count,
                 batch_size=1,
             )
+            final_host_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT roots.host_id
+                    FROM (
+                        SELECT DISTINCT host_id
+                        FROM connector_outbox
+                        WHERE connector = 'turn-final'
+                          AND delivery_kind = 'final_ready'
+                    ) AS roots
+                    LEFT JOIN store_maintenance_cursors AS serviced
+                      ON serviced.scope = roots.host_id
+                    ORDER BY
+                        serviced.last_completed_at IS NOT NULL,
+                        serviced.last_completed_at,
+                        roots.host_id
+                    """
+                ).fetchall()
+            ]
+            final_examined = 0
+            final_deleted = 0
+            final_remaining = False
+            final_budget = int(policy.batch_size)
+            for final_host_id in final_host_ids:
+                if final_budget <= 0:
+                    final_remaining = True
+                    break
+                final_candidates = _acknowledged_final_retention_candidates_conn(
+                    conn,
+                    host_id=final_host_id,
+                    cutoff_at=final_cutoff_at,
+                    retention_count=acknowledged_final_retention_count,
+                    batch_size=final_budget + 1,
+                )
+                selected_final_candidates = final_candidates[:final_budget]
+                final_remaining = final_remaining or (
+                    len(final_candidates) > final_budget
+                )
+                final_examined += len(selected_final_candidates)
+                for _source_outbox_id, final_turn_id in selected_final_candidates:
+                    deleted_rows = _delete_acknowledged_final_turn_conn(
+                        conn,
+                        host_id=final_host_id,
+                        turn_id=final_turn_id,
+                        tombstone_retention_count=acknowledged_final_retention_count,
+                    )
+                    final_deleted += int(deleted_rows["turns"])
+                final_budget -= len(selected_final_candidates)
+                conn.execute(
+                    """
+                    INSERT INTO store_maintenance_cursors (
+                        scope, last_completed_at
+                    ) VALUES (?, ?)
+                    ON CONFLICT(scope) DO UPDATE SET
+                        last_completed_at = excluded.last_completed_at
+                    """,
+                    (str(final_host_id), current_at),
+                )
+            if not final_remaining:
+                final_remaining = any(
+                    _acknowledged_final_retention_candidates_conn(
+                        conn,
+                        host_id=final_host_id,
+                        cutoff_at=final_cutoff_at,
+                        retention_count=acknowledged_final_retention_count,
+                        batch_size=1,
+                    )
+                    for final_host_id in final_host_ids
+                )
             conn.execute(
                 """
                 UPDATE store_maintenance_state
@@ -9079,6 +12839,17 @@ def maybe_run_automatic_store_maintenance(
             "examined": len(candidates),
             "deleted": deleted,
             "remaining_candidates": bool(remaining_ids),
+        },
+        "final_retention": {
+            "examined": final_examined,
+            "deleted": final_deleted,
+            "remaining_candidates": bool(final_remaining),
+            "acknowledged_final_retention_days": int(
+                acknowledged_final_retention_days
+            ),
+            "acknowledged_final_retention_count": int(
+                acknowledged_final_retention_count
+            ),
         },
         "batch_size": policy.batch_size,
     }))
@@ -9179,9 +12950,11 @@ def _turn_content_retention_candidates_conn(
     host_id: str,
     cutoff_at: str,
     batch_size: int,
+    retention_count: int,
 ) -> list[tuple[str, int]]:
     rows = conn.execute(
-        """
+        _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+        + """
         SELECT candidate_type, candidate_id
         FROM (
             SELECT
@@ -9197,13 +12970,14 @@ def _turn_content_retention_candidates_conn(
                 END AS eligible_at
             FROM turn_presentation_plans AS plans
             WHERE plans.host_id = :host_id
+              AND plans.source_outbox_id IS NULL
               AND (
                   (
                       plans.state = 'preparing'
                       AND plans.created_at < :cutoff_at
                   )
                   OR (
-                      plans.state IN ('completed', 'superseded', 'failed')
+                      plans.state IN ('completed', 'superseded')
                       AND COALESCE(
                           plans.completed_at,
                           plans.activated_at,
@@ -9254,7 +13028,6 @@ def _turn_content_retention_candidates_conn(
                                 plans.state = 'preparing'
                                 OR outbox.status NOT IN (
                                     'delivered',
-                                    'dead_letter',
                                     'superseded'
                                 )
                                 OR outbox.updated_at IS NULL
@@ -9264,13 +13037,267 @@ def _turn_content_retention_candidates_conn(
                         OR (
                             deliveries.id IS NOT NULL
                             AND (
-                                deliveries.status = 'leased'
+                                deliveries.status NOT IN (
+                                    'delivered',
+                                    'superseded',
+                                    'failed',
+                                    'deferred',
+                                    'expired'
+                                )
                                 OR COALESCE(
                                     deliveries.delivered_at,
                                     deliveries.created_at
                                 ) >= :cutoff_at
                             )
                         )
+                    )
+              )
+            UNION ALL
+            SELECT
+                'plan' AS candidate_type,
+                plans.id AS candidate_id,
+                COALESCE(plans.activated_at, plans.created_at) AS eligible_at
+            FROM turn_presentation_plans AS plans
+            JOIN connector_outbox AS source
+              ON source.id = plans.source_outbox_id
+            WHERE plans.host_id = :host_id
+              AND plans.state = 'superseded'
+              AND COALESCE(plans.activated_at, plans.created_at) < :cutoff_at
+              AND (
+                  plans.activated_at IS NULL
+                  OR plans.id = COALESCE(
+                      (
+                          SELECT MAX(latest_superseded.id)
+                          FROM turn_presentation_plans AS latest_superseded
+                          WHERE latest_superseded.host_id = plans.host_id
+                            AND latest_superseded.name = plans.name
+                            AND latest_superseded.turn_id = plans.turn_id
+                            AND latest_superseded.state = 'superseded'
+                            AND latest_superseded.activated_at IS NOT NULL
+                      ),
+                      0
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_plans AS summary
+                      WHERE summary.host_id = plans.host_id
+                        AND summary.name = plans.name
+                        AND summary.turn_id = plans.turn_id
+                        AND summary.id > plans.id
+                        AND summary.state = 'superseded'
+                        AND summary.activated_at IS NOT NULL
+                        AND summary.source_outbox_id IS NULL
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_plans AS completed
+                      WHERE completed.host_id = plans.host_id
+                        AND completed.name = plans.name
+                        AND completed.turn_id = plans.turn_id
+                        AND completed.id > plans.id
+                        AND completed.state = 'completed'
+                        AND completed.completed_at IS NOT NULL
+                  )
+              )
+              AND source.host_id = plans.host_id
+              AND source.connector = :turn_final_name
+              AND source.delivery_kind = 'final_ready'
+              AND source.turn_id = plans.turn_id
+              AND source.content_revision = plans.content_revision
+              AND source.status = 'superseded'
+              AND source.updated_at IS NOT NULL
+              AND source.updated_at < :cutoff_at
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connector_deliveries AS source_attempts
+                  WHERE source_attempts.outbox_id = source.id
+                    AND (
+                        source_attempts.status NOT IN (
+                            'delivered',
+                            'superseded',
+                            'failed',
+                            'deferred',
+                            'expired'
+                        )
+                        OR COALESCE(
+                            source_attempts.delivered_at,
+                            source_attempts.created_at
+                        ) >= :cutoff_at
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_jobs AS jobs
+                  LEFT JOIN connector_outbox AS outbox
+                    ON outbox.id = jobs.outbox_id
+                  LEFT JOIN connector_deliveries AS deliveries
+                    ON deliveries.outbox_id = outbox.id
+                  WHERE jobs.plan_id = plans.id
+                    AND (
+                        (
+                            outbox.id IS NOT NULL
+                            AND (
+                                outbox.status NOT IN (
+                                    'delivered',
+                                    'superseded'
+                                )
+                                OR outbox.updated_at IS NULL
+                                OR outbox.updated_at >= :cutoff_at
+                            )
+                        )
+                        OR (
+                            deliveries.id IS NOT NULL
+                            AND (
+                                deliveries.status NOT IN (
+                                    'delivered',
+                                    'superseded',
+                                    'failed',
+                                    'deferred',
+                                    'expired'
+                                )
+                                OR COALESCE(
+                                    deliveries.delivered_at,
+                                    deliveries.created_at
+                                ) >= :cutoff_at
+                            )
+                        )
+                    )
+              )
+            UNION ALL
+            SELECT
+                'plan' AS candidate_type,
+                plans.id AS candidate_id,
+                source.updated_at AS eligible_at
+            FROM turn_presentation_plans AS plans
+            JOIN connector_outbox AS source
+              ON source.id = plans.source_outbox_id
+            JOIN ranked AS delivered_rank
+              ON delivered_rank.source_outbox_id = source.id
+             AND delivered_rank.is_current = 0
+            WHERE plans.host_id = :host_id
+              AND plans.state IN ('completed', 'superseded')
+              AND plans.completed_at IS NOT NULL
+              AND (
+                  plans.completed_at < :cutoff_at
+                  OR delivered_rank.acknowledged_rank > :retention_count
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS completed
+                  WHERE completed.host_id = plans.host_id
+                    AND completed.name = plans.name
+                    AND completed.turn_id = plans.turn_id
+                    AND completed.id > plans.id
+                    AND completed.state = 'completed'
+                    AND completed.completed_at IS NOT NULL
+              )
+              AND source.host_id = plans.host_id
+              AND source.connector = :turn_final_name
+              AND source.delivery_kind = 'final_ready'
+              AND source.turn_id = plans.turn_id
+              AND source.content_revision = plans.content_revision
+              AND source.status = 'delivered'
+              AND source.updated_at IS NOT NULL
+              AND (
+                  source.updated_at < :cutoff_at
+                  OR delivered_rank.acknowledged_rank > :retention_count
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connector_deliveries AS source_attempts
+                  WHERE source_attempts.outbox_id = source.id
+                    AND (
+                        source_attempts.status NOT IN (
+                            'delivered',
+                            'superseded',
+                            'failed',
+                            'deferred',
+                            'expired'
+                        )
+                        OR (
+                            COALESCE(
+                                source_attempts.delivered_at,
+                                source_attempts.created_at
+                            ) >= :cutoff_at
+                            AND delivered_rank.acknowledged_rank
+                                <= :retention_count
+                        )
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_jobs AS jobs
+                  LEFT JOIN connector_outbox AS outbox
+                    ON outbox.id = jobs.outbox_id
+                  LEFT JOIN connector_deliveries AS deliveries
+                    ON deliveries.outbox_id = outbox.id
+                  WHERE jobs.plan_id = plans.id
+                    AND (
+                        (
+                            outbox.id IS NULL
+                            OR outbox.status != 'delivered'
+                            OR outbox.updated_at IS NULL
+                            OR (
+                                outbox.updated_at >= :cutoff_at
+                                AND delivered_rank.acknowledged_rank
+                                    <= :retention_count
+                            )
+                        )
+                        OR (
+                            deliveries.id IS NOT NULL
+                            AND (
+                                deliveries.status NOT IN (
+                                    'delivered',
+                                    'superseded',
+                                    'failed',
+                                    'deferred',
+                                    'expired'
+                                )
+                                OR (
+                                    COALESCE(
+                                        deliveries.delivered_at,
+                                        deliveries.created_at
+                                    ) >= :cutoff_at
+                                    AND delivered_rank.acknowledged_rank
+                                        <= :retention_count
+                                )
+                            )
+                        )
+                    )
+              )
+            UNION ALL
+            SELECT
+                'source' AS candidate_type,
+                source.id AS candidate_id,
+                source.updated_at AS eligible_at
+            FROM connector_outbox AS source
+            WHERE source.host_id = :host_id
+              AND source.connector = :turn_final_name
+              AND source.delivery_kind = 'final_ready'
+              AND source.status = 'superseded'
+              AND source.updated_at IS NOT NULL
+              AND source.updated_at < :cutoff_at
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans AS plans
+                  WHERE plans.source_outbox_id = source.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connector_deliveries AS attempts
+                  WHERE attempts.outbox_id = source.id
+                    AND (
+                        attempts.status NOT IN (
+                            'delivered',
+                            'superseded',
+                            'failed',
+                            'deferred',
+                            'expired'
+                        )
+                        OR COALESCE(
+                            attempts.delivered_at,
+                            attempts.created_at
+                        ) >= :cutoff_at
                     )
               )
             UNION ALL
@@ -9289,6 +13316,14 @@ def _turn_content_retention_candidates_conn(
                   WHERE plans.host_id = revisions.host_id
                     AND plans.turn_id = revisions.turn_id
                     AND plans.content_revision = revisions.content_revision
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM connector_outbox AS typed_final
+                  WHERE typed_final.host_id = revisions.host_id
+                    AND typed_final.turn_id = revisions.turn_id
+                    AND typed_final.content_revision = revisions.content_revision
+                    AND typed_final.delivery_kind GLOB 'final_*'
               )
               AND NOT EXISTS (
                   SELECT 1
@@ -9326,10 +13361,98 @@ def _turn_content_retention_candidates_conn(
             "host_id": str(host_id),
             "cutoff_at": str(cutoff_at),
             "turn_final_name": _TURN_FINAL_NAME,
+            "retention_count": int(retention_count),
             "batch_size": int(batch_size),
         },
     ).fetchall()
     return [(str(row[0]), int(row[1])) for row in rows]
+
+
+def _delivered_final_rank_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    source_outbox_id: int,
+) -> tuple[int, int] | None:
+    row = conn.execute(
+        _ACKNOWLEDGED_FINAL_ELIGIBILITY_CTE
+        + """
+        SELECT acknowledged_rank, is_current
+        FROM ranked
+        WHERE source_outbox_id = :source_outbox_id
+        """,
+        {
+            "host_id": str(host_id),
+            "source_outbox_id": int(source_outbox_id),
+        },
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), int(row[1])
+
+
+def _terminal_source_anchor_reference_reason_conn(
+    conn: sqlite3.Connection,
+    *,
+    source_outbox_id: int,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    source_status: str,
+    cutoff_at: str,
+    allow_young: bool = False,
+) -> str | None:
+    source = conn.execute(
+        """
+        SELECT
+            host_id, connector, delivery_kind, turn_id, content_revision,
+            status, updated_at
+        FROM connector_outbox
+        WHERE id = ?
+        """,
+        (int(source_outbox_id),),
+    ).fetchone()
+    if source is None:
+        return "source_anchor"
+    if (
+        str(source[0]) != str(host_id)
+        or str(source[1]) != _TURN_FINAL_NAME
+        or str(source[2]) != "final_ready"
+        or str(source[3]) != str(turn_id)
+        or str(source[4]) != str(content_revision_value)
+        or str(source[5]) != str(source_status)
+        or not source[6]
+        or (not allow_young and str(source[6]) >= str(cutoff_at))
+    ):
+        return "source_anchor"
+    if str(source_status) == _CONNECTOR_TERMINAL_OUTBOX_STATUS:
+        revision = conn.execute(
+            """
+            SELECT is_current
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (str(host_id), str(turn_id), str(content_revision_value)),
+        ).fetchone()
+        if revision is None or int(revision[0]) != 0:
+            return "current_source_anchor"
+    unsafe_attempt = conn.execute(
+        """
+        SELECT 1
+        FROM connector_deliveries
+        WHERE outbox_id = ?
+          AND (
+              status NOT IN ('delivered', 'superseded', 'failed', 'deferred', 'expired')
+              OR (
+                  ? = 0
+                  AND COALESCE(delivered_at, created_at) >= ?
+              )
+          )
+        LIMIT 1
+        """,
+        (int(source_outbox_id), int(bool(allow_young)), str(cutoff_at)),
+    ).fetchone()
+    return "source_attempt" if unsafe_attempt is not None else None
 
 
 def _terminal_plan_reference_reason_conn(
@@ -9337,14 +13460,63 @@ def _terminal_plan_reference_reason_conn(
     *,
     plan: sqlite3.Row | tuple[Any, ...],
     cutoff_at: str,
+    retention_count: int,
 ) -> str | None:
     plan_id = int(plan[0])
     host_id = str(plan[1])
     name = str(plan[2])
     plan_token = str(plan[3])
     turn_id = str(plan[4])
-    state = str(plan[5])
-    activated_at = plan[7]
+    content_revision_value = str(plan[5])
+    state = str(plan[6])
+    activated_at = plan[8]
+    source_outbox_id = int(plan[10]) if plan[10] is not None else None
+    was_completed = state == "completed" or (
+        state == "superseded" and plan[9] is not None
+    )
+    allow_young = False
+    if source_outbox_id is not None:
+        if state == "superseded" and not was_completed:
+            source_status = _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+        elif was_completed:
+            newer_completed = conn.execute(
+                """
+                SELECT 1
+                FROM turn_presentation_plans
+                WHERE host_id = ? AND name = ? AND turn_id = ?
+                  AND id > ? AND state = 'completed'
+                  AND completed_at IS NOT NULL
+                LIMIT 1
+                """,
+                (host_id, name, turn_id, plan_id),
+            ).fetchone()
+            rank = _delivered_final_rank_conn(
+                conn,
+                host_id=host_id,
+                source_outbox_id=source_outbox_id,
+            )
+            if (
+                newer_completed is None
+                or rank is None
+                or int(rank[1]) != 0
+            ):
+                return "current_completed_baseline"
+            allow_young = int(rank[0]) > max(1, int(retention_count))
+            source_status = _CONNECTOR_TERMINAL_OUTBOX_STATUS
+        else:
+            return "source_anchor"
+        source_reason = _terminal_source_anchor_reference_reason_conn(
+            conn,
+            source_outbox_id=source_outbox_id,
+            host_id=host_id,
+            turn_id=turn_id,
+            content_revision_value=content_revision_value,
+            source_status=source_status,
+            cutoff_at=cutoff_at,
+            allow_young=allow_young,
+        )
+        if source_reason is not None:
+            return source_reason
     if state == "preparing":
         unexpected_anchor = conn.execute(
             """
@@ -9362,31 +13534,32 @@ def _terminal_plan_reference_reason_conn(
         return "reference" if unexpected_anchor is not None else None
     if state not in _TURN_CONTENT_TERMINAL_PLAN_STATES:
         return "reference"
-    live_replacement = conn.execute(
-        """
-        SELECT 1
-        FROM turn_presentation_plans
-        WHERE host_id = ? AND name = ? AND turn_id = ?
-          AND replaces_plan_token = ?
-          AND state IN ('preparing', 'waiting_predecessor', 'active')
-        LIMIT 1
-        """,
-        (host_id, name, turn_id, plan_token),
-    ).fetchone()
-    if live_replacement is not None:
-        return "replacement"
-    latest_completed = conn.execute(
-        """
-        SELECT COALESCE(MAX(id), 0)
-        FROM turn_presentation_plans
-        WHERE host_id = ? AND name = ? AND turn_id = ?
-          AND completed_at IS NOT NULL
-        """,
-        (host_id, name, turn_id),
-    ).fetchone()
-    baseline_id = int(latest_completed[0] or 0)
-    if activated_at is not None and (baseline_id == 0 or plan_id >= baseline_id):
-        return "failed_prefix_or_current_baseline"
+    if source_outbox_id is None:
+        live_replacement = conn.execute(
+            """
+            SELECT 1
+            FROM turn_presentation_plans
+            WHERE host_id = ? AND name = ? AND turn_id = ?
+              AND replaces_plan_token = ?
+              AND state IN ('preparing', 'waiting_predecessor', 'active')
+            LIMIT 1
+            """,
+            (host_id, name, turn_id, plan_token),
+        ).fetchone()
+        if live_replacement is not None:
+            return "replacement"
+        latest_completed = conn.execute(
+            """
+            SELECT COALESCE(MAX(id), 0)
+            FROM turn_presentation_plans
+            WHERE host_id = ? AND name = ? AND turn_id = ?
+              AND completed_at IS NOT NULL
+            """,
+            (host_id, name, turn_id),
+        ).fetchone()
+        baseline_id = int(latest_completed[0] or 0)
+        if activated_at is not None and (baseline_id == 0 or plan_id >= baseline_id):
+            return "failed_prefix_or_current_baseline"
     anchors = conn.execute(
         """
         SELECT
@@ -9404,27 +13577,206 @@ def _terminal_plan_reference_reason_conn(
         """,
         (plan_id,),
     ).fetchall()
+    allowed_outbox_states = (
+        {_CONNECTOR_TERMINAL_OUTBOX_STATUS}
+        if was_completed
+        else _TURN_CONTENT_TERMINAL_OUTBOX_STATES
+    )
     for outbox_id, outbox_status, updated_at, delivery_id, delivery_status, audit_at in anchors:
-        if outbox_id is not None and (
-            str(outbox_status) not in _TURN_CONTENT_TERMINAL_OUTBOX_STATES
+        if (
+            outbox_id is None
+            or str(outbox_status) not in allowed_outbox_states
             or not updated_at
-            or str(updated_at) >= str(cutoff_at)
+            or (not allow_young and str(updated_at) >= str(cutoff_at))
         ):
             return "outbox"
         if delivery_id is not None and (
-            str(delivery_status) == _CONNECTOR_LEASE_STATUS
+            str(delivery_status) not in _TURN_CONTENT_TERMINAL_ATTEMPT_STATES
             or not audit_at
-            or str(audit_at) >= str(cutoff_at)
+            or (not allow_young and str(audit_at) >= str(cutoff_at))
         ):
             return "delivery"
     return None
 
 
+def _superseded_plan_summary_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan: sqlite3.Row | tuple[Any, ...],
+) -> tuple[bool, int]:
+    plan_id = int(plan[0])
+    host_id = str(plan[1])
+    name = str(plan[2])
+    turn_id = str(plan[4])
+    state = str(plan[6])
+    activated_at = plan[8]
+    source_outbox_id = int(plan[10]) if plan[10] is not None else None
+    part_count = int(plan[11])
+    if (
+        source_outbox_id is None
+        or state != "superseded"
+        or activated_at is None
+    ):
+        return False, part_count
+    newer_completed = conn.execute(
+        """
+        SELECT 1
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND id > ? AND state = 'completed' AND completed_at IS NOT NULL
+        LIMIT 1
+        """,
+        (host_id, name, turn_id, plan_id),
+    ).fetchone()
+    if newer_completed is not None:
+        return False, part_count
+    latest_superseded = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0)
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND state = 'superseded' AND activated_at IS NOT NULL
+        """,
+        (host_id, name, turn_id),
+    ).fetchone()
+    if int(latest_superseded[0] or 0) != plan_id:
+        return False, part_count
+    completed_baseline = conn.execute(
+        """
+        SELECT COALESCE(MAX(id), 0)
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND id < ? AND state = 'completed' AND completed_at IS NOT NULL
+        """,
+        (host_id, name, turn_id, plan_id),
+    ).fetchone()
+    baseline_id = int(completed_baseline[0] or 0)
+    footprint = conn.execute(
+        """
+        SELECT COALESCE(MAX(part_count), 0)
+        FROM turn_presentation_plans
+        WHERE host_id = ? AND name = ? AND turn_id = ?
+          AND activated_at IS NOT NULL AND id >= ?
+        """,
+        (host_id, name, turn_id, baseline_id),
+    ).fetchone()
+    return True, max(part_count, int(footprint[0] or 0))
+
+
+def _delete_terminal_source_anchor_conn(
+    conn: sqlite3.Connection,
+    *,
+    source_outbox_id: int,
+    host_id: str,
+    turn_id: str,
+    content_revision_value: str,
+    cutoff_at: str,
+    source_status: str,
+    allow_young: bool = False,
+) -> dict[str, int]:
+    reason = _terminal_source_anchor_reference_reason_conn(
+        conn,
+        source_outbox_id=int(source_outbox_id),
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+        content_revision_value=str(content_revision_value),
+        source_status=str(source_status),
+        cutoff_at=str(cutoff_at),
+        allow_young=bool(allow_young),
+    )
+    if reason is not None:
+        return {"queue_anchors": 0, "attempts": 0}
+    remaining_reference = conn.execute(
+        """
+        SELECT 1
+        FROM turn_presentation_plans
+        WHERE source_outbox_id = ?
+        LIMIT 1
+        """,
+        (int(source_outbox_id),),
+    ).fetchone()
+    if remaining_reference is not None:
+        return {"queue_anchors": 0, "attempts": 0}
+    attempts_deleted = int(
+        conn.execute(
+            "DELETE FROM connector_deliveries WHERE outbox_id = ?",
+            (int(source_outbox_id),),
+        ).rowcount
+        or 0
+    )
+    anchor_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM connector_outbox
+            WHERE id = ? AND host_id = ? AND connector = ?
+              AND delivery_kind = 'final_ready' AND turn_id = ?
+              AND content_revision = ? AND status = ?
+              AND updated_at IS NOT NULL
+              AND (? = 1 OR updated_at < ?)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM turn_presentation_plans
+                  WHERE source_outbox_id = connector_outbox.id
+              )
+            """,
+            (
+                int(source_outbox_id),
+                str(host_id),
+                _TURN_FINAL_NAME,
+                str(turn_id),
+                str(content_revision_value),
+                str(source_status),
+                int(bool(allow_young)),
+                str(cutoff_at),
+            ),
+        ).rowcount
+        or 0
+    )
+    if anchor_deleted != 1:
+        raise StoreSchemaError("turn_content_source_cleanup_race")
+    return {
+        "queue_anchors": anchor_deleted,
+        "attempts": attempts_deleted,
+    }
+
+
 def _delete_retained_plan_conn(
     conn: sqlite3.Connection,
     *,
-    plan_id: int,
-) -> dict[str, int]:
+    plan: sqlite3.Row | tuple[Any, ...],
+    cutoff_at: str,
+    retain_summary: bool,
+    summary_part_count: int,
+    retention_count: int,
+) -> tuple[dict[str, int], bool]:
+    plan_id = int(plan[0])
+    host_id = str(plan[1])
+    name = str(plan[2])
+    turn_id = str(plan[4])
+    content_revision_value = str(plan[5])
+    state = str(plan[6])
+    was_completed = state == "completed" or (
+        state == "superseded" and plan[9] is not None
+    )
+    source_status = (
+        _CONNECTOR_TERMINAL_OUTBOX_STATUS
+        if was_completed
+        else _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+    )
+    delivered_rank = (
+        _delivered_final_rank_conn(
+            conn,
+            host_id=host_id,
+            source_outbox_id=int(plan[10]),
+        )
+        if was_completed and plan[10] is not None
+        else None
+    )
+    allow_young = bool(
+        delivered_rank is not None
+        and int(delivered_rank[0]) > max(1, int(retention_count))
+    )
+    source_outbox_id = int(plan[10]) if plan[10] is not None else None
     outbox_ids = [
         int(row[0])
         for row in conn.execute(
@@ -9433,14 +13785,24 @@ def _delete_retained_plan_conn(
             FROM turn_presentation_jobs
             WHERE plan_id = ? AND outbox_id IS NOT NULL
             """,
-            (int(plan_id),),
+            (plan_id,),
         ).fetchall()
     ]
-    deliveries_deleted = 0
-    outbox_deleted = 0
+    recoveries_deleted = int(
+        conn.execute(
+            """
+            DELETE FROM turn_presentation_recoveries
+            WHERE failed_plan_id = ? OR recovered_plan_id = ?
+            """,
+            (plan_id, plan_id),
+        ).rowcount
+        or 0
+    )
+    attempts_deleted = 0
+    queue_anchors_deleted = 0
     if outbox_ids:
         placeholders = ",".join("?" for _ in outbox_ids)
-        deliveries_deleted = int(
+        attempts_deleted = int(
             conn.execute(
                 f"DELETE FROM connector_deliveries WHERE outbox_id IN ({placeholders})",
                 outbox_ids,
@@ -9450,32 +13812,111 @@ def _delete_retained_plan_conn(
     jobs_deleted = int(
         conn.execute(
             "DELETE FROM turn_presentation_jobs WHERE plan_id = ?",
-            (int(plan_id),),
+            (plan_id,),
         ).rowcount
         or 0
     )
     if outbox_ids:
         placeholders = ",".join("?" for _ in outbox_ids)
-        outbox_deleted = int(
+        queue_anchors_deleted = int(
             conn.execute(
                 f"DELETE FROM connector_outbox WHERE id IN ({placeholders})",
                 outbox_ids,
             ).rowcount
             or 0
         )
-    plan_deleted = int(
-        conn.execute(
-            "DELETE FROM turn_presentation_plans WHERE id = ?",
-            (int(plan_id),),
-        ).rowcount
-        or 0
+    if retain_summary:
+        summary_updated = int(
+            conn.execute(
+                """
+                UPDATE turn_presentation_plans
+                SET source_outbox_id = NULL, part_count = ?
+                WHERE id = ? AND state = 'superseded'
+                """,
+                (int(summary_part_count), plan_id),
+            ).rowcount
+            or 0
+        )
+        if summary_updated != 1:
+            raise StoreSchemaError("turn_content_summary_cleanup_race")
+        collapsed_plans_deleted = int(
+            conn.execute(
+                """
+                DELETE FROM turn_presentation_plans
+                WHERE host_id = ? AND name = ? AND turn_id = ?
+                  AND id != ? AND state = 'superseded'
+                  AND source_outbox_id IS NULL
+                  AND activated_at IS NOT NULL AND activated_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_jobs AS jobs
+                      WHERE jobs.plan_id = turn_presentation_plans.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM turn_presentation_recoveries AS recoveries
+                      WHERE recoveries.failed_plan_id = turn_presentation_plans.id
+                         OR recoveries.recovered_plan_id = turn_presentation_plans.id
+                  )
+                """,
+                (host_id, name, turn_id, plan_id, str(cutoff_at)),
+            ).rowcount
+            or 0
+        )
+        plan_deleted = collapsed_plans_deleted
+        changed = True
+    else:
+        plan_deleted = int(
+            conn.execute(
+                "DELETE FROM turn_presentation_plans WHERE id = ?",
+                (plan_id,),
+            ).rowcount
+            or 0
+        )
+        changed = bool(plan_deleted)
+    if source_outbox_id is not None:
+        source_counts = _delete_terminal_source_anchor_conn(
+            conn,
+            source_outbox_id=source_outbox_id,
+            host_id=host_id,
+            turn_id=turn_id,
+            content_revision_value=content_revision_value,
+            source_status=source_status,
+            allow_young=allow_young,
+            cutoff_at=cutoff_at,
+        )
+        queue_anchors_deleted += int(source_counts["queue_anchors"])
+        attempts_deleted += int(source_counts["attempts"])
+    revision_deleted = 0
+    revision = conn.execute(
+        """
+        SELECT rowid
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (host_id, turn_id, content_revision_value),
+    ).fetchone()
+    if revision is not None:
+        revision_deleted = int(
+            _delete_superseded_revision_conn(
+                conn,
+                revision_rowid=int(revision[0]),
+                host_id=host_id,
+                cutoff_at=cutoff_at,
+                allow_young=allow_young,
+            )
+        )
+    return (
+        {
+            "plans": plan_deleted,
+            "recoveries": recoveries_deleted,
+            "jobs": jobs_deleted,
+            "queue_anchors": queue_anchors_deleted,
+            "attempts": attempts_deleted,
+            "revisions": revision_deleted,
+        },
+        changed,
     )
-    return {
-        "plans": plan_deleted,
-        "jobs": jobs_deleted,
-        "queue_anchors": outbox_deleted,
-        "attempts": deliveries_deleted,
-    }
 
 
 def _delete_superseded_revision_conn(
@@ -9484,7 +13925,23 @@ def _delete_superseded_revision_conn(
     revision_rowid: int,
     host_id: str,
     cutoff_at: str,
+    allow_young: bool = False,
 ) -> bool:
+    identity = conn.execute(
+        """
+        SELECT turn_id, content_revision
+        FROM turn_content_revisions
+        WHERE rowid = ? AND host_id = ?
+        """,
+        (int(revision_rowid), str(host_id)),
+    ).fetchone()
+    if identity is None or _typed_final_reference_exists_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(identity[0]),
+        content_revision_value=str(identity[1]),
+    ):
+        return False
     cursor = conn.execute(
         """
         DELETE FROM turn_content_revisions AS revisions
@@ -9492,7 +13949,7 @@ def _delete_superseded_revision_conn(
           AND revisions.host_id = ?
           AND revisions.is_current = 0
           AND revisions.superseded_at IS NOT NULL
-          AND revisions.superseded_at < ?
+          AND (? = 1 OR revisions.superseded_at < ?)
           AND NOT EXISTS (
               SELECT 1
               FROM turn_presentation_plans AS plans
@@ -9532,11 +13989,21 @@ def _delete_superseded_revision_conn(
         (
             int(revision_rowid),
             str(host_id),
+            int(bool(allow_young)),
             str(cutoff_at),
             _TURN_FINAL_NAME,
         ),
     )
-    return bool(cursor.rowcount)
+    deleted = bool(cursor.rowcount)
+    if deleted:
+        conn.execute(
+            """
+            DELETE FROM turn_content_page_boundaries
+            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+            """,
+            (str(host_id), str(identity[0]), str(identity[1])),
+        )
+    return deleted
 
 
 def cleanup_turn_content_retention(
@@ -9544,6 +14011,7 @@ def cleanup_turn_content_retention(
     host_id: str,
     *,
     retention_days: int,
+    acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     now: str | None = None,
     dry_run: bool = False,
     batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
@@ -9554,9 +14022,14 @@ def cleanup_turn_content_retention(
         1,
         min(int(batch_size), _TURN_CONTENT_MAINTENANCE_BATCH_MAX),
     )
+    bounded_retention_count = max(
+        1,
+        int(acknowledged_final_retention_count),
+    )
     cutoff_at = _utc_cutoff(retention_days=days, now=now)
     empty_counts = {
         "plans": 0,
+        "recoveries": 0,
         "jobs": 0,
         "queue_anchors": 0,
         "attempts": 0,
@@ -9577,14 +14050,6 @@ def cleanup_turn_content_retention(
             "skipped_reference": 0,
             "deleted_rows": empty_counts,
         })
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        candidates = _turn_content_retention_candidates_conn(
-            conn,
-            host_id=str(host_id),
-            cutoff_at=cutoff_at,
-            batch_size=bounded_batch,
-        )
     deleted_rows = dict(empty_counts)
     skipped_reference = 0
     deleted = 0
@@ -9592,33 +14057,27 @@ def cleanup_turn_content_retention(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
+            candidates = _turn_content_retention_candidates_conn(
+                conn,
+                host_id=str(host_id),
+                cutoff_at=cutoff_at,
+                retention_count=bounded_retention_count,
+                batch_size=bounded_batch,
+            )
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             for candidate_type, candidate_id in candidates:
                 if candidate_type == "plan":
                     plan = conn.execute(
                         """
                         SELECT
-                            id, host_id, name, plan_token, turn_id, state,
-                            created_at, activated_at, completed_at
+                            id, host_id, name, plan_token, turn_id,
+                            content_revision, state, created_at, activated_at,
+                            completed_at, source_outbox_id, part_count
                         FROM turn_presentation_plans
                         WHERE id = ? AND host_id = ?
-                          AND (
-                              (state = 'preparing' AND created_at < ?)
-                              OR (
-                                  state IN ('completed', 'superseded', 'failed')
-                                  AND COALESCE(
-                                      completed_at,
-                                      activated_at,
-                                      created_at
-                                  ) < ?
-                              )
-                          )
                         """,
-                        (
-                            int(candidate_id),
-                            str(host_id),
-                            cutoff_at,
-                            cutoff_at,
-                        ),
+                        (int(candidate_id), str(host_id)),
                     ).fetchone()
                     if plan is None:
                         skipped_reference += 1
@@ -9627,19 +14086,63 @@ def cleanup_turn_content_retention(
                         conn,
                         plan=plan,
                         cutoff_at=cutoff_at,
+                        retention_count=bounded_retention_count,
                     ) is not None:
                         skipped_reference += 1
                         continue
-                    plan_counts = _delete_retained_plan_conn(
-                        conn,
-                        plan_id=int(candidate_id),
+                    retain_summary, summary_part_count = (
+                        _superseded_plan_summary_conn(conn, plan=plan)
                     )
-                    if not plan_counts["plans"]:
+                    plan_counts, changed = _delete_retained_plan_conn(
+                        conn,
+                        plan=plan,
+                        cutoff_at=cutoff_at,
+                        retain_summary=retain_summary,
+                        summary_part_count=summary_part_count,
+                        retention_count=bounded_retention_count,
+                    )
+                    if not changed:
                         skipped_reference += 1
                         continue
                     deleted += 1
                     for key, count in plan_counts.items():
                         deleted_rows[key] += int(count)
+                    continue
+                if candidate_type == "source":
+                    source = conn.execute(
+                        """
+                        SELECT host_id, turn_id, content_revision
+                        FROM connector_outbox
+                        WHERE id = ?
+                        """,
+                        (int(candidate_id),),
+                    ).fetchone()
+                    if (
+                        source is None
+                        or source[1] is None
+                        or source[2] is None
+                    ):
+                        skipped_reference += 1
+                        continue
+                    source_counts = _delete_terminal_source_anchor_conn(
+                        conn,
+                        source_outbox_id=int(candidate_id),
+                        host_id=str(source[0]),
+                        turn_id=str(source[1]),
+                        content_revision_value=str(source[2]),
+                        source_status=_CONNECTOR_SUPERSEDED_OUTBOX_STATUS,
+                        cutoff_at=cutoff_at,
+                    )
+                    if not source_counts["queue_anchors"]:
+                        skipped_reference += 1
+                        continue
+                    deleted += 1
+                    deleted_rows["queue_anchors"] += int(
+                        source_counts["queue_anchors"]
+                    )
+                    deleted_rows["attempts"] += int(
+                        source_counts["attempts"]
+                    )
                     continue
                 if _delete_superseded_revision_conn(
                     conn,
@@ -9681,6 +14184,8 @@ def run_store_maintenance(
     *,
     retention_days: int,
     max_outbox_attempts: int,
+    acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
+    acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     now: str | None = None,
     dry_run: bool = False,
     content_batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
@@ -9713,10 +14218,20 @@ def run_store_maintenance(
         now=now,
         dry_run=dry_run,
     )
+    final_retention = cleanup_acknowledged_final_retention(
+        db_path,
+        host_id,
+        acknowledged_final_retention_days=acknowledged_final_retention_days,
+        acknowledged_final_retention_count=acknowledged_final_retention_count,
+        now=now,
+        dry_run=dry_run,
+        batch_size=content_batch_size,
+    )
     turn_content = cleanup_turn_content_retention(
         db_path,
         host_id,
         retention_days=retention_days,
+        acknowledged_final_retention_count=acknowledged_final_retention_count,
         now=now,
         dry_run=dry_run,
         batch_size=content_batch_size,
@@ -9725,6 +14240,7 @@ def run_store_maintenance(
         bool(retention.get("ok"))
         and bool(snapshots.get("ok"))
         and bool(outbox.get("ok"))
+        and bool(final_retention.get("ok"))
         and bool(turn_content.get("ok"))
     )
     return sanitize_public_value({
@@ -9769,6 +14285,38 @@ def run_store_maintenance(
             "max_attempts": int(outbox.get("max_attempts") or max_outbox_attempts),
             "updated": int(outbox.get("updated") or 0),
         },
+        "final_retention": {
+            "dry_run": bool(final_retention.get("dry_run")),
+            "acknowledged_final_retention_days": int(
+                final_retention.get("acknowledged_final_retention_days")
+                or acknowledged_final_retention_days
+            ),
+            "acknowledged_final_retention_count": int(
+                final_retention.get("acknowledged_final_retention_count")
+                or acknowledged_final_retention_count
+            ),
+            "cutoff_at": final_retention.get("cutoff_at"),
+            "batch_size": int(
+                final_retention.get("batch_size") or content_batch_size
+            ),
+            "examined": int(final_retention.get("examined") or 0),
+            "deleted": int(final_retention.get("deleted") or 0),
+            "remaining_candidates": bool(
+                final_retention.get("remaining_candidates")
+            ),
+            "deleted_rows": dict(
+                final_retention.get("deleted_rows")
+                or {
+                    "recoveries": 0,
+                    "attempts": 0,
+                    "jobs": 0,
+                    "plans": 0,
+                    "anchors": 0,
+                    "revisions": 0,
+                    "turns": 0,
+                }
+            ),
+        },
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),
             "retention_days": int(
@@ -9790,6 +14338,7 @@ def run_store_maintenance(
                 turn_content.get("deleted_rows")
                 or {
                     "plans": 0,
+                    "recoveries": 0,
                     "jobs": 0,
                     "queue_anchors": 0,
                     "attempts": 0,
@@ -9812,7 +14361,6 @@ _TURN_CONTENT_FIELDS = frozenset(
     }
 )
 
-_SOURCE_TURN_HISTORY_LIMIT = 6
 
 _TURN_IDENTITY_SEED_FIELDS = (
     "schema_version",
@@ -9826,6 +14374,7 @@ _TURN_IDENTITY_SEED_FIELDS = (
     "origin_command_id",
     "title",
     "summary",
+    "meta",
 )
 
 
@@ -9866,6 +14415,30 @@ def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) ->
         str(payload.get("updated_at") or payload.get("observed_at") or ""),
         str(payload.get("id") or payload.get("turn_id") or ""),
     )
+
+
+def _turn_continuity_identity(payload: Mapping[str, Any]) -> tuple[str, str, int] | None:
+    meta = payload.get("meta")
+    if isinstance(meta, Mapping):
+        stable_key = meta.get("stable_key")
+        stable_key_version = meta.get("stable_key_version")
+        if (
+            _valid_final_stable_key(stable_key)
+            and type(stable_key_version) is int
+            and stable_key_version == 1
+        ):
+            return ("stable_key", str(stable_key), 1)
+    return None
+
+
+def _turn_uses_current_canonical_identity(
+    turn_id: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    try:
+        return Turn.from_dict(payload).id == str(turn_id)
+    except (TypeError, ValueError):
+        return False
 
 
 def _turn_content_matches_origin(payload: Mapping[str, Any], content: Mapping[str, Any]) -> bool:
@@ -11517,6 +16090,54 @@ def _merge_turn_content_conn(
     rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
     if not rows:
         return 0
+    current_worker_row = conn.execute(
+        """
+        SELECT payload_json, snapshot_content_fingerprint
+        FROM workers
+        WHERE host_id = ? AND worker_id = ?
+        """,
+        (str(host_id), str(worker_id)),
+    ).fetchone()
+    if current_worker_row is None:
+        return 0
+    current_worker_payload = _json_object(current_worker_row[0])
+    current_identity = _turn_continuity_identity(current_worker_payload)
+    if current_identity is not None:
+        rows = [
+            row
+            for row in rows
+            if _turn_continuity_identity(row[1]) == current_identity
+        ]
+    else:
+        current_snapshot_fingerprint = str(current_worker_row[1] or "")
+        placeholder_ids = {
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT turn_id
+                FROM turns
+                WHERE host_id = ?
+                  AND worker_id = ?
+                  AND snapshot_content_fingerprint = ?
+                """,
+                (
+                    str(host_id),
+                    str(worker_id),
+                    current_snapshot_fingerprint,
+                ),
+            ).fetchall()
+        }
+        rows = [
+            row
+            for row in rows
+            if str(row[0]) in placeholder_ids
+            or (
+                _turn_continuity_identity(row[1]) is None
+                and _turn_uses_current_canonical_identity(str(row[0]), row[1])
+            )
+        ]
+    if not rows:
+        return 0
     incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
     exact_source_rows = [
         row
@@ -11539,6 +16160,8 @@ def _merge_turn_content_conn(
         key=lambda row: _turn_merge_score(row[4], automation_probe),
     )
     changed = False
+    selected_turn_id: str | None = None
+    command_predecessor_turn_id: str | None = None
     if exact_source_rows:
         turn_id, payload, current, stored_observed_at = exact_source_rows[0]
         if not _turn_observation_is_newer(observed_at, stored_observed_at):
@@ -11574,6 +16197,7 @@ def _merge_turn_content_conn(
             turn_id=str(turn_id),
             observed_at=observed_at,
         )
+        selected_turn_id = str(turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
     elif incoming_source_turn:
         seed = {
@@ -11647,6 +16271,15 @@ def _merge_turn_content_conn(
             turn_id=str(turn_id),
             observed_at=observed_at,
         )
+        selected_turn_id = str(turn_id)
+        if (
+            str(item.get("origin_command_id") or "").strip()
+            and str(base_payload.get("origin_command_id") or "").strip()
+            == str(item.get("origin_command_id") or "").strip()
+            and not str(base_payload.get("source_turn_id") or "").strip()
+            and str(base_turn_id) != str(turn_id)
+        ):
+            command_predecessor_turn_id = str(base_turn_id)
         if not str(base_payload.get("source_turn_id") or "").strip():
             base_payload["assistant_stream_text"] = None
             _update_turn_row(
@@ -11656,7 +16289,6 @@ def _merge_turn_content_conn(
                 base_payload,
                 observed_at,
             )
-        _prune_source_turn_history(conn, host_id, worker_id)
         changed = True
     else:
         if (
@@ -11696,7 +16328,34 @@ def _merge_turn_content_conn(
             turn_id=str(base_turn_id),
             observed_at=observed_at,
         )
+        selected_turn_id = str(base_turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
+    if selected_turn_id is not None:
+        current_revision = conn.execute(
+            """
+            SELECT content_revision
+            FROM turn_content_revisions
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (str(host_id), selected_turn_id),
+        ).fetchone()
+        anchor_id = (
+            _ensure_final_ready_anchor_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=selected_turn_id,
+                content_revision_value=str(current_revision[0]),
+                now=str(observed_at),
+            )
+            if current_revision is not None
+            else None
+        )
+        if anchor_id is not None and command_predecessor_turn_id is not None:
+            _delete_turn_if_unreferenced_conn(
+                conn,
+                str(host_id),
+                command_predecessor_turn_id,
+            )
     return int(changed)
 
 
@@ -11955,35 +16614,6 @@ def _update_turn_row(
     return True
 
 
-def _prune_source_turn_history(
-    conn: sqlite3.Connection,
-    host_id: str,
-    worker_id: str,
-) -> None:
-    rows = conn.execute(
-        """
-        SELECT turn_id, payload_json
-        FROM turns
-        WHERE host_id = ? AND worker_id = ?
-        ORDER BY COALESCE(updated_at, observed_at, '') DESC
-        """,
-        (str(host_id), str(worker_id)),
-    ).fetchall()
-    kept = 0
-    for turn_id, payload_json in rows:
-        try:
-            payload = json.loads(str(payload_json or "{}"))
-        except json.JSONDecodeError:
-            payload = {}
-        if not isinstance(payload, Mapping) or not str(
-            payload.get("source_turn_id") or ""
-        ).strip():
-            continue
-        kept += 1
-        if kept <= _SOURCE_TURN_HISTORY_LIMIT:
-            continue
-        _delete_turn_if_unreferenced_conn(conn, str(host_id), str(turn_id))
-
 
 def upsert_command_pending_turn(
     db_path: Path,
@@ -12005,6 +16635,9 @@ def upsert_command_pending_turn(
         worker_id = str(worker.get("id") or "").strip()
     if not worker_id:
         return None
+    worker_meta = getattr(worker, "meta", None)
+    if worker_meta is None and isinstance(worker, Mapping):
+        worker_meta = worker.get("meta")
     item = sanitize_public_mapping(Turn(
         host_id=str(host_id),
         worker_id=worker_id,
@@ -12021,6 +16654,7 @@ def upsert_command_pending_turn(
         started_at=current_time,
         updated_at=current_time,
         origin_command_id=clean_request_id,
+        meta=worker_meta if isinstance(worker_meta, Mapping) else {},
     ).to_dict())
     turn_id = str(item.get("id") or "")
     if not turn_id:
@@ -13055,14 +17689,154 @@ def get_turn_content(
         }
 
 
+def _upsert_worker_bindings_conn(
+    conn: sqlite3.Connection,
+    bindings: Iterable[WorkerBinding],
+) -> int:
+    binding_list = list(bindings)
+    if not binding_list:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO worker_bindings (
+            host_id,
+            worker_id,
+            worker_fingerprint,
+            backend,
+            target_kind,
+            target_value,
+            turn_target_kind,
+            turn_target_value,
+            sendable,
+            reason,
+            observed_at,
+            expires_at,
+            private_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(host_id, backend, private_fingerprint) DO UPDATE SET
+            worker_id = excluded.worker_id,
+            worker_fingerprint = excluded.worker_fingerprint,
+            target_kind = excluded.target_kind,
+            target_value = excluded.target_value,
+            turn_target_kind = excluded.turn_target_kind,
+            turn_target_value = excluded.turn_target_value,
+            sendable = excluded.sendable,
+            reason = excluded.reason,
+            observed_at = excluded.observed_at,
+            expires_at = excluded.expires_at
+        WHERE excluded.observed_at >= worker_bindings.observed_at
+        """,
+        [
+            (
+                binding.host_id,
+                binding.worker_id,
+                binding.worker_fingerprint,
+                binding.backend,
+                binding.target_kind,
+                binding.target_value,
+                binding.turn_target_kind,
+                binding.turn_target_value,
+                int(binding.sendable),
+                binding.reason,
+                binding.observed_at,
+                binding.expires_at,
+                binding.private_fingerprint,
+            )
+            for binding in binding_list
+        ],
+    )
+    return len(binding_list)
+
+
+def _expire_stale_worker_bindings_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    *,
+    backend: str,
+    current_private_fingerprints: Iterable[str],
+    now: str,
+    reason: str = "stale_observation",
+) -> int:
+    current = {str(value) for value in current_private_fingerprints}
+    if current:
+        placeholders = ",".join("?" for _ in current)
+        cursor = conn.execute(
+            f"""
+            UPDATE worker_bindings
+            SET sendable = 0,
+                reason = ?,
+                expires_at = ?
+            WHERE host_id = ?
+              AND backend = ?
+              AND expires_at > ?
+              AND observed_at <= ?
+              AND private_fingerprint NOT IN ({placeholders})
+            """,
+            [
+                str(reason),
+                str(now),
+                str(host_id),
+                str(backend),
+                str(now),
+                str(now),
+                *sorted(current),
+            ],
+        )
+    else:
+        cursor = conn.execute(
+            """
+            UPDATE worker_bindings
+            SET sendable = 0,
+                reason = ?,
+                expires_at = ?
+            WHERE host_id = ?
+              AND backend = ?
+              AND expires_at > ?
+              AND observed_at <= ?
+            """,
+            (
+                str(reason),
+                str(now),
+                str(host_id),
+                str(backend),
+                str(now),
+                str(now),
+            ),
+        )
+    return int(cursor.rowcount or 0)
+
+
 def save_snapshot(
     db_path: Path,
     snapshot: Snapshot,
     *,
     observation: SnapshotObservationContext | None = None,
-) -> None:
-    """Persist a canonical snapshot and its authorized lifecycle transitions."""
+    worker_bindings: Iterable[WorkerBinding] | None = None,
+    binding_backend: str | None = None,
+    binding_observation_authoritative: bool = False,
+    binding_workers_present: bool = True,
+) -> bool:
+    """Persist a canonical snapshot; return whether it became the host projection."""
     context = observation or SnapshotObservationContext()
+    binding_list = (
+        None
+        if worker_bindings is None
+        else separate_duplicate_worker_bindings(
+            binding
+            if isinstance(binding, WorkerBinding)
+            else WorkerBinding(**binding)
+            for binding in worker_bindings
+        )
+    )
+    if binding_list is not None:
+        if not binding_backend:
+            raise ValueError("binding_backend is required")
+        if any(
+            binding.host_id != snapshot.host_id
+            or binding.backend != str(binding_backend)
+            for binding in binding_list
+        ):
+            raise ValueError("snapshot binding scope mismatch")
     private_snapshot_data = _snapshot_dict(snapshot)
     created_at = _strict_utc_timestamp(private_snapshot_data.get("updated_at"))
     if created_at is None:
@@ -13086,29 +17860,38 @@ def save_snapshot(
                 """,
                 (str(public_snapshot.host_id),),
             ).fetchone()
+            retained_created_at = str(latest[2]) if latest is not None else ""
+            retained_at = (
+                _strict_utc_timestamp(retained_created_at)
+                if latest is not None
+                else None
+            )
+            retained_is_unknown = (
+                latest is None
+                or retained_at is None
+                or (
+                    retained_at == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
+                    and not _legacy_snapshot_created_at_is_authoritative(
+                        retained_created_at,
+                        latest[3],
+                    )
+                )
+            )
+            refresh_current = retained_is_unknown
+            exact_replay = False
+            if retained_at is not None and not retained_is_unknown:
+                incoming_order = _connector_datetime(created_at)
+                retained_order = _connector_datetime(retained_at)
+                refresh_current = incoming_order > retained_order or (
+                    incoming_order == retained_order
+                    and fingerprint > str(latest[1])
+                )
+                exact_replay = (
+                    incoming_order == retained_order
+                    and fingerprint == str(latest[1])
+                )
             if latest is not None and str(latest[1]) == fingerprint:
                 snapshot_id = int(latest[0])
-                retained_created_at = str(latest[2])
-                retained_at = _strict_utc_timestamp(retained_created_at)
-                retained_is_unknown = (
-                    retained_at is None
-                    or (
-                        retained_at
-                        == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
-                        and not _legacy_snapshot_created_at_is_authoritative(
-                            retained_created_at,
-                            latest[3],
-                        )
-                    )
-                )
-                refresh_current = (
-                    retained_is_unknown
-                    or (
-                        retained_at is not None
-                        and _connector_datetime(created_at)
-                        >= _connector_datetime(retained_at)
-                    )
-                )
                 if refresh_current:
                     conn.execute(
                         """
@@ -13123,8 +17906,7 @@ def save_snapshot(
                             snapshot_id,
                         ),
                     )
-            else:
-                refresh_current = True
+            elif refresh_current:
                 cursor = conn.execute(
                     """
                     INSERT INTO snapshots (
@@ -13153,6 +17935,21 @@ def save_snapshot(
                     data,
                     content_fingerprint=fingerprint,
                 )
+                if binding_list is not None:
+                    _upsert_worker_bindings_conn(conn, binding_list)
+                    if binding_observation_authoritative and (
+                        binding_list or not binding_workers_present
+                    ):
+                        _expire_stale_worker_bindings_conn(
+                            conn,
+                            str(public_snapshot.host_id),
+                            backend=str(binding_backend),
+                            current_private_fingerprints=[
+                                binding.private_fingerprint
+                                for binding in binding_list
+                            ],
+                            now=created_at,
+                        )
             _apply_attention_observation_conn(
                 conn,
                 snapshot=public_snapshot,
@@ -13164,6 +17961,7 @@ def save_snapshot(
         except Exception:
             conn.rollback()
             raise
+    return bool(refresh_current or exact_replay)
 
 
 def latest_snapshot(db_path: Path, host_id: str | None = None) -> Snapshot | None:
@@ -13468,55 +18266,7 @@ def upsert_worker_bindings(db_path: Path, bindings: Iterable[WorkerBinding]) -> 
         return 0
     with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
-        conn.executemany(
-            """
-            INSERT INTO worker_bindings (
-                host_id,
-                worker_id,
-                worker_fingerprint,
-                backend,
-                target_kind,
-                target_value,
-                turn_target_kind,
-                turn_target_value,
-                sendable,
-                reason,
-                observed_at,
-                expires_at,
-                private_fingerprint
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, backend, private_fingerprint) DO UPDATE SET
-                worker_id = excluded.worker_id,
-                worker_fingerprint = excluded.worker_fingerprint,
-                target_kind = excluded.target_kind,
-                target_value = excluded.target_value,
-                turn_target_kind = excluded.turn_target_kind,
-                turn_target_value = excluded.turn_target_value,
-                sendable = excluded.sendable,
-                reason = excluded.reason,
-                observed_at = excluded.observed_at,
-                expires_at = excluded.expires_at
-            """,
-            [
-                (
-                    binding.host_id,
-                    binding.worker_id,
-                    binding.worker_fingerprint,
-                    binding.backend,
-                    binding.target_kind,
-                    binding.target_value,
-                    binding.turn_target_kind,
-                    binding.turn_target_value,
-                    int(binding.sendable),
-                    binding.reason,
-                    binding.observed_at,
-                    binding.expires_at,
-                    binding.private_fingerprint,
-                )
-                for binding in binding_list
-            ],
-        )
-    return len(binding_list)
+        return _upsert_worker_bindings_conn(conn, binding_list)
 
 
 def list_worker_bindings(
@@ -13632,8 +18382,8 @@ def expire_worker_bindings(
     """Mark matching private bindings expired and unsendable without deleting rows."""
     current_time = now or utc_timestamp()
     fingerprints = [str(value) for value in (private_fingerprints or [])]
-    clauses = ["host_id = ?", "expires_at > ?"]
-    params: list[Any] = [str(host_id), current_time]
+    clauses = ["host_id = ?", "expires_at > ?", "observed_at <= ?"]
+    params: list[Any] = [str(host_id), current_time, current_time]
     if backend is not None:
         clauses.append("backend = ?")
         params.append(str(backend))
@@ -13671,51 +18421,16 @@ def expire_stale_worker_bindings(
 ) -> int:
     """Expire host/backend bindings absent from a fresh successful observation."""
     current_time = now or utc_timestamp()
-    current = {str(value) for value in current_private_fingerprints}
     with _connect(db_path, prepare=True) as conn:
         _ensure_schema(conn)
-        if current:
-            placeholders = ",".join("?" for _ in current)
-            cursor = conn.execute(
-                f"""
-                UPDATE worker_bindings
-                SET sendable = 0,
-                    reason = ?,
-                    expires_at = ?
-                WHERE host_id = ?
-                  AND backend = ?
-                  AND expires_at > ?
-                  AND private_fingerprint NOT IN ({placeholders})
-                """,
-                [
-                    str(reason),
-                    current_time,
-                    str(host_id),
-                    str(backend),
-                    current_time,
-                    *sorted(current),
-                ],
-            )
-        else:
-            cursor = conn.execute(
-                """
-                UPDATE worker_bindings
-                SET sendable = 0,
-                    reason = ?,
-                    expires_at = ?
-                WHERE host_id = ?
-                  AND backend = ?
-                  AND expires_at > ?
-                """,
-                [
-                    str(reason),
-                    current_time,
-                    str(host_id),
-                    str(backend),
-                    current_time,
-                ],
-            )
-        return int(cursor.rowcount or 0)
+        return _expire_stale_worker_bindings_conn(
+            conn,
+            str(host_id),
+            backend=str(backend),
+            current_private_fingerprints=current_private_fingerprints,
+            now=current_time,
+            reason=str(reason),
+        )
 
 
 def get_command_receipt(

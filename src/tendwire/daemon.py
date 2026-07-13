@@ -43,6 +43,222 @@ def _nonnegative_float(value: Any) -> float | None:
     return converted
 
 
+_STORE_COUNT_FIELDS = (
+    "snapshots",
+    "events",
+    "spaces",
+    "workers",
+    "turns",
+    "pending_interactions",
+    "attention_items",
+    "commands",
+    "command_receipts",
+    "backend_health",
+)
+_OUTBOX_PUBLIC_STATUSES = frozenset(
+    {
+        "queued",
+        "leased",
+        "awaiting_ack",
+        "delivered",
+        "deferred",
+        "retry",
+        "dead_letter",
+        "superseded",
+        "unknown",
+    }
+)
+
+
+def _validated_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _store_counts_health(value: Any) -> tuple[dict[str, int], bool]:
+    fallback = {field: 0 for field in _STORE_COUNT_FIELDS}
+    if not isinstance(value, Mapping) or set(value) != set(_STORE_COUNT_FIELDS):
+        return fallback, False
+    parsed = {
+        field: _validated_nonnegative_int(value.get(field))
+        for field in _STORE_COUNT_FIELDS
+    }
+    if any(count is None for count in parsed.values()):
+        return fallback, False
+    return {field: int(parsed[field]) for field in _STORE_COUNT_FIELDS}, True
+
+
+def _outbox_health(value: Any) -> tuple[dict[str, Any], bool]:
+    fallback = {"pending": 0, "leased": 0, "completed": 0, "by_status": {}}
+    if not isinstance(value, Mapping) or set(value) != {
+        "pending",
+        "leased",
+        "completed",
+        "by_status",
+    }:
+        return fallback, False
+    by_status_value = value.get("by_status")
+    if not isinstance(by_status_value, Mapping):
+        return fallback, False
+    by_status: dict[str, int] = {}
+    for key, count_value in by_status_value.items():
+        if not isinstance(key, str) or key not in _OUTBOX_PUBLIC_STATUSES:
+            return fallback, False
+        count = _validated_nonnegative_int(count_value)
+        if count is None:
+            return fallback, False
+        by_status[key] = count
+    pending = _validated_nonnegative_int(value.get("pending"))
+    leased = _validated_nonnegative_int(value.get("leased"))
+    completed = _validated_nonnegative_int(value.get("completed"))
+    if (
+        pending is None
+        or leased is None
+        or completed is None
+        or pending
+        != sum(by_status.get(status, 0) for status in ("queued", "deferred", "retry"))
+        or leased != by_status.get("leased", 0)
+        or completed
+        != sum(by_status.get(status, 0) for status in ("delivered", "superseded"))
+    ):
+        return fallback, False
+    return {
+        "pending": pending,
+        "leased": leased,
+        "completed": completed,
+        "by_status": by_status,
+    }, True
+
+
+def _maintenance_health(
+    config: Config,
+    value: Any,
+) -> tuple[dict[str, Any], bool]:
+    fallback = {
+        "last_completed_at": None,
+        "status": "not_initialized",
+        "snapshot_count": 0,
+        "snapshot_retention_days": config.snapshot_retention_days,
+        "snapshot_retention_count": config.snapshot_retention_count,
+        "maintenance_batch_size": config.snapshot_maintenance_batch_size,
+        "maintenance_cadence_seconds": config.store_maintenance_cadence_seconds,
+        "backlog": False,
+    }
+    if not isinstance(value, Mapping) or set(value) != set(fallback):
+        return fallback, False
+    snapshot_count = _validated_nonnegative_int(value.get("snapshot_count"))
+    last_completed_value = value.get("last_completed_at")
+    last_completed_at = (
+        None
+        if last_completed_value is None
+        else _valid_observation_timestamp(
+            last_completed_value if isinstance(last_completed_value, str) else None
+        )
+    )
+    status = value.get("status")
+    policy_values = (
+        ("snapshot_retention_days", config.snapshot_retention_days),
+        ("snapshot_retention_count", config.snapshot_retention_count),
+        ("maintenance_batch_size", config.snapshot_maintenance_batch_size),
+        ("maintenance_cadence_seconds", config.store_maintenance_cadence_seconds),
+    )
+    valid = (
+        isinstance(status, str)
+        and status in {"not_initialized", "never", "ok", "failed"}
+        and snapshot_count is not None
+        and (
+            last_completed_value is None
+            or last_completed_at is not None
+        )
+        and all(
+            type(value.get(field)) is int
+            and value.get(field) == expected
+            for field, expected in policy_values
+        )
+        and isinstance(value.get("backlog"), bool)
+    )
+    if not valid:
+        return fallback, False
+    return {
+        **fallback,
+        "last_completed_at": last_completed_at,
+        "status": str(value["status"]),
+        "snapshot_count": snapshot_count,
+        "backlog": bool(value["backlog"]),
+    }, True
+
+
+_FINAL_RETENTION_COUNT_FIELDS = (
+    "acknowledged",
+    "unresolved",
+    "queued",
+    "leased",
+    "deferred",
+    "retry",
+    "dead_letter",
+    "awaiting_ack",
+    "eligible",
+)
+
+
+def _final_retention_health(
+    config: Config,
+    value: Any,
+) -> tuple[dict[str, Any], bool]:
+    """Validate the fixed public retention aggregate without exposing row data."""
+    fallback = {
+        **{key: 0 for key in _FINAL_RETENTION_COUNT_FIELDS},
+        "acknowledged_final_retention_days": (
+            config.acknowledged_final_retention_days
+        ),
+        "acknowledged_final_retention_count": (
+            config.acknowledged_final_retention_count
+        ),
+        "storage_pressure": False,
+    }
+    if not isinstance(value, Mapping):
+        return fallback, False
+    counts = tuple(value.get(key) for key in _FINAL_RETENTION_COUNT_FIELDS)
+    valid_counts = all(
+        isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        for count in counts
+    )
+    days_value = value.get("acknowledged_final_retention_days")
+    count_value = value.get("acknowledged_final_retention_count")
+    valid_policy = (
+        type(days_value) is int
+        and days_value == config.acknowledged_final_retention_days
+        and type(count_value) is int
+        and count_value == config.acknowledged_final_retention_count
+    )
+    storage_pressure = value.get("storage_pressure")
+    component_counts = counts[2:-1]
+    if (
+        not valid_counts
+        or not valid_policy
+        or not isinstance(storage_pressure, bool)
+        or counts[-1] > counts[0]
+        or any(component > counts[1] for component in component_counts)
+        or sum(component_counts) > counts[1]
+        or (
+            (counts[-1] > 0 or counts[1] > config.acknowledged_final_retention_count)
+            and storage_pressure is not True
+        )
+    ):
+        return fallback, False
+    return {
+        **dict(zip(_FINAL_RETENTION_COUNT_FIELDS, counts, strict=True)),
+        "acknowledged_final_retention_days": (
+            config.acknowledged_final_retention_days
+        ),
+        "acknowledged_final_retention_count": (
+            config.acknowledged_final_retention_count
+        ),
+        "storage_pressure": storage_pressure,
+    }, True
+
+
 def _turn_ingestion_health(config: Config, scheduler: Any | None) -> dict[str, Any]:
     raw: Mapping[str, Any] = {}
     if scheduler is not None:
@@ -364,6 +580,12 @@ class TendwireDaemon:
             result = maybe_run_automatic_store_maintenance(
                 Path(self.config.db_path),
                 policy=policy,
+                acknowledged_final_retention_days=(
+                    self.config.acknowledged_final_retention_days
+                ),
+                acknowledged_final_retention_count=(
+                    self.config.acknowledged_final_retention_count
+                ),
                 cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
             snapshot_result = result.get("snapshot")
@@ -445,7 +667,17 @@ class TendwireDaemon:
             "status": "store_unavailable",
             "host_id": self.config.host_id,
             "counts": {},
-            "outbox": {"pending": 0, "leased": 0, "terminal": 0, "by_status": {}},
+            "outbox": {"pending": 0, "leased": 0, "completed": 0, "by_status": {}},
+            "final_retention": {
+                **{key: 0 for key in _FINAL_RETENTION_COUNT_FIELDS},
+                "acknowledged_final_retention_days": (
+                    self.config.acknowledged_final_retention_days
+                ),
+                "acknowledged_final_retention_count": (
+                    self.config.acknowledged_final_retention_count
+                ),
+                "storage_pressure": False,
+            },
             "maintenance": {
                 "last_completed_at": None,
                 "status": "not_initialized",
@@ -463,12 +695,48 @@ class TendwireDaemon:
             store_payload = store_status(
                 Path(self.config.db_path),
                 self.config.host_id,
+                acknowledged_final_retention_days=(
+                    self.config.acknowledged_final_retention_days
+                ),
+                acknowledged_final_retention_count=(
+                    self.config.acknowledged_final_retention_count
+                ),
                 snapshot_retention_days=self.config.snapshot_retention_days,
                 snapshot_retention_count=self.config.snapshot_retention_count,
                 maintenance_batch_size=self.config.snapshot_maintenance_batch_size,
                 maintenance_cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
-        store_ok = bool(store_payload.get("ok"))
+        store_origin_valid = (
+            type(store_payload.get("schema_version")) is int
+            and store_payload.get("schema_version") == 1
+            and
+            store_payload.get("ok") is True
+            and store_payload.get("status") == "ok"
+            and store_payload.get("host_id") == self.config.host_id
+        )
+        counts, counts_valid = _store_counts_health(
+            store_payload.get("counts") if store_origin_valid else None
+        )
+        outbox, outbox_valid = _outbox_health(
+            store_payload.get("outbox") if store_origin_valid else None
+        )
+        final_retention, final_retention_valid = _final_retention_health(
+            self.config,
+            store_payload.get("final_retention") if store_origin_valid else None,
+        )
+        maintenance, maintenance_valid = _maintenance_health(
+            self.config,
+            store_payload.get("maintenance") if store_origin_valid else None,
+        )
+        if maintenance["snapshot_count"] != counts["snapshots"]:
+            maintenance, maintenance_valid = _maintenance_health(self.config, None)
+        store_ok = bool(
+            store_origin_valid
+            and counts_valid
+            and outbox_valid
+            and final_retention_valid
+            and maintenance_valid
+        )
         backend_runtime: dict[str, Any] = {}
         if self._event_backend is not None and hasattr(self._event_backend, "operational_status"):
             status_value = getattr(self._event_backend, "operational_status")
@@ -480,21 +748,36 @@ class TendwireDaemon:
             if isinstance(backend_maintenance, Mapping)
             else self._automatic_maintenance_status
         )
-        maintenance_payload = store_payload.get("maintenance")
-        maintenance = (
-            dict(maintenance_payload)
-            if isinstance(maintenance_payload, Mapping)
-            else {}
-        )
         if runtime_maintenance is not None:
             maintenance["last_check"] = dict(runtime_maintenance)
-        maintenance_degraded = maintenance.get("status") == "failed" or (
-            runtime_maintenance is not None
-            and not bool(runtime_maintenance.get("ok"))
+        maintenance_degraded = (
+            not maintenance_valid
+            or maintenance.get("status") == "failed"
+            or bool(maintenance.get("backlog"))
+            or (
+                runtime_maintenance is not None
+                and not bool(runtime_maintenance.get("ok"))
+            )
+            or not final_retention_valid
+            or bool(final_retention["storage_pressure"])
         )
         pending_ingestion = _pending_ingestion_health(self.config)
-        last_event_at = backend_runtime.get("last_event_at") or store_payload.get("last_event_at")
-        last_snapshot_at = backend_runtime.get("last_snapshot_at") or store_payload.get("last_snapshot_at") or snapshot.updated_at
+        stored_last_event_at = _valid_observation_timestamp(
+            store_payload.get("last_event_at")
+            if store_ok and isinstance(store_payload.get("last_event_at"), str)
+            else None
+        )
+        stored_last_snapshot_at = _valid_observation_timestamp(
+            store_payload.get("last_snapshot_at")
+            if store_ok and isinstance(store_payload.get("last_snapshot_at"), str)
+            else None
+        )
+        last_event_at = backend_runtime.get("last_event_at") or stored_last_event_at
+        last_snapshot_at = (
+            backend_runtime.get("last_snapshot_at")
+            or stored_last_snapshot_at
+            or snapshot.updated_at
+        )
         payload = {
             "schema_version": 1,
             "status": (
@@ -517,10 +800,11 @@ class TendwireDaemon:
                     if maintenance_degraded
                     else "healthy"
                 ),
-                "counts": store_payload.get("counts", {}),
-                "outbox": store_payload.get("outbox", {}),
-                "last_event_at": store_payload.get("last_event_at"),
-                "last_snapshot_at": store_payload.get("last_snapshot_at"),
+                "counts": counts,
+                "outbox": outbox,
+                "final_retention": final_retention,
+                "last_event_at": stored_last_event_at,
+                "last_snapshot_at": stored_last_snapshot_at,
                 "maintenance": maintenance,
             },
             "snapshot": {
@@ -555,6 +839,12 @@ class TendwireDaemon:
                 "max_workers": self.config.max_workers,
                 "max_outbox_attempts": self.config.max_outbox_attempts,
                 "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
+                "acknowledged_final_retention_days": (
+                    self.config.acknowledged_final_retention_days
+                ),
+                "acknowledged_final_retention_count": (
+                    self.config.acknowledged_final_retention_count
+                ),
                 "snapshot_retention_days": self.config.snapshot_retention_days,
                 "snapshot_retention_count": self.config.snapshot_retention_count,
                 "snapshot_maintenance_batch_size": self.config.snapshot_maintenance_batch_size,
