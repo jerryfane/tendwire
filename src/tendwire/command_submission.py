@@ -1414,9 +1414,9 @@ def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
 
 
 def _direct_replay_worker_id(request: CommandRequest) -> str | None:
-    """Return an exact explicit ID only when no mutable selector must resolve."""
+    """Return an explicit public ID when no mutable selector must resolve."""
     target = request.target or {}
-    if set(target) != {"worker_id"}:
+    if not set(target).issubset({"worker_id", "worker_fingerprint"}):
         return None
     worker_id = target.get("worker_id")
     if not isinstance(worker_id, str) or not worker_id.strip():
@@ -1450,15 +1450,23 @@ def replay_command_receipt(
     stored_worker_id = receipt.get("public_worker_id")
     canonical_version = receipt.get("canonical_version")
     if request.action == "send_instruction":
-        public_worker_id = _direct_replay_worker_id(request)
-        if public_worker_id is None:
+        explicit_worker_id = _direct_replay_worker_id(request)
+        if explicit_worker_id is None:
             return None
-        if canonical_version != 0 and (
-            not isinstance(stored_worker_id, str) or not stored_worker_id
-        ):
-            return _backend_uncertain(
-                request,
-                "stored request receipt is malformed; not retrying mutation",
+        if canonical_version != 0:
+            if not isinstance(stored_worker_id, str) or not stored_worker_id:
+                return _backend_uncertain(
+                    request,
+                    "stored request receipt is malformed; not retrying mutation",
+                )
+            if explicit_worker_id != stored_worker_id:
+                return _duplicate_request(request)
+            public_worker_id = stored_worker_id
+        else:
+            public_worker_id = (
+                stored_worker_id
+                if isinstance(stored_worker_id, str) and stored_worker_id
+                else explicit_worker_id
             )
     else:
         if not isinstance(stored_worker_id, str) or not stored_worker_id:
@@ -1519,9 +1527,10 @@ def submit_command(
         if isinstance(candidate, Mapping):
             existing_receipt = candidate
 
-    # Terminal and post-send evidence is immutable. An exact worker_id-only
-    # retry can compare directly, but aliases and mutable preconditions must
-    # resolve against current healthy public authority before any replay.
+    # Terminal and post-send evidence is immutable. A retry with an explicit
+    # worker_id, optionally accompanied by a noncanonical worker fingerprint,
+    # can compare with the stored public worker ID before current authority is
+    # consulted. Aliases still require current healthy public resolution.
     if existing_receipt is not None and existing_receipt.get("state") != "reserved":
         if existing_receipt.get("legacy_collision") is not False:
             return _backend_uncertain(
@@ -1550,8 +1559,8 @@ def submit_command(
                 existing_receipt,
             )
         if request.action == "send_instruction":
-            replay_worker_id = _direct_replay_worker_id(request)
-            if replay_worker_id is None:
+            explicit_worker_id = _direct_replay_worker_id(request)
+            if explicit_worker_id is None:
                 snapshot = _current_snapshot(config)
                 health_error = _backend_health_error(config, request, snapshot)
                 if health_error is not None:
@@ -1560,6 +1569,23 @@ def submit_command(
                 if isinstance(replay_worker, CommandEnvelope):
                     return replay_worker
                 replay_worker_id = replay_worker.id
+            else:
+                stored_worker_id = existing_receipt.get("public_worker_id")
+                if existing_receipt.get("canonical_version") != 0:
+                    if not isinstance(stored_worker_id, str) or not stored_worker_id:
+                        return _backend_uncertain(
+                            request,
+                            "stored request receipt is malformed; not retrying mutation",
+                        )
+                    if explicit_worker_id != stored_worker_id:
+                        return _duplicate_request(request)
+                    replay_worker_id = stored_worker_id
+                else:
+                    replay_worker_id = (
+                        stored_worker_id
+                        if isinstance(stored_worker_id, str) and stored_worker_id
+                        else explicit_worker_id
+                    )
         else:
             stored_worker_id = existing_receipt.get("public_worker_id")
             if not isinstance(stored_worker_id, str) or not stored_worker_id:

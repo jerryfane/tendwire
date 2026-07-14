@@ -667,6 +667,86 @@ def test_submit_command_allows_same_instruction_after_worker_fingerprint_changes
     ]
 
 
+def test_submit_command_terminal_worker_id_and_fingerprint_replays_after_healthy_worker_churn(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        fingerprint="worker-fingerprint-1",
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request = _request(
+        request_id="terminal-worker-churn",
+        worker_fingerprint=worker.fingerprint,
+    )
+
+    accepted = submit_command(
+        config,
+        request,
+        socket_client_factory=_factory(calls),
+    )
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.disposition == DISPOSITION_TERMINAL_ACCEPTED
+
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:01:00+00:00",
+            workers=[],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    no_backend = lambda _config: pytest.fail(
+        "terminal replay after worker churn must not create a socket client"
+    )
+
+    exact_replay = submit_command(
+        config,
+        request,
+        socket_client_factory=no_backend,
+    )
+    refreshed_fingerprint = submit_command(
+        config,
+        _request(
+            request_id="terminal-worker-churn",
+            worker_fingerprint="worker-fingerprint-2",
+        ),
+        socket_client_factory=no_backend,
+    )
+    changed_worker = submit_command(
+        config,
+        _request(
+            request_id="terminal-worker-churn",
+            worker_id="w-2",
+            worker_fingerprint=worker.fingerprint,
+        ),
+        socket_client_factory=no_backend,
+    )
+    changed_instruction = submit_command(
+        config,
+        _request(
+            request_id="terminal-worker-churn",
+            text="changed",
+            worker_fingerprint=worker.fingerprint,
+        ),
+        socket_client_factory=no_backend,
+    )
+
+    assert exact_replay.to_dict() == accepted.to_dict()
+    assert refreshed_fingerprint.to_dict() == accepted.to_dict()
+    assert changed_worker.status == STATUS_DUPLICATE_REQUEST
+    assert changed_worker.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert changed_instruction.status == STATUS_DUPLICATE_REQUEST
+    assert changed_instruction.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert calls == _expected_submit_calls()
+
+
 def test_submit_command_waits_for_text_to_stage_before_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

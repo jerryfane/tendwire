@@ -975,7 +975,7 @@ def test_cli_daemon_response_loss_recovers_accepted_receipt_exactly_once(
         (
             "worker-precondition",
             {"worker_id": "w-1", "worker_fingerprint": "current-fingerprint"},
-            None,
+            STATUS_ACCEPTED,
         ),
         (
             "worker-plus-null-alias",
@@ -984,7 +984,7 @@ def test_cli_daemon_response_loss_recovers_accepted_receipt_exactly_once(
         ),
     ],
 )
-def test_cli_response_loss_reconciliation_never_reuses_stored_target_authority(
+def test_cli_response_loss_reconciliation_only_uses_stored_explicit_worker_identity(
     case: str,
     current_target: dict[str, Any],
     expected_status: str | None,
@@ -1068,6 +1068,13 @@ def test_cli_response_loss_reconciliation_never_reuses_stored_target_authority(
         assert code == 2
         assert captured.out == ""
         assert "unresolved" in captured.err
+    elif expected_status == STATUS_ACCEPTED:
+        assert code == 0
+        assert captured.err == ""
+        payload = json.loads(captured.out)
+        assert payload["status"] == STATUS_ACCEPTED
+        assert payload["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
+        _assert_no_command_public_forbidden_fields(payload)
     else:
         assert code == 1
         assert captured.err == ""
