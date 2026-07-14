@@ -267,6 +267,49 @@ def test_cli_command_unknown_action_rejected(capsys, monkeypatch) -> None:
     assert captured.err == ""
 
 
+def test_cli_command_fingerprint_only_target_rejected(capsys, monkeypatch, tmp_path) -> None:
+    """A fingerprint-only send is invalid at the CLI, before any store or backend work."""
+    db_path = tmp_path / "fingerprint-only.db"
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "action": "send_instruction",
+                    "request_id": "fingerprint-only",
+                    "dry_run": False,
+                    "target": {"worker_fingerprint": "fingerprint-A"},
+                    "instruction": {"text": "hello"},
+                }
+            )
+        ),
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "unavailable.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 1
+    assert payload["ok"] is False
+    assert payload["status"] == "invalid_request"
+    assert payload["disposition"] == DISPOSITION_NO_RECEIPT
+    assert captured.err == ""
+    # A request this malformed never reaches durable state.
+    assert not db_path.exists()
+
+
 def test_cli_command_read_snapshot_neutral_result(capsys, monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.stdin",

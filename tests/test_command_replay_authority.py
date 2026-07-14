@@ -25,12 +25,14 @@ from tendwire.command_submission import replay_command_receipt, submit_command
 from tendwire.config import Config
 from tendwire.core.commands import (
     DISPOSITION_IN_PROGRESS,
+    DISPOSITION_NO_RECEIPT,
     DISPOSITION_TERMINAL_ACCEPTED,
     DISPOSITION_TERMINAL_REJECTED,
     DISPOSITION_TERMINAL_UNCERTAIN,
     STATUS_ACCEPTED,
     STATUS_BACKEND_UNSUPPORTED,
     STATUS_DUPLICATE_REQUEST,
+    STATUS_INVALID_REQUEST,
     STATUS_PENDING,
     STATUS_REQUEST_STATE_UNCERTAIN,
     CommandRequest,
@@ -346,6 +348,182 @@ def test_exact_retry_replays_accepted_receipt_while_backend_is_degraded(
     _remove_workers(config, health="degraded")
 
     retry = submit_command(config, payload, socket_client_factory=_forbidden_factory)
+
+    assert retry.to_dict() == accepted.to_dict()
+    assert _sent_texts(calls) == ["hello"]
+
+
+def test_fingerprint_only_targets_cannot_claim_another_workers_receipt(
+    tmp_path: Path,
+) -> None:
+    """The collision that blocked 2edc6cc: two fingerprints, one request ID.
+
+    A fingerprint is a mutable precondition, not identity, so the selector proof
+    excludes it. If a fingerprint could stand alone as the whole target, every
+    such target would share one proof -- and reusing the request ID with a
+    fingerprint naming a different worker would replay the first worker's
+    accepted result. Rejecting the shape outright is what closes that hole.
+    """
+    config = _config(tmp_path)
+    first_worker = _worker()
+    second_worker = _worker(worker_id="w-2", name="Beta", space_id="space-2")
+    _seed(
+        config,
+        [first_worker, second_worker],
+        [_binding(first_worker), _binding(second_worker)],
+    )
+    assert first_worker.fingerprint != second_worker.fingerprint
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(
+            request_id="fingerprint-collision",
+            target={"worker_fingerprint": first_worker.fingerprint},
+        ),
+        socket_client_factory=_factory(calls),
+    )
+    changed = submit_command(
+        config,
+        _request(
+            request_id="fingerprint-collision",
+            target={"worker_fingerprint": second_worker.fingerprint},
+        ),
+        socket_client_factory=_factory(calls),
+    )
+
+    # Under 2edc6cc the first was accepted and the second replayed its stored
+    # terminal_accepted body: one worker's result claimed for another.
+    for envelope in (first, changed):
+        assert envelope.ok is False
+        assert envelope.status == STATUS_INVALID_REQUEST
+        assert envelope.disposition == DISPOSITION_NO_RECEIPT
+    assert _sent_texts(calls) == []
+    assert _receipt_rows(config) == []
+
+
+def test_fingerprint_only_target_does_no_store_source_or_backend_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejection happens in the parser, before anything durable or observable."""
+    config = _config(tmp_path)
+    touched: list[str] = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        touched.append("io")
+        raise AssertionError("an invalid target must not reach store or source work")
+
+    monkeypatch.setattr(command_submission, "get_command_request", forbidden)
+    monkeypatch.setattr(command_submission, "_current_snapshot", forbidden)
+    monkeypatch.setattr(command_submission, "latest_snapshot", forbidden)
+    monkeypatch.setattr(command_submission, "reserve_command_request", forbidden)
+    monkeypatch.setattr(
+        "tendwire.command_submission.project_from_observations",
+        forbidden,
+    )
+
+    envelope = submit_command(
+        config,
+        _request(
+            request_id="fingerprint-only",
+            target={"worker_fingerprint": "fingerprint-A"},
+        ),
+        socket_client_factory=forbidden,
+    )
+
+    assert envelope.ok is False
+    assert envelope.status == STATUS_INVALID_REQUEST
+    assert envelope.disposition == DISPOSITION_NO_RECEIPT
+    assert touched == []
+    assert config.db_path is not None
+    assert not config.db_path.exists()
+
+
+def test_fingerprint_only_target_is_rejected_by_daemon_and_read_only_replay(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = _worker()
+    _seed(config, [worker], [_binding(worker)])
+    payload = _request(
+        request_id="fingerprint-only",
+        target={"worker_fingerprint": worker.fingerprint},
+    )
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: _snapshot([worker]),
+        get_health=lambda: {"ok": True},
+        submit_command=lambda params: submit_command(
+            config,
+            params,
+            socket_client_factory=_forbidden_factory,
+        ),
+    )
+
+    response = api.dispatch({"method": "command.submit", "params": payload, "id": "1"})
+
+    assert response["result"]["ok"] is False
+    assert response["result"]["status"] == STATUS_INVALID_REQUEST
+    assert response["result"]["disposition"] == DISPOSITION_NO_RECEIPT
+    # The rejection names the rule it broke without echoing the observation the
+    # caller sent, and it leaves no durable trace of the request.
+    rendered = json.dumps(response)
+    assert worker.fingerprint not in rendered
+    assert "worker_fingerprint" in response["result"]["error"]["message"]
+    assert response["result"]["error"]["details"]["allowed"] == [
+        "name",
+        "space_id",
+        "worker_id",
+    ]
+    # The read-only response-loss path cannot resolve it either, and must never
+    # invent a receipt for a request that could not have created one.
+    assert replay_command_receipt(config, payload) is None
+    assert _receipt_rows(config) == []
+    assert config.db_path is not None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        command_events = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'command_request'"
+        ).fetchone()[0]
+    assert command_events == 0
+
+
+@pytest.mark.parametrize("selector_kind", ["name", "space_id", "name_and_space"])
+def test_refreshed_fingerprint_beside_a_stable_selector_replays_stored_result(
+    tmp_path: Path,
+    selector_kind: str,
+) -> None:
+    """A refreshed fingerprint is a precondition, not a different command.
+
+    This is the alias path, so equivalence is proven by the stored selector
+    proof -- which is exactly the evidence that must ignore the fingerprint.
+    """
+    config = _config(tmp_path)
+    worker = _worker()
+    _seed(config, [worker], [_binding(worker)])
+    stable = _selector(selector_kind, worker)
+    payload = _request(
+        request_id=f"fingerprint-beside-{selector_kind}",
+        target={**stable, "worker_fingerprint": worker.fingerprint},
+    )
+    calls: list[dict[str, Any]] = []
+
+    accepted = submit_command(config, payload, socket_client_factory=_factory(calls))
+    assert accepted.status == STATUS_ACCEPTED
+
+    # The worker is re-observed with fresh data, so its fingerprint moves.
+    refreshed_worker = _worker(status="waiting")
+    assert refreshed_worker.fingerprint != worker.fingerprint
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        _snapshot([refreshed_worker], updated_at="2026-01-01T00:06:00+00:00"),
+    )
+    refreshed = _request(
+        request_id=f"fingerprint-beside-{selector_kind}",
+        target={**stable, "worker_fingerprint": refreshed_worker.fingerprint},
+    )
+
+    retry = submit_command(config, refreshed, socket_client_factory=_forbidden_factory)
 
     assert retry.to_dict() == accepted.to_dict()
     assert _sent_texts(calls) == ["hello"]

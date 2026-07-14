@@ -150,6 +150,14 @@ DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
 
 # Neutral target fields permitted in command requests.
 TARGET_ALLOWED_FIELDS = frozenset({"worker_id", "worker_fingerprint", "space_id", "name"})
+
+# Selectors that name a worker durably. A worker_fingerprint is a mutable
+# observation precondition -- "proceed only if the worker still looks like this"
+# -- and never worker identity, so it names no target on its own. Two different
+# fingerprints would then be indistinguishable to any identity-based idempotency
+# key, letting one request ID claim another worker's stored result. Every target
+# must carry at least one of these.
+TARGET_STABLE_SELECTOR_FIELDS = frozenset({"worker_id", "space_id", "name"})
 INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
 ANSWER_PENDING_PARAM_FIELDS = frozenset(
     {"pending_id", "pending_fingerprint", "choice_id"}
@@ -296,13 +304,26 @@ def _validate_target_shape(target: dict[str, Any] | None) -> dict[str, Any] | No
             f"target contains disallowed fields: {sorted(extra)}",
             details={"field": "target", "disallowed": sorted(extra)},
         )
+    if _string_value(target.get("worker_fingerprint")) and not _target_has_stable_selector(
+        target
+    ):
+        return error_value(
+            STATUS_INVALID_REQUEST,
+            "target requires a stable selector beside worker_fingerprint",
+            details={
+                "field": "target",
+                "allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS),
+            },
+        )
     return None
 
 
-def _target_has_explicit_selector(target: dict[str, Any] | None) -> bool:
+def _target_has_stable_selector(target: dict[str, Any] | None) -> bool:
     if not isinstance(target, dict):
         return False
-    return any(_string_value(target.get(field)) for field in TARGET_ALLOWED_FIELDS)
+    return any(
+        _string_value(target.get(field)) for field in TARGET_STABLE_SELECTOR_FIELDS
+    )
 
 
 def is_valid_request_id(value: Any) -> bool:
@@ -477,9 +498,15 @@ def build_selector_proof(request: CommandRequest) -> str:
     worker disappears from current authority.
 
     ``worker_fingerprint`` is deliberately excluded: it is a mutable observation
-    precondition, not command identity. The proof is a fixed-width digest, so it
-    is bounded independently of untrusted input, carries no private binding or
-    backend-routing data, and is never part of any public surface.
+    precondition, not command identity, so refreshing it must not create a
+    different command. Excluding it is only safe because a validated target
+    always carries a stable selector (see TARGET_STABLE_SELECTOR_FIELDS) -- were
+    a fingerprint-only target legal, every one of them would share this proof and
+    a changed target could claim another worker's stored result.
+
+    The proof is a fixed-width digest, so it is bounded independently of
+    untrusted input, carries no private binding or backend-routing data, and is
+    never part of any public surface.
     """
     if not isinstance(request, CommandRequest):
         raise TypeError("request must be a CommandRequest")
@@ -586,11 +613,14 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                 "send_instruction requires a target",
                 details={"field": "target"},
             )
-        if not _target_has_explicit_selector(request.target):
+        if not _target_has_stable_selector(request.target):
             return error_value(
                 STATUS_INVALID_REQUEST,
-                "send_instruction requires at least one explicit target selector",
-                details={"field": "target", "allowed": sorted(TARGET_ALLOWED_FIELDS)},
+                "send_instruction requires at least one stable target selector",
+                details={
+                    "field": "target",
+                    "allowed": sorted(TARGET_STABLE_SELECTOR_FIELDS),
+                },
             )
         if request.instruction is None or not _string_value(request.instruction.get("text")):
             return error_value(

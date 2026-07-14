@@ -38,6 +38,8 @@ from tendwire.core.commands import (
     CanonicalMutation,
     MAX_INSTRUCTION_LENGTH,
     build_canonical_mutation,
+    build_selector_proof,
+    is_selector_proof,
     is_valid_request_id,
     parse_command_request,
     resolve_target,
@@ -924,7 +926,7 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
     error = validate_request(empty_target)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
-    assert "explicit target selector" in error["message"]
+    assert "stable target selector" in error["message"]
 
     missing_text = CommandRequest(
         action="send_instruction",
@@ -934,6 +936,127 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
     error = validate_request(missing_text)
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
+
+
+@pytest.mark.parametrize("action", ["send_instruction", "resolve_target"])
+def test_validate_rejects_a_fingerprint_only_target(action: str) -> None:
+    """A fingerprint names no worker, so it can never be the whole target.
+
+    It is a mutable observation precondition. Alone it would make two genuinely
+    different targets look identical to every identity-based check.
+    """
+    request = CommandRequest(
+        action=action,
+        request_id="fingerprint-only",
+        dry_run=False,
+        target={"worker_fingerprint": "fingerprint-A"},
+        instruction={"text": "hello"} if action == "send_instruction" else None,
+    )
+
+    error = validate_request(request)
+
+    assert error is not None
+    assert error["code"] == STATUS_INVALID_REQUEST
+    assert "worker_fingerprint" in error["message"]
+    assert error["details"]["allowed"] == ["name", "space_id", "worker_id"]
+
+
+@pytest.mark.parametrize(
+    "stable",
+    [
+        {"worker_id": "w-1"},
+        {"name": "Alpha"},
+        {"space_id": "space-1"},
+        {"name": "Alpha", "space_id": "space-1"},
+    ],
+)
+def test_validate_accepts_a_fingerprint_beside_a_stable_selector(
+    stable: dict[str, Any],
+) -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="fingerprint-beside",
+        dry_run=False,
+        target={**stable, "worker_fingerprint": "fingerprint-A"},
+        instruction={"text": "hello"},
+    )
+
+    assert validate_request(request) is None
+
+
+@pytest.mark.parametrize(
+    "stable",
+    [
+        {"worker_id": "w-1"},
+        {"name": "Alpha"},
+        {"space_id": "space-1"},
+        {"name": "Alpha", "space_id": "space-1"},
+    ],
+)
+def test_selector_proof_ignores_a_refreshed_worker_fingerprint(
+    stable: dict[str, Any],
+) -> None:
+    """A refreshed fingerprint beside a stable selector is the same command."""
+
+    def proof(fingerprint: str | None) -> str:
+        target = dict(stable)
+        if fingerprint is not None:
+            target["worker_fingerprint"] = fingerprint
+        return build_selector_proof(
+            CommandRequest(
+                action="send_instruction",
+                request_id="proof",
+                dry_run=False,
+                target=target,
+                instruction={"text": "hello"},
+            )
+        )
+
+    assert proof("fingerprint-A") == proof("fingerprint-B") == proof(None)
+
+
+def test_selector_proof_distinguishes_every_stable_selector_shape() -> None:
+    """Each shape and value must hash differently, or a retry could cross targets."""
+
+    def proof(target: dict[str, Any]) -> str:
+        return build_selector_proof(
+            CommandRequest(
+                action="send_instruction",
+                request_id="proof",
+                dry_run=False,
+                target=target,
+                instruction={"text": "hello"},
+            )
+        )
+
+    proofs = [
+        proof({"worker_id": "w-1"}),
+        proof({"worker_id": "w-2"}),
+        proof({"name": "Alpha"}),
+        proof({"name": "Beta"}),
+        proof({"space_id": "space-1"}),
+        proof({"space_id": "space-2"}),
+        proof({"name": "Alpha", "space_id": "space-1"}),
+        # A name that happens to equal a space, and vice versa, must not collide.
+        proof({"name": "space-1"}),
+        proof({"space_id": "Alpha"}),
+    ]
+
+    assert len(set(proofs)) == len(proofs)
+    assert all(is_selector_proof(value) for value in proofs)
+
+
+def test_selector_proof_requires_a_valid_target() -> None:
+    fingerprint_only = CommandRequest(
+        action="send_instruction",
+        request_id="fingerprint-only",
+        dry_run=False,
+        target={"worker_fingerprint": "fingerprint-A"},
+        instruction={"text": "hello"},
+    )
+
+    with pytest.raises(ValueError):
+        build_selector_proof(fingerprint_only)
 
 
 @pytest.mark.parametrize(
