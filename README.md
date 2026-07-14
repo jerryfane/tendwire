@@ -503,6 +503,9 @@ variables:
 | `max_workers` | `TENDWIRE_MAX_WORKERS` | `512` | integer >= 1 |
 | `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
 | `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
+| `command_retry_horizon_seconds` | `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS` | `604800` | positive integer no greater than 604800 |
+| `command_receipt_retention_seconds` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS` | `2592000` | integer at least 691200 and strictly greater than the retry horizon |
+| `command_receipt_retention_count` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT` | `4096` | positive integer; newest bounded inactive receipts per host |
 | `acknowledged_final_retention_days` | `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS` | `30` | positive integer |
 | `acknowledged_final_retention_count` | `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT` | `4096` | positive integer; newest proven acknowledged finals per host |
 | `snapshot_retention_days` | `TENDWIRE_SNAPSHOT_RETENTION_DAYS` | `14` | positive integer |
@@ -544,9 +547,14 @@ fields: daemon status and `started_at`; store status/counts and outbox counts;
 snapshot and last event/snapshot/reconcile timestamps when available; backend
 runtime readiness when the socket backend is active; backend health; and numeric
 `limits` for debounce, reconcile, event retention, output excerpt, worker cap,
-outbox attempt/claim TTL, snapshot retention age/count/batch/cadence, and exact
-`acknowledged_final_retention_days` / `acknowledged_final_retention_count`
-values. `store.final_retention` is aggregate-only:
+outbox attempt/claim TTL, snapshot retention age/count/batch/cadence, exact
+acknowledged-final age/count, and exact command retry-horizon and receipt
+retention age/count values. `store.command_requests` is aggregate-only:
+`total`, the five state counters, `stale_active`, `eligible`,
+`retry_horizon_seconds`, `retention_seconds`, `retention_count`, and
+`storage_pressure`. It never exposes a request ID, action, canonical request or
+fingerprint, resolved worker, instruction, pending choice, or private binding.
+`store.final_retention` is also aggregate-only:
 `acknowledged`, `unresolved`, `queued`, `leased`, `deferred`, `retry`,
 `dead_letter`, `awaiting_ack`, `eligible`,
 `acknowledged_final_retention_days`,
@@ -841,7 +849,7 @@ worker status alone does not create one.
 
 ## SQLite store
 
-The current store schema is version 11 (`PRAGMA user_version=11`). Migration is
+The current store schema is version 12 (`PRAGMA user_version=12`). Migration is
 idempotent and transactional. Schema v6 introduced immutable canonical turn
 content revisions and backfilled legacy rows, marking a legacy `[truncated]`
 value `known_incomplete` rather than claiming recovery. Schema v7 added
@@ -863,6 +871,13 @@ and integer `stable_key_version=1` from persisted turn metadata into the root of
 its `schema_version=2` payload. Every materialized range job preserves that
 exact source route under `turn`. Neither `worker_id` nor `worker_fingerprint`
 is final-delivery routing authority.
+
+Schema v12 rebuilds command receipts around one host-wide
+`(host_id, request_id)` authority, canonical resolved public-worker identity,
+and the explicit `reserved`, `send_started`, `accepted`, `rejected`, and
+`uncertain` lifecycle. The transactional v11-to-v12 migration converts
+ambiguous legacy action-scoped collisions into terminal uncertainty rather
+than selecting one mutation as authoritative.
 
 A missing, partial, malformed, boolean-valued, or unsupported owner pair creates
 a nonroutable `schema_version=1` `final_migration_hold`/`dead_letter`.
@@ -1006,9 +1021,10 @@ pressure only, never final content or turn, revision, final, provider, or
 private-state identity.
 
 `store cleanup` performs one bounded online batch and reports aggregate
-`retention`, database-wide `snapshots`, `outbox`, `final_retention`, and
-`turn_content` objects. The event/outbox/final/turn-content policy defaults come
-from the normal configuration. Retention age/count/batch/cadence values must be
+`retention`, database-wide `snapshots`, `outbox`, `final_retention`,
+`command_requests`, and `turn_content` objects. Event, outbox, final,
+command-receipt, and turn-content policy defaults come from the normal
+configuration. Retention age/count/batch/cadence values must be
 positive integers. Day policies are capped at 365000, counts at
 9223372036854775807, maintenance batches at 1000, and cadence at 31536000000
 seconds; an affected cleanup class rejects an invalid override rather than
@@ -1026,8 +1042,17 @@ unlinked part or any queued, leased, deferred, `retry`, `awaiting_ack`, or
 `dead_letter` work blocks cleanup and contributes to pressure. Only then is an
 acknowledged graph eligible when older than the 30-day age window or ranked
 beyond the newest 4096 per-host count window by default. Cleanup also does not
-remove current projections, command receipts, private worker bindings, live
-outbox work or leases, or current referenced turn content.
+remove current projections, private worker bindings, live
+outbox work or leases, current referenced turn content, active `reserved`
+command-owner leases, or any `send_started` row directly. An expired `reserved`
+row remains a reclaimable pre-send reservation for the same canonical mutation;
+the retry horizon does not convert it to uncertainty. A `send_started` row older
+than the retry horizon (604800 seconds by default) becomes `uncertain` instead
+of being deleted or retried. The bounded deletion pool contains only expired
+`reserved` rows and terminal `accepted`, `rejected`, or `uncertain` rows. A row
+in that pool is eligible only when it is both older than the configured age
+floor (2592000 seconds by default) and ranked beyond the newest-per-host count
+floor (4096 by default).
 With `--dry-run`, every maintenance transaction is rolled back; the aggregate
 candidate/action counts are predictions and no store row or maintenance marker
 is changed.
@@ -1040,17 +1065,21 @@ per host by the acknowledged-final retention count (4096 by default).
 
 Automatic maintenance is deliberately coarse and bounded. After a stored
 snapshot, the daemon consults one persisted database-wide cadence marker (3600
-seconds by default). When due, it removes at most 100 snapshot rows and a
-shared budget of 100 eligible acknowledged-final graphs across hosts. Private
-per-host service cursors order never-serviced hosts first and then the
-least-recently serviced, preventing a lexicographically early busy host from
-starving others. Later batches resume backlog; no batch loops to empty,
-compacts pages, or invokes `VACUUM`.
+seconds by default). When due, it removes at most 100 snapshot rows, uses a
+shared budget of 100 eligible acknowledged-final graphs across hosts, and runs
+one separate command-receipt batch of at most 100 transitions/deletions.
+Command-receipt maintenance converts stale `send_started` receipts to
+`uncertain` before considering bounded inactive deletion. Private per-host
+final service cursors
+order never-serviced hosts first and then the least-recently serviced,
+preventing a lexicographically early busy host from starving others. Later
+batches resume backlog; no batch loops to empty, compacts pages, or invokes
+`VACUUM`.
 
 `store compact` is an explicit CLI-only database operation, not a daemon API.
 Dry-run accepts optional `--snapshot-retention-days`,
 `--snapshot-retention-count`, and `--batch-size` overrides, but rejects
-`--acknowledge-offline` and `--backup-path`; it opens the current v11 store
+`--acknowledge-offline` and `--backup-path`; it opens the current v12 store
 read-only, runs `PRAGMA quick_check`, estimates eligible snapshots and disk
 headroom, and is strictly non-mutating. Execute requires all writers stopped,
 the literal `--acknowledge-offline` flag, and a new nonexistent private backup
@@ -1289,8 +1318,12 @@ change is required.
 - `schema_version` — required; must be the JSON integer `1` exactly. Missing
   values, strings, floats, booleans, null, arrays, objects, and other integers
   are rejected before store, projection, Herdr observation, or backend send work.
-- `action` — one of `noop`, `read_snapshot`, `resolve_target`, `send_instruction`.
-- `request_id` — optional; required for non-dry-run `send_instruction`.
+- `action` — one of `noop`, `read_snapshot`, `resolve_target`,
+  `send_instruction`, or `answer_pending`.
+- `request_id` — optional for non-mutating/dry-run work; required for every
+  non-dry-run `send_instruction` and `answer_pending`. A required mutating ID
+  must be nonempty and exactly as supplied: leading or trailing whitespace is
+  rejected rather than trimmed.
 - `dry_run` — defaults to `true`; only literal JSON booleans are accepted, and
   a request must explicitly set `dry_run: false` to ask for mutation.
 - `target` — optional neutral target descriptor using only `worker_id`,
@@ -1326,11 +1359,12 @@ any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
 Status values include `noop`, `snapshot`, `resolved`, `dry_run`, `accepted`,
 `rejected`, `not_found`, `ambiguous_target`, `stale_target`,
 `backend_unavailable`, `ambiguous_backend_target`, `backend_unsupported`,
-`backend_failed`, `duplicate_request`, `duplicate_instruction`,
-`request_state_uncertain`, `invalid_request`, and `pending` for internal receipt
-reservation. A backend that is not enabled, not reachable before send start, or
-not healthy reports `backend_unavailable`; a disconnect, timeout, protocol
-failure, or OS error after send start reports `request_state_uncertain`.
+`backend_failed`, `duplicate_request`, `request_state_uncertain`,
+`invalid_request`, and `pending`. `pending` is the in-progress envelope status;
+it is distinct from the durable receipt lifecycle described below. A backend
+that is not enabled, not reachable before send start, or not healthy reports
+`backend_unavailable`; a disconnect, timeout, protocol failure, or OS error
+after send start reports `request_state_uncertain`.
 
 Errors use a neutral shape: `code`, `message`, and sanitized `details`. Public
 results must never include connector delivery state, Herdr routing objects, bot
@@ -1344,21 +1378,29 @@ backend argv, or route/delivery fields.
 - `resolve_target` — resolves a target against live workers and returns a single
   target (`resolved`) or a list of sanitized candidates (`not_found`,
   `ambiguous_target`, `stale_target`).
-- `send_instruction` — validates target/instruction/idempotency. Dry runs return
-  status `dry_run` without creating receipts or calling Herdr. Non-dry runs
+- `send_instruction` — validates the request shape and instruction. Dry runs
+  return status `dry_run` without consulting or requiring a backend or store,
+  creating a receipt, resolving mutable authority, or calling Herdr. Non-dry runs
   resolve a neutral public worker selector against the authoritative Tendwire
   snapshot, load Tendwire-owned private bindings from the local store, and send
   through Herdr's socket `agent.send` method. The private target value is chosen
   by Tendwire from `WorkerBinding` internals and is never accepted from or
   returned to public clients.
+- `answer_pending` — validates the exact public pending ID, fingerprint, and
+  choice ID. Dry runs return the same pure `dry_run` preview described above.
+  Non-dry runs resolve the authoritative public worker and private
+  revision-bound route, then submit the private picker ordinal without exposing
+  it.
 
 ### Safety rules
 
 - Dry-run by default. A request must explicitly set `dry_run: false` to request
-  mutation.
-- Non-dry-run `send_instruction` requires a `request_id`, at least one explicit
-  target selector, an available command receipt store, and exact single target
-  resolution.
+  mutation. A validated mutation dry-run is pure and backend/store independent;
+  it never creates a receipt or consults mutable target authority.
+- Every non-dry-run `send_instruction` or `answer_pending` requires a
+  `request_id`, an available command receipt store, and exact single public
+  worker resolution. `send_instruction` also requires at least one explicit
+  target selector.
 - Targets with status `closed`, `failed`, or `unknown` are rejected for
   `send_instruction`.
 - The send adapter never treats public selectors as raw Herdr send targets.
@@ -1394,28 +1436,50 @@ backend argv, or route/delivery fields.
 
 ### Idempotency receipts
 
-Non-dry-run `send_instruction` first reserves a neutral pending receipt in the
-SQLite store when a database path is available, before backend mutation. The
-receipt key is `host_id`/`request_id`/`action` and records `action`,
-`payload_fingerprint`, `status`, timestamps, and a sanitized `result_json`.
-The store enforces one durable row per key with a unique index and migrates
-legacy duplicate rows by keeping the latest receipt before enabling the
-constraint. Completion updates the reserved row instead of inserting another
-row. Dry-runs never create receipts.
+Every non-dry-run `send_instruction` and `answer_pending` reserves a durable
+SQLite receipt before backend mutation. The sole authority key is the
+host-wide `(host_id, request_id)` pair; `action` is not part of that unique key.
+The receipt table enforces one durable row per key with a unique index.
+After authoritative target resolution, Tendwire builds canonical mutation v1
+from the action, resolved public `worker_id`, and exact instruction text or
+pending-ID/fingerprint/choice triple. The request ID, unresolved selector
+spelling, worker observation fingerprint, connector origin, and private binding
+are not canonical identity inputs. Different selector forms that resolve to
+the same public worker therefore name the same mutation; a selector that names
+a different public worker does not.
 
-Receipt semantics:
+The durable lifecycle is `reserved`, `send_started`, `accepted`, `rejected`,
+or `uncertain`:
 
-- Same `request_id`/`action` with the same payload fingerprint returns the
-  cached completed result.
-- Same `request_id`/`action` with a different fingerprint rejects with
-  `duplicate_request`.
-- A pending/uncertain receipt rejects with `request_state_uncertain` and does
-  not retry the mutation.
-- A recent same-worker, same long instruction submitted under a different
-  `request_id` may be accepted as `duplicate_instruction` with delivery state
-  `duplicate_suppressed`. This protects Telegram/source-mode replay and manual
-  repair paths from resending old long directives while still allowing short
-  repeated nudges such as "continue".
+- `reserved` means one owner has claimed the request before send start. A
+  concurrent replay reports it in progress; only an expired pre-send owner
+  lease may be reacquired for the same canonical mutation.
+- `send_started` is recorded before the external mutation. It is never
+  automatically retried; replay returns `request_state_uncertain`.
+- `accepted` and `rejected` are terminal and replay their stored sanitized
+  envelope for the same canonical mutation.
+- `uncertain` is terminal evidence that the mutation may have occurred. Replay
+  returns `request_state_uncertain` and never starts another send.
+- Reusing the same host/request ID for a different action, resolved public
+  worker, instruction, or pending choice rejects with `duplicate_request`
+  before mutation.
+- A different `request_id` is an independent mutation and, when otherwise
+  valid, sends even when its instruction text matches earlier work. Tendwire
+  performs no content-based command suppression or time-window heuristic.
+
+The retry horizon defaults to 604800 seconds and may not exceed 604800. Bounded
+maintenance converts only a `send_started` receipt older than that horizon to
+`uncertain`; it does not retry the effect. A `reserved` receipt is pre-send
+ownership: its active lease remains protected, and an expired lease may be
+reacquired for the same canonical mutation rather than converted to
+`uncertain`. The bounded deletion pool contains only expired `reserved` rows
+and terminal `accepted`, `rejected`, or `uncertain` rows. Within that pool, a
+row is deletable only when it is both older than the configured retention age
+(2592000 seconds by default) and ranked beyond the newest 4096 rows for its host
+by default. Retention seconds have a hard minimum of 691200 and must be strictly
+greater than the retry horizon. Active `reserved` owner leases are outside the
+deletion pool, and `send_started` rows are transitioned rather than deleted
+directly. Dry-runs never create receipts.
 
 ### Unsafe non-goals
 

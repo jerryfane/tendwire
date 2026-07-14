@@ -9,15 +9,19 @@ import pytest
 
 from tendwire.core.commands import (
     ALLOWED_ACTIONS,
+    CANONICAL_MUTATION_VERSION,
     STATUS_AMBIGUOUS_TARGET,
     STATUS_INVALID_REQUEST,
     STATUS_NOT_FOUND,
     STATUS_REJECTED,
     STATUS_RESOLVED,
     STATUS_STALE_TARGET,
+    VALID_STATUSES,
     CommandEnvelope,
     CommandRequest,
+    CanonicalMutation,
     MAX_INSTRUCTION_LENGTH,
+    build_canonical_mutation,
     parse_command_request,
     resolve_target,
     sanitize_command_result,
@@ -171,6 +175,10 @@ def test_allowed_actions_frozen() -> None:
     }
 
 
+def test_duplicate_instruction_is_not_a_command_status() -> None:
+    assert "duplicate_instruction" not in VALID_STATUSES
+
+
 def test_command_request_defaults_are_dry_run() -> None:
     request = CommandRequest(action="noop")
     assert request.dry_run is True
@@ -236,6 +244,152 @@ def test_command_request_to_dict_roundtrip() -> None:
     data = request.to_dict()
     restored = CommandRequest.from_dict(data)
     assert restored == request
+
+
+def test_build_canonical_send_instruction_has_hard_coded_v1_identity() -> None:
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="request-is-not-canonical",
+        dry_run=False,
+        target={
+            "name": "raw selector spelling",
+            "space_id": "raw-space",
+            "worker_fingerprint": "transient-observation",
+        },
+        instruction={"text": "Deploy α\nnow"},
+        params={"origin": {"source": "arbitrary"}, "null_noise": None},
+    )
+
+    mutation = build_canonical_mutation(request, public_worker_id="worker-public-7")
+
+    assert isinstance(mutation, CanonicalMutation)
+    assert mutation.canonical_version == CANONICAL_MUTATION_VERSION == 1
+    assert mutation.action == "send_instruction"
+    assert mutation.public_worker_id == "worker-public-7"
+    assert mutation.canonical_json == (
+        '{"action":"send_instruction","canonical_version":1,'
+        '"instruction":{"text":"Deploy α\\nnow"},"options":{},'
+        '"target":{"worker_id":"worker-public-7"}}'
+    )
+    assert mutation.fingerprint == "92368719174890d8481f2a6d"
+
+
+def test_canonical_send_instruction_equates_selectors_after_resolution() -> None:
+    by_name = CommandRequest(
+        action="send_instruction",
+        request_id="request-by-name",
+        dry_run=False,
+        target={
+            "name": "Alpha",
+            "space_id": "space-one",
+            "worker_fingerprint": "transient-one",
+        },
+        instruction={"text": "exact text"},
+        params={"origin": {"source": "one"}, "ignored": None},
+    )
+    by_id = CommandRequest(
+        action="send_instruction",
+        request_id="request-by-id",
+        dry_run=False,
+        target={"worker_id": "selector-worker", "worker_fingerprint": "transient-two"},
+        instruction={"text": "exact text"},
+        params={"origin": "different"},
+    )
+
+    first = build_canonical_mutation(by_name, public_worker_id="resolved-worker")
+    second = build_canonical_mutation(by_id, public_worker_id="resolved-worker")
+
+    assert first.canonical_json == second.canonical_json
+    assert first.fingerprint == second.fingerprint
+    assert "request-by-name" not in first.canonical_json
+    assert "transient-one" not in first.canonical_json
+    assert "origin" not in first.canonical_json
+    assert '"options":{}' in first.canonical_json
+
+
+@pytest.mark.parametrize(
+    ("instruction_text", "public_worker_id"),
+    [
+        ("exact text changed", "resolved-worker"),
+        ("exact text", "different-worker"),
+    ],
+)
+def test_canonical_send_instruction_fingerprint_changes_for_semantics(
+    instruction_text: str,
+    public_worker_id: str,
+) -> None:
+    baseline_request = CommandRequest(
+        action="send_instruction",
+        request_id="baseline",
+        dry_run=False,
+        target={"worker_id": "selector"},
+        instruction={"text": "exact text"},
+    )
+    changed_request = CommandRequest(
+        action="send_instruction",
+        request_id="changed",
+        dry_run=False,
+        target={"worker_id": "selector"},
+        instruction={"text": instruction_text},
+    )
+    baseline = build_canonical_mutation(
+        baseline_request,
+        public_worker_id="resolved-worker",
+    )
+
+    changed = build_canonical_mutation(
+        changed_request,
+        public_worker_id=public_worker_id,
+    )
+
+    assert changed.fingerprint != baseline.fingerprint
+
+
+def test_build_canonical_answer_pending_has_hard_coded_v1_identity() -> None:
+    request = _answer_pending_request(request_id="not-canonical")
+
+    mutation = build_canonical_mutation(request, public_worker_id="worker-public-7")
+
+    assert mutation.canonical_version == 1
+    assert mutation.action == "answer_pending"
+    assert mutation.public_worker_id == "worker-public-7"
+    assert mutation.canonical_json == (
+        '{"action":"answer_pending","canonical_version":1,"options":{},'
+        '"pending":{"choice_id":"choice-public",'
+        '"pending_fingerprint":"pending-revision","pending_id":"pending-public"},'
+        '"target":{"worker_id":"worker-public-7"}}'
+    )
+    assert mutation.fingerprint == "1a88307fbc8afd0a1205eaca"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pending_id", "pending-public-changed"),
+        ("pending_fingerprint", "pending-revision-changed"),
+        ("choice_id", " choice-public "),
+    ],
+)
+def test_canonical_answer_pending_fingerprint_changes_for_exact_semantics(
+    field: str,
+    value: str,
+) -> None:
+    baseline = build_canonical_mutation(
+        _answer_pending_request(request_id="baseline"),
+        public_worker_id="worker-public-7",
+    )
+    params = {
+        "pending_id": "pending-public",
+        "pending_fingerprint": "pending-revision",
+        "choice_id": "choice-public",
+    }
+    params[field] = value
+    changed = build_canonical_mutation(
+        _answer_pending_request(request_id="changed", params=params),
+        public_worker_id="worker-public-7",
+    )
+
+    assert changed.fingerprint != baseline.fingerprint
 
 
 def test_command_envelope_shape_matches_contract() -> None:
@@ -467,8 +621,13 @@ def test_validate_send_instruction_requires_target_and_text() -> None:
     assert error["code"] == STATUS_INVALID_REQUEST
 
 
-@pytest.mark.parametrize("request_id", [None, "", "   \t"])
-def test_validate_send_instruction_non_dry_run_requires_nonblank_request_id(request_id: str | None) -> None:
+@pytest.mark.parametrize(
+    "request_id",
+    [None, "", "   \t", " leading", "trailing ", "\twrapped\t"],
+)
+def test_validate_send_instruction_non_dry_run_requires_canonical_request_id(
+    request_id: str | None,
+) -> None:
     request = CommandRequest(
         action="send_instruction",
         request_id=request_id,
@@ -480,6 +639,20 @@ def test_validate_send_instruction_non_dry_run_requires_nonblank_request_id(requ
     assert error is not None
     assert error["code"] == STATUS_INVALID_REQUEST
     assert "request_id" in error["message"]
+
+
+def test_validate_mutation_request_ids_preserve_internal_whitespace() -> None:
+    send = CommandRequest(
+        action="send_instruction",
+        request_id="opaque  request\tid",
+        dry_run=False,
+        target={"worker_id": "w-1"},
+        instruction={"text": "ok"},
+    )
+    answer = _answer_pending_request(request_id="opaque  request\tid")
+
+    assert validate_request(send) is None
+    assert validate_request(answer) is None
 
 
 def _answer_pending_request(
@@ -588,8 +761,11 @@ def test_validate_answer_pending_rejects_non_exact_shape(
     assert field in str(error)
 
 
-@pytest.mark.parametrize("request_id", [None, "", "   \t"])
-def test_validate_answer_pending_non_dry_run_requires_request_id(
+@pytest.mark.parametrize(
+    "request_id",
+    [None, "", "   \t", " leading", "trailing ", "\twrapped\t"],
+)
+def test_validate_answer_pending_non_dry_run_requires_canonical_request_id(
     request_id: str | None,
 ) -> None:
     error = validate_request(_answer_pending_request(request_id=request_id))

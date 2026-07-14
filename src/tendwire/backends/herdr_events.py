@@ -723,6 +723,15 @@ class HerdrEventBackend:
                 acknowledged_final_retention_count=(
                     self.config.acknowledged_final_retention_count
                 ),
+                command_retry_horizon_seconds=(
+                    self.config.command_retry_horizon_seconds
+                ),
+                command_receipt_retention_seconds=(
+                    self.config.command_receipt_retention_seconds
+                ),
+                command_receipt_retention_count=(
+                    self.config.command_receipt_retention_count
+                ),
                 cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
             snapshot_result = result.get("snapshot")

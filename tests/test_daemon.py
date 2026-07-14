@@ -21,7 +21,12 @@ import pytest
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.cli import main
 from tendwire.config import Config
-from tendwire.core.commands import STATUS_ACCEPTED, STATUS_INVALID_REQUEST, CommandEnvelope
+from tendwire.core.commands import (
+    STATUS_ACCEPTED,
+    STATUS_INVALID_REQUEST,
+    STATUS_PENDING,
+    CommandEnvelope,
+)
 from tendwire.core.models import (
     AttentionSignal,
     BackendHealth,
@@ -48,12 +53,12 @@ from tendwire.local_state import LocalStateError, LocalStateErrorCode, LocalStat
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     attention_payload_from_store,
-    get_command_receipt,
+    get_command_request,
     init_store,
     latest_snapshot,
     merge_backend_pending,
-    pending_payload_from_store,
     merge_turn_content,
+    pending_payload_from_store,
     save_snapshot,
     upsert_worker_bindings,
 )
@@ -1280,6 +1285,9 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         snapshot_maintenance_batch_size=6,
         store_maintenance_cadence_seconds=44,
         pending_stale_grace_seconds=31,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=77,
     )
     snapshot = project_from_raw(
         config,
@@ -1366,6 +1374,22 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "acknowledged_final_retention_count": 500,
         "storage_pressure": False,
     }
+    assert health["store"]["command_requests"] == {
+        "total": 0,
+        "states": {
+            "reserved": 0,
+            "send_started": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "uncertain": 0,
+        },
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": 120,
+        "retention_seconds": 691_200,
+        "retention_count": 77,
+        "storage_pressure": False,
+    }
     assert health["store"]["maintenance"] == {
         "last_completed_at": None,
         "status": "never",
@@ -1386,6 +1410,9 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         "outbox_claim_ttl_seconds": 33,
         "acknowledged_final_retention_days": 40,
         "acknowledged_final_retention_count": 500,
+        "command_retry_horizon_seconds": 120,
+        "command_receipt_retention_seconds": 691_200,
+        "command_receipt_retention_count": 77,
         "snapshot_retention_days": 9,
         "snapshot_retention_count": 70,
         "snapshot_maintenance_batch_size": 6,
@@ -1417,6 +1444,232 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
     }
     assert "health.db" not in encoded
     assert str(tmp_path) not in encoded
+    assert "sentinel-private" not in encoded
+    _assert_no_public_json_forbidden(health)
+
+
+def test_daemon_health_accepts_valid_command_request_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "valid-command-health.db"
+    config = Config(
+        host_id="command-health-host",
+        db_path=db_path,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=7,
+    )
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+    expected = {
+        "total": 15,
+        "states": {
+            "reserved": 1,
+            "send_started": 2,
+            "accepted": 3,
+            "rejected": 4,
+            "uncertain": 5,
+        },
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": 120,
+        "retention_seconds": 691_200,
+        "retention_count": 7,
+        "storage_pressure": False,
+    }
+
+    def valid_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["command_requests"] = expected
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", valid_status)
+    health = TendwireDaemon(config).get_health()
+
+    assert health["status"] == "ok"
+    assert health["store"]["status"] == "healthy"
+    assert health["store"]["command_requests"] == expected
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "retry_policy",
+        "retention_policy",
+        "count_policy",
+        "state_type",
+        "total",
+        "stale_active",
+        "eligible",
+        "pressure",
+        "shape",
+    ],
+)
+def test_daemon_health_rejects_invalid_command_request_aggregate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / f"invalid-command-health-{case}.db"
+    config = Config(
+        host_id="command-health-host",
+        db_path=db_path,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=7,
+    )
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+
+    def invalid_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        aggregate = payload["command_requests"]
+        if case == "retry_policy":
+            aggregate["retry_horizon_seconds"] = 121
+        elif case == "retention_policy":
+            aggregate["retention_seconds"] = 691_201
+        elif case == "count_policy":
+            aggregate["retention_count"] = 8
+        elif case == "state_type":
+            aggregate["states"]["reserved"] = True
+        elif case == "total":
+            aggregate["total"] = 1
+        elif case == "stale_active":
+            aggregate["states"]["reserved"] = 1
+            aggregate["total"] = 1
+            aggregate["stale_active"] = 1
+            aggregate["storage_pressure"] = True
+        elif case == "eligible":
+            aggregate["eligible"] = 1
+            aggregate["storage_pressure"] = True
+        elif case == "pressure":
+            aggregate["storage_pressure"] = True
+        else:
+            del aggregate["eligible"]
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", invalid_status)
+    health = TendwireDaemon(config).get_health()
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "unavailable"
+    assert health["store"]["command_requests"] == {
+        "total": 0,
+        "states": {
+            "reserved": 0,
+            "send_started": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "uncertain": 0,
+        },
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": 120,
+        "retention_seconds": 691_200,
+        "retention_count": 7,
+        "storage_pressure": False,
+    }
+
+
+def test_daemon_health_degrades_on_command_request_storage_pressure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "command-pressure.db"
+    config = Config(
+        host_id="command-pressure-host",
+        db_path=db_path,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=2,
+    )
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+
+    def pressured_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["command_requests"] = {
+            "total": 4,
+            "states": {
+                "reserved": 1,
+                "send_started": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "uncertain": 3,
+            },
+            "stale_active": 0,
+            "eligible": 1,
+            "retry_horizon_seconds": 120,
+            "retention_seconds": 691_200,
+            "retention_count": 2,
+            "storage_pressure": True,
+        }
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", pressured_status)
+    health = TendwireDaemon(config).get_health()
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "degraded"
+    assert health["store"]["command_requests"]["eligible"] == 1
+    assert health["store"]["command_requests"]["storage_pressure"] is True
+
+
+def test_daemon_health_command_request_aggregate_never_exposes_row_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.store import sqlite as store_sqlite
+
+    db_path = tmp_path / "private-command-health.db"
+    config = Config(host_id="command-health-host", db_path=db_path)
+    init_store(db_path)
+    save_snapshot(db_path, project_from_raw(config, workers=[]))
+    real_status = store_sqlite.store_status
+    private_fields = {
+        "id": "sentinel-private-id",
+        "request_id": "sentinel-private-request",
+        "action": "sentinel-private-action",
+        "canonical_request_json": "sentinel-private-canonical-json",
+        "canonical_fingerprint": "sentinel-private-canonical-fingerprint",
+        "result": "sentinel-private-result",
+        "worker": "sentinel-private-worker",
+        "binding": "sentinel-private-binding",
+    }
+
+    def private_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = real_status(*args, **kwargs)
+        payload["command_requests"].update(private_fields)
+        return payload
+
+    monkeypatch.setattr(store_sqlite, "store_status", private_status)
+    health = TendwireDaemon(config).get_health()
+    command_requests = health["store"]["command_requests"]
+    encoded = json.dumps(health, sort_keys=True)
+
+    assert health["status"] == "degraded"
+    assert health["store"]["status"] == "unavailable"
+    assert set(command_requests) == {
+        "total",
+        "states",
+        "stale_active",
+        "eligible",
+        "retry_horizon_seconds",
+        "retention_seconds",
+        "retention_count",
+        "storage_pressure",
+    }
+    assert not set(private_fields).intersection(command_requests)
     assert "sentinel-private" not in encoded
     _assert_no_public_json_forbidden(health)
 
@@ -1558,6 +1811,22 @@ def test_daemon_health_degrades_on_public_safe_final_storage_pressure(
                 "row_id": 987,
                 "private_state_json": "sentinel-private-state",
                 "source_path": str(tmp_path / "sentinel-private-source"),
+            },
+            "command_requests": {
+                "total": 0,
+                "states": {
+                    "reserved": 0,
+                    "send_started": 0,
+                    "accepted": 0,
+                    "rejected": 0,
+                    "uncertain": 0,
+                },
+                "stale_active": 0,
+                "eligible": 0,
+                "retry_horizon_seconds": config.command_retry_horizon_seconds,
+                "retention_seconds": config.command_receipt_retention_seconds,
+                "retention_count": config.command_receipt_retention_count,
+                "storage_pressure": False,
             },
         }
         return payload
@@ -1749,8 +2018,11 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         store_maintenance_cadence_seconds=91,
         acknowledged_final_retention_days=33,
         acknowledged_final_retention_count=456,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=77,
     )
-    calls: list[tuple[Path, Any, int, int, int]] = []
+    calls: list[tuple[Path, Any, int, int, int, int, int, int]] = []
 
     def observe(_config: Config) -> Snapshot:
         snapshot = _public_snapshot()
@@ -1763,6 +2035,9 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         policy: Any,
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
+        command_retry_horizon_seconds: int = 604_800,
+        command_receipt_retention_seconds: int = 2_592_000,
+        command_receipt_retention_count: int = 4096,
         cadence_seconds: int = 3600,
         now: str | None = None,
     ) -> dict[str, Any]:
@@ -1773,6 +2048,9 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
                 policy,
                 acknowledged_final_retention_days,
                 acknowledged_final_retention_count,
+                command_retry_horizon_seconds,
+                command_receipt_retention_seconds,
+                command_receipt_retention_count,
                 cadence_seconds,
             )
         )
@@ -1810,7 +2088,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         daemon.stop()
 
     assert len(calls) == 1
-    path, policy, final_days, final_count, cadence = calls[0]
+    path, policy, final_days, final_count, retry_horizon, retention_seconds, retention_count, cadence = calls[0]
     assert path == db_path
     assert (
         policy.retention_days,
@@ -1818,8 +2096,11 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         policy.batch_size,
         final_days,
         final_count,
+        retry_horizon,
+        retention_seconds,
+        retention_count,
         cadence,
-    ) == (21, 123, 17, 33, 456, 91)
+    ) == (21, 123, 17, 33, 456, 120, 691_200, 77, 91)
     assert health["store"]["maintenance"]["last_check"] == {
         "ok": True,
         "status": "not_due",
@@ -4020,9 +4301,10 @@ def test_daemon_shutdown_is_bounded_closes_active_socket_and_reaps_executor(
     assert remaining == set()
 
 
-def test_daemon_command_submit_uses_existing_receipt_idempotency(
+def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
     tmp_path: Path,
     monkeypatch,
+    capsys,
 ) -> None:
     db_path = tmp_path / "commands.db"
     socket_path = tmp_path / "commands.sock"
@@ -4095,6 +4377,21 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
         "tendwire.command_submission._default_socket_client_factory",
         lambda config: FakeHerdrSocketClient(),
     )
+    from tendwire import command_submission
+
+    real_reserve = command_submission.reserve_command_request
+    reservation_barrier = threading.Barrier(2, timeout=5)
+
+    def synchronized_reserve(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = real_reserve(*args, **kwargs)
+        reservation_barrier.wait()
+        return result
+
+    monkeypatch.setattr(
+        command_submission,
+        "reserve_command_request",
+        synchronized_reserve,
+    )
 
     daemon = TendwireDaemon(
         config,
@@ -4104,7 +4401,6 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
     thread = threading.Thread(target=daemon.serve_forever)
     thread.start()
     try:
-        client = DaemonAPIClient(socket_path)
         request = {
             "schema_version": 1,
             "action": "send_instruction",
@@ -4113,14 +4409,41 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
             "target": {"worker_id": "w-1"},
             "instruction": {"text": "hello"},
         }
-        first = client.request("command.submit", request)
-        second = client.request("command.submit", request)
+        start_barrier = threading.Barrier(3, timeout=5)
+        results: list[dict[str, Any] | None] = [None, None]
+        errors: list[BaseException] = []
 
-        assert first["ok"] is True
-        assert first["result"]["status"] == STATUS_ACCEPTED
-        assert second["ok"] is True
-        assert second["result"]["status"] == STATUS_ACCEPTED
+        def submit(index: int) -> None:
+            try:
+                start_barrier.wait()
+                results[index] = DaemonAPIClient(
+                    socket_path,
+                    timeout_seconds=5,
+                ).request("command.submit", request)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        clients = [
+            threading.Thread(target=submit, args=(index,))
+            for index in range(2)
+        ]
+        for client_thread in clients:
+            client_thread.start()
+        start_barrier.wait()
+        for client_thread in clients:
+            client_thread.join(timeout=5)
+
+        assert errors == []
+        assert all(not client_thread.is_alive() for client_thread in clients)
+        responses = [result for result in results if result is not None]
+        assert len(responses) == 2
+        assert all(response["ok"] is True for response in responses)
+        assert sorted(response["result"]["status"] for response in responses) == [
+            STATUS_ACCEPTED,
+            STATUS_PENDING,
+        ]
         assert calls == [
+            {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
@@ -4128,10 +4451,46 @@ def test_daemon_command_submit_uses_existing_receipt_idempotency(
             {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
         ]
-        assert get_command_receipt(db_path, "cmd-host", "req-1", "send_instruction") is not None
-        assert "agent-private" not in json.dumps(first)
-        assert "pane-private" not in json.dumps(first)
-        _assert_no_public_json_forbidden(first)
+        receipt = get_command_request(db_path, "cmd-host", "req-1")
+        assert receipt is not None
+        assert receipt["state"] == "accepted"
+        assert receipt["status"] == STATUS_ACCEPTED
+        assert receipt["terminal_at"] is not None
+
+        monkeypatch.setattr(
+            command_submission,
+            "reserve_command_request",
+            real_reserve,
+        )
+        replay = DaemonAPIClient(socket_path).request("command.submit", request)
+        assert replay["ok"] is True
+        assert replay["result"]["status"] == STATUS_ACCEPTED
+        monkeypatch.setenv("TENDWIRE_DATA_DIR", str(tmp_path / "cli-state"))
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
+        cli_code = main(
+            [
+                "--host-id",
+                "cmd-host",
+                "--socket-path",
+                str(socket_path),
+                "command",
+                "--json",
+                "--db-path",
+                str(db_path),
+            ]
+        )
+        captured = capsys.readouterr()
+        cli_result = json.loads(captured.out)
+        assert cli_code == 0
+        assert captured.err == ""
+        assert cli_result == replay["result"]
+        _assert_no_public_json_forbidden(cli_result)
+        assert len([call for call in calls if call["method"] == "pane.send_text"]) == 1
+        for response in [*responses, replay]:
+            encoded = json.dumps(response)
+            assert "agent-private" not in encoded
+            assert "pane-private" not in encoded
+            _assert_no_public_json_forbidden(response)
     finally:
         daemon.stop()
         thread.join(timeout=2)

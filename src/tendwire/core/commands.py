@@ -53,7 +53,6 @@ STATUS_BACKEND_UNSUPPORTED = "backend_unsupported"
 STATUS_AMBIGUOUS_BACKEND_TARGET = "ambiguous_backend_target"
 STATUS_BACKEND_FAILED = "backend_failed"
 STATUS_DUPLICATE_REQUEST = "duplicate_request"
-STATUS_DUPLICATE_INSTRUCTION = "duplicate_instruction"
 STATUS_REQUEST_STATE_UNCERTAIN = "request_state_uncertain"
 STATUS_INVALID_REQUEST = "invalid_request"
 STATUS_PENDING = "pending"
@@ -74,7 +73,6 @@ VALID_STATUSES = frozenset(
         STATUS_AMBIGUOUS_BACKEND_TARGET,
         STATUS_BACKEND_FAILED,
         STATUS_DUPLICATE_REQUEST,
-        STATUS_DUPLICATE_INSTRUCTION,
         STATUS_REQUEST_STATE_UNCERTAIN,
         STATUS_INVALID_REQUEST,
         STATUS_PENDING,
@@ -238,8 +236,16 @@ def _target_has_explicit_selector(target: dict[str, Any] | None) -> bool:
 
 
 def has_nonblank_request_id(value: str | None) -> bool:
-    """Return True when request_id is present and not only whitespace."""
-    return isinstance(value, str) and bool(value.strip())
+    """Return True for a nonblank request ID with canonical edge whitespace.
+
+    Request IDs are otherwise opaque: internal whitespace and every other
+    validated character remain exact idempotency-key bytes.
+    """
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+    )
 
 
 def _validate_instruction_shape(instruction: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -292,7 +298,13 @@ class CommandRequest:
         }
 
     def payload_fingerprint(self) -> str:
-        """Return a stable fingerprint of this request for idempotency receipts."""
+        """Return the legacy raw-request fingerprint used by compatibility callers.
+
+        This includes request identity and unresolved selector spelling, so it is
+        not authoritative for mutating-command idempotency.  New mutation
+        persistence must use :func:`build_canonical_mutation` after resolving the
+        public worker identity.
+        """
         return stable_fingerprint(self.to_dict())
 
     @classmethod
@@ -306,6 +318,75 @@ class CommandRequest:
             instruction=data.get("instruction"),
             params=data.get("params"),
         )
+
+
+CANONICAL_MUTATION_VERSION = 1
+
+
+@dataclass(frozen=True)
+class CanonicalMutation:
+    """One resolved public mutation and its authoritative canonical identity."""
+
+    canonical_version: int
+    action: str
+    public_worker_id: str
+    canonical_json: str
+    fingerprint: str
+
+
+def build_canonical_mutation(
+    request: CommandRequest,
+    *,
+    public_worker_id: str,
+) -> CanonicalMutation:
+    """Build canonical v1 identity after authoritative public-worker resolution.
+
+    Request IDs, dry-run state, unresolved selectors, worker observation
+    fingerprints, connector origin metadata, and private binding data are
+    intentionally outside this representation.
+    """
+    if not isinstance(request, CommandRequest):
+        raise TypeError("request must be a CommandRequest")
+    if request.action not in {"send_instruction", "answer_pending"}:
+        raise ValueError("canonical mutations require send_instruction or answer_pending")
+    if request.dry_run is not False:
+        raise ValueError("canonical mutations require a non-dry-run request")
+    request_error = validate_request(request)
+    if request_error is not None:
+        raise ValueError(str(request_error.get("message") or "invalid command request"))
+    if not isinstance(public_worker_id, str) or not public_worker_id.strip():
+        raise ValueError("public_worker_id must be a nonblank string")
+
+    if request.action == "send_instruction":
+        assert request.instruction is not None
+        canonical_payload: dict[str, Any] = {
+            "canonical_version": CANONICAL_MUTATION_VERSION,
+            "action": "send_instruction",
+            "target": {"worker_id": public_worker_id},
+            "instruction": {"text": request.instruction["text"]},
+            "options": {},
+        }
+    else:
+        assert request.params is not None
+        canonical_payload = {
+            "canonical_version": CANONICAL_MUTATION_VERSION,
+            "action": "answer_pending",
+            "target": {"worker_id": public_worker_id},
+            "pending": {
+                "pending_id": request.params["pending_id"],
+                "pending_fingerprint": request.params["pending_fingerprint"],
+                "choice_id": request.params["choice_id"],
+            },
+            "options": {},
+        }
+
+    return CanonicalMutation(
+        canonical_version=CANONICAL_MUTATION_VERSION,
+        action=request.action,
+        public_worker_id=public_worker_id,
+        canonical_json=stable_json_dumps(canonical_payload),
+        fingerprint=stable_fingerprint(canonical_payload),
+    )
 
 
 def validate_request(request: CommandRequest) -> dict[str, Any] | None:

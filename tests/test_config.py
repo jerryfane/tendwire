@@ -9,6 +9,11 @@ import sys
 import pytest
 
 from tendwire.config import (
+    DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
+    DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
+    DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
+    MAX_COMMAND_RETRY_HORIZON_SECONDS,
+    MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
     DEFAULT_TURN_REFRESH_WORKERS,
     MAX_MAINTENANCE_CADENCE_SECONDS,
@@ -28,6 +33,9 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
         "TENDWIRE_MAX_WORKERS",
         "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
         "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
+        "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
+        "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
+        "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -40,6 +48,9 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     assert config.max_workers == 512
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
+    assert config.command_retry_horizon_seconds == 604_800
+    assert config.command_receipt_retention_seconds == 2_592_000
+    assert config.command_receipt_retention_count == 4096
 
 
 def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
@@ -50,6 +61,9 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS", "45")
+    monkeypatch.setenv("TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS", "120")
+    monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS", "691200")
+    monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT", "99")
 
     env_config = load_config()
     explicit = load_config(
@@ -60,8 +74,10 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         max_workers="9",
         max_outbox_attempts="4",
         connector_claim_ttl_seconds="15",
+        command_retry_horizon_seconds="60",
+        command_receipt_retention_seconds="691200",
+        command_receipt_retention_count="12",
     )
-
     assert env_config.event_debounce_seconds == 0.25
     assert env_config.reconcile_interval_seconds == 0
     assert env_config.event_retention_days == 14
@@ -69,6 +85,9 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
     assert env_config.connector_claim_ttl_seconds == 45
+    assert env_config.command_retry_horizon_seconds == 120
+    assert env_config.command_receipt_retention_seconds == 691_200
+    assert env_config.command_receipt_retention_count == 99
     assert explicit.event_debounce_seconds == 0.1
     assert explicit.reconcile_interval_seconds == 5
     assert explicit.event_retention_days == 2
@@ -76,6 +95,9 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert explicit.max_workers == 9
     assert explicit.max_outbox_attempts == 4
     assert explicit.connector_claim_ttl_seconds == 15
+    assert explicit.command_retry_horizon_seconds == 60
+    assert explicit.command_receipt_retention_seconds == 691_200
+    assert explicit.command_receipt_retention_count == 12
 
 
 @pytest.mark.parametrize(
@@ -191,6 +213,87 @@ def test_retention_policies_reject_values_above_sqlite_time_bounds(
 ) -> None:
     with pytest.raises(ValueError, match=rf"{field} must be <= {maximum}"):
         Config(**{field: value})
+
+
+COMMAND_RECEIPT_ENV_NAMES = (
+    "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
+    "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
+    "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
+)
+
+
+def test_command_receipt_retention_defaults_and_constants(monkeypatch) -> None:
+    for name in COMMAND_RECEIPT_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    config = load_config()
+    assert DEFAULT_COMMAND_RETRY_HORIZON_SECONDS == 604_800
+    assert DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS == 2_592_000
+    assert DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT == 4096
+    assert MIN_COMMAND_RECEIPT_RETENTION_SECONDS == 691_200
+    assert config.command_retry_horizon_seconds == DEFAULT_COMMAND_RETRY_HORIZON_SECONDS
+    assert (
+        config.command_receipt_retention_seconds
+        == DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS
+    )
+    assert (
+        config.command_receipt_retention_count
+        == DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "command_retry_horizon_seconds",
+            MAX_COMMAND_RETRY_HORIZON_SECONDS + 1,
+            rf"command_retry_horizon_seconds must be <= {MAX_COMMAND_RETRY_HORIZON_SECONDS}",
+        ),
+        (
+            "command_receipt_retention_seconds",
+            0,
+            "command_receipt_retention_seconds must be >= 1",
+        ),
+        (
+            "command_receipt_retention_seconds",
+            MIN_COMMAND_RECEIPT_RETENTION_SECONDS - 1,
+            rf"command_receipt_retention_seconds must be >= {MIN_COMMAND_RECEIPT_RETENTION_SECONDS}",
+        ),
+        (
+            "command_receipt_retention_count",
+            True,
+            "command_receipt_retention_count must be an integer >= 1",
+        ),
+    ],
+)
+def test_command_receipt_retention_rejects_invalid_bounds(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Config(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("horizon", "retention"),
+    [(604_800, 604_800), (604_800, 604_799), (10, 1)],
+)
+def test_command_receipt_retention_must_strictly_exceed_retry_horizon(
+    horizon: int,
+    retention: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "command_receipt_retention_seconds must be greater than "
+            "command_retry_horizon_seconds"
+        ),
+    ):
+        Config(
+            command_retry_horizon_seconds=horizon,
+            command_receipt_retention_seconds=retention,
+        )
 
 
 TURN_REFRESH_ENV_NAMES = (

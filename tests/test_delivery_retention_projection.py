@@ -165,7 +165,7 @@ def _turn_rows_snapshot(db_path: Path) -> tuple[tuple[Any, ...], ...]:
 
 def _assert_continuity_integrity(db_path: Path) -> None:
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone() == (11,)
+        assert conn.execute("PRAGMA user_version").fetchone() == (store_sqlite.STORE_SCHEMA_VERSION,) == (12,)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         current_counts = conn.execute(
             """
@@ -1158,7 +1158,7 @@ def test_stale_different_fingerprint_snapshot_cannot_regress_or_prune_projection
 def test_same_owner_exact_source_survives_worker_fingerprint_space_and_source_churn_without_rekey_or_repost(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "existing-v11-owner-continuity.db"
+    db_path = tmp_path / "existing-v12-owner-continuity.db"
     first = _owner_snapshot(
         db_path,
         worker_id="worker-a",
@@ -1320,14 +1320,14 @@ def test_same_owner_exact_source_survives_worker_fingerprint_space_and_source_ch
         ),
     ],
 )
-def test_existing_v11_legacy_source_token_dual_matches_only_exact_owner(
+def test_existing_v12_legacy_source_token_dual_matches_only_exact_owner(
     tmp_path: Path,
     replacement_key: str | None,
     expected_source_count: int,
     expected_root_kinds: tuple[str, ...],
 ) -> None:
     label = replacement_key[-1] if replacement_key is not None else "missing"
-    db_path = tmp_path / f"existing-v11-legacy-token-{label}.db"
+    db_path = tmp_path / f"existing-v12-legacy-token-{label}.db"
     first = _owner_snapshot(
         db_path,
         worker_id="worker-a",
@@ -1427,7 +1427,7 @@ def test_existing_v11_legacy_source_token_dual_matches_only_exact_owner(
 def test_exact_owner_source_ambiguity_rolls_back_turn_pending_and_graph(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "existing-v11-source-ambiguity.db"
+    db_path = tmp_path / "existing-v12-source-ambiguity.db"
     first = _owner_snapshot(
         db_path,
         worker_id="worker-a",

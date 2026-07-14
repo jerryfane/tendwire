@@ -26,6 +26,11 @@ DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
 DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
+DEFAULT_COMMAND_RETRY_HORIZON_SECONDS = 604_800
+DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS = 2_592_000
+DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT = 4096
+MAX_COMMAND_RETRY_HORIZON_SECONDS = 604_800
+MIN_COMMAND_RECEIPT_RETENTION_SECONDS = 691_200
 DEFAULT_SNAPSHOT_RETENTION_DAYS = 14
 DEFAULT_SNAPSHOT_RETENTION_COUNT = 4096
 DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 100
@@ -59,6 +64,9 @@ class Config:
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
     acknowledged_final_retention_days: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS
     acknowledged_final_retention_count: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT
+    command_retry_horizon_seconds: int = DEFAULT_COMMAND_RETRY_HORIZON_SECONDS
+    command_receipt_retention_seconds: int = DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS
+    command_receipt_retention_count: int = DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT
     snapshot_retention_days: int = DEFAULT_SNAPSHOT_RETENTION_DAYS
     snapshot_retention_count: int = DEFAULT_SNAPSHOT_RETENTION_COUNT
     snapshot_maintenance_batch_size: int = DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE
@@ -177,6 +185,46 @@ class Config:
                 maximum=MAX_SQLITE_INTEGER,
             ),
         )
+        object.__setattr__(
+            self,
+            "command_retry_horizon_seconds",
+            _bounded_positive_int(
+                self.command_retry_horizon_seconds,
+                "command_retry_horizon_seconds",
+                maximum=MAX_COMMAND_RETRY_HORIZON_SECONDS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "command_receipt_retention_seconds",
+            _bounded_positive_int(
+                self.command_receipt_retention_seconds,
+                "command_receipt_retention_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "command_receipt_retention_count",
+            _bounded_positive_int(
+                self.command_receipt_retention_count,
+                "command_receipt_retention_count",
+                maximum=MAX_SQLITE_INTEGER,
+            ),
+        )
+        if self.command_receipt_retention_seconds <= self.command_retry_horizon_seconds:
+            raise ValueError(
+                "command_receipt_retention_seconds must be greater than "
+                "command_retry_horizon_seconds"
+            )
+        if (
+            self.command_receipt_retention_seconds
+            < MIN_COMMAND_RECEIPT_RETENTION_SECONDS
+        ):
+            raise ValueError(
+                "command_receipt_retention_seconds must be >= "
+                f"{MIN_COMMAND_RECEIPT_RETENTION_SECONDS}"
+            )
         object.__setattr__(
             self,
             "snapshot_retention_days",
@@ -310,6 +358,9 @@ def load_config(
     connector_claim_ttl_seconds: int | str | None = None,
     acknowledged_final_retention_days: int | str | None = None,
     acknowledged_final_retention_count: int | str | None = None,
+    command_retry_horizon_seconds: int | str | None = None,
+    command_receipt_retention_seconds: int | str | None = None,
+    command_receipt_retention_count: int | str | None = None,
     snapshot_retention_days: int | str | None = None,
     snapshot_retention_count: int | str | None = None,
     snapshot_maintenance_batch_size: int | str | None = None,
@@ -437,6 +488,21 @@ def load_config(
             acknowledged_final_retention_count,
             "TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT",
             DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+        ),
+        command_retry_horizon_seconds=_resolve_value(
+            command_retry_horizon_seconds,
+            "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
+            DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
+        ),
+        command_receipt_retention_seconds=_resolve_value(
+            command_receipt_retention_seconds,
+            "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
+            DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
+        ),
+        command_receipt_retention_count=_resolve_value(
+            command_receipt_retention_count,
+            "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
+            DEFAULT_COMMAND_RECEIPT_RETENTION_COUNT,
         ),
         snapshot_retention_days=_resolve_value(
             snapshot_retention_days,

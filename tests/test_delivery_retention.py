@@ -12,17 +12,25 @@ from typing import Any
 import pytest
 
 from tendwire.config import Config
+from tendwire.core.commands import (
+    STATUS_ACCEPTED,
+    CommandEnvelope,
+    CommandRequest,
+    build_canonical_mutation,
+)
 from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import turn_final_delivery_identity
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     cleanup_acknowledged_final_retention,
-    get_command_receipt,
+    finish_command_request,
+    get_command_request,
     init_store,
+    mark_command_send_started,
     merge_turn_content,
     reclaim_expired_connector_leases,
-    save_command_receipt,
+    reserve_command_request,
     save_snapshot,
     store_status,
     turns_payload_from_store,
@@ -711,25 +719,56 @@ def test_completed_command_receipt_does_not_release_command_linked_pending_turn(
         observed_at="2026-01-01T00:00:00+00:00",
     )
     assert pending is not None
-    save_command_receipt(
-        db_path,
-        HOST_ID,
-        "request-pending-1",
-        "send",
-        "fingerprint-1",
-        "accepted",
-        '{"status":"accepted"}',
-        uncertain=False,
+    request = CommandRequest(
+        action="send_instruction",
+        request_id="request-pending-1",
+        dry_run=False,
+        target={"worker_id": WORKER_ID},
+        instruction={"text": "keep this command pending"},
     )
-    receipt = get_command_receipt(
-        db_path,
-        HOST_ID,
-        "request-pending-1",
-        "send",
+    canonical = build_canonical_mutation(request, public_worker_id=WORKER_ID)
+    accepted = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result={"worker_id": WORKER_ID},
     )
+    reservation = reserve_command_request(
+        db_path,
+        host_id=HOST_ID,
+        request_id=request.request_id or "",
+        action=request.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=accepted.to_json(),
+    )
+    owner_token = reservation["owner_token"]
+    assert isinstance(owner_token, str)
+    assert mark_command_send_started(
+        db_path,
+        host_id=HOST_ID,
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        binding_fingerprint="retention-binding",
+    )["status"] == "send_started"
+    assert finish_command_request(
+        db_path,
+        host_id=HOST_ID,
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        expected_state="send_started",
+        terminal_state="accepted",
+        status=STATUS_ACCEPTED,
+        result_json=accepted.to_json(),
+    )["status"] == "accepted"
+    receipt = get_command_request(db_path, HOST_ID, "request-pending-1")
     assert receipt is not None
     assert receipt["status"] == "accepted"
-    assert receipt["uncertain"] is False
+    assert receipt["state"] == "accepted"
 
     _merge_final(
         db_path,

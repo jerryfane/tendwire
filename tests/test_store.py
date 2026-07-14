@@ -12,7 +12,7 @@ import sqlite3
 import stat
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,17 +39,21 @@ from tendwire.store.sqlite import (
     SnapshotObservationContext,
     CompactionOptions,
     ack_connector_delivery,
+    backend_pending_choice_terminal_effect,
     append_event,
     attention_payload_from_store,
     cleanup_event_retention,
     cleanup_acknowledged_final_retention,
+    command_pending_turn_terminal_effect,
     compact_store,
     defer_connector_delivery,
     exhaust_connector_retries,
     expire_stale_worker_bindings,
     expire_worker_bindings,
     fail_connector_delivery,
-    get_command_receipt,
+    cleanup_command_request_retention,
+    finish_command_request,
+    get_command_request,
     init_store,
     latest_snapshot,
     list_attention_items,
@@ -57,10 +61,11 @@ from tendwire.store.sqlite import (
     list_worker_bindings,
     reclaim_expired_connector_leases,
     poll_connector_outbox,
-    reserve_command_receipt,
+    mark_command_send_started,
+    reserve_command_request,
+    reserve_terminal_command_replay,
     resolve_worker_binding,
     run_store_maintenance,
-    save_command_receipt,
     save_snapshot,
     store_status,
     tail_event_metadata,
@@ -275,24 +280,17 @@ def _invoke_creation_capable_store_path(name: str, db_path: Path) -> None:
             backend="herdr",
             current_private_fingerprints=[],
         )
-    elif name == "reserve_command_receipt":
-        reserve_command_receipt(
+    elif name == "reserve_command_request":
+        reserve_command_request(
             db_path,
-            "host-a",
-            "request-1",
-            "send_instruction",
-            "payload-fingerprint",
-            '{"status":"pending"}',
-        )
-    elif name == "save_command_receipt":
-        save_command_receipt(
-            db_path,
-            "host-a",
-            "request-1",
-            "send_instruction",
-            "payload-fingerprint",
-            STATUS_ACCEPTED,
-            '{"status":"accepted"}',
+            host_id="host-a",
+            request_id="request-1",
+            action="send_instruction",
+            canonical_version=1,
+            canonical_fingerprint="payload-fingerprint",
+            canonical_request_json='{"action":"send_instruction"}',
+            public_worker_id="worker-1",
+            pending_result_json='{"status":"pending"}',
         )
     else:
         raise AssertionError(f"unknown creation-capable path: {name}")
@@ -609,8 +607,7 @@ def test_store_reads_do_not_invoke_local_state_mutation_for_absent_sidecars(
         "upsert_worker_bindings",
         "expire_worker_bindings",
         "expire_stale_worker_bindings",
-        "reserve_command_receipt",
-        "save_command_receipt",
+        "reserve_command_request",
     ],
 )
 def test_every_creation_capable_store_path_prepares_private_sqlite_state(
@@ -1341,16 +1338,45 @@ def test_store_initializes_v8_schema_with_companion_attention_lifecycle(tmp_path
             "target_value",
             "expires_at",
         } <= binding_indexed
-        command_columns = {row[1] for row in conn.execute("PRAGMA table_info(commands)")}
+        command_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(commands)")
+        }
         assert {
             "host_id",
             "request_id",
             "action",
-            "payload_fingerprint",
+            "canonical_version",
+            "canonical_fingerprint",
+            "public_worker_id",
+            "state",
             "status",
+            "request_json",
             "result_json",
-            "uncertain",
-        } <= command_columns
+            "reserved_at",
+            "send_started_at",
+            "terminal_at",
+            "updated_at",
+            "legacy_collision",
+            "legacy_collision_count",
+        } == command_columns - {"id", "created_at"}
+        receipt_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(command_receipts)")
+        }
+        assert {
+            "canonical_version",
+            "canonical_fingerprint",
+            "canonical_request_json",
+            "public_worker_id",
+            "state",
+            "owner_token_hash",
+            "owner_expires_at",
+            "binding_fingerprint",
+            "reserved_at",
+            "send_started_at",
+            "terminal_at",
+            "updated_at",
+        } <= receipt_columns
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         attention_columns = {row[1] for row in conn.execute("PRAGMA table_info(attention_items)")}
         assert {
             "attention_id",
@@ -1511,13 +1537,27 @@ def test_store_command_receipts_have_unique_logical_key_index(tmp_path: Path) ->
     init_store(db_path)
 
     with sqlite3.connect(str(db_path)) as conn:
-        indexes = _unique_index_columns(conn, "command_receipts")
+        receipt_indexes = _unique_index_columns(conn, "command_receipts")
+        command_indexes = _unique_index_columns(conn, "commands")
+        receipt_index_names = {
+            row[1] for row in conn.execute("PRAGMA index_list(command_receipts)")
+        }
+        command_index_names = {
+            row[1] for row in conn.execute("PRAGMA index_list(commands)")
+        }
 
-    assert indexes["ux_command_receipts_host_request_action"] == (
+    assert receipt_indexes["ux_command_receipts_host_request"] == (
         "host_id",
         "request_id",
-        "action",
     )
+    assert command_indexes["ux_commands_host_request"] == (
+        "host_id",
+        "request_id",
+    )
+    assert "idx_command_receipts_host_state_terminal" in receipt_index_names
+    assert "idx_commands_host_state_updated" in command_index_names
+    assert "ux_command_receipts_host_request_action" not in receipt_index_names
+    assert "ux_commands_host_request_action" not in command_index_names
 
 
 def test_store_status_tail_and_retention_cleanup_are_host_scoped_and_bounded(tmp_path: Path) -> None:
@@ -1839,14 +1879,38 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
         {"note": unsafe_value, "pane_id": "private-pane"},
         sort_keys=True,
     )
-    save_command_receipt(
+    reservation = reserve_command_request(
         db_path,
         host_id="public-host",
         request_id="private-receipt",
         action="send_instruction",
-        payload_fingerprint="private-receipt-fingerprint",
+        canonical_version=1,
+        canonical_fingerprint="private-receipt-fingerprint",
+        canonical_request_json='{"action":"send_instruction"}',
+        public_worker_id="worker-public",
+        pending_result_json='{"status":"pending"}',
+        now="2026-01-01T00:01:00+00:00",
+    )
+    started = mark_command_send_started(
+        db_path,
+        host_id="public-host",
+        request_id="private-receipt",
+        canonical_fingerprint="private-receipt-fingerprint",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding-fingerprint",
+        now="2026-01-01T00:01:01+00:00",
+    )
+    finish_command_request(
+        db_path,
+        host_id="public-host",
+        request_id="private-receipt",
+        canonical_fingerprint="private-receipt-fingerprint",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
         status="accepted",
         result_json=private_result_json,
+        now="2026-01-01T00:01:02+00:00",
     )
 
     assert merge_turn_content(
@@ -2015,11 +2079,10 @@ def test_store_public_json_boundaries_share_recursive_sanitizer(
         backend="private-backend",
     )
     assert private_bindings[0].target_value == unsafe_value
-    receipt = get_command_receipt(
+    receipt = get_command_request(
         db_path,
         "public-host",
         "private-receipt",
-        "send_instruction",
     )
     assert receipt is not None
     assert json.loads(receipt["result_json"])["note"] == unsafe_value
@@ -2333,11 +2396,10 @@ def test_store_migrates_partial_v3_db_with_legacy_data_idempotently(tmp_path: Pa
         assert conn.execute("SELECT COUNT(*) FROM worker_bindings").fetchone()[0] == 1
         command = conn.execute(
             """
-            SELECT status, payload_fingerprint, result_json
+            SELECT status, canonical_fingerprint, result_json
             FROM commands
             WHERE host_id = 'legacy-host'
               AND request_id = 'legacy-req'
-              AND action = 'send_instruction'
             """
         ).fetchone()
 
@@ -4571,268 +4633,1608 @@ def test_store_save_latest_host_scope_and_list_hosts(tmp_path: Path) -> None:
     assert list_hosts(db_path) == ["host-a", "host-b"]
 
 
-def test_store_command_receipts_track_idempotency(tmp_path: Path) -> None:
-    db_path = tmp_path / "tendwire.db"
+def _reserve_test_request(
+    db_path: Path,
+    *,
+    host_id: str = "host-a",
+    request_id: str,
+    action: str = "send_instruction",
+    fingerprint: str | None = None,
+    now: str = "2026-01-01T00:00:00+00:00",
+    lease_seconds: float = 30.0,
+) -> dict[str, Any]:
+    canonical_fingerprint = fingerprint or f"{action}:{request_id}"
+    return reserve_command_request(
+        db_path,
+        host_id=host_id,
+        request_id=request_id,
+        action=action,
+        canonical_version=1,
+        canonical_fingerprint=canonical_fingerprint,
+        canonical_request_json=json.dumps(
+            {"action": action, "request": request_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        public_worker_id="worker-public",
+        pending_result_json='{"ok":false,"status":"pending"}',
+        owner_lease_seconds=lease_seconds,
+        now=now,
+    )
+
+
+def _accept_test_request(
+    db_path: Path,
+    *,
+    host_id: str = "host-a",
+    request_id: str,
+    now: str,
+) -> dict[str, Any]:
+    reservation = _reserve_test_request(
+        db_path,
+        host_id=host_id,
+        request_id=request_id,
+        now=now,
+    )
+    started = mark_command_send_started(
+        db_path,
+        host_id=host_id,
+        request_id=request_id,
+        canonical_fingerprint=f"send_instruction:{request_id}",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint=f"private:{request_id}",
+        now=now,
+    )
+    return finish_command_request(
+        db_path,
+        host_id=host_id,
+        request_id=request_id,
+        canonical_fingerprint=f"send_instruction:{request_id}",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status=STATUS_ACCEPTED,
+        result_json='{"ok":true,"status":"accepted"}',
+        now=now,
+    )
+
+
+def test_store_host_wide_request_identity_conflicts_across_actions_and_tombstones(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "host-wide.db"
     init_store(db_path)
+    reservation = _reserve_test_request(db_path, request_id="same-id")
 
-    assert get_command_receipt(db_path, "host-a", "req-1", "send_instruction") is None
-
-    save_command_receipt(
+    collision = _reserve_test_request(
         db_path,
-        host_id="host-a",
-        request_id="req-1",
-        action="send_instruction",
-        payload_fingerprint="fp-1",
-        status="backend_unsupported",
-        result_json='{"ok": false}',
+        request_id="same-id",
+        action="answer_pending",
+        fingerprint="answer-fingerprint",
     )
+    assert collision["status"] == "request_id_conflict"
+    assert collision["owner_token"] is None
+    assert collision["receipt"]["action"] == "send_instruction"
 
-    receipt = get_command_receipt(db_path, "host-a", "req-1", "send_instruction")
-    assert receipt is not None
-    assert receipt["payload_fingerprint"] == "fp-1"
-    assert receipt["status"] == "backend_unsupported"
-    assert receipt["uncertain"] is False
-    assert receipt["completed_at"] is not None
-
-    save_command_receipt(
+    started = mark_command_send_started(
         db_path,
         host_id="host-a",
-        request_id="req-2",
-        action="send_instruction",
-        payload_fingerprint="fp-2",
+        request_id="same-id",
+        canonical_fingerprint="send_instruction:same-id",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )
+    terminal = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="same-id",
+        canonical_fingerprint="send_instruction:same-id",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"result":"original"}',
+        now="2026-01-01T00:00:02+00:00",
+    )
+    assert terminal["status"] == "accepted"
+
+    replay = _reserve_test_request(db_path, request_id="same-id")
+    overwrite = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="same-id",
+        canonical_fingerprint="send_instruction:same-id",
+        owner_token=reservation["owner_token"],
+        expected_state="send_started",
+        terminal_state="uncertain",
         status="request_state_uncertain",
-        result_json='{"ok": false}',
-        uncertain=True,
+        result_json='{"result":"overwritten"}',
+        now="2026-01-01T00:00:03+00:00",
     )
-
-    uncertain = get_command_receipt(db_path, "host-a", "req-2", "send_instruction")
-    assert uncertain is not None
-    assert uncertain["uncertain"] is True
-    assert uncertain["completed_at"] is None
-
-
-def test_store_migrates_legacy_duplicate_command_receipts_by_latest_row(tmp_path: Path) -> None:
-    db_path = tmp_path / "legacy-receipts.db"
+    assert replay["status"] == "terminal"
+    assert overwrite["status"] == "terminal"
+    receipt = get_command_request(db_path, "host-a", "same-id")
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
+    assert receipt["result_json"] == '{"result":"original"}'
+    assert "binding_fingerprint" not in receipt
     with sqlite3.connect(str(db_path)) as conn:
-        conn.executescript(
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT binding_fingerprint FROM command_receipts"
+        ).fetchone()[0] == "private-binding"
+
+
+def test_store_enforces_command_transition_graph_owner_and_transactional_effect(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "transitions.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(db_path, request_id="transition")
+
+    with pytest.raises(ValueError, match="illegal command request transition"):
+        finish_command_request(
+            db_path,
+            host_id="host-a",
+            request_id="transition",
+            canonical_fingerprint="send_instruction:transition",
+            owner_token=reservation["owner_token"],
+            expected_state="reserved",
+            terminal_state="accepted",
+            status="accepted",
+            result_json="{}",
+        )
+    not_owner = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="transition",
+        canonical_fingerprint="send_instruction:transition",
+        owner_token="wrong-owner",
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )
+    assert not_owner["status"] == "not_owner"
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="transition",
+        canonical_fingerprint="send_instruction:transition",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )
+    assert started["status"] == "send_started"
+    invalid = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="transition",
+        canonical_fingerprint="send_instruction:transition",
+        owner_token=reservation["owner_token"],
+        expected_state="reserved",
+        terminal_state="rejected",
+        status="backend_rejected",
+        result_json="{}",
+        now="2026-01-01T00:00:02+00:00",
+    )
+    assert invalid["status"] == "invalid_state"
+
+    def fail_effect(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE commands SET result_json = 'corrupt' "
+            "WHERE host_id = 'host-a' AND request_id = 'transition'"
+        )
+        raise RuntimeError("effect failed")
+
+    with pytest.raises(RuntimeError, match="effect failed"):
+        finish_command_request(
+            db_path,
+            host_id="host-a",
+            request_id="transition",
+            canonical_fingerprint="send_instruction:transition",
+            owner_token=reservation["owner_token"],
+            expected_state="send_started",
+            terminal_state="accepted",
+            status="accepted",
+            result_json='{"result":"accepted"}',
+            terminal_effect=fail_effect,
+            now="2026-01-01T00:00:02+00:00",
+        )
+    receipt = get_command_request(db_path, "host-a", "transition")
+    assert receipt is not None
+    assert receipt["state"] == "send_started"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state, result_json FROM commands "
+            "WHERE host_id = 'host-a' AND request_id = 'transition'"
+        ).fetchone() == ("send_started", '{"ok":false,"status":"pending"}')
+
+    accepted = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="transition",
+        canonical_fingerprint="send_instruction:transition",
+        owner_token=reservation["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"result":"accepted"}',
+        now="2026-01-01T00:00:02+00:00",
+    )
+    assert accepted["status"] == "accepted"
+
+    rejected_reservation = _reserve_test_request(
+        db_path,
+        request_id="rejected",
+        now="2026-01-01T00:01:00+00:00",
+    )
+    rejected = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="rejected",
+        canonical_fingerprint="send_instruction:rejected",
+        owner_token=rejected_reservation["owner_token"],
+        expected_state="reserved",
+        terminal_state="rejected",
+        status="backend_rejected",
+        result_json='{"ok":false}',
+        now="2026-01-01T00:01:01+00:00",
+    )
+    assert rejected["status"] == "rejected"
+
+
+def test_command_pending_turn_terminal_effect_is_atomic_with_acceptance(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "pending-turn-effect.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(db_path, request_id="turn-effect")
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="turn-effect",
+        canonical_fingerprint="send_instruction:turn-effect",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )
+    invalid_effect = command_pending_turn_terminal_effect(
+        host_id="host-a",
+        worker={"id": "worker-public", "name": "Worker"},
+        request_id="turn-effect",
+        instruction_text="",
+    )
+    with pytest.raises(
+        store_sqlite.StoreSchemaError,
+        match="command_pending_turn_terminal_effect_failed",
+    ):
+        finish_command_request(
+            db_path,
+            host_id="host-a",
+            request_id="turn-effect",
+            canonical_fingerprint="send_instruction:turn-effect",
+            owner_token=started["owner_token"],
+            expected_state="send_started",
+            terminal_state="accepted",
+            status="accepted",
+            result_json='{"ok":true}',
+            terminal_effect=invalid_effect,
+            now="2026-01-01T00:00:02+00:00",
+        )
+    assert get_command_request(
+        db_path, "host-a", "turn-effect"
+    )["state"] == "send_started"
+    assert turns_payload_from_store(db_path, "host-a")["turns"] == []
+
+    valid_effect = command_pending_turn_terminal_effect(
+        host_id="host-a",
+        worker={"id": "worker-public", "name": "Worker"},
+        request_id="turn-effect",
+        instruction_text="Continue safely.",
+    )
+    result = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="turn-effect",
+        canonical_fingerprint="send_instruction:turn-effect",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"ok":true}',
+        terminal_effect=valid_effect,
+        now="2026-01-01T00:00:02+00:00",
+    )
+    assert result["status"] == "accepted"
+    turns = turns_payload_from_store(db_path, "host-a")["turns"]
+    assert len(turns) == 1
+    assert turns[0]["origin_command_id"] == "turn-effect"
+    assert turns[0]["user_text"] == "Continue safely."
+
+
+def test_backend_pending_choice_terminal_effect_is_atomic_with_acceptance(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "pending-choice-effect.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(
+        db_path,
+        request_id="choice-effect",
+        action="answer_pending",
+        fingerprint="choice-effect-fingerprint",
+    )
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="choice-effect",
+        canonical_fingerprint="choice-effect-fingerprint",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
             """
-            CREATE TABLE snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                content_fingerprint TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE command_receipts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id TEXT NOT NULL,
-                request_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                payload_fingerprint TEXT NOT NULL,
-                status TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                uncertain INTEGER NOT NULL DEFAULT 0
-            );
-            INSERT INTO command_receipts (
-                host_id, request_id, action, payload_fingerprint, status,
-                result_json, created_at, completed_at, uncertain
-            ) VALUES
-                ('host-a', 'req-1', 'send_instruction', 'fp-old', 'backend_failed',
-                 '{"status":"backend_failed"}', '2026-01-01T00:00:00+00:00',
-                 '2026-01-01T00:00:01+00:00', 0),
-                ('host-a', 'req-1', 'send_instruction', 'fp-new', 'accepted',
-                 '{"status":"accepted"}', '2026-01-01T00:00:02+00:00',
-                 '2026-01-01T00:00:03+00:00', 0);
-            PRAGMA user_version = 2;
+            INSERT INTO backend_pending (
+                host_id, worker_id, payload_json, observed_at, revision_digest,
+                choice_routes_json, binding_private_fingerprint,
+                observed_turn_target_value, observation_state, freshness,
+                last_success_at, last_failure_at, grace_deadline, updated_at
+            ) VALUES (
+                'host-a', 'worker-public', '{"kind":"approval"}',
+                '2026-01-01T00:00:00+00:00', 'revision',
+                '{"choice":1}', 'private-binding', 'private-target',
+                'open', 'fresh', '2026-01-01T00:00:00+00:00', NULL, NULL,
+                '2026-01-01T00:00:00+00:00'
+            )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO backend_pending_claims (
+                host_id, worker_id, claim_token, revision_digest, choice_id,
+                picker_ordinal, worker_fingerprint,
+                binding_private_fingerprint, turn_target_value, state,
+                claimed_at, send_started_at
+            ) VALUES (
+                'host-a', 'worker-public', 'claim-token', 'revision', 'choice',
+                1, 'worker-fingerprint', 'private-binding', 'private-target',
+                'send_started', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:01+00:00'
+            )
+            """
+        )
+    effect = backend_pending_choice_terminal_effect(
+        host_id="host-a",
+        claim_token="claim-token",
+        accepted=True,
+    )
+    result = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="choice-effect",
+        canonical_fingerprint="choice-effect-fingerprint",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"ok":true}',
+        terminal_effect=effect,
+        now="2026-01-01T00:00:02+00:00",
+    )
+    assert result["status"] == "accepted"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT observation_state, payload_json FROM backend_pending"
+        ).fetchone() == ("none", "{}")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM backend_pending_claims"
+        ).fetchone()[0] == 0
 
+    missing_reservation = _reserve_test_request(
+        db_path,
+        request_id="missing-choice",
+        action="answer_pending",
+        fingerprint="missing-choice-fingerprint",
+        now="2026-01-01T00:01:00+00:00",
+    )
+    missing_started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="missing-choice",
+        canonical_fingerprint="missing-choice-fingerprint",
+        owner_token=missing_reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:01:01+00:00",
+    )
+    with pytest.raises(
+        store_sqlite.StoreSchemaError,
+        match="backend_pending_choice_terminal_effect_failed",
+    ):
+        finish_command_request(
+            db_path,
+            host_id="host-a",
+            request_id="missing-choice",
+            canonical_fingerprint="missing-choice-fingerprint",
+            owner_token=missing_started["owner_token"],
+            expected_state="send_started",
+            terminal_state="accepted",
+            status="accepted",
+            result_json='{"ok":true}',
+            terminal_effect=backend_pending_choice_terminal_effect(
+                host_id="host-a",
+                claim_token="missing-claim",
+                accepted=True,
+            ),
+            now="2026-01-01T00:01:02+00:00",
+        )
+    assert get_command_request(
+        db_path, "host-a", "missing-choice"
+    )["state"] == "send_started"
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "status"),
+    [
+        ("rejected", "backend_rejected"),
+        ("uncertain", "request_state_uncertain"),
+    ],
+)
+def test_store_terminal_replay_atomically_inserts_only_when_request_row_is_missing(
+    tmp_path: Path,
+    terminal_state: str,
+    status: str,
+) -> None:
+    db_path = tmp_path / f"terminal-replay-{terminal_state}.db"
     init_store(db_path)
-
-    with sqlite3.connect(str(db_path)) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
-        indexes = _unique_index_columns(conn, "command_receipts")
-
-    receipt = get_command_receipt(db_path, "host-a", "req-1", "send_instruction")
-    assert count == 1
-    assert receipt is not None
-    assert receipt["payload_fingerprint"] == "fp-new"
-    assert receipt["status"] == STATUS_ACCEPTED
-    assert indexes["ux_command_receipts_host_request_action"] == (
-        "host_id",
-        "request_id",
-        "action",
+    request_id = f"terminal-replay-{terminal_state}"
+    fingerprint = f"send_instruction:{request_id}"
+    canonical_json = json.dumps(
+        {"action": "send_instruction", "request": request_id},
+        sort_keys=True,
+        separators=(",", ":"),
     )
+    inserted = reserve_terminal_command_replay(
+        db_path,
+        host_id="host-a",
+        request_id=request_id,
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint=fingerprint,
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        terminal_state=terminal_state,
+        status=status,
+        result_json=json.dumps({"ok": False, "status": status}),
+        now="2026-01-01T00:00:00+00:00",
+    )
+    assert inserted["status"] == terminal_state
+    assert inserted["owner_token"] is None
+    assert inserted["receipt"]["state"] == terminal_state
+    assert inserted["receipt"]["status"] == status
+    assert inserted["receipt"]["terminal_at"] == "2026-01-01T00:00:00+00:00"
+
+    replay = reserve_terminal_command_replay(
+        db_path,
+        host_id="host-a",
+        request_id=request_id,
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint=fingerprint,
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        terminal_state=terminal_state,
+        status=status,
+        result_json='{"must":"not overwrite"}',
+        now="2026-01-02T00:00:00+00:00",
+    )
+    assert replay["status"] == "terminal"
+    assert replay["receipt"] == inserted["receipt"]
+
+    conflict = reserve_terminal_command_replay(
+        db_path,
+        host_id="host-a",
+        request_id=request_id,
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint=f"{fingerprint}:changed",
+        canonical_request_json=json.dumps(
+            {"action": "send_instruction", "request": f"{request_id}:changed"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        public_worker_id="worker-public",
+        terminal_state=terminal_state,
+        status=status,
+        result_json='{"must":"not overwrite"}',
+        now="2026-01-02T00:00:01+00:00",
+    )
+    assert conflict["status"] == "request_id_conflict"
+    assert conflict["receipt"] == inserted["receipt"]
+
+    reserved_id = f"existing-reserved-{terminal_state}"
+    reserved = _reserve_test_request(
+        db_path,
+        request_id=reserved_id,
+        now="2026-01-01T00:01:00+00:00",
+    )
+    existing = reserve_terminal_command_replay(
+        db_path,
+        host_id="host-a",
+        request_id=reserved_id,
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint=f"send_instruction:{reserved_id}",
+        canonical_request_json=json.dumps(
+            {"action": "send_instruction", "request": reserved_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        public_worker_id="worker-public",
+        terminal_state=terminal_state,
+        status=status,
+        result_json=json.dumps({"ok": False, "status": status}),
+        now="2026-01-01T00:01:01+00:00",
+    )
+    assert existing["status"] == "in_progress"
+    assert existing["owner_token"] is None
+    assert existing["receipt"]["state"] == "reserved"
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id=reserved_id,
+        canonical_fingerprint=f"send_instruction:{reserved_id}",
+        owner_token=reserved["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:01:02+00:00",
+    )
+    assert started["status"] == "send_started"
 
 
-def test_store_completion_updates_reserved_receipt_row(tmp_path: Path) -> None:
-    db_path = tmp_path / "completion.db"
+def test_store_expired_exact_owner_can_still_start_or_consume_without_takeover(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "expired-owner.db"
     init_store(db_path)
-
-    reservation = reserve_command_receipt(
+    send_reservation = _reserve_test_request(
+        db_path,
+        request_id="expired-send-owner",
+        now="2026-01-01T00:00:00+00:00",
+        lease_seconds=10,
+    )
+    started = mark_command_send_started(
         db_path,
         host_id="host-a",
-        request_id="req-update",
-        action="send_instruction",
-        payload_fingerprint="fp-update",
-        pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
+        request_id="expired-send-owner",
+        canonical_fingerprint="send_instruction:expired-send-owner",
+        owner_token=send_reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:11+00:00",
     )
-    assert reservation["reserved"] is True
+    assert started["status"] == "send_started"
+    assert started["owner_token"] == send_reservation["owner_token"]
 
-    save_command_receipt(
+    terminal_reservation = _reserve_test_request(
+        db_path,
+        request_id="expired-terminal-owner",
+        now="2026-01-01T00:00:00+00:00",
+        lease_seconds=10,
+    )
+    consumed = finish_command_request(
         db_path,
         host_id="host-a",
-        request_id="req-update",
-        action="send_instruction",
-        payload_fingerprint="fp-update",
-        status=STATUS_ACCEPTED,
-        result_json='{"ok": true, "status": "accepted"}',
+        request_id="expired-terminal-owner",
+        canonical_fingerprint="send_instruction:expired-terminal-owner",
+        owner_token=terminal_reservation["owner_token"],
+        expected_state="reserved",
+        terminal_state="uncertain",
+        status="request_state_uncertain",
+        result_json='{"ok":false,"status":"request_state_uncertain"}',
+        now="2026-01-01T00:00:11+00:00",
     )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
-
-    receipt = get_command_receipt(db_path, "host-a", "req-update", "send_instruction")
-    assert count == 1
-    assert receipt is not None
-    assert receipt["status"] == STATUS_ACCEPTED
-    assert receipt["uncertain"] is False
-    assert receipt["completed_at"] is not None
+    assert consumed["status"] == "uncertain"
+    assert consumed["receipt"]["state"] == "uncertain"
+    assert _reserve_test_request(
+        db_path,
+        request_id="expired-terminal-owner",
+        now="2026-02-01T00:00:00+00:00",
+    )["status"] == "terminal"
 
 
-def test_store_command_audit_tracks_one_row_per_receipt_key(tmp_path: Path) -> None:
-    db_path = tmp_path / "command-audit.db"
+def test_store_expired_reserved_takeover_rotates_owner_fence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "lease.db"
     init_store(db_path)
-
-    reservation = reserve_command_receipt(
+    first = _reserve_test_request(
         db_path,
-        host_id="host-a",
-        request_id="audit-req",
-        action="send_instruction",
-        payload_fingerprint="audit-fp",
-        pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
+        request_id="leased",
+        now="2026-01-01T00:00:00+00:00",
+        lease_seconds=10,
     )
-    duplicate = reserve_command_receipt(
+    second = _reserve_test_request(
         db_path,
-        host_id="host-a",
-        request_id="audit-req",
-        action="send_instruction",
-        payload_fingerprint="audit-fp",
-        pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
+        request_id="leased",
+        now="2026-01-01T00:00:11+00:00",
+        lease_seconds=10,
     )
-
-    assert reservation["reserved"] is True
-    assert duplicate["reserved"] is False
+    assert second["status"] == "reserved"
+    assert second["owner_token"] != first["owner_token"]
     with sqlite3.connect(str(db_path)) as conn:
-        pending_rows = conn.execute(
-            """
-            SELECT status, payload_fingerprint, uncertain, completed_at
-            FROM commands
-            WHERE host_id = 'host-a'
-              AND request_id = 'audit-req'
-              AND action = 'send_instruction'
-            """
-        ).fetchall()
-    assert pending_rows == [("pending", "audit-fp", 1, None)]
-
-    save_command_receipt(
-        db_path,
-        host_id="host-a",
-        request_id="audit-req",
-        action="send_instruction",
-        payload_fingerprint="audit-fp",
-        status=STATUS_ACCEPTED,
-        result_json='{"ok": true, "status": "accepted"}',
-    )
-
-    with sqlite3.connect(str(db_path)) as conn:
-        rows = conn.execute(
-            """
-            SELECT status, payload_fingerprint, uncertain, completed_at, result_json, updated_at
-            FROM commands
-            WHERE host_id = 'host-a'
-              AND request_id = 'audit-req'
-              AND action = 'send_instruction'
-            """
-        ).fetchall()
-        receipt_count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
-
-    assert receipt_count == 1
-    assert len(rows) == 1
-    assert rows[0][0:3] == (STATUS_ACCEPTED, "audit-fp", 0)
-    assert rows[0][3] is not None
-    assert rows[0][4] == '{"ok": true, "status": "accepted"}'
-    updated_at = rows[0][5]
-
-    init_store(db_path)
-    get_command_receipt(db_path, "host-a", "audit-req", "send_instruction")
-
-    with sqlite3.connect(str(db_path)) as conn:
-        stable_updated_at = conn.execute(
-            """
-            SELECT updated_at
-            FROM commands
-            WHERE host_id = 'host-a'
-              AND request_id = 'audit-req'
-              AND action = 'send_instruction'
-            """
+        stored_hash = conn.execute(
+            "SELECT owner_token_hash FROM command_receipts "
+            "WHERE host_id = 'host-a' AND request_id = 'leased'"
         ).fetchone()[0]
+    assert stored_hash == store_sqlite._owner_token_hash(second["owner_token"])
+    assert stored_hash != store_sqlite._owner_token_hash(first["owner_token"])
 
-    assert stable_updated_at == updated_at
+    stale_start = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="leased",
+        canonical_fingerprint="send_instruction:leased",
+        owner_token=first["owner_token"],
+        binding_fingerprint="private-old",
+        now="2026-01-01T00:00:12+00:00",
+    )
+    assert stale_start["status"] == "not_owner"
+    stale_finish = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="leased",
+        canonical_fingerprint="send_instruction:leased",
+        owner_token=first["owner_token"],
+        expected_state="reserved",
+        terminal_state="rejected",
+        status="backend_rejected",
+        result_json='{"ok":false}',
+        now="2026-01-01T00:00:12+00:00",
+    )
+    assert stale_finish["status"] == "not_owner"
+
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="leased",
+        canonical_fingerprint="send_instruction:leased",
+        owner_token=second["owner_token"],
+        binding_fingerprint="private-new",
+        now="2026-01-01T00:00:12+00:00",
+    )
+    assert started["status"] == "send_started"
+    accepted = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="leased",
+        canonical_fingerprint="send_instruction:leased",
+        owner_token=second["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"ok":true}',
+        now="2026-01-01T00:00:13+00:00",
+    )
+    assert accepted["status"] == "accepted"
+    assert _reserve_test_request(
+        db_path,
+        request_id="leased",
+        now="2026-02-01T00:00:00+00:00",
+    )["status"] == "terminal"
 
 
-def test_store_command_receipt_reservation_allows_one_concurrent_mutation(tmp_path: Path) -> None:
+def test_store_terminal_consumption_linearizes_before_expired_takeover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "terminal-takeover-race.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(
+        db_path,
+        request_id="terminal-takeover-race",
+        now="2026-01-01T00:00:00+00:00",
+        lease_seconds=10,
+    )
+    finish_has_lock = threading.Barrier(2)
+    release_finish = threading.Barrier(2)
+    takeover_connected = threading.Barrier(2)
+    original_row = store_sqlite._command_request_row
+    original_connect = store_sqlite._connect
+    finish_paused = threading.Event()
+    results: dict[str, dict[str, Any]] = {}
+    errors: list[BaseException] = []
+
+    def interleaved_row(
+        conn: sqlite3.Connection,
+        host_id: str,
+        request_id: str,
+    ) -> Any:
+        row = original_row(conn, host_id, request_id)
+        if (
+            threading.current_thread().name == "terminal-replay"
+            and not finish_paused.is_set()
+        ):
+            finish_paused.set()
+            finish_has_lock.wait(timeout=5)
+            release_finish.wait(timeout=5)
+        return row
+
+    def interleaved_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = original_connect(*args, **kwargs)
+        if threading.current_thread().name == "expired-takeover":
+            takeover_connected.wait(timeout=5)
+        return conn
+
+    monkeypatch.setattr(store_sqlite, "_command_request_row", interleaved_row)
+    monkeypatch.setattr(store_sqlite, "_connect", interleaved_connect)
+
+    def consume_terminal() -> None:
+        try:
+            results["finish"] = finish_command_request(
+                db_path,
+                host_id="host-a",
+                request_id="terminal-takeover-race",
+                canonical_fingerprint="send_instruction:terminal-takeover-race",
+                owner_token=reservation["owner_token"],
+                expected_state="reserved",
+                terminal_state="uncertain",
+                status="request_state_uncertain",
+                result_json='{"ok":false,"status":"request_state_uncertain"}',
+                now="2026-01-01T00:00:11+00:00",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def attempt_takeover() -> None:
+        try:
+            results["takeover"] = _reserve_test_request(
+                db_path,
+                request_id="terminal-takeover-race",
+                now="2026-01-01T00:00:11+00:00",
+                lease_seconds=10,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    finish_thread = threading.Thread(target=consume_terminal, name="terminal-replay")
+    finish_thread.start()
+    finish_has_lock.wait(timeout=5)
+    takeover_thread = threading.Thread(target=attempt_takeover, name="expired-takeover")
+    takeover_thread.start()
+    takeover_connected.wait(timeout=5)
+    release_finish.wait(timeout=5)
+    finish_thread.join(timeout=5)
+    takeover_thread.join(timeout=5)
+
+    assert not finish_thread.is_alive()
+    assert not takeover_thread.is_alive()
+    assert errors == []
+    assert results["finish"]["status"] == "uncertain"
+    assert results["takeover"]["status"] == "terminal"
+    assert results["takeover"]["owner_token"] is None
+    receipt = get_command_request(db_path, "host-a", "terminal-takeover-race")
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    assert _reserve_test_request(
+        db_path,
+        request_id="terminal-takeover-race",
+        now="2026-02-01T00:00:00+00:00",
+    )["status"] == "terminal"
+
+
+def test_store_command_reservation_allows_one_concurrent_owner(tmp_path: Path) -> None:
     db_path = tmp_path / "race.db"
     init_store(db_path)
     barrier = threading.Barrier(2)
-    mutations: list[str] = []
-    results: list[dict[str, object]] = []
+    results: list[dict[str, Any]] = []
     lock = threading.Lock()
 
-    def attempt(label: str) -> None:
+    def attempt() -> None:
         barrier.wait(timeout=5)
-        reservation = reserve_command_receipt(
-            db_path,
-            host_id="host-a",
-            request_id="req-race",
-            action="send_instruction",
-            payload_fingerprint="same-fp",
-            pending_result_json='{"ok": false, "status": "request_state_uncertain"}',
-        )
+        result = _reserve_test_request(db_path, request_id="race")
         with lock:
-            results.append(reservation)
-            if reservation["reserved"]:
-                mutations.append(label)
-        if reservation["reserved"]:
-            save_command_receipt(
-                db_path,
-                host_id="host-a",
-                request_id="req-race",
-                action="send_instruction",
-                payload_fingerprint="same-fp",
-                status=STATUS_ACCEPTED,
-                result_json='{"ok": true, "status": "accepted"}',
-            )
+            results.append(result)
 
-    threads = [threading.Thread(target=attempt, args=(label,)) for label in ("a", "b")]
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=5)
 
     assert not any(thread.is_alive() for thread in threads)
-    assert len(results) == 2
-    assert sum(1 for result in results if result["reserved"]) == 1
-    assert len(mutations) == 1
-    receipt = get_command_receipt(db_path, "host-a", "req-race", "send_instruction")
-    assert receipt is not None
-    assert receipt["status"] == STATUS_ACCEPTED
-    assert receipt["uncertain"] is False
+    assert sorted(result["status"] for result in results) == [
+        "in_progress",
+        "reserved",
+    ]
+    assert sum(result["owner_token"] is not None for result in results) == 1
     with sqlite3.connect(str(db_path)) as conn:
-        count = conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0]
-    assert count == 1
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 1
+
+
+def test_store_v11_host_request_collision_migrates_to_uncertain_tombstone(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-collision.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
+            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
+        )
+        for index, (action, fingerprint) in enumerate(
+            (
+                ("send_instruction", "send-fingerprint"),
+                ("answer_pending", "answer-fingerprint"),
+            )
+        ):
+            created = f"2026-01-01T00:00:0{index}+00:00"
+            conn.execute(
+                """
+                INSERT INTO command_receipts (
+                    host_id, request_id, action, payload_fingerprint, status,
+                    result_json, created_at, completed_at, uncertain
+                ) VALUES (?, 'collision', ?, ?, 'accepted', ?, ?, ?, 0)
+                """,
+                (
+                    "host-a",
+                    action,
+                    fingerprint,
+                    '{"ok":true,"private":"must-not-survive"}',
+                    created,
+                    created,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO commands (
+                    host_id, request_id, action, payload_fingerprint, status,
+                    dry_run, uncertain, request_json, result_json, created_at,
+                    reserved_at, completed_at, updated_at
+                ) VALUES (?, 'collision', ?, ?, 'accepted', 0, 0, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "host-a",
+                    action,
+                    fingerprint,
+                    '{"target":{"worker_id":"public","worker_fingerprint":"private"}}',
+                    '{"ok":true,"private":"must-not-survive"}',
+                    created,
+                    created,
+                    created,
+                    created,
+                ),
+            )
+        conn.execute("PRAGMA user_version = 11")
+
+    init_store(db_path)
+    receipt = get_command_request(db_path, "host-a", "collision")
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    assert receipt["status"] == "request_state_uncertain"
+    assert receipt["legacy_collision"] is True
+    assert receipt["legacy_collision_count"] == 4
+    assert receipt["canonical_request_json"] == "{}"
+    assert "must-not-survive" not in receipt["result_json"]
+    assert _reserve_test_request(
+        db_path,
+        request_id="collision",
+        fingerprint="new-fingerprint",
+    )["status"] == "terminal"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state, legacy_collision FROM commands"
+        ).fetchone() == ("uncertain", 1)
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        conn.execute(store_sqlite.CREATE_EVENTS_TABLE)
+
+    _accept_test_request(
+        db_path,
+        request_id="newer-than-collision",
+        now="2026-02-02T00:00:00+00:00",
+    )
+    cleanup = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-03-05T00:00:00+00:00",
+    )
+    assert cleanup["deleted"] == 1
+    assert get_command_request(db_path, "host-a", "collision") is None
+    assert get_command_request(
+        db_path, "host-a", "newer-than-collision"
+    ) is not None
+
+
+
+def test_store_v11_noncollision_replays_only_exact_legacy_raw_fingerprint(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-noncollision.db"
+    legacy_fingerprint = "legacy-raw-payload-fingerprint"
+    canonical_json = '{"action":"send_instruction","worker_id":"worker-public"}'
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
+            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
+        )
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, payload_fingerprint, status,
+                result_json, created_at, completed_at, uncertain
+            ) VALUES (
+                'host-a', 'legacy-exact', 'send_instruction', ?, 'accepted',
+                '{"ok":true,"status":"accepted"}',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:01+00:00', 0
+            )
+            """,
+            (legacy_fingerprint,),
+        )
+        conn.execute(
+            """
+            INSERT INTO commands (
+                host_id, request_id, action, payload_fingerprint, status,
+                dry_run, uncertain, request_json, result_json, created_at,
+                reserved_at, completed_at, updated_at
+            ) VALUES (
+                'host-a', 'legacy-exact', 'send_instruction', ?, 'accepted',
+                0, 0, '{"target":{"worker_id":"worker-public"}}',
+                '{"ok":true,"status":"accepted"}',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:01+00:00',
+                '2026-01-01T00:00:01+00:00'
+            )
+            """,
+            (legacy_fingerprint,),
+        )
+        conn.execute("PRAGMA user_version = 11")
+
+    init_store(db_path)
+    canonical_only = reserve_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="legacy-exact",
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint=legacy_fingerprint,
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        pending_result_json='{"ok":false,"status":"pending"}',
+    )
+    assert canonical_only["status"] == "request_id_conflict"
+
+    exact_replay = reserve_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="legacy-exact",
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint="new-canonical-fingerprint",
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        pending_result_json='{"ok":false,"status":"pending"}',
+        legacy_raw_payload_fingerprint=legacy_fingerprint,
+    )
+    assert exact_replay["status"] == "terminal"
+    assert exact_replay["receipt"]["canonical_version"] == 0
+    assert exact_replay["receipt"]["canonical_fingerprint"] == legacy_fingerprint
+    assert exact_replay["receipt"]["result_json"] == (
+        '{"ok":true,"status":"accepted"}'
+    )
+
+    wrong_raw = reserve_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="legacy-exact",
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint="new-canonical-fingerprint",
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        pending_result_json='{"ok":false,"status":"pending"}',
+        legacy_raw_payload_fingerprint="different-legacy-raw-fingerprint",
+    )
+    wrong_action = reserve_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="legacy-exact",
+        action="answer_pending",
+        canonical_version=1,
+        canonical_fingerprint="new-canonical-fingerprint",
+        canonical_request_json=canonical_json,
+        public_worker_id="worker-public",
+        pending_result_json='{"ok":false,"status":"pending"}',
+        legacy_raw_payload_fingerprint=legacy_fingerprint,
+    )
+    assert wrong_raw["status"] == "request_id_conflict"
+    assert wrong_action["status"] == "request_id_conflict"
+
+def test_store_v11_receipt_audit_disagreement_fails_closed(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-disagreement.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.executescript(
+            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
+            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
+        )
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, payload_fingerprint, status,
+                result_json, created_at, completed_at, uncertain
+            ) VALUES (
+                'host-a', 'disagree', 'send_instruction', 'same-fingerprint',
+                'accepted', '{"ok":true}', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:01+00:00', 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO commands (
+                host_id, request_id, action, payload_fingerprint, status,
+                dry_run, uncertain, request_json, result_json, created_at,
+                reserved_at, completed_at, updated_at
+            ) VALUES (
+                'host-a', 'disagree', 'send_instruction', 'same-fingerprint',
+                'backend_failed', 0, 0, '{}', '{"ok":false}',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:01+00:00',
+                '2026-01-01T00:00:01+00:00'
+            )
+            """
+        )
+        conn.execute("PRAGMA user_version = 11")
+    init_store(db_path)
+    receipt = get_command_request(db_path, "host-a", "disagree")
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    assert receipt["legacy_collision"] is True
+
+
+def test_store_command_retention_obeys_age_count_host_and_batch_floors(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention.db"
+    init_store(db_path)
+    for host_id in ("host-a", "host-b"):
+        for index in range(4):
+            _accept_test_request(
+                db_path,
+                host_id=host_id,
+                request_id=f"{host_id}-old-{index}",
+                now=f"2026-01-0{index + 1}T00:00:00+00:00",
+            )
+    _accept_test_request(
+        db_path,
+        host_id="host-a",
+        request_id="host-a-inside-floor",
+        now="2026-01-30T00:00:00+00:00",
+    )
+    uncertain_reservation = _reserve_test_request(
+        db_path,
+        request_id="uncertain",
+        now="2026-01-01T00:00:00+00:00",
+    )
+    finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="uncertain",
+        canonical_fingerprint="send_instruction:uncertain",
+        owner_token=uncertain_reservation["owner_token"],
+        expected_state="reserved",
+        terminal_state="uncertain",
+        status="request_state_uncertain",
+        result_json='{"evidence":"keep"}',
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    dry_run = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=691_200,
+        retention_count=2,
+        host_id="host-a",
+        now="2026-02-01T00:00:00+00:00",
+        dry_run=True,
+        batch_size=1,
+    )
+    assert dry_run["deleted"] == 1
+    assert dry_run["remaining_candidates"] is True
+    assert get_command_request(db_path, "host-a", "host-a-old-0") is not None
+
+    first = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=691_200,
+        retention_count=2,
+        host_id="host-a",
+        now="2026-02-01T00:00:00+00:00",
+        batch_size=1,
+    )
+    second = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=691_200,
+        retention_count=2,
+        host_id="host-a",
+        now="2026-02-01T00:00:00+00:00",
+        batch_size=1,
+    )
+    assert (first["deleted"], second["deleted"]) == (1, 1)
+    assert get_command_request(db_path, "host-a", "host-a-inside-floor") is not None
+    assert get_command_request(db_path, "host-a", "uncertain") is None
+    assert all(
+        get_command_request(db_path, "host-b", f"host-b-old-{index}") is not None
+        for index in range(4)
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        receipt_keys = {
+            (row[0], row[1])
+            for row in conn.execute(
+                "SELECT host_id, request_id FROM command_receipts"
+            ).fetchall()
+        }
+        command_keys = {
+            (row[0], row[1])
+            for row in conn.execute(
+                "SELECT host_id, request_id FROM commands"
+            ).fetchall()
+        }
+        assert receipt_keys == command_keys
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_store_command_retention_rejects_equal_retry_and_retention_horizon(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention-equal-horizon.db"
+    init_store(db_path)
+    _reserve_test_request(
+        db_path,
+        request_id="must-remain",
+        now="2026-01-01T00:00:00+00:00",
+    )
+
+    result = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=604_800,
+        retention_count=1,
+        now="2026-02-01T00:00:00+00:00",
+    )
+    assert result["ok"] is False
+    assert result["status"] == "invalid_policy"
+    assert result["deleted"] == 0
+    assert get_command_request(db_path, "host-a", "must-remain") is not None
+
+
+def test_store_retention_reacquires_expired_reserved_without_pre_send_suppression(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention-reserved-retry.db"
+    init_store(db_path)
+    first = _reserve_test_request(
+        db_path,
+        request_id="stale-reserved",
+        now="2026-01-01T00:00:00+00:00",
+    )
+
+    at_retry_horizon = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-08T00:00:00+00:00",
+    )
+    after_retry_horizon = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-08T00:00:01+00:00",
+    )
+    assert at_retry_horizon["stale_active"] == 0
+    assert after_retry_horizon["stale_active"] == 0
+    assert after_retry_horizon["deleted"] == 0
+    assert get_command_request(
+        db_path, "host-a", "stale-reserved"
+    )["state"] == "reserved"
+
+    second = _reserve_test_request(
+        db_path,
+        request_id="stale-reserved",
+        now="2026-01-08T00:00:02+00:00",
+    )
+    assert second["status"] == "reserved"
+    assert second["owner_token"] != first["owner_token"]
+    assert mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="stale-reserved",
+        canonical_fingerprint="send_instruction:stale-reserved",
+        owner_token=first["owner_token"],
+        binding_fingerprint="stale-private-binding",
+        now="2026-01-08T00:00:03+00:00",
+    )["status"] == "not_owner"
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="stale-reserved",
+        canonical_fingerprint="send_instruction:stale-reserved",
+        owner_token=second["owner_token"],
+        binding_fingerprint="current-private-binding",
+        now="2026-01-08T00:00:03+00:00",
+    )
+    assert started["status"] == "send_started"
+    terminal = finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="stale-reserved",
+        canonical_fingerprint="send_instruction:stale-reserved",
+        owner_token=second["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status="accepted",
+        result_json='{"ok":true,"status":"accepted"}',
+        now="2026-01-08T00:00:04+00:00",
+    )
+    assert terminal["status"] == "accepted"
+
+
+def test_store_retention_sanitizes_stale_send_started_then_bounds_uncertainty(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention-send-started.db"
+    init_store(db_path)
+    reservation = reserve_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="stale-send",
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint="stale-send-fingerprint",
+        canonical_request_json='{"action":"send_instruction"}',
+        public_worker_id="worker-public",
+        pending_result_json='{"private":"must-not-survive"}',
+        now="2026-01-01T00:00:00+00:00",
+    )
+    assert mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="stale-send",
+        canonical_fingerprint="stale-send-fingerprint",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )["status"] == "send_started"
+
+    exact_retry_boundary = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-08T00:00:01+00:00",
+    )
+    assert exact_retry_boundary["stale_active"] == 0
+    assert get_command_request(db_path, "host-a", "stale-send")["state"] == (
+        "send_started"
+    )
+
+    converted = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-08T00:00:02+00:00",
+    )
+    assert converted["stale_active"] == 1
+    assert converted["deleted"] == 0
+    receipt = get_command_request(db_path, "host-a", "stale-send")
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    assert receipt["result_json"] == (
+        '{"ok":false,"status":"request_state_uncertain"}'
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT result_json FROM commands "
+            "WHERE host_id = 'host-a' AND request_id = 'stale-send'"
+        ).fetchone()[0] == '{"ok":false,"status":"request_state_uncertain"}'
+        public_events = json.dumps(
+            [
+                row[0]
+                for row in conn.execute(
+                    "SELECT payload_json FROM events "
+                    "WHERE host_id = 'host-a' "
+                    "AND aggregate_type = 'command_request'"
+                ).fetchall()
+            ]
+        )
+    assert "must-not-survive" not in public_events
+
+    _accept_test_request(
+        db_path,
+        request_id="newer-terminal",
+        now="2026-01-09T00:00:00+00:00",
+    )
+    exact_retention_boundary = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-02-07T00:00:02+00:00",
+    )
+    assert exact_retention_boundary["deleted"] == 0
+    assert get_command_request(db_path, "host-a", "stale-send") is not None
+
+    beyond_retention = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-02-07T00:00:03+00:00",
+    )
+    assert beyond_retention["deleted"] == 1
+    assert get_command_request(db_path, "host-a", "stale-send") is None
+    assert get_command_request(db_path, "host-a", "newer-terminal") is not None
+
+
+def test_store_retention_bounds_expired_pre_send_only_beyond_age_and_count(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention-expired-pre-send.db"
+    init_store(db_path)
+    _reserve_test_request(
+        db_path,
+        request_id="old-expired",
+        now="2026-01-01T00:00:00+00:00",
+    )
+    _reserve_test_request(
+        db_path,
+        request_id="newer-expired",
+        now="2026-01-02T00:00:00+00:00",
+    )
+    _reserve_test_request(
+        db_path,
+        request_id="active-lease",
+        now="2026-01-31T00:00:00+00:00",
+    )
+
+    exact_boundary = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-31T00:00:00+00:00",
+        batch_size=10,
+    )
+    assert exact_boundary["stale_active"] == 0
+    assert exact_boundary["deleted"] == 0
+    assert get_command_request(db_path, "host-a", "old-expired") is not None
+
+    beyond_boundary = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=2_592_000,
+        retention_count=1,
+        now="2026-01-31T00:00:01+00:00",
+        batch_size=10,
+    )
+    assert beyond_boundary["deleted"] == 1
+    assert get_command_request(db_path, "host-a", "old-expired") is None
+    assert get_command_request(db_path, "host-a", "newer-expired") is not None
+    assert get_command_request(db_path, "host-a", "active-lease") is not None
+
+
+def test_store_retention_reports_terminal_work_when_send_started_batch_is_full(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention-exact-batch.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(
+        db_path,
+        request_id="stale-active",
+        now="2026-01-01T00:00:00+00:00",
+    )
+    assert mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="stale-active",
+        canonical_fingerprint="send_instruction:stale-active",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        now="2026-01-01T00:00:01+00:00",
+    )["status"] == "send_started"
+    for index in range(2):
+        _accept_test_request(
+            db_path,
+            request_id=f"terminal-{index}",
+            now=f"2026-01-0{index + 1}T00:00:00+00:00",
+        )
+    result = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=691_200,
+        retention_count=1,
+        now="2026-02-01T00:00:00+00:00",
+        batch_size=1,
+    )
+    assert result["stale_active"] == 1
+    assert result["deleted"] == 0
+    assert result["remaining_candidates"] is True
+    receipt = get_command_request(db_path, "host-a", "stale-active")
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    assert receipt["result_json"] == (
+        '{"ok":false,"status":"request_state_uncertain"}'
+    )
+
+
+def test_manual_and_automatic_maintenance_reach_command_request_retention(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "command-maintenance.db"
+    init_store(db_path)
+    for host_id in ("host-a", "host-b"):
+        for index in range(2):
+            _accept_test_request(
+                db_path,
+                host_id=host_id,
+                request_id=f"{host_id}-terminal-{index}",
+                now=f"2026-01-0{index + 1}T00:00:00+00:00",
+            )
+
+    dry_run = run_store_maintenance(
+        db_path,
+        "host-a",
+        retention_days=7,
+        max_outbox_attempts=3,
+        command_retry_horizon_seconds=604_800,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=1,
+        now="2026-02-01T00:00:00+00:00",
+        dry_run=True,
+        content_batch_size=1,
+    )
+    assert dry_run["command_requests"]["deleted"] == 1
+    assert get_command_request(
+        db_path, "host-a", "host-a-terminal-0"
+    ) is not None
+
+    manual = run_store_maintenance(
+        db_path,
+        "host-a",
+        retention_days=7,
+        max_outbox_attempts=3,
+        command_retry_horizon_seconds=604_800,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=1,
+        now="2026-02-01T00:00:00+00:00",
+        content_batch_size=1,
+    )
+    assert manual["ok"] is True
+    assert manual["command_requests"]["deleted"] == 1
+    assert sum(
+        get_command_request(
+            db_path, "host-a", f"host-a-terminal-{index}"
+        ) is not None
+        for index in range(2)
+    ) == 1
+    assert all(
+        get_command_request(
+            db_path, "host-b", f"host-b-terminal-{index}"
+        ) is not None
+        for index in range(2)
+    )
+
+    automatic = store_sqlite.maybe_run_automatic_store_maintenance(
+        db_path,
+        policy=store_sqlite.SnapshotRetentionPolicy(
+            retention_days=30,
+            retention_count=4096,
+            batch_size=1,
+        ),
+        command_retry_horizon_seconds=604_800,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=1,
+        now="2026-02-01T01:00:00+00:00",
+    )
+    assert automatic["ok"] is True
+    assert automatic["command_requests"]["deleted"] == 1
+    assert sum(
+        get_command_request(
+            db_path, "host-b", f"host-b-terminal-{index}"
+        ) is not None
+        for index in range(2)
+    ) == 1
+
+
+def test_store_status_command_request_metrics_are_aggregate_only(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "command-status.db"
+    init_store(db_path)
+    current = datetime.now().astimezone()
+    current_at = current.isoformat(timespec="seconds")
+    old_at = (current - timedelta(days=40)).isoformat(timespec="seconds")
+    old_started_at = (
+        current - timedelta(days=40) + timedelta(seconds=1)
+    ).isoformat(timespec="seconds")
+    reservation = _reserve_test_request(
+        db_path,
+        request_id="private-request-id",
+        now=current_at,
+    )
+    finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="private-request-id",
+        canonical_fingerprint="send_instruction:private-request-id",
+        owner_token=reservation["owner_token"],
+        expected_state="reserved",
+        terminal_state="uncertain",
+        status="request_state_uncertain",
+        result_json='{"private":"secret-evidence"}',
+        now=current_at,
+    )
+    _reserve_test_request(
+        db_path,
+        request_id="active-private-id",
+        now=current_at,
+    )
+    _reserve_test_request(
+        db_path,
+        request_id="expired-private-id",
+        now=old_at,
+    )
+    stale_send = _reserve_test_request(
+        db_path,
+        request_id="send-started-private-id",
+        now=old_at,
+    )
+    assert mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="send-started-private-id",
+        canonical_fingerprint="send_instruction:send-started-private-id",
+        owner_token=stale_send["owner_token"],
+        binding_fingerprint="private-binding",
+        now=old_started_at,
+    )["status"] == "send_started"
+
+    status = store_status(
+        db_path,
+        "host-a",
+        command_retry_horizon_seconds=604_800,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=1,
+    )
+    metrics = status["command_requests"]
+    assert metrics["total"] == 4
+    assert metrics["states"] == {
+        "reserved": 2,
+        "send_started": 1,
+        "accepted": 0,
+        "rejected": 0,
+        "uncertain": 1,
+    }
+    assert metrics["stale_active"] == 1
+    assert metrics["eligible"] == 1
+    assert metrics["storage_pressure"] is True
+    assert metrics["retry_horizon_seconds"] == 604_800
+    assert metrics["retention_seconds"] == 691_200
+    assert metrics["retention_count"] == 1
+    assert status["maintenance"]["backlog"] is True
+    public_json = json.dumps(metrics, sort_keys=True)
+    assert "private-request-id" not in public_json
+    assert "active-private-id" not in public_json
+    assert "expired-private-id" not in public_json
+    assert "send-started-private-id" not in public_json
+    assert "secret-evidence" not in public_json
 
 
 def test_distinct_source_turns_mint_distinct_public_turn_ids(tmp_path: Path) -> None:
@@ -11085,24 +12487,39 @@ def test_v7_to_current_conservatively_classifies_legacy_final_and_preserves_stat
             )
         ],
     ) == 1
-    reserved = reserve_command_receipt(
+    reserved = reserve_command_request(
         db_path,
-        "host-a",
-        "preserved-request",
-        "send_instruction",
-        "preserved-command-fingerprint",
-        '{"status":"pending"}',
-        request_json='{"instruction":"preserved"}',
+        host_id="host-a",
+        request_id="preserved-request",
+        action="send_instruction",
+        canonical_version=1,
+        canonical_fingerprint="preserved-command-fingerprint",
+        canonical_request_json='{"action":"send_instruction"}',
+        public_worker_id="worker-1",
+        pending_result_json='{"status":"pending"}',
+        now="2026-01-31T00:02:01+00:00",
     )
-    assert reserved == {"reserved": True, "receipt": None}
-    save_command_receipt(
+    assert reserved["status"] == "reserved"
+    started = mark_command_send_started(
         db_path,
-        "host-a",
-        "preserved-request",
-        "send_instruction",
-        "preserved-command-fingerprint",
-        STATUS_ACCEPTED,
-        '{"status":"accepted","result":"preserved"}',
+        host_id="host-a",
+        request_id="preserved-request",
+        canonical_fingerprint="preserved-command-fingerprint",
+        owner_token=reserved["owner_token"],
+        binding_fingerprint="preserved-private-binding",
+        now="2026-01-31T00:02:02+00:00",
+    )
+    finish_command_request(
+        db_path,
+        host_id="host-a",
+        request_id="preserved-request",
+        canonical_fingerprint="preserved-command-fingerprint",
+        owner_token=started["owner_token"],
+        expected_state="send_started",
+        terminal_state="accepted",
+        status=STATUS_ACCEPTED,
+        result_json='{"status":"accepted","result":"preserved"}',
+        now="2026-01-31T00:02:03+00:00",
     )
     assert store_sqlite.merge_backend_pending(
         db_path,

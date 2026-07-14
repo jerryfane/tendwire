@@ -55,6 +55,35 @@ The connector outbox is a neutral boundary. It stores public connector jobs and
 public-safe delivery state; concrete Telegram delivery, topic routing, retries,
 and rate limits stay in Herdres or another connector process.
 
+Mutating command idempotency is host-wide: `(host_id, request_id)` is the sole
+receipt authority across actions. A required mutating request ID must be
+nonempty and have no leading or trailing whitespace; edge whitespace is
+rejected, not normalized. Tendwire canonicalizes only after resolving a neutral
+selector to one public worker identity; raw selector spelling, observation
+fingerprints, connector metadata, and private binding data are not authority.
+Reusing an ID for a changed canonical mutation fails before send, while a
+different ID remains an independent send even when instruction text matches.
+Tendwire therefore makes no content-based command deduplication claim. A
+validated mutation dry-run is pure and requires neither backend nor store; it
+creates no receipt and consults no mutable target authority.
+
+Receipt state is explicit: an active `reserved` lease protects a pre-send owner,
+and an expired lease remains reclaimable for the same canonical mutation.
+`send_started` is durable evidence that an external effect may begin;
+`accepted` and `rejected` are replayable terminal results, and `uncertain` is
+terminal evidence that an effect may have occurred. A `send_started` row older
+than the retry horizon becomes `uncertain`; neither state is automatically
+retried. Retention bounds only expired `reserved` rows and terminal `accepted`,
+`rejected`, or `uncertain` rows, and deletes a bounded row only after it is both
+older than the age floor and beyond the per-host newest-count floor. Active
+leases remain outside the deletion pool, and `send_started` is transitioned
+rather than deleted directly.
+
+The SQLite receipt is private local state and may contain canonical instruction
+or pending-choice data; public command, event, status, and health surfaces do
+not expose that stored payload or its private binding evidence. Connector-origin
+fields and raw Telegram identities remain invalid public command inputs.
+
 Dead letters remain unresolved and retention-protected. Bounded
 `connector.inspect` exposes only public-safe opaque identities, timestamps, and
 aggregate attempt/failed-job metadata. Exact `connector.retry` first
@@ -68,13 +97,19 @@ the removed graph. Only durable ACK evidence proves delivery, and a provider
 may have accepted work whose receipt was lost, so neither Tendwire nor Herdres
 claims provider-perfect exactly-once effects.
 
-Store status and daemon health scope final-retention and snapshot pressure to
-the requested, validated host. They expose fixed aggregate counts, configured
-policies (defaulting to 30 days/4096 proven finals and 14 days/4096 changed
-snapshots per host), and `storage_pressure` only. They never identify a turn,
-final, revision, source, provider operation, private state, or worker
-fingerprint; a malformed or wrong-host aggregate fails closed and degrades
-health.
+Store status and daemon health scope final-retention, command-request, and
+snapshot pressure to the requested, validated host. Final/snapshot aggregates
+expose fixed counts, configured policies (defaulting to 30 days/4096 proven
+finals and 14 days/4096 changed snapshots per host), and `storage_pressure`
+only. Command-request aggregates expose the five state counts, stale
+`send_started`/eligible bounded counts, policy values (604800-second retry
+horizon, 2592000-second receipt age, and 4096 bounded inactive receipts per host
+by default), and pressure only. Receipt age has a 691200-second hard floor and
+must remain strictly greater than the retry horizon. These surfaces never
+identify a request, action, canonical payload/fingerprint, instruction, pending
+choice, resolved worker, turn, final, revision, source, provider operation,
+private state, or worker fingerprint; a
+malformed or wrong-host aggregate fails closed and degrades health.
 
 ## Local-State Permissions and Socket Sharing
 

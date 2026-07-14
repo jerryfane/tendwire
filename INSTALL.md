@@ -370,22 +370,55 @@ deduplicated and bounded per host by the same count policy. Missing/malformed
 owners, known-incomplete content, and internal automation remain nonretryable
 safety holds and are never converted by cleanup or retry.
 
+Command receipts use one host-wide `(host_id, request_id)` authority across
+mutating actions. A required mutating request ID must be nonempty and have no
+leading or trailing whitespace; Tendwire rejects rather than trims edge
+whitespace. Canonical identity is computed only after authoritative selector
+resolution and contains the resolved public worker identity plus the exact
+mutation; raw selector spelling and private binding data are not authority. A
+validated mutation dry-run is pure: it needs neither a backend nor a store,
+creates no receipt, and does not resolve mutable target authority.
+
+The durable states are `reserved`, `send_started`, `accepted`, `rejected`, and
+`uncertain`. An active `reserved` lease protects its pre-send owner; after lease
+expiry the same canonical mutation may reclaim it. `send_started` is durable
+evidence that an external effect may have begun, so replay never automatically
+retries it. Accepted/rejected work replays the stored result. Different request
+IDs remain independent sends even when instruction content matches.
+
+By default, a `send_started` receipt older than the 604800-second retry horizon
+becomes `uncertain`; `reserved` is not converted merely because it is old.
+The bounded deletion pool contains only expired pre-send `reserved` rows and
+terminal `accepted`, `rejected`, or `uncertain` rows. A row in that pool is
+eligible only when it is both older than 2592000 seconds and ranked beyond the
+newest 4096 bounded rows for its host. Active owner leases and `send_started`
+rows remain protected from deletion.
+
 The daemon checks a persisted database-wide cadence after a stored snapshot.
-By default, it removes at most 100 snapshot rows and shares a 100-graph final
-budget across hosts once per 3600 seconds. Persisted per-host service cursors
-choose never-serviced then least-recently-serviced hosts, so one busy host
-cannot starve another. Later batches resume backlog; automatic maintenance
-never runs `VACUUM` or promises immediate enforcement.
+By default, it removes at most 100 snapshot rows, shares a 100-graph final
+budget across hosts, and processes a separate batch of at most 100 stale
+`send_started` transitions or bounded inactive receipt deletions once per 3600
+seconds.
+Persisted per-host service cursors choose never-serviced then
+least-recently-serviced final hosts, so one busy host cannot starve another.
+Later batches resume backlog; automatic maintenance never runs `VACUUM` or
+promises immediate enforcement.
 
 Override defaults with `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_DAYS`,
 `TENDWIRE_ACKNOWLEDGED_FINAL_RETENTION_COUNT`,
+`TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS`,
+`TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS`,
+`TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT`,
 `TENDWIRE_SNAPSHOT_RETENTION_DAYS`, `TENDWIRE_SNAPSHOT_RETENTION_COUNT`,
 `TENDWIRE_SNAPSHOT_MAINTENANCE_BATCH_SIZE`, and
 `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS`. Values are positive integers:
-day policies are at most 365000, counts at most 9223372036854775807, maintenance
-batch size at most 1000, and cadence at most 31536000000 seconds. Invalid
-configured values fail closed; an affected cleanup class rejects an invalid
-per-invocation policy rather than applying that class.
+the command retry horizon is at most 604800 seconds; command-receipt retention
+is at least 691200 seconds, strictly greater than that horizon, and at most
+31536000000 seconds; day policies are at most 365000; counts are at most
+9223372036854775807; the maintenance batch size is at most 1000; and cadence is
+at most 31536000000 seconds. Invalid configured values fail closed; an affected
+cleanup class rejects an invalid per-invocation policy rather than applying
+that class.
 
 Use the JSON-only online hooks for aggregate inspection and bounded cleanup:
 
@@ -425,15 +458,20 @@ known-incomplete, internal-automation, stale, ambiguous, and resolved cases
 fail closed. Retry is never bulk and never justifies manual SQLite edits.
 
 `store status` reports the database-wide cadence timestamp, but its snapshot
-count/backlog and public-safe `final_retention` pressure are scoped to the
-requested host. The aggregate includes acknowledged, unresolved and per-status
-counts, the policy, eligibility, and `storage_pressure`. Daemon health validates
-the exact host, configured policy, nonnegative/component totals, eligibility,
-and pressure relationship; malformed/wrong-host data and valid pressure degrade
-health without exposing an identity.
+count/backlog and public-safe final-retention and command-request pressure are
+scoped to the requested host. Final retention includes acknowledged,
+unresolved/per-status counts, policy, eligibility, and `storage_pressure`;
+command requests include only state/candidate counts, retry/retention policy,
+and pressure. Daemon health validates the exact host, configured policy,
+nonnegative/component totals, eligibility, and pressure relationships;
+malformed/wrong-host data and valid pressure degrade health without exposing an
+identity.
 
 `cleanup` reports aggregate database-wide snapshots plus host-scoped outbox,
-final-retention, and turn-content results. Its flags override policy only for
+final-retention, command-request, and turn-content results. Command-request
+output contains only policy, state/candidate counts, and storage pressure; it
+does not expose request IDs, actions, canonical payloads, instructions, workers,
+pending choices, or private bindings. Cleanup flags override policy only for
 that invocation and do not rewrite configuration. A dry-run rolls back every
 maintenance transaction and changes neither rows nor maintenance/service
 cursors.
@@ -444,7 +482,7 @@ window with all Tendwire, connector, and other SQLite writers stopped. The
 dry-run mode is strictly read-only: it does not initialize or migrate a store,
 repair permissions, checkpoint WAL, create a backup, prune rows, build a
 replacement, update a marker or timestamp, or change the database family. It
-requires current schema v11 and rejects both `--acknowledge-offline` and
+requires current schema v12 and rejects both `--acknowledge-offline` and
 `--backup-path`.
 
 Follow this order exactly:
@@ -454,7 +492,7 @@ Follow this order exactly:
 2. **Stop Tendwire.** Stop `tendwired.service` and every one-shot or alternate
    writer. Confirm all database writers are stopped.
 3. **Dry-run.** From the same installed release or source checkout that owns
-   the current v11 store, run:
+   the current v12 store, run:
 
    ```bash
    tendwire store compact --dry-run \
@@ -531,15 +569,17 @@ offline.
 
 ## Compatible Tendwire/Herdres Pair and Copy-First Dry Check
 
-Goal 05B through Goal 10 are a paired producer/consumer contract. Install or
+Goal 05B through Goal 11 are a paired producer/consumer contract. Install or
 upgrade Tendwire with a Herdres revision that explicitly supports all of the
 following together:
 
-- Tendwire SQLite store schema v11, including transactional migration of v8
-  turns, v9 pending rows, typed final-root columns/indexes, and the private
-  per-host fair-maintenance cursor table. A partial legacy final-table set,
-  invalid recovery edge, descriptor/route failure, or later migration error
-  rolls back every schema/root/cursor change and leaves `user_version` at 10;
+- Tendwire SQLite store schema v12, including transactional migration of v8
+  turns, v9 pending rows, typed final-root columns/indexes, the private per-host
+  fair-maintenance cursor table, and the v11-to-v12 command-receipt rebuild. A
+  partial legacy final-table set, invalid recovery edge, descriptor/route
+  failure, or later migration error rolls back every schema/root/cursor change
+  for that step. Ambiguous legacy action-scoped rows for one host/request ID
+  migrate to terminal uncertainty rather than selecting one as authoritative;
 - owner-aware canonical turn identity, atomic monotonic snapshot plus
   same-scope binding freshness, and schema-v2 root routes containing the exact
   public stable-key pair captured from persisted turn metadata;
@@ -550,6 +590,13 @@ following together:
   missing owners, known-incomplete finals, and internal automation become
   nonpollable `final_migration_hold`/`dead_letter` rather than a mass repost.
   Missing-owner/automation safety holds are permanently nonretryable;
+- host-wide command request authority keyed by `(host_id, request_id)`,
+  canonicalized only after resolution to the public worker identity. Explicit
+  `reserved`/`send_started`/`accepted`/`rejected`/`uncertain` states prevent
+  uncertain replay, while different request IDs always remain distinct sends.
+  Receipt maintenance keeps active leases, changes only stale `send_started`
+  rows to uncertainty, and bounds expired reservations plus
+  accepted/rejected/uncertain history outside both its age and count floors;
 - `turn.list` schema v2 with descriptor schema v1, 1,000-character previews and
   insertion-stable paging; schema-v1 `turn.content.get` with a 49,152-byte
   UTF-8 page ceiling;

@@ -85,7 +85,7 @@ automatically reused.
 
 ## 5. Goal 07/09 ingestion and pending verification
 
-The release contract uses store schema v11. Its transactional v8-to-v9
+The release contract uses store schema v12. Its transactional v8-to-v9
 migration backfills immutable positive `list_sequence` values independently per
 host and creates the uniqueness/paging state used by stable `turn.list`
 traversal. The v9-to-v10 migration preserves public pending rows while adding
@@ -98,6 +98,15 @@ routable root payload has `schema_version=2` and the exact root-level public
 metadata; every plan job must preserve the exact
 turn/revision/final-identity/stable-key route. No worker-fingerprint fallback is
 permitted.
+
+The transactional v11-to-v12 migration replaces action-scoped command rows with
+one host-wide `(host_id, request_id)` authority and explicit
+`reserved`/`send_started`/`accepted`/`rejected`/`uncertain` state. Canonical
+mutation v1 uses the action, resolved public worker identity, and exact
+instruction or pending choice, not request ID, raw selector spelling, worker
+observation fingerprint, connector origin, or private binding. Ambiguous
+legacy collisions become terminal uncertainty; a migration failure rolls back
+the v12 rebuild and leaves `PRAGMA user_version=11`.
 
 Delivery requires exact canonical range coverage and host-bound all-part proof.
 Linkable unresolved work also requires the exact route on every job. Unknown or
@@ -451,7 +460,49 @@ visited hosts first, and never runs `VACUUM`.
 Record the two command results; do not substitute a live connector smoke and do
 not claim production deployment from this hermetic gate.
 
-## 9. Local hygiene (optional, before building from a dirty tree)
+## 9. Goal 11 host-wide command idempotency contract
+
+The Goal 11 release evidence is local and public-safe:
+
+- One receipt owns each `(host_id, request_id)` across mutating actions. Required
+  mutating request IDs are nonempty and reject leading or trailing whitespace
+  rather than trimming it. The canonical mutation is built after authoritative
+  selector resolution to the public worker identity.
+- A same-ID canonical replay returns in-progress, cached terminal, or uncertain
+  state without a second send. Changed action, resolved worker, instruction, or
+  pending choice rejects as `duplicate_request`.
+- A different request ID is always a distinct mutation and, when otherwise
+  valid, sends even if instruction content matches an earlier request. There is
+  no content-based or time-window command suppression.
+- A validated mutation dry-run is pure and backend/store independent: it
+  creates no receipt, resolves no mutable target authority, and requests no
+  external effect.
+- The durable lifecycle is exactly `reserved`, `send_started`, `accepted`,
+  `rejected`, and `uncertain`. An active `reserved` lease protects pre-send
+  ownership; an expired lease remains reclaimable for the same canonical
+  mutation. Once send has started, ambiguous completion is never automatically
+  retried or acknowledged as success.
+- `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS=604800`,
+  `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS=2592000`, and
+  `TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT=4096` are the conservative defaults.
+  The retry horizon is positive and at most 604800 seconds; receipt age is at
+  least 691200 seconds and strictly greater than the horizon.
+- Bounded maintenance changes only `send_started` rows older than the retry
+  horizon to `uncertain`; it does not age `reserved` rows into uncertainty. Its
+  deletion pool contains only expired `reserved` rows and terminal `accepted`,
+  `rejected`, or `uncertain` rows. A pool row is deleted only after it is both
+  older than the age floor and beyond the per-host newest-count floor. Active
+  `reserved` leases remain, and `send_started` is transitioned rather than
+  deleted directly. Store status and daemon health expose
+  only aggregate state/policy/candidate counts and pressure, never request IDs,
+  canonical requests, instructions, pending choices, workers, or private
+  bindings.
+
+These checks use temporary local SQLite state and fake backend transport. They
+do not require or authorize a live Herdr send, connector, network credential,
+Tendwire deployment, Herdres service, or production maintenance operation.
+
+## 10. Local hygiene (optional, before building from a dirty tree)
 
 ```sh
 find . -type d -name __pycache__ -not -path './.git/*' -exec rm -rf {} +

@@ -259,6 +259,88 @@ def _final_retention_health(
     }, True
 
 
+_COMMAND_REQUEST_STATES = (
+    "reserved",
+    "send_started",
+    "accepted",
+    "rejected",
+    "uncertain",
+)
+
+
+def _command_requests_health(
+    config: Config,
+    value: Any,
+) -> tuple[dict[str, Any], bool]:
+    """Validate the fixed public command-request aggregate without row data."""
+    fallback = {
+        "total": 0,
+        "states": {state: 0 for state in _COMMAND_REQUEST_STATES},
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": config.command_retry_horizon_seconds,
+        "retention_seconds": config.command_receipt_retention_seconds,
+        "retention_count": config.command_receipt_retention_count,
+        "storage_pressure": False,
+    }
+    if not isinstance(value, Mapping) or set(value) != set(fallback):
+        return fallback, False
+    states_value = value.get("states")
+    if (
+        not isinstance(states_value, Mapping)
+        or set(states_value) != set(_COMMAND_REQUEST_STATES)
+    ):
+        return fallback, False
+    states = {
+        state: _validated_nonnegative_int(states_value.get(state))
+        for state in _COMMAND_REQUEST_STATES
+    }
+    total = _validated_nonnegative_int(value.get("total"))
+    stale_active = _validated_nonnegative_int(value.get("stale_active"))
+    eligible = _validated_nonnegative_int(value.get("eligible"))
+    storage_pressure = value.get("storage_pressure")
+    valid_policy = all(
+        type(value.get(field)) is int and value.get(field) == expected
+        for field, expected in (
+            ("retry_horizon_seconds", config.command_retry_horizon_seconds),
+            ("retention_seconds", config.command_receipt_retention_seconds),
+            ("retention_count", config.command_receipt_retention_count),
+        )
+    )
+    if (
+        any(count is None for count in states.values())
+        or total is None
+        or stale_active is None
+        or eligible is None
+        or not valid_policy
+        or not isinstance(storage_pressure, bool)
+    ):
+        return fallback, False
+    state_counts = {state: int(states[state]) for state in _COMMAND_REQUEST_STATES}
+    eligible_pool = (
+        state_counts["reserved"]
+        + state_counts["accepted"]
+        + state_counts["rejected"]
+        + state_counts["uncertain"]
+    )
+    if (
+        total != sum(state_counts.values())
+        or stale_active > state_counts["send_started"]
+        or eligible
+        > max(0, eligible_pool - config.command_receipt_retention_count)
+        or storage_pressure is not bool(stale_active or eligible)
+    ):
+        return fallback, False
+    return {
+        **fallback,
+        "total": total,
+        "states": state_counts,
+        "stale_active": stale_active,
+        "eligible": eligible,
+        "storage_pressure": storage_pressure,
+    }, True
+
+
 def _turn_ingestion_health(config: Config, scheduler: Any | None) -> dict[str, Any]:
     raw: Mapping[str, Any] = {}
     if scheduler is not None:
@@ -586,6 +668,15 @@ class TendwireDaemon:
                 acknowledged_final_retention_count=(
                     self.config.acknowledged_final_retention_count
                 ),
+                command_retry_horizon_seconds=(
+                    self.config.command_retry_horizon_seconds
+                ),
+                command_receipt_retention_seconds=(
+                    self.config.command_receipt_retention_seconds
+                ),
+                command_receipt_retention_count=(
+                    self.config.command_receipt_retention_count
+                ),
                 cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
             snapshot_result = result.get("snapshot")
@@ -661,6 +752,7 @@ class TendwireDaemon:
 
     def get_health(self) -> dict[str, Any]:
         snapshot = self.get_snapshot()
+        command_requests_default, _ = _command_requests_health(self.config, None)
         store_payload: dict[str, Any] = {
             "schema_version": 1,
             "ok": False,
@@ -678,6 +770,7 @@ class TendwireDaemon:
                 ),
                 "storage_pressure": False,
             },
+            "command_requests": command_requests_default,
             "maintenance": {
                 "last_completed_at": None,
                 "status": "not_initialized",
@@ -705,6 +798,15 @@ class TendwireDaemon:
                 snapshot_retention_count=self.config.snapshot_retention_count,
                 maintenance_batch_size=self.config.snapshot_maintenance_batch_size,
                 maintenance_cadence_seconds=self.config.store_maintenance_cadence_seconds,
+                command_retry_horizon_seconds=(
+                    self.config.command_retry_horizon_seconds
+                ),
+                command_receipt_retention_seconds=(
+                    self.config.command_receipt_retention_seconds
+                ),
+                command_receipt_retention_count=(
+                    self.config.command_receipt_retention_count
+                ),
             )
         store_origin_valid = (
             type(store_payload.get("schema_version")) is int
@@ -724,6 +826,10 @@ class TendwireDaemon:
             self.config,
             store_payload.get("final_retention") if store_origin_valid else None,
         )
+        command_requests, command_requests_valid = _command_requests_health(
+            self.config,
+            store_payload.get("command_requests") if store_origin_valid else None,
+        )
         maintenance, maintenance_valid = _maintenance_health(
             self.config,
             store_payload.get("maintenance") if store_origin_valid else None,
@@ -735,6 +841,7 @@ class TendwireDaemon:
             and counts_valid
             and outbox_valid
             and final_retention_valid
+            and command_requests_valid
             and maintenance_valid
         )
         backend_runtime: dict[str, Any] = {}
@@ -760,6 +867,8 @@ class TendwireDaemon:
             )
             or not final_retention_valid
             or bool(final_retention["storage_pressure"])
+            or not command_requests_valid
+            or bool(command_requests["storage_pressure"])
         )
         pending_ingestion = _pending_ingestion_health(self.config)
         stored_last_event_at = _valid_observation_timestamp(
@@ -803,6 +912,7 @@ class TendwireDaemon:
                 "counts": counts,
                 "outbox": outbox,
                 "final_retention": final_retention,
+                "command_requests": command_requests,
                 "last_event_at": stored_last_event_at,
                 "last_snapshot_at": stored_last_snapshot_at,
                 "maintenance": maintenance,
@@ -844,6 +954,15 @@ class TendwireDaemon:
                 ),
                 "acknowledged_final_retention_count": (
                     self.config.acknowledged_final_retention_count
+                ),
+                "command_retry_horizon_seconds": (
+                    self.config.command_retry_horizon_seconds
+                ),
+                "command_receipt_retention_seconds": (
+                    self.config.command_receipt_retention_seconds
+                ),
+                "command_receipt_retention_count": (
+                    self.config.command_receipt_retention_count
                 ),
                 "snapshot_retention_days": self.config.snapshot_retention_days,
                 "snapshot_retention_count": self.config.snapshot_retention_count,

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
 import json
 import sqlite3
 from pathlib import Path
@@ -9,6 +12,7 @@ from typing import Any
 
 import pytest
 import tendwire.command_submission as command_submission
+import tendwire.store.sqlite as store_sqlite
 
 from tendwire.backends.herdr_protocol import HerdrProtocolError
 from tendwire.backends.herdr_socket import (
@@ -22,18 +26,22 @@ from tendwire.core.commands import (
     STATUS_AMBIGUOUS_BACKEND_TARGET,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
-    STATUS_DUPLICATE_INSTRUCTION,
     STATUS_DUPLICATE_REQUEST,
     STATUS_INVALID_REQUEST,
     STATUS_NOT_FOUND,
+    STATUS_PENDING,
+    STATUS_REJECTED,
     STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_STALE_TARGET,
+    CommandEnvelope,
+    CommandRequest,
+    build_canonical_mutation,
 )
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
 from tendwire.store.sqlite import (
     apply_backend_pending_observation,
-    get_command_receipt,
+    get_command_request,
     init_store,
     merge_turn_content,
     pending_payload_from_store,
@@ -41,7 +49,20 @@ from tendwire.store.sqlite import (
     turns_payload_from_store,
     upsert_command_pending_turn,
     upsert_worker_bindings,
+    reserve_command_request,
 )
+
+
+def _receipt_for_action(
+    db_path: Path,
+    host_id: str,
+    request_id: str,
+    action: str,
+) -> dict[str, Any] | None:
+    receipt = get_command_request(db_path, host_id, request_id)
+    if receipt is None or receipt["action"] != action:
+        return None
+    return {**receipt, "uncertain": receipt["state"] in {"send_started", "uncertain"}}
 
 
 _FORBIDDEN_PUBLIC_KEYS = {
@@ -67,12 +88,18 @@ def _assert_no_private_json(value: Any, path: str = "$") -> None:
             _assert_no_private_json(item, f"{path}[{index}]")
 
 
-def _config(tmp_path: Path, *, backend: str = "socket") -> Config:
+def _config(
+    tmp_path: Path,
+    *,
+    backend: str = "socket",
+    timeout: float = 5.0,
+) -> Config:
     return Config(
         host_id="cmd-host",
         data_dir=tmp_path,
         db_path=tmp_path / "commands.db",
         herdr_backend=backend,
+        herdr_timeout_seconds=timeout,
     )
 
 
@@ -103,6 +130,15 @@ def _healthy_backend() -> BackendHealth:
         outcome="healthy_non_empty",
         observed_at="2026-01-01T00:00:00+00:00",
         counts={"workers": 1},
+    )
+
+
+def _degraded_backend() -> BackendHealth:
+    return BackendHealth(
+        name="herdr",
+        status="degraded",
+        outcome="timeout",
+        observed_at="2026-01-01T00:01:00+00:00",
     )
 
 
@@ -167,6 +203,7 @@ class _FakeSocketClient:
         self.calls = calls
         self.raises = raises
         self.pane_id = pane_id
+        self.close_count = 0
 
     def connect(self) -> "_FakeSocketClient":
         return self
@@ -180,7 +217,7 @@ class _FakeSocketClient:
         return {"accepted": True}
 
     def close(self) -> None:
-        return None
+        self.close_count += 1
 
 
 def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None, pane_id: str = "pane-secret"):
@@ -213,6 +250,9 @@ def _expected_private_clear_calls(pane_id: str = "pane-secret") -> list[dict[str
         (None, True),
         ("", True),
         ("   \t", True),
+        (" leading", True),
+        ("trailing ", True),
+        ("\twrapped\t", True),
     ],
 )
 def test_submit_command_rejects_invalid_request_id_before_mutation(
@@ -304,7 +344,7 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
     assert envelope.status != STATUS_NOT_FOUND
     assert envelope.status != STATUS_REQUEST_STATE_UNCERTAIN
     assert config.db_path is not None
-    receipt = get_command_receipt(config.db_path, "cmd-host", f"setup-{label}", "send_instruction")
+    receipt = _receipt_for_action(config.db_path, "cmd-host", f"setup-{label}", "send_instruction")
     assert receipt is not None
     assert receipt["status"] == STATUS_BACKEND_UNAVAILABLE
     assert receipt["uncertain"] is False
@@ -344,13 +384,13 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
     ]
     assert config.db_path is not None
-    receipt = get_command_receipt(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
+    receipt = _receipt_for_action(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
     assert receipt is not None
     assert receipt["uncertain"] is True
     with sqlite3.connect(str(config.db_path)) as conn:
         events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
-    assert "command.send_started" in events
-    assert "command.submitted" in events
+    assert "command.request.send_started" in events
+    assert "command.request.uncertain" in events
 
 
 def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: Path) -> None:
@@ -380,7 +420,7 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
     assert calls == _expected_submit_calls()
 
     assert config.db_path is not None
-    receipt = get_command_receipt(config.db_path, "cmd-host", "req-1", "send_instruction")
+    receipt = _receipt_for_action(config.db_path, "cmd-host", "req-1", "send_instruction")
     assert receipt is not None
     assert receipt["status"] == STATUS_ACCEPTED
     assert receipt["uncertain"] is False
@@ -418,14 +458,25 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         ).fetchone()
     assert [row[0] for row in event_rows] == [
         "snapshot.saved",
-        "command.reserved",
-        "command.send_started",
-        "command.submitted",
-        "command.cached",
-        "command.duplicate",
+        "command.request.reserved",
+        "command.request.send_started",
+        "command.request.accepted",
     ]
+    command_events = [json.loads(row[1]) for row in event_rows[1:]]
+    assert [
+        (event["state"], event["status"])
+        for event in command_events
+    ] == [
+        ("reserved", STATUS_PENDING),
+        ("send_started", STATUS_PENDING),
+        ("accepted", STATUS_ACCEPTED),
+    ]
+    assert "detail" not in command_events[0]
+    assert command_events[1]["detail"]["target"] == {"worker_id": "w-1"}
+    assert command_events[2]["detail"]["envelope"] == first.to_dict()
     assert command_row is not None
-    assert json.loads(command_row[0])["request_id"] == "req-1"
+    assert json.loads(command_row[0])["target"] == {"worker_id": "w-1"}
+    assert "request_id" not in json.loads(command_row[0])
 
     public_surfaces = [
         first.to_dict(),
@@ -443,14 +494,14 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         _assert_no_private_json(surface)
 
 
-def test_submit_command_suppresses_recent_same_worker_long_instruction_with_new_request_id(
+def test_submit_command_sends_identical_100_character_instructions_with_distinct_ids(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-    text = "When this exact long Telegram instruction appears again, it should be treated as replay."
+    text = "x" * 100
 
     first = submit_command(
         config,
@@ -464,39 +515,45 @@ def test_submit_command_suppresses_recent_same_worker_long_instruction_with_new_
     )
 
     assert first.status == STATUS_ACCEPTED
-    assert second.ok is True
-    assert second.status == STATUS_DUPLICATE_INSTRUCTION
-    assert second.result == {
-        "target": {"worker_id": "w-1"},
-        "delivery_state": "duplicate_suppressed",
-        "deduplicated": True,
-        "replay_window_seconds": 21600,
-    }
-    assert calls == [
+    assert second.status == STATUS_ACCEPTED
+    expected_send = [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
         {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
     ]
+    assert calls == [*expected_send, *expected_send]
 
     assert config.db_path is not None
-    first_receipt = get_command_receipt(config.db_path, "cmd-host", "long-1", "send_instruction")
-    second_receipt = get_command_receipt(config.db_path, "cmd-host", "long-2", "send_instruction")
+    first_receipt = get_command_request(config.db_path, "cmd-host", "long-1")
+    second_receipt = get_command_request(config.db_path, "cmd-host", "long-2")
     assert first_receipt is not None
-    assert first_receipt["status"] == STATUS_ACCEPTED
+    assert first_receipt["state"] == "accepted"
     assert second_receipt is not None
-    assert second_receipt["status"] == STATUS_DUPLICATE_INSTRUCTION
+    assert second_receipt["state"] == "accepted"
     with sqlite3.connect(str(config.db_path)) as conn:
-        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+        events = [
+            row[0]
+            for row in conn.execute(
+                "SELECT event_type FROM events WHERE aggregate_type = 'command_request' ORDER BY id"
+            ).fetchall()
+        ]
     assert events == [
-        "snapshot.saved",
-        "command.reserved",
-        "command.send_started",
-        "command.submitted",
-        "command.reserved",
-        "command.duplicate_instruction",
+        "command.request.reserved",
+        "command.request.send_started",
+        "command.request.accepted",
+        "command.request.reserved",
+        "command.request.send_started",
+        "command.request.accepted",
     ]
-    public_json = json.dumps([second.to_dict(), json.loads(second_receipt["result_json"])])
+    public_json = json.dumps(
+        [
+            first.to_dict(),
+            second.to_dict(),
+            json.loads(first_receipt["result_json"]),
+            json.loads(second_receipt["result_json"]),
+        ]
+    )
     assert text not in public_json
     assert "agent-secret" not in public_json
     assert "private-secret" not in public_json
@@ -674,6 +731,8 @@ def test_submit_command_backend_unavailable_prevents_not_found_and_send(tmp_path
     assert envelope.status == STATUS_BACKEND_UNAVAILABLE
     assert calls == []
     assert envelope.status != STATUS_NOT_FOUND
+    assert config.db_path is not None
+    assert get_command_request(config.db_path, config.host_id, "degraded-1") is None
 
 
 def test_submit_command_missing_worker_can_return_not_found_when_backend_healthy(tmp_path: Path) -> None:
@@ -689,6 +748,85 @@ def test_submit_command_missing_worker_can_return_not_found_when_backend_healthy
 
     assert envelope.status == STATUS_NOT_FOUND
     assert calls == []
+def test_submit_command_resolved_health_failure_is_terminal_and_replayed(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)], health=_degraded_backend())
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(request_id="resolved-degraded"),
+        socket_client_factory=_factory(calls),
+    )
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:02:00+00:00",
+            workers=[worker],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id="resolved-degraded"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert replay.to_dict() == first.to_dict()
+    assert calls == []
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "resolved-degraded",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
+    assert receipt["status"] == STATUS_BACKEND_UNAVAILABLE
+
+
+def test_submit_command_disallowed_worker_rejection_is_terminal_and_replayed(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    closed = Worker(id="w-1", name="Alpha", status="closed")
+    _seed(config, [closed], [_binding(closed)])
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(request_id="closed-worker"),
+        socket_client_factory=_factory(calls),
+    )
+    active = Worker(id="w-1", name="Alpha", status="active")
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:02:00+00:00",
+            workers=[active],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id="closed-worker"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.status == STATUS_REJECTED
+    assert replay.to_dict() == first.to_dict()
+    assert calls == []
+    receipt = get_command_request(config.db_path, config.host_id, "closed-worker")
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
+    assert receipt["status"] == STATUS_REJECTED
 
 
 def test_submit_command_rejects_stale_worker_fingerprint_and_binding(tmp_path: Path) -> None:
@@ -781,14 +919,819 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     ]
 
     assert config.db_path is not None
-    receipt = get_command_receipt(config.db_path, "cmd-host", "timeout-1", "send_instruction")
+    receipt = _receipt_for_action(config.db_path, "cmd-host", "timeout-1", "send_instruction")
     assert receipt is not None
     assert receipt["uncertain"] is True
     with sqlite3.connect(str(config.db_path)) as conn:
-        events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
-    assert "command.send_started" in events
-    assert "command.submitted" in events
-    assert "command.uncertain" in events
+        event_rows = conn.execute(
+            "SELECT event_type, payload_json FROM events "
+            "WHERE aggregate_id = ? ORDER BY id",
+            ("timeout-1",),
+        ).fetchall()
+    assert [row[0] for row in event_rows] == [
+        "command.request.reserved",
+        "command.request.send_started",
+        "command.request.uncertain",
+    ]
+    payloads = [json.loads(row[1]) for row in event_rows]
+    assert [(item["state"], item["status"]) for item in payloads] == [
+        ("reserved", STATUS_PENDING),
+        ("send_started", STATUS_PENDING),
+        ("uncertain", STATUS_REQUEST_STATE_UNCERTAIN),
+    ]
+
+
+def test_submit_command_non_id_selector_replay_requires_authoritative_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        space_id="space-1",
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(request_id="selector-unavailable"),
+        socket_client_factory=_factory(calls),
+    )
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:01:00+00:00",
+            workers=[],
+            backend_health=[_degraded_backend()],
+        ),
+    )
+    by_name = _request(request_id="selector-unavailable")
+    by_name["target"] = {"name": "Alpha"}
+    by_space = _request(request_id="selector-unavailable")
+    by_space["target"] = {"space_id": "space-1"}
+
+    name_replay = submit_command(config, by_name, socket_client_factory=_factory(calls))
+    space_replay = submit_command(config, by_space, socket_client_factory=_factory(calls))
+
+    assert first.status == STATUS_ACCEPTED
+    assert name_replay.status == STATUS_BACKEND_UNAVAILABLE
+    assert space_replay.status == STATUS_BACKEND_UNAVAILABLE
+    assert calls == _expected_submit_calls()
+
+
+def test_submit_command_equivalent_resolved_selectors_replay_once(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        space_id="space-1",
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    by_name = _request(request_id="selector-equivalent")
+    by_name["target"] = {"name": "Alpha"}
+    by_space_with_origin = _request(request_id="selector-equivalent")
+    by_space_with_origin["target"] = {"space_id": "space-1"}
+    by_space_with_origin["params"] = {"origin": "connector-observation"}
+
+    first = submit_command(
+        config,
+        _request(request_id="selector-equivalent"),
+        socket_client_factory=_factory(calls),
+    )
+    second = submit_command(config, by_name, socket_client_factory=_factory(calls))
+    third = submit_command(
+        config,
+        by_space_with_origin,
+        socket_client_factory=_factory(calls),
+    )
+
+    assert first.status == STATUS_ACCEPTED
+    assert second.to_dict() == first.to_dict()
+    assert third.to_dict() == first.to_dict()
+    assert calls == _expected_submit_calls()
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, "selector-equivalent")
+    assert receipt is not None
+    assert receipt["public_worker_id"] == worker.id
+    canonical = json.loads(receipt["canonical_request_json"])
+    assert canonical["target"] == {"worker_id": worker.id}
+    assert canonical["options"] == {}
+    assert "origin" not in receipt["canonical_request_json"]
+
+
+@pytest.mark.parametrize("selector_kind", ["name", "space_id"])
+def test_submit_command_changed_resolved_selector_conflicts_without_backend(
+    tmp_path: Path,
+    selector_kind: str,
+) -> None:
+    config = _config(tmp_path / selector_kind)
+    first_worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        space_id="space-1",
+    )
+    second_worker = Worker(
+        id="w-2",
+        name="Beta",
+        status="active",
+        space_id="space-2",
+    )
+    _seed(config, [first_worker, second_worker], [_binding(first_worker)])
+    selector = {"name": "Alpha"} if selector_kind == "name" else {"space_id": "space-1"}
+    request = _request(request_id=f"selector-changed-{selector_kind}")
+    request["target"] = selector
+    calls: list[dict[str, Any]] = []
+
+    accepted = submit_command(config, request, socket_client_factory=_factory(calls))
+    if selector_kind == "name":
+        changed_workers = [
+            Worker(id="w-1", name="Former", status="active", space_id="space-1"),
+            Worker(id="w-2", name="Alpha", status="active", space_id="space-2"),
+        ]
+    else:
+        changed_workers = [
+            Worker(id="w-1", name="Alpha", status="active", space_id="former-space"),
+            Worker(id="w-2", name="Beta", status="active", space_id="space-1"),
+        ]
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:02:00+00:00",
+            workers=changed_workers,
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    conflict = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: pytest.fail(
+            "changed selector resolution must not create a socket client"
+        ),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert conflict.status == STATUS_DUPLICATE_REQUEST
+    assert calls == _expected_submit_calls()
+
+
+def test_submit_command_migrated_v11_exact_raw_request_replays(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    request_payload = _request(request_id="legacy-exact")
+    request = CommandRequest.from_dict(request_payload)
+    accepted = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result={
+            "target": {"worker_id": "w-1"},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": "active",
+            "observed_turn_state": "pending_observation",
+        },
+    )
+    legacy_fingerprint = request.payload_fingerprint()
+    result_json = json.dumps(
+        accepted.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    request_json = json.dumps(
+        request.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.executescript(
+            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
+            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
+        )
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, payload_fingerprint, status,
+                result_json, created_at, completed_at, uncertain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                config.host_id,
+                request.request_id,
+                request.action,
+                legacy_fingerprint,
+                STATUS_ACCEPTED,
+                result_json,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO commands (
+                host_id, request_id, action, payload_fingerprint, status,
+                dry_run, uncertain, request_json, result_json, created_at,
+                reserved_at, completed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                config.host_id,
+                request.request_id,
+                request.action,
+                legacy_fingerprint,
+                STATUS_ACCEPTED,
+                request_json,
+                result_json,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute("PRAGMA user_version = 11")
+
+    init_store(config.db_path)
+    replay = submit_command(
+        config,
+        request_payload,
+        socket_client_factory=lambda _config: pytest.fail(
+            "legacy terminal replay must not create a socket client"
+        ),
+    )
+    changed = submit_command(
+        config,
+        _request(request_id="legacy-exact", text="changed"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "legacy request collision must not create a socket client"
+        ),
+    )
+
+    assert replay.to_dict() == accepted.to_dict()
+    assert changed.status == STATUS_DUPLICATE_REQUEST
+
+
+def test_submit_command_same_id_text_target_and_action_collide_without_backend(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    first_worker = Worker(id="w-1", name="Alpha", status="active")
+    second_worker = Worker(id="w-2", name="Beta", status="active")
+    _seed(
+        config,
+        [first_worker, second_worker],
+        [
+            _binding(first_worker),
+            _binding(
+                second_worker,
+                value="other-agent-secret",
+                private_fingerprint="other-private-secret",
+            ),
+        ],
+    )
+    calls: list[dict[str, Any]] = []
+    request_id = "collision-1"
+
+    accepted = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=_factory(calls),
+    )
+    changed_text = submit_command(
+        config,
+        _request(request_id=request_id, text="changed"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "text collision must not create a socket client"
+        ),
+    )
+    changed_target = submit_command(
+        config,
+        _request(request_id=request_id, worker_id=second_worker.id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "target collision must not create a socket client"
+        ),
+    )
+    changed_action = submit_command(
+        config,
+        _answer_request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "action collision must not create a socket client"
+        ),
+    )
+    unknown_options = _request(request_id=request_id)
+    unknown_options["options"] = {"mode": "invented"}
+    invalid_options = submit_command(
+        config,
+        unknown_options,
+        socket_client_factory=lambda _config: pytest.fail(
+            "invalid options must not create a socket client"
+        ),
+    )
+    fresh_unknown_options = _request(request_id="options-invalid-fresh")
+    fresh_unknown_options["options"] = {"mode": "invented"}
+    fresh_invalid_options = submit_command(
+        config,
+        fresh_unknown_options,
+        socket_client_factory=lambda _config: pytest.fail(
+            "invalid options must not create a socket client"
+        ),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert changed_text.status == STATUS_DUPLICATE_REQUEST
+    assert changed_target.status == STATUS_DUPLICATE_REQUEST
+    assert changed_action.status == STATUS_DUPLICATE_REQUEST
+    assert invalid_options.status == STATUS_INVALID_REQUEST
+    assert fresh_invalid_options.status == STATUS_INVALID_REQUEST
+    assert calls == _expected_submit_calls()
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, request_id)
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
+    assert receipt["public_worker_id"] == first_worker.id
+    assert (
+        get_command_request(config.db_path, config.host_id, "options-invalid-fresh")
+        is None
+    )
+
+
+def test_submit_command_private_preparation_over_30_second_budget_precedes_reservation_and_sends_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, timeout=31)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    pane_lookup_started = Event()
+    release_pane_lookup = Event()
+    first_calls: list[dict[str, Any]] = []
+    second_calls: list[dict[str, Any]] = []
+    clients: list[_FakeSocketClient] = []
+
+    class BlockingClient(_FakeSocketClient):
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            if method == "agent.get":
+                assert timeout == 31
+                pane_lookup_started.set()
+                assert release_pane_lookup.wait(timeout=5)
+            return super().request(method, params, timeout=timeout)
+
+    def first_factory(config: Config) -> BlockingClient:
+        client = BlockingClient(first_calls)
+        clients.append(client)
+        return client
+
+    def second_factory(config: Config) -> _FakeSocketClient:
+        client = _FakeSocketClient(second_calls)
+        clients.append(client)
+        return client
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            submit_command,
+            config,
+            _request(request_id="concurrent-1"),
+            socket_client_factory=first_factory,
+        )
+        assert pane_lookup_started.wait(timeout=5)
+        assert config.db_path is not None
+        assert get_command_request(config.db_path, config.host_id, "concurrent-1") is None
+        second = submit_command(
+            config,
+            _request(request_id="concurrent-1"),
+            socket_client_factory=second_factory,
+        )
+        release_pane_lookup.set()
+        first = first_future.result(timeout=5)
+
+    assert first.status == STATUS_ACCEPTED
+    assert second.status == STATUS_ACCEPTED
+    assert first_calls == [{"method": "agent.get", "params": {"target": "agent-secret"}}]
+    assert second_calls == _expected_submit_calls()
+    assert [client.close_count for client in clients] == [1, 1]
+    receipt = get_command_request(config.db_path, config.host_id, "concurrent-1")
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM command_receipts "
+            "WHERE host_id = ? AND request_id = ? AND state = 'accepted'",
+            (config.host_id, "concurrent-1"),
+        ).fetchone()[0] == 1
+    assert sum(call["method"] == "pane.send_text" for call in first_calls + second_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("after_commit", "expected_status", "expected_state"),
+    [
+        (False, STATUS_PENDING, "reserved"),
+        (True, STATUS_REQUEST_STATE_UNCERTAIN, "send_started"),
+    ],
+)
+def test_submit_command_send_start_exception_recovers_durable_state_and_closes_prepared_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_commit: bool,
+    expected_status: str,
+    expected_state: str,
+) -> None:
+    config = _config(tmp_path / expected_state)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    real_mark = command_submission.mark_command_send_started
+    calls: list[dict[str, Any]] = []
+    clients: list[_FakeSocketClient] = []
+
+    def lose_send_start_response(*args: Any, **kwargs: Any) -> Any:
+        if after_commit:
+            result = real_mark(*args, **kwargs)
+            assert result["status"] == "send_started"
+        raise HerdrSocketTimeoutError("send-start response lost")
+
+    def factory(config: Config) -> _FakeSocketClient:
+        client = _FakeSocketClient(calls)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        command_submission,
+        "mark_command_send_started",
+        lose_send_start_response,
+    )
+    first = submit_command(
+        config,
+        _request(request_id="send-start-loss"),
+        socket_client_factory=factory,
+    )
+
+    assert first.status == expected_status
+    assert calls == [{"method": "agent.get", "params": {"target": "agent-secret"}}]
+    assert clients[0].close_count == 1
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, "send-start-loss")
+    assert receipt is not None
+    assert receipt["state"] == expected_state
+
+    if after_commit:
+        replay = submit_command(
+            config,
+            _request(request_id="send-start-loss"),
+            socket_client_factory=lambda _config: pytest.fail(
+                "send-started replay must not prepare another client"
+            ),
+        )
+        assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+        assert len(clients) == 1
+    else:
+        replay = submit_command(
+            config,
+            _request(request_id="send-start-loss"),
+            socket_client_factory=factory,
+        )
+        assert replay.status == STATUS_PENDING
+        conflict = submit_command(
+            config,
+            _request(request_id="send-start-loss", text="different"),
+            socket_client_factory=factory,
+        )
+        assert conflict.status == STATUS_DUPLICATE_REQUEST
+        assert [client.close_count for client in clients] == [1, 1, 1]
+        assert calls == [
+            {"method": "agent.get", "params": {"target": "agent-secret"}},
+            {"method": "agent.get", "params": {"target": "agent-secret"}},
+            {"method": "agent.get", "params": {"target": "agent-secret"}},
+        ]
+    assert not any(call["method"] == "pane.send_text" for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("initial_kind", "expected_replay_status", "expected_state"),
+    [
+        ("accepted", STATUS_REQUEST_STATE_UNCERTAIN, "uncertain"),
+        ("rejected", STATUS_REJECTED, "rejected"),
+    ],
+)
+def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepared_takeover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_kind: str,
+    expected_replay_status: str,
+    expected_state: str,
+) -> None:
+    config = _config(tmp_path / initial_kind)
+    worker_status = "active" if initial_kind == "accepted" else "closed"
+    worker = Worker(id="w-1", name="Alpha", status=worker_status)
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    initial_calls: list[dict[str, Any]] = []
+    first = submit_command(
+        config,
+        _request(request_id="terminal-delete-race"),
+        socket_client_factory=_factory(initial_calls),
+    )
+    assert first.status == (
+        STATUS_ACCEPTED if initial_kind == "accepted" else STATUS_REJECTED
+    )
+    assert config.db_path is not None
+
+    active_worker = Worker(id="w-1", name="Alpha", status="active")
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:02:00+00:00",
+            workers=[active_worker],
+            backend_health=[_healthy_backend()],
+        ),
+    )
+    upsert_worker_bindings(config.db_path, [_binding(active_worker)])
+
+    real_atomic_replay = command_submission.reserve_terminal_command_replay
+    deleted = Event()
+    contender_prepared = Event()
+    release_contender = Event()
+    atomic_calls = 0
+
+    def delete_then_insert_terminal(*args: Any, **kwargs: Any) -> Any:
+        nonlocal atomic_calls
+        atomic_calls += 1
+        with sqlite3.connect(str(config.db_path)) as conn:
+            conn.execute(
+                "DELETE FROM command_receipts WHERE host_id = ? AND request_id = ?",
+                (config.host_id, "terminal-delete-race"),
+            )
+            conn.commit()
+        deleted.set()
+        assert contender_prepared.wait(timeout=5)
+        try:
+            return real_atomic_replay(*args, **kwargs)
+        finally:
+            release_contender.set()
+
+    monkeypatch.setattr(
+        command_submission,
+        "reserve_terminal_command_replay",
+        delete_then_insert_terminal,
+    )
+    contender_calls: list[dict[str, Any]] = []
+
+    class PreparedContenderClient(_FakeSocketClient):
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            if method == "agent.get":
+                contender_prepared.set()
+                assert release_contender.wait(timeout=5)
+            return super().request(method, params, timeout=timeout)
+
+    contender_client = PreparedContenderClient(contender_calls)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        replay_future = executor.submit(
+            submit_command,
+            config,
+            _request(request_id="terminal-delete-race"),
+            socket_client_factory=lambda _config: pytest.fail(
+                "terminal replay must not prepare another client"
+            ),
+        )
+        assert deleted.wait(timeout=5)
+        contender_future = executor.submit(
+            submit_command,
+            config,
+            _request(request_id="terminal-delete-race"),
+            socket_client_factory=lambda _config: contender_client,
+        )
+        replay = replay_future.result(timeout=5)
+        contender = contender_future.result(timeout=5)
+
+    assert replay.status == expected_replay_status
+    assert contender.to_dict() == replay.to_dict()
+    assert atomic_calls == 1
+    assert contender_client.close_count == 1
+    assert contender_calls == [
+        {"method": "agent.get", "params": {"target": "agent-secret"}}
+    ]
+    receipt = get_command_request(config.db_path, config.host_id, "terminal-delete-race")
+    assert receipt is not None
+    assert receipt["state"] == expected_state
+    assert receipt["state"] != "reserved"
+    assert sum(call["method"] == "pane.send_text" for call in initial_calls) == (
+        1 if initial_kind == "accepted" else 0
+    )
+
+
+def test_submit_command_timeout_before_send_start_rejects_and_replays(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+
+    class ConnectTimeoutClient:
+        def connect(self) -> None:
+            raise HerdrSocketTimeoutError("connect timeout")
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            raise AssertionError("pane operations must not run")
+
+        def close(self) -> None:
+            return None
+
+    first = submit_command(
+        config,
+        _request(request_id="before-timeout"),
+        socket_client_factory=lambda _config: ConnectTimeoutClient(),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id="before-timeout"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "rejected replay must not create a socket client"
+        ),
+    )
+
+    assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert replay.to_dict() == first.to_dict()
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, "before-timeout")
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
+    assert receipt["send_started_at"] is None
+
+
+def test_submit_command_finalization_timeout_after_send_is_uncertain_and_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    calls: list[dict[str, Any]] = []
+
+    def timeout_finish(*args: Any, **kwargs: Any) -> Any:
+        raise HerdrSocketTimeoutError("receipt finalization timeout")
+
+    monkeypatch.setattr(command_submission, "finish_command_request", timeout_finish)
+    first = submit_command(
+        config,
+        _request(request_id="after-timeout"),
+        socket_client_factory=_factory(calls),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id="after-timeout"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "send-started replay must not create a socket client"
+        ),
+    )
+
+    assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert calls == _expected_submit_calls()
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, "after-timeout")
+    assert receipt is not None
+    assert receipt["state"] == "send_started"
+
+
+def test_submit_command_accepted_finalization_response_loss_replays_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    calls: list[dict[str, Any]] = []
+    real_finish = command_submission.finish_command_request
+
+    def finish_then_lose_response(*args: Any, **kwargs: Any) -> Any:
+        result = real_finish(*args, **kwargs)
+        assert result["status"] == "accepted"
+        raise HerdrSocketTimeoutError("accepted response lost")
+
+    monkeypatch.setattr(
+        command_submission,
+        "finish_command_request",
+        finish_then_lose_response,
+    )
+    first = submit_command(
+        config,
+        _request(request_id="accepted-response-loss"),
+        socket_client_factory=_factory(calls),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id="accepted-response-loss"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "accepted replay must not create a socket client"
+        ),
+    )
+
+    assert first.status == STATUS_ACCEPTED
+    assert replay.to_dict() == first.to_dict()
+    assert calls == _expected_submit_calls()
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "accepted-response-loss",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
+    turns = turns_payload_from_store(config.db_path, config.host_id)["turns"]
+    assert (
+        sum(
+            turn.get("origin_command_id") == "accepted-response-loss"
+            for turn in turns
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("damage", ["malformed_result", "illegal_state"])
+def test_submit_command_illegal_or_malformed_terminal_receipt_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    config = _config(tmp_path / damage)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
+    calls: list[dict[str, Any]] = []
+    request_id = f"damaged-{damage}"
+    accepted = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=_factory(calls),
+    )
+    assert accepted.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+
+    if damage == "malformed_result":
+        with sqlite3.connect(str(config.db_path)) as conn:
+            conn.execute(
+                "UPDATE command_receipts SET result_json = '{' "
+                "WHERE host_id = ? AND request_id = ?",
+                (config.host_id, request_id),
+            )
+            conn.commit()
+    else:
+        real_reserve = command_submission.reserve_terminal_command_replay
+
+        def illegal_reserve(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            result = real_reserve(*args, **kwargs)
+            receipt = dict(result["receipt"])
+            receipt["state"] = "illegal"
+            return {**result, "receipt": receipt}
+
+        monkeypatch.setattr(
+            command_submission,
+            "reserve_terminal_command_replay",
+            illegal_reserve,
+        )
+
+    replay = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "damaged receipt replay must not create a socket client"
+        ),
+    )
+
+    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert calls == _expected_submit_calls()
 
 
 def _answer_request(
@@ -810,6 +1753,149 @@ def _answer_request(
             "choice_id": choice_id,
         },
     }
+
+
+@pytest.mark.parametrize("terminal_status", [STATUS_ACCEPTED, STATUS_REJECTED])
+def test_answer_pending_migrated_v11_terminal_replays_without_current_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    request_payload = _answer_request(request_id=f"legacy-answer-{terminal_status}")
+    request = CommandRequest.from_dict(request_payload)
+    if terminal_status == STATUS_ACCEPTED:
+        terminal = CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=terminal_status,
+            result={
+                "target": {"worker_id": "legacy-worker"},
+                "pending": {
+                    "id": "pending-public",
+                    "fingerprint": "revision-public",
+                },
+                "choice": {"choice_id": "choice-public"},
+                "delivery_state": "submitted",
+                "transport_state": "submitted",
+                "observed_pending_state": "pending_observation",
+            },
+        )
+    else:
+        terminal = CommandEnvelope.from_result(
+            request,
+            ok=False,
+            status=terminal_status,
+            error={
+                "code": terminal_status,
+                "message": "legacy pending answer was rejected before send",
+            },
+        )
+    raw_fingerprint = request.payload_fingerprint()
+    result_json = terminal.to_json()
+    request_json = json.dumps(
+        request.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.executescript(
+            store_sqlite.CREATE_LEGACY_COMMAND_RECEIPTS_TABLE
+            + store_sqlite.CREATE_LEGACY_COMMANDS_TABLE
+        )
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, payload_fingerprint, status,
+                result_json, created_at, completed_at, uncertain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                config.host_id,
+                request.request_id,
+                request.action,
+                raw_fingerprint,
+                terminal_status,
+                result_json,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO commands (
+                host_id, request_id, action, payload_fingerprint, status,
+                dry_run, uncertain, request_json, result_json, created_at,
+                reserved_at, completed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                config.host_id,
+                request.request_id,
+                request.action,
+                raw_fingerprint,
+                terminal_status,
+                request_json,
+                result_json,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:01+00:00",
+                "2026-01-01T00:00:01+00:00",
+            ),
+        )
+        conn.execute("PRAGMA user_version = 11")
+
+    init_store(config.db_path)
+    migrated = get_command_request(
+        config.db_path,
+        config.host_id,
+        request.request_id or "",
+    )
+    assert migrated is not None
+    assert migrated["canonical_version"] == 0
+    assert migrated["canonical_fingerprint"] == raw_fingerprint
+    assert migrated["public_worker_id"] == ""
+    assert migrated["state"] == (
+        "accepted" if terminal_status == STATUS_ACCEPTED else "rejected"
+    )
+    assert migrated["legacy_collision"] is False
+
+    def command_rows() -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        with sqlite3.connect(str(config.db_path)) as conn:
+            return (
+                conn.execute(
+                    "SELECT * FROM command_receipts ORDER BY id"
+                ).fetchall(),
+                conn.execute("SELECT * FROM commands ORDER BY id").fetchall(),
+            )
+
+    rows_before = command_rows()
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("legacy terminal replay must not consult or mutate current authority")
+
+    monkeypatch.setattr(command_submission, "_validate_pending_choice", forbidden)
+    monkeypatch.setattr(command_submission, "_answer_pending", forbidden)
+    monkeypatch.setattr(command_submission, "reserve_command_request", forbidden)
+
+    replay = submit_command(
+        config,
+        request_payload,
+        socket_client_factory=forbidden,
+    )
+    changed_choice = submit_command(
+        config,
+        _answer_request(
+            request_id=request.request_id or "",
+            choice_id="changed-choice",
+        ),
+        socket_client_factory=forbidden,
+    )
+
+    assert replay.to_dict() == terminal.to_dict()
+    assert changed_choice.status == STATUS_DUPLICATE_REQUEST
+    assert command_rows() == rows_before
 
 
 class _PendingClaim:
@@ -908,15 +1994,18 @@ def _patch_pending_store_flow(
             picker_ordinal=picker_ordinal,
         )
 
-    def finish(
-        db_path: Path,
+    def finish_effect(
+        *,
         host_id: str,
         claim_token: str,
-        *,
         accepted: bool,
-    ) -> bool:
-        transitions.append(("finish", claim_token, accepted))
-        return finish_result
+    ) -> Any:
+        def apply(conn: sqlite3.Connection) -> None:
+            transitions.append(("finish", claim_token, accepted))
+            if not finish_result:
+                raise RuntimeError("pending finish failed")
+
+        return apply
 
     def abandon(db_path: Path, host_id: str, claim_token: str) -> bool:
         transitions.append(("abandon", claim_token))
@@ -924,7 +2013,11 @@ def _patch_pending_store_flow(
 
     monkeypatch.setattr(command_submission, "claim_backend_pending_choice", claim)
     monkeypatch.setattr(command_submission, "start_backend_pending_choice_send", start)
-    monkeypatch.setattr(command_submission, "finish_backend_pending_choice_send", finish)
+    monkeypatch.setattr(
+        command_submission,
+        "backend_pending_choice_terminal_effect",
+        finish_effect,
+    )
     monkeypatch.setattr(command_submission, "abandon_backend_pending_choice_claim", abandon)
     monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     return transitions
@@ -942,34 +2035,109 @@ def _expected_answer_calls(
     ]
 
 
-def test_answer_pending_dry_run_validates_current_choice_without_claim_or_socket(
+@pytest.mark.parametrize(
+    ("payload", "expected_result"),
+    [
+        (
+            {
+                "schema_version": 1,
+                "action": "send_instruction",
+                "dry_run": True,
+                "target": {"name": "Alpha", "space_id": "space-1"},
+                "instruction": {"text": "hello"},
+            },
+            {
+                "target": {"name": "Alpha", "space_id": "space-1"},
+                "instruction": {"text": "hello"},
+            },
+        ),
+        (
+            _answer_request(request_id="", dry_run=True),
+            {
+                "pending": {
+                    "id": "pending-public",
+                    "fingerprint": "revision-public",
+                },
+                "choice": {"choice_id": "choice-public"},
+                "delivery_state": "not_submitted",
+            },
+        ),
+    ],
+)
+def test_mutation_dry_run_is_pure_without_store_snapshot_or_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any],
+    expected_result: dict[str, Any],
 ) -> None:
-    config = _config(tmp_path)
-    worker = Worker(id="w-1", name="Alpha", status="active")
-    _seed(
-        config,
-        [worker],
-        [_binding(worker, private_fingerprint="binding-private")],
-    )
-    transitions = _patch_pending_store_flow(monkeypatch, worker)
-    calls: list[dict[str, Any]] = []
+    config = _config(tmp_path, backend="cli")
+    calls: list[str] = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        calls.append("io")
+        raise AssertionError("dry-run must not consult mutable command authority")
+
+    monkeypatch.setattr(command_submission, "get_command_request", forbidden)
+    monkeypatch.setattr(command_submission, "_current_snapshot", forbidden)
+    monkeypatch.setattr(command_submission, "_validate_pending_choice", forbidden)
+    monkeypatch.setattr(command_submission, "reserve_command_request", forbidden)
 
     envelope = submit_command(
         config,
-        _answer_request(request_id="", dry_run=True),
-        socket_client_factory=_factory(calls),
+        payload,
+        socket_client_factory=forbidden,
     )
 
     assert envelope.ok is True
     assert envelope.status == "dry_run"
-    assert envelope.result == {
-        "target": {"worker_id": "w-1"},
-        "pending": {"id": "pending-public", "fingerprint": "revision-public"},
-        "choice": {"choice_id": "choice-public"},
-        "delivery_state": "not_submitted",
-    }
+    assert envelope.result == expected_result
+    assert calls == []
+    assert config.db_path is not None
+    assert not config.db_path.exists()
+def test_answer_pending_reacquired_reservation_worker_drift_finishes_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    current_worker = Worker(id="w-2", name="Beta", status="active")
+    _seed(config, [current_worker], [_binding(current_worker)])
+    payload = _answer_request(request_id="answer-reacquired")
+    request = CommandRequest.from_dict(payload)
+    canonical = build_canonical_mutation(request, public_worker_id="w-1")
+    pending = command_submission._request_in_progress(request)
+    assert config.db_path is not None
+    initial = reserve_command_request(
+        config.db_path,
+        host_id=config.host_id,
+        request_id=request.request_id or "",
+        action=canonical.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=store_sqlite.envelope_to_receipt_json(pending),
+        legacy_raw_payload_fingerprint=request.payload_fingerprint(),
+        owner_lease_seconds=1,
+        now="2020-01-01T00:00:00+00:00",
+    )
+    assert initial["status"] == "reserved"
+    transitions = _patch_pending_store_flow(monkeypatch, current_worker)
+    calls: list[dict[str, Any]] = []
+
+    drift = submit_command(
+        config,
+        payload,
+        socket_client_factory=_factory(calls),
+    )
+    replay = submit_command(
+        config,
+        payload,
+        socket_client_factory=_factory(calls),
+    )
+
+    assert drift.status == STATUS_DUPLICATE_REQUEST
+    assert replay.to_dict() == drift.to_dict()
+    assert calls == []
     assert transitions == [
         (
             "claim",
@@ -980,9 +2148,14 @@ def test_answer_pending_dry_run_validates_current_choice_without_claim_or_socket
             None,
         )
     ]
-    assert calls == []
-    assert config.db_path is not None
-    assert get_command_receipt(config.db_path, "cmd-host", "", "answer_pending") is None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        request.request_id or "",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
+    assert receipt["status"] == STATUS_DUPLICATE_REQUEST
 
 
 def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
@@ -1011,11 +2184,14 @@ def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
         _answer_request(),
         socket_client_factory=_factory(calls),
     )
-    monkeypatch.setattr(
-        command_submission,
-        "_append_command_event",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            OSError("cached audit unavailable")
+    assert config.db_path is not None
+    save_snapshot(
+        config.db_path,
+        Snapshot(
+            host_id=config.host_id,
+            updated_at="2026-01-01T00:01:00+00:00",
+            workers=[worker],
+            backend_health=[_degraded_backend()],
         ),
     )
     replay = submit_command(
@@ -1023,10 +2199,19 @@ def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
         _answer_request(),
         socket_client_factory=_factory(calls),
     )
-    changed_payload = submit_command(
+    changed_choice = submit_command(
         config,
         _answer_request(choice_id="different-choice"),
-        socket_client_factory=_factory(calls),
+        socket_client_factory=lambda _config: pytest.fail(
+            "choice collision must not create a socket client"
+        ),
+    )
+    changed_pending_revision = submit_command(
+        config,
+        _answer_request(pending_fingerprint="different-revision"),
+        socket_client_factory=lambda _config: pytest.fail(
+            "pending collision must not create a socket client"
+        ),
     )
 
     assert first.ok is True
@@ -1040,9 +2225,18 @@ def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
         "observed_pending_state": "pending_observation",
     }
     assert replay.to_dict() == first.to_dict()
-    assert changed_payload.status == STATUS_DUPLICATE_REQUEST
+    assert changed_choice.status == STATUS_DUPLICATE_REQUEST
+    assert changed_pending_revision.status == STATUS_DUPLICATE_REQUEST
     assert calls == _expected_answer_calls()
     assert transitions == [
+        (
+            "claim",
+            False,
+            "pending-public",
+            "revision-public",
+            "choice-public",
+            None,
+        ),
         (
             "claim",
             True,
@@ -1056,7 +2250,7 @@ def test_answer_pending_claims_sends_only_ordinal_and_replays_receipt(
     ]
 
     assert config.db_path is not None
-    receipt = get_command_receipt(config.db_path, "cmd-host", "answer-1", "answer_pending")
+    receipt = _receipt_for_action(config.db_path, "cmd-host", "answer-1", "answer_pending")
     assert receipt is not None
     assert receipt["status"] == STATUS_ACCEPTED
     turns = turns_payload_from_store(config.db_path, config.host_id)["turns"]
@@ -1106,7 +2300,7 @@ def test_answer_pending_changed_disappeared_stale_or_unknown_fails_before_socket
 
 
 
-def test_answer_pending_second_request_loses_claim_race_without_socket(
+def test_answer_pending_claim_race_closes_prepared_loser_without_second_send(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1119,43 +2313,51 @@ def test_answer_pending_second_request_loses_claim_race_without_socket(
     )
     transitions = _patch_pending_store_flow(monkeypatch, worker)
     original_claim = command_submission.claim_backend_pending_choice
-    claim_count = 0
+    mutating_claim_count = 0
 
     def racing_claim(*args: Any, **kwargs: Any) -> _PendingClaim:
-        nonlocal claim_count
-        claim_count += 1
-        if claim_count == 2:
-            transitions.append(("claim_race_lost",))
-            return _PendingClaim("already_claimed", worker, claim_token=None)
+        nonlocal mutating_claim_count
+        if kwargs.get("claim", True):
+            mutating_claim_count += 1
+            if mutating_claim_count == 2:
+                transitions.append(("claim_race_lost",))
+                return _PendingClaim("already_claimed", worker, claim_token=None)
         return original_claim(*args, **kwargs)
 
     monkeypatch.setattr(command_submission, "claim_backend_pending_choice", racing_claim)
     calls: list[dict[str, Any]] = []
-    losing_result: list[Any] = []
+    nested_result: list[Any] = []
+    clients: list[_FakeSocketClient] = []
+
+    def nested_factory(config: Config) -> _FakeSocketClient:
+        client = _FakeSocketClient(calls)
+        clients.append(client)
+        return client
 
     class _RacingClient(_FakeSocketClient):
         def connect(self) -> "_FakeSocketClient":
-            losing_result.append(
+            nested_result.append(
                 submit_command(
                     config,
-                    _answer_request(request_id="answer-race-loser"),
-                    socket_client_factory=lambda _config: pytest.fail(
-                        "losing request must not create a socket client"
-                    ),
+                    _answer_request(request_id="answer-race-nested"),
+                    socket_client_factory=nested_factory,
                 )
             )
             return self
 
-    winner = submit_command(
+    outer_client = _RacingClient(calls)
+    clients.append(outer_client)
+    outer = submit_command(
         config,
-        _answer_request(request_id="answer-race-winner"),
-        socket_client_factory=lambda _config: _RacingClient(calls),
+        _answer_request(request_id="answer-race-outer"),
+        socket_client_factory=lambda _config: outer_client,
     )
 
-    assert winner.status == STATUS_ACCEPTED
-    assert len(losing_result) == 1
-    assert losing_result[0].status == STATUS_STALE_TARGET
+    assert outer.status == STATUS_STALE_TARGET
+    assert len(nested_result) == 1
+    assert nested_result[0].status == STATUS_ACCEPTED
     assert calls == _expected_answer_calls()
+    assert [client.close_count for client in clients] == [1, 1]
 
 
 def test_answer_pending_post_send_failure_is_uncertain_and_not_retried(
@@ -1194,12 +2396,10 @@ def test_answer_pending_post_send_failure_is_uncertain_and_not_retried(
         {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "2"}},
     ]
     assert config.db_path is not None
-    receipt = get_command_receipt(
-        config.db_path,
-        "cmd-host",
-        "answer-uncertain",
-        "answer_pending",
-    )
+    receipt = _receipt_for_action(config.db_path,
+    "cmd-host",
+    "answer-uncertain",
+    "answer_pending",)
     assert receipt is not None
     assert receipt["uncertain"] is True
 
@@ -1247,12 +2447,10 @@ def test_answer_pending_public_surfaces_recursively_exclude_private_route_values
         ordinal=3,
     )
     assert config.db_path is not None
-    receipt = get_command_receipt(
-        config.db_path,
-        "cmd-host",
-        "answer-private",
-        "answer_pending",
-    )
+    receipt = _receipt_for_action(config.db_path,
+    "cmd-host",
+    "answer-private",
+    "answer_pending",)
     assert receipt is not None
     with sqlite3.connect(str(config.db_path)) as conn:
         event_payloads = [
@@ -1349,7 +2547,7 @@ def test_answer_pending_integrates_with_durable_two_phase_claim(
 
 
 @pytest.mark.parametrize("start_status", ["changed", "stale", "binding_changed"])
-def test_answer_pending_second_cas_rejects_change_before_pane_mutation(
+def test_answer_pending_post_receipt_send_start_cas_change_is_uncertain_without_pane_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     start_status: str,
@@ -1386,17 +2584,95 @@ def test_answer_pending_second_cas_rejects_change_before_pane_mutation(
         socket_client_factory=_factory(calls),
     )
 
-    assert envelope.status == STATUS_STALE_TARGET
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert envelope.error == {
-        "code": STATUS_STALE_TARGET,
-        "message": "pending interaction changed or is no longer answerable",
+        "code": STATUS_REQUEST_STATE_UNCERTAIN,
+        "message": "previous request state is uncertain; not retrying mutation",
         "details": {},
     }
     assert calls == []
-    assert transitions[-1] == ("abandon", "claim-private")
+    assert transitions[-2:] == [
+        ("abandon", "claim-private"),
+        ("finish", "claim-private", False),
+    ]
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        f"answer-start-{start_status}",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
 
 
-def test_answer_pending_failed_pre_send_release_is_uncertain(
+
+@pytest.mark.parametrize(
+    ("claim_released", "expected_status", "expected_state"),
+    [
+        (True, STATUS_PENDING, "reserved"),
+        (False, STATUS_REQUEST_STATE_UNCERTAIN, "uncertain"),
+    ],
+)
+def test_answer_pending_send_start_exception_is_retryable_only_after_claim_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claim_released: bool,
+    expected_status: str,
+    expected_state: str,
+) -> None:
+    config = _config(tmp_path / expected_state)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(
+        config,
+        [worker],
+        [_binding(worker, private_fingerprint="binding-private")],
+    )
+    transitions = _patch_pending_store_flow(monkeypatch, worker)
+
+    if not claim_released:
+        def fail_abandon(db_path: Path, host_id: str, claim_token: str) -> bool:
+            transitions.append(("abandon_failed", claim_token))
+            return False
+
+        monkeypatch.setattr(
+            command_submission,
+            "abandon_backend_pending_choice_claim",
+            fail_abandon,
+        )
+
+    def fail_before_send_start(*args: Any, **kwargs: Any) -> Any:
+        raise HerdrSocketTimeoutError("send-start unavailable before commit")
+
+    monkeypatch.setattr(
+        command_submission,
+        "mark_command_send_started",
+        fail_before_send_start,
+    )
+    client = _FakeSocketClient([])
+    envelope = submit_command(
+        config,
+        _answer_request(request_id="answer-mark-failure"),
+        socket_client_factory=lambda _config: client,
+    )
+
+    assert envelope.status == expected_status
+    assert client.close_count == 1
+    assert client.calls == []
+    assert transitions[-1] == (
+        ("abandon", "claim-private")
+        if claim_released
+        else ("abandon_failed", "claim-private")
+    )
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "answer-mark-failure",
+    )
+    assert receipt is not None
+    assert receipt["state"] == expected_state
+
+def test_answer_pending_socket_setup_failure_precedes_claim_and_is_definite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1422,34 +2698,42 @@ def test_answer_pending_failed_pre_send_release_is_uncertain(
         "abandon_backend_pending_choice_claim",
         failed_abandon,
     )
+
     def failed_factory(config: Config) -> Any:
         raise OSError("socket unavailable")
 
-    calls: list[dict[str, Any]] = []
-
     envelope = submit_command(
         config,
-        _answer_request(request_id="answer-release-failed"),
+        _answer_request(request_id="answer-setup-failed"),
         socket_client_factory=failed_factory,
     )
 
-    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert envelope.status == STATUS_BACKEND_UNAVAILABLE
     assert envelope.error == {
-        "code": STATUS_REQUEST_STATE_UNCERTAIN,
-        "message": "pending answer claim could not be safely released",
+        "code": STATUS_BACKEND_UNAVAILABLE,
+        "message": "Herdr socket could not be reached",
         "details": {},
     }
-    assert calls == []
-    assert transitions[-1] == ("abandon_failed", "claim-private")
+    assert transitions == [
+        (
+            "claim",
+            False,
+            "pending-public",
+            "revision-public",
+            "choice-public",
+            None,
+        )
+    ]
     assert config.db_path is not None
-    receipt = get_command_receipt(
+    receipt = _receipt_for_action(
         config.db_path,
         config.host_id,
-        "answer-release-failed",
+        "answer-setup-failed",
         "answer_pending",
     )
     assert receipt is not None
-    assert receipt["uncertain"] is True
+    assert receipt["state"] == "rejected"
+    assert receipt["uncertain"] is False
 
 
 def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
@@ -1662,12 +2946,10 @@ def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
         pane_id="owner-pane-a-private",
     )
 
-    receipt = get_command_receipt(
-        config.db_path,
-        config.host_id,
-        request_id,
-        "send_instruction",
-    )
+    receipt = _receipt_for_action(config.db_path,
+    config.host_id,
+    request_id,
+    "send_instruction",)
     assert receipt is not None
     with sqlite3.connect(str(config.db_path)) as conn:
         event_payloads = [

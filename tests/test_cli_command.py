@@ -26,12 +26,16 @@ from tendwire.core.commands import (
     STATUS_REQUEST_STATE_UNCERTAIN,
     CommandEnvelope,
     CommandRequest,
+    build_canonical_mutation,
 )
 from tendwire.core.models import Space, Worker, WorkerBinding
 from tendwire.store.sqlite import (
-    get_command_receipt,
+    finish_command_request,
+    get_command_request,
     init_store,
     list_worker_bindings,
+    mark_command_send_started,
+    reserve_command_request,
     upsert_worker_bindings,
 )
 
@@ -86,6 +90,52 @@ def _accepted_backend(calls: list[tuple[Any, Any]]):
         )
 
     return send
+
+
+def _seed_uncertain_request(db_path: Path, request: CommandRequest) -> None:
+    canonical = build_canonical_mutation(request, public_worker_id="w-1")
+    pending = CommandEnvelope.error(
+        request,
+        {
+            "code": STATUS_REQUEST_STATE_UNCERTAIN,
+            "message": "pending",
+            "details": {},
+        },
+    )
+    reservation = reserve_command_request(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        action=request.action,
+        canonical_version=canonical.canonical_version,
+        canonical_fingerprint=canonical.fingerprint,
+        canonical_request_json=canonical.canonical_json,
+        public_worker_id=canonical.public_worker_id,
+        pending_result_json=pending.to_json(),
+    )
+    owner_token = reservation["owner_token"]
+    assert isinstance(owner_token, str)
+    started = mark_command_send_started(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        binding_fingerprint="seed-binding",
+    )
+    assert started["status"] == "send_started"
+    finished = finish_command_request(
+        db_path,
+        host_id="cmd-host",
+        request_id=request.request_id or "",
+        canonical_fingerprint=canonical.fingerprint,
+        owner_token=owner_token,
+        expected_state="send_started",
+        terminal_state="uncertain",
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        result_json=pending.to_json(),
+    )
+    assert finished["status"] == "uncertain"
 
 
 def test_cli_command_invalid_json(capsys, monkeypatch) -> None:
@@ -187,33 +237,70 @@ def test_cli_command_read_snapshot_neutral_result(capsys, monkeypatch) -> None:
     assert captured.err == ""
 
 
-def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
-    monkeypatch.setattr(
-        "tendwire.cli.herdr_send_instruction",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
-    )
-    db_path = tmp_path / "cmd.db"
-    init_store(db_path)
-    monkeypatch.setattr(
-        "sys.stdin",
-        io.StringIO(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "action": "send_instruction",
-                    "target": {"worker_id": "w-1"},
-                    "instruction": {"text": "hello"},
-                }
-            )
+@pytest.mark.parametrize(
+    ("request_payload", "expected_result"),
+    [
+        (
+            {
+                "schema_version": 1,
+                "action": "send_instruction",
+                "target": {"name": "Alpha"},
+                "instruction": {"text": "hello"},
+            },
+            {
+                "target": {"name": "Alpha"},
+                "instruction": {"text": "hello"},
+            },
         ),
-    )
+        (
+            {
+                "schema_version": 1,
+                "action": "answer_pending",
+                "params": {
+                    "pending_id": "pending-public",
+                    "pending_fingerprint": "revision-public",
+                    "choice_id": "choice-public",
+                },
+            },
+            {
+                "pending": {
+                    "id": "pending-public",
+                    "fingerprint": "revision-public",
+                },
+                "choice": {"choice_id": "choice-public"},
+                "delivery_state": "not_submitted",
+            },
+        ),
+    ],
+)
+def test_cli_command_mutation_dry_run_is_pure_and_creates_no_receipt(
+    request_payload: dict[str, Any],
+    expected_result: dict[str, Any],
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        calls.append("io")
+        raise AssertionError("dry-run must not call daemon, backend, or command store")
+
+    monkeypatch.setattr("tendwire.cli._try_daemon_attempt", forbidden)
+    monkeypatch.setattr("tendwire.command_submission.get_command_request", forbidden)
+    monkeypatch.setattr("tendwire.command_submission._current_snapshot", forbidden)
+    monkeypatch.setattr("tendwire.command_submission._validate_pending_choice", forbidden)
+    monkeypatch.setattr("tendwire.command_submission.reserve_command_request", forbidden)
+
+    db_path = tmp_path / f"{request_payload['action']}.db"
+    init_store(db_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request_payload)))
     code = main(
         [
             "--host-id",
             "cmd-host",
-            "--herdr-bin",
-            "definitely-not-a-real-herdr-binary",
+            "--socket-path",
+            str(tmp_path / "unavailable.sock"),
             "command",
             "--json",
             "--db-path",
@@ -221,14 +308,16 @@ def test_cli_command_send_instruction_dry_run_no_receipt(capsys, monkeypatch, tm
         ]
     )
     captured = capsys.readouterr()
-    assert code == 0
     payload = json.loads(captured.out)
+
+    assert code == 0
     assert payload["ok"] is True
-    assert payload["status"] == STATUS_DRY_RUN
+    assert payload["status"] == "dry_run"
     assert payload["dry_run"] is True
-    # Dry-runs never create receipts.
-    assert get_command_receipt(db_path, "cmd-host", "", "send_instruction") is None
+    assert payload["result"] == expected_result
+    assert calls == []
     with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM command_receipts").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM commands").fetchone()[0] == 0
 
 
@@ -252,8 +341,8 @@ def test_cli_command_socket_mode_mutation_unavailable_does_not_fallback(
     monkeypatch.delenv("TENDWIRE_SOCKET_PATH", raising=False)
     monkeypatch.delenv("TENDWIRE_HERDR_BACKEND", raising=False)
     monkeypatch.delenv("TENDWIRE_DATA_DIR", raising=False)
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_fetch)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+
+
 
     socket_path = tmp_path / f"{mode}.sock"
     data_dir = tmp_path / "data"
@@ -316,12 +405,8 @@ def test_cli_command_socket_mode_mutation_unavailable_does_not_fallback(
         assert fragment not in serialized
     _assert_no_command_public_forbidden_fields(payload)
 
-    receipt = get_command_receipt(db_path, "cmd-host", request_id, "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
-    assert cached["request_id"] == request_id
+    # A definite pre-start daemon failure never creates a local receipt.
+    assert get_command_request(db_path, "cmd-host", request_id) is None
 
 
 def test_cli_daemon_client_uses_method_specific_timeouts(
@@ -435,8 +520,8 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
                     request_started=True,
                 ) from exc
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_fetch)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+
+
     monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", TimeoutDaemonAPIClient)
 
     db_path = tmp_path / "timeout.db"
@@ -480,11 +565,112 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
     assert calls == []
     _assert_no_command_public_forbidden_fields(payload)
 
-    receipt = get_command_receipt(db_path, "cmd-host", request_id, "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is True
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_REQUEST_STATE_UNCERTAIN
+    # Client-edge uncertainty is not authoritative store state.
+    assert get_command_request(db_path, "cmd-host", request_id) is None
+
+
+@pytest.mark.parametrize(
+    ("action", "action_fields"),
+    [
+        (
+            "send_instruction",
+            {
+                "target": {"worker_id": "w-1"},
+                "instruction": {"text": "hello"},
+            },
+        ),
+        (
+            "answer_pending",
+            {
+                "params": {
+                    "pending_id": "pending-" + ("a" * 24),
+                    "pending_fingerprint": "b" * 24,
+                    "choice_id": "choice-" + ("c" * 24),
+                },
+            },
+        ),
+    ],
+    ids=["send", "answer"],
+)
+@pytest.mark.parametrize(
+    ("request_started", "expected_status"),
+    [
+        (False, STATUS_BACKEND_UNAVAILABLE),
+        (True, STATUS_REQUEST_STATE_UNCERTAIN),
+    ],
+    ids=["pre-start", "may-have-started"],
+)
+def test_cli_mutations_never_fallback_or_write_receipt_on_daemon_edge_failure(
+    action: str,
+    action_fields: dict[str, Any],
+    request_started: bool,
+    expected_status: str,
+    capsys,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FailingDaemonAPIClient:
+        def __init__(
+            self,
+            socket_path: Any,
+            *,
+            timeout_seconds: float,
+            max_response_bytes: int = 1024 * 1024,
+        ) -> None:
+            del socket_path, timeout_seconds, max_response_bytes
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            from tendwire.daemon_api import DaemonProtocolError
+
+            calls.append((method, dict(params or {})))
+            raise DaemonProtocolError(
+                "deterministic protocol failure",
+                request_started=request_started,
+            )
+
+    request_id = f"{action}-{request_started}"
+    request = {
+        "schema_version": 1,
+        "action": action,
+        "request_id": request_id,
+        "dry_run": False,
+        **action_fields,
+    }
+    db_path = tmp_path / f"{action}-{request_started}.db"
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        FailingDaemonAPIClient,
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(request)))
+
+    code = main(
+        [
+            "--host-id",
+            "cmd-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "command",
+            "--json",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert code == 1
+    assert captured.err == ""
+    assert payload["status"] == expected_status
+    assert payload["request_id"] == request_id
+    assert calls == [("command.submit", request)]
+    assert get_command_request(db_path, "cmd-host", request_id) is None
+    _assert_no_command_public_forbidden_fields(payload)
 
 
 @pytest.mark.parametrize(
@@ -494,6 +680,9 @@ def test_cli_command_socket_mode_daemon_timeout_is_uncertain(
         (None, True),
         ("", True),
         ("   \t", True),
+        (" leading", True),
+        ("trailing ", True),
+        ("\twrapped\t", True),
     ],
 )
 def test_cli_command_send_instruction_non_dry_run_requires_request_id(
@@ -509,10 +698,8 @@ def test_cli_command_send_instruction_non_dry_run_requires_request_id(
         calls.append("called")
         raise AssertionError("invalid request_id must stop before backend or store mutation")
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded)
-    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded)
-    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded)
+    monkeypatch.setattr("tendwire.command_submission.reserve_command_request", guarded)
+    monkeypatch.setattr("tendwire.command_submission._default_socket_client_factory", guarded)
     payload: dict[str, Any] = {
         "schema_version": 1,
         "action": "send_instruction",
@@ -551,11 +738,8 @@ def test_cli_command_send_instruction_requires_socket_backend_for_mutation(
 ) -> None:
     db_path = tmp_path / "literal-false.db"
     calls: list[tuple[Any, Any]] = []
-    monkeypatch.setattr(
-        "tendwire.cli.fetch_herdr_command_observation",
-        _fake_herdr_command_observation,
-    )
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -592,11 +776,7 @@ def test_cli_command_send_instruction_requires_socket_backend_for_mutation(
     assert payload["dry_run"] is False
     assert calls == []
 
-    receipt = get_command_receipt(db_path, "cmd-host", "literal-false", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert get_command_request(db_path, "cmd-host", "literal-false") is None
 
 
 def test_cli_command_default_backend_does_not_rehydrate_private_stored_binding(
@@ -633,8 +813,8 @@ def test_cli_command_default_backend_does_not_rehydrate_private_stored_binding(
             outcome="healthy_non_empty",
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -709,8 +889,8 @@ def test_cli_command_does_not_send_through_expired_stored_binding(
             outcome="healthy_non_empty",
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -803,8 +983,8 @@ def test_cli_command_duplicate_current_binding_is_ambiguous_and_not_expired(
             ],
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", duplicate_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -879,8 +1059,8 @@ def test_cli_command_stored_duplicate_binding_is_ambiguous_and_skips_backend(
             outcome="healthy_non_empty",
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", targetless_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -931,7 +1111,7 @@ def test_cli_command_rejects_non_boolean_dry_run_before_backend(
         calls.append("fetch")
         raise AssertionError("invalid dry_run must not fetch")
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_observation)
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -977,12 +1157,8 @@ def test_cli_command_rejects_malformed_schema_version_before_pipeline(
         calls.append("called")
         raise AssertionError("invalid schema_version must stop before pipeline work")
 
-    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded)
-    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded)
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded)
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded)
-    monkeypatch.setattr("tendwire.cli.project_from_observations", guarded)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded)
+    monkeypatch.setattr("tendwire.command_submission.reserve_command_request", guarded)
+    monkeypatch.setattr("tendwire.command_submission._default_socket_client_factory", guarded)
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1060,12 +1236,9 @@ def test_cli_command_send_instruction_empty_target_rejects_before_fetch(capsys, 
 
 def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
-    monkeypatch.setattr(
-        "tendwire.cli.fetch_herdr_command_observation",
-        _fake_herdr_command_observation,
-    )
+
     calls: list[tuple[Any, Any]] = []
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
     db_path = tmp_path / "cmd.db"
     payload = json.dumps(
         {
@@ -1096,12 +1269,7 @@ def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, mo
     result1 = json.loads(captured1.out)
     _assert_socket_backend_required_payload(result1, request_id="dup-1")
 
-    receipt = get_command_receipt(db_path, "cmd-host", "dup-1", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    assert receipt["completed_at"] is not None
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert get_command_request(db_path, "cmd-host", "dup-1") is None
 
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     code2 = main(
@@ -1126,12 +1294,9 @@ def test_cli_command_duplicate_request_id_same_payload_returns_cached(capsys, mo
 
 def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
-    monkeypatch.setattr(
-        "tendwire.cli.fetch_herdr_command_observation",
-        _fake_herdr_command_observation,
-    )
+
     calls: list[tuple[Any, Any]] = []
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", _accepted_backend(calls))
+
     db_path = tmp_path / "cmd.db"
     payload1 = json.dumps(
         {
@@ -1186,15 +1351,12 @@ def test_cli_command_duplicate_request_id_different_payload_rejects(capsys, monk
     captured = capsys.readouterr()
     assert code == 1
     result = json.loads(captured.out)
-    assert result["status"] == STATUS_DUPLICATE_REQUEST
+    assert result["status"] == STATUS_BACKEND_UNAVAILABLE
     assert calls == []
 
 
 def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "cmd.db"
-    # Seed an uncertain receipt directly.
-    from tendwire.store.sqlite import init_store, save_command_receipt
-
     pending_request = CommandRequest(
         action="send_instruction",
         request_id="uncertain-1",
@@ -1202,29 +1364,9 @@ def test_cli_command_pending_receipt_rejects_without_retry(capsys, monkeypatch, 
         target={"worker_id": "w-1"},
         instruction={"text": "hello"},
     )
+    # Seed terminal uncertainty through the v12 CAS lifecycle.
     init_store(db_path)
-    save_command_receipt(
-        db_path,
-        host_id="cmd-host",
-        request_id="uncertain-1",
-        action="send_instruction",
-        payload_fingerprint=pending_request.payload_fingerprint(),
-        status=STATUS_REQUEST_STATE_UNCERTAIN,
-        result_json=json.dumps(
-            {
-                "schema_version": 1,
-                "action": "send_instruction",
-                "request_id": "uncertain-1",
-                "ok": False,
-                "dry_run": False,
-                "status": STATUS_REQUEST_STATE_UNCERTAIN,
-                "result": None,
-                "error": {"code": STATUS_REQUEST_STATE_UNCERTAIN, "message": "pending", "details": {}},
-                "warnings": [],
-            }
-        ),
-        uncertain=True,
-    )
+    _seed_uncertain_request(db_path, pending_request)
 
     monkeypatch.setattr(
         "sys.stdin",
@@ -1263,7 +1405,6 @@ def test_cli_command_uncertain_receipt_changed_payload_is_duplicate_without_retr
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "cmd.db"
-    from tendwire.store.sqlite import init_store, save_command_receipt
 
     original_request = CommandRequest(
         action="send_instruction",
@@ -1273,40 +1414,17 @@ def test_cli_command_uncertain_receipt_changed_payload_is_duplicate_without_retr
         instruction={"text": "hello"},
     )
     init_store(db_path)
-    save_command_receipt(
-        db_path,
-        host_id="cmd-host",
-        request_id="uncertain-changed",
-        action="send_instruction",
-        payload_fingerprint=original_request.payload_fingerprint(),
-        status=STATUS_REQUEST_STATE_UNCERTAIN,
-        result_json=json.dumps(
-            {
-                "schema_version": 1,
-                "action": "send_instruction",
-                "request_id": "uncertain-changed",
-                "ok": False,
-                "dry_run": False,
-                "status": STATUS_REQUEST_STATE_UNCERTAIN,
-                "result": None,
-                "error": {"code": STATUS_REQUEST_STATE_UNCERTAIN, "message": "pending", "details": {}},
-                "warnings": [],
-            }
-        ),
-        uncertain=True,
-    )
+    _seed_uncertain_request(db_path, original_request)
     calls: list[str] = []
 
-    def guarded_observation(config: Any) -> HerdrCommandObservation:
-        calls.append("fetch")
-        raise AssertionError("changed duplicate receipt must not fetch Herdr")
+    def guarded_backend(*args: Any, **kwargs: Any) -> Any:
+        calls.append("backend")
+        raise AssertionError("changed duplicate receipt must not reach the backend")
 
-    def guarded_send(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
-        calls.append("send")
-        raise AssertionError("changed duplicate receipt must not send")
-
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", guarded_observation)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        guarded_backend,
+    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1413,10 +1531,7 @@ def test_cli_command_legacy_backend_guard_and_receipt_are_sanitized(
 ) -> None:
     db_path = tmp_path / "cmd.db"
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", _fake_herdr_state)
-    monkeypatch.setattr(
-        "tendwire.cli.fetch_herdr_command_observation",
-        _fake_herdr_command_observation,
-    )
+
     calls: list[tuple[Any, Any]] = []
 
     def leaky_backend(config: Any, target: Any, instruction: Any) -> CommandEnvelope:
@@ -1437,7 +1552,7 @@ def test_cli_command_legacy_backend_guard_and_receipt_are_sanitized(
             },
         )
 
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", leaky_backend)
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1472,12 +1587,7 @@ def test_cli_command_legacy_backend_guard_and_receipt_are_sanitized(
     assert calls == []
     _assert_no_command_public_forbidden_fields(payload)
 
-    receipt = get_command_receipt(db_path, "cmd-host", "sanitize-1", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
-    _assert_no_command_public_forbidden_fields(cached)
+    assert get_command_request(db_path, "cmd-host", "sanitize-1") is None
     assert captured.err == ""
 
 
@@ -1673,17 +1783,15 @@ def test_cli_command_forbidden_field_rejects_before_backend_and_store(
         calls.append("fetch")
         raise AssertionError("fetch_herdr_state called before validation")
 
-    def guarded_reserve_receipt(*args: Any, **kwargs: Any) -> Any:
-        calls.append("reserve_receipt")
-        raise AssertionError("reserve_command_receipt called before validation")
-
-    def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
-        calls.append("save_receipt")
-        raise AssertionError("save_command_receipt called before validation")
+    def guarded_reserve_request(*args: Any, **kwargs: Any) -> Any:
+        calls.append("reserve_request")
+        raise AssertionError("reserve_command_request called before validation")
 
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
-    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded_reserve_receipt)
-    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
+    monkeypatch.setattr(
+        "tendwire.command_submission.reserve_command_request",
+        guarded_reserve_request,
+    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1724,13 +1832,9 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
     """Raw top-level forbidden fields reject before store, projection, or backend work."""
     calls: list[str] = []
 
-    def guarded_reserve_receipt(*args: Any, **kwargs: Any) -> Any:
-        calls.append("reserve_receipt")
-        raise AssertionError("reserve_command_receipt called before raw validation")
-
-    def guarded_save_receipt(*args: Any, **kwargs: Any) -> None:
-        calls.append("save_receipt")
-        raise AssertionError("save_command_receipt called before raw validation")
+    def guarded_reserve_request(*args: Any, **kwargs: Any) -> Any:
+        calls.append("reserve_request")
+        raise AssertionError("reserve_command_request called before raw validation")
 
     def guarded_fetch(config: Any) -> tuple[list[Space], list[Worker]]:
         calls.append("fetch")
@@ -1748,12 +1852,17 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
         calls.append("backend")
         raise AssertionError("backend sender called before raw validation")
 
-    monkeypatch.setattr("tendwire.cli.reserve_command_receipt", guarded_reserve_receipt)
-    monkeypatch.setattr("tendwire.cli.save_command_receipt", guarded_save_receipt)
+    monkeypatch.setattr(
+        "tendwire.command_submission.reserve_command_request",
+        guarded_reserve_request,
+    )
     monkeypatch.setattr("tendwire.cli.fetch_herdr_state", guarded_fetch)
     monkeypatch.setattr("tendwire.cli.project_from_observations", guarded_project)
     monkeypatch.setattr("tendwire.cli.execute_command", guarded_execute)
-    monkeypatch.setattr("tendwire.cli.herdr_send_instruction", guarded_send)
+    monkeypatch.setattr(
+        "tendwire.command_submission._default_socket_client_factory",
+        guarded_send,
+    )
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1792,7 +1901,7 @@ def test_cli_command_raw_top_level_forbidden_rejects_before_pipeline(
 def test_cli_command_backend_unavailable_preserves_request_id(
     capsys, monkeypatch, tmp_path: Path
 ) -> None:
-    """Non-dry-run send_instruction preserves request_id in stdout and receipt."""
+    """A pre-start backend failure preserves request_id without store authority."""
     db_path = tmp_path / "req.db"
     upsert_worker_bindings(
         db_path,
@@ -1846,28 +1955,17 @@ def test_cli_command_backend_unavailable_preserves_request_id(
     assert payload["status"] == STATUS_BACKEND_UNAVAILABLE
     assert payload["request_id"] == "req-visible"
 
-    receipt = get_command_receipt(db_path, "cmd-host", "req-visible", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["request_id"] == "req-visible"
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert get_command_request(db_path, "cmd-host", "req-visible") is None
     with sqlite3.connect(str(db_path)) as conn:
-        audit_row = conn.execute(
+        assert conn.execute(
             """
-            SELECT request_json
+            SELECT COUNT(*)
             FROM commands
             WHERE host_id = ?
               AND request_id = ?
-              AND action = ?
             """,
-            ("cmd-host", "req-visible", "send_instruction"),
-        ).fetchone()
-    assert audit_row is not None
-    audit_request = json.loads(audit_row[0])
-    assert audit_request["request_id"] == "req-visible"
-    assert audit_request["target"] == {"worker_id": "w-1"}
-    assert audit_request["instruction"] == {"text": "hello"}
+            ("cmd-host", "req-visible"),
+        ).fetchone()[0] == 0
     current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
     assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
@@ -1904,11 +2002,8 @@ def test_cli_command_default_backend_blocks_degraded_observation_send(
             message="Herdr agent observation is not healthy",
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", degraded_observation)
-    monkeypatch.setattr(
-        "tendwire.cli.herdr_send_instruction",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
-    )
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -1942,11 +2037,7 @@ def test_cli_command_default_backend_blocks_degraded_observation_send(
 
     assert code == 1
     _assert_socket_backend_required_payload(payload, request_id="degraded-1")
-    receipt = get_command_receipt(db_path, "cmd-host", "degraded-1", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert get_command_request(db_path, "cmd-host", "degraded-1") is None
     current = list_worker_bindings(db_path, "cmd-host", backend="herdr")
     assert [binding.private_fingerprint for binding in current] == ["still-live-private"]
 
@@ -1964,11 +2055,8 @@ def test_cli_command_default_backend_blocks_healthy_empty_observation_send(
             outcome="empty_healthy",
         )
 
-    monkeypatch.setattr("tendwire.cli.fetch_herdr_command_observation", empty_observation)
-    monkeypatch.setattr(
-        "tendwire.cli.herdr_send_instruction",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("backend called")),
-    )
+
+
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO(
@@ -2002,8 +2090,4 @@ def test_cli_command_default_backend_blocks_healthy_empty_observation_send(
 
     assert code == 1
     _assert_socket_backend_required_payload(payload, request_id="empty-1")
-    receipt = get_command_receipt(db_path, "cmd-host", "empty-1", "send_instruction")
-    assert receipt is not None
-    assert receipt["uncertain"] is False
-    cached = json.loads(receipt["result_json"])
-    assert cached["status"] == STATUS_BACKEND_UNAVAILABLE
+    assert get_command_request(db_path, "cmd-host", "empty-1") is None

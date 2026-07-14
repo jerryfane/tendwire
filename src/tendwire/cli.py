@@ -18,25 +18,20 @@ from typing import Any
 from .backends.herdr_cli import (
     bindings_from_workers,
     diagnose_herdr,
-    fetch_herdr_command_observation,
     fetch_herdr_snapshot_observation,
     fetch_herdr_state,
     herdr_backend_health,
     rehydrate_workers_from_bindings,
 )
-from .backends.herdr_command import send_instruction as herdr_send_instruction
 from .backends.herdr_turns import refresh_structured_turn_content
 from .config import Config, load_config
 from .core.actions import CommandContext, execute_command
 from .core.attention import attention_payload_from_snapshot
 from .core.commands import (
     STATUS_BACKEND_UNAVAILABLE,
-    STATUS_DUPLICATE_REQUEST,
     STATUS_REQUEST_STATE_UNCERTAIN,
-    STATUS_PENDING,
     CommandEnvelope,
     error_value,
-    has_nonblank_request_id,
     parse_command_request,
     validate_request,
 )
@@ -47,8 +42,6 @@ from .core.models import (
     public_json_dumps,
     sanitize_public_mapping,
     separate_duplicate_worker_bindings,
-    stable_json_dumps,
-    utc_timestamp,
 )
 from .core.turns import (
     TURN_LIST_DEFAULT_LIMIT,
@@ -58,17 +51,14 @@ from .core.turns import (
 from .local_state import repair_config_state
 from .store.sqlite import (
     CompactionOptions,
-    compact_store,
     attention_payload_from_store,
-    envelope_to_receipt_json,
+    compact_store,
     expire_stale_worker_bindings,
     latest_healthy_backend_snapshot,
     latest_snapshot,
-    pending_payload_from_store,
     list_worker_bindings,
-    reserve_command_receipt,
+    pending_payload_from_store,
     run_store_maintenance,
-    save_command_receipt,
     store_status,
     tail_event_metadata,
     turns_payload_from_store,
@@ -626,34 +616,6 @@ def _fetch_snapshot_observation_with_bindings(
     return spaces, workers, bindings, backend_health, complete_barrier
 
 
-def _fetch_command_observation_with_bindings(
-    config: Config,
-    stored_bindings: list[WorkerBinding],
-) -> Any:
-    try:
-        observation = fetch_herdr_command_observation(config, stored_bindings=stored_bindings)
-    except TypeError:
-        observation = fetch_herdr_command_observation(config)
-    bindings = getattr(observation, "bindings", None)
-    if bindings is None:
-        object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
-    elif not bindings:
-        object.__setattr__(observation, "bindings", bindings_from_workers(config, observation.workers))
-    backend_health = getattr(observation, "backend_health", None)
-    if backend_health is None or not backend_health:
-        object.__setattr__(
-            observation,
-            "backend_health",
-            [
-                herdr_backend_health(
-                    getattr(observation, "outcome", "unknown"),
-                    message=getattr(observation, "message", "") or None,
-                    spaces=getattr(observation, "spaces", []) or [],
-                    workers=getattr(observation, "workers", []) or [],
-                )
-            ],
-        )
-    return observation
 
 
 def _herdr_health_from_items(items: list[BackendHealth]) -> BackendHealth:
@@ -663,24 +625,6 @@ def _herdr_health_from_items(items: list[BackendHealth]) -> BackendHealth:
     return herdr_backend_health("unknown")
 
 
-def _observation_health(observation: Any) -> BackendHealth:
-    health = getattr(observation, "health", None)
-    if isinstance(health, BackendHealth):
-        return health
-    items = getattr(observation, "backend_health", None)
-    if items:
-        return _herdr_health_from_items(list(items))
-    return herdr_backend_health(
-        getattr(observation, "outcome", "unknown"),
-        message=getattr(observation, "message", "") or None,
-        spaces=getattr(observation, "spaces", []) or [],
-        workers=getattr(observation, "workers", []) or [],
-    )
-
-
-def _health_observed_at(backend_health: list[BackendHealth]) -> str:
-    health = _herdr_health_from_items(backend_health)
-    return health.observed_at or utc_timestamp()
 
 
 def observe_public_snapshot(
@@ -1219,129 +1163,25 @@ def cmd_doctor(
     return 0 if payload.get("status") == "ok" else 1
 
 
-def _envelope_from_receipt(request: Any, receipt: dict[str, Any]) -> CommandEnvelope:
-    if receipt is None:
-        return None
-    if receipt["payload_fingerprint"] != request.payload_fingerprint():
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_DUPLICATE_REQUEST,
-                "request_id reused with a different payload",
-            ),
-        )
-    if receipt["uncertain"]:
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_REQUEST_STATE_UNCERTAIN,
-                "previous request state is uncertain; not retrying mutation",
-            ),
-        )
-    cached = CommandEnvelope.from_dict(json.loads(receipt["result_json"]))
-    return cached
-
-
-def _command_request_json(request: Any) -> str:
-    if hasattr(request, "to_dict"):
-        return stable_json_dumps(request.to_dict())
-    return "{}"
-
-
-def _reserve_command_receipt(config: Config, request: Any) -> CommandEnvelope | None:
-    """Reserve a mutating command key, or return an existing receipt envelope."""
-    from .core.commands import CommandRequest
-
-    if not isinstance(request, CommandRequest):
-        return None
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
-        return None
-    if config.db_path is None:
-        return None
-    pending = CommandEnvelope.error(
-        request,
-        error_value(
-            STATUS_REQUEST_STATE_UNCERTAIN,
-            "request is pending backend mutation",
-        ),
-    )
-    reservation = reserve_command_receipt(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id,
-        action=request.action,
-        payload_fingerprint=request.payload_fingerprint(),
-        pending_result_json=envelope_to_receipt_json(pending),
-        status=STATUS_PENDING,
-        request_json=_command_request_json(request),
-    )
-    if reservation["reserved"]:
-        return None
-    return _envelope_from_receipt(request, reservation["receipt"])
-
-
-def _save_command_receipt(config: Config, request: Any, envelope: CommandEnvelope) -> None:
-    from .core.commands import CommandRequest
-
-    if not isinstance(request, CommandRequest):
-        return
-    if config.db_path is None:
-        return
-    if request.action != "send_instruction" or request.dry_run or not has_nonblank_request_id(request.request_id):
-        return
-    uncertain = envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
-    save_command_receipt(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id,
-        action=request.action,
-        payload_fingerprint=request.payload_fingerprint(),
-        status=envelope.status,
-        result_json=envelope_to_receipt_json(envelope),
-        uncertain=uncertain,
-    )
-
-
-def _command_observation_error(request: Any, observation: Any) -> CommandEnvelope | None:
-    from .core.commands import CommandRequest
-
-    if not isinstance(request, CommandRequest):
-        return None
-    if request.action != "send_instruction" or request.dry_run:
-        return None
-    health = _observation_health(observation)
-    if getattr(observation, "healthy", False) and health.status == "healthy":
-        return None
-    message = health.message or getattr(observation, "message", "")
-    if health.status == "unavailable" or getattr(observation, "status", "") == "unavailable":
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_BACKEND_UNAVAILABLE,
-                message or "Herdr backend is unavailable",
-            ),
-        )
-    return CommandEnvelope.error(
-        request,
-        error_value(
-            STATUS_REQUEST_STATE_UNCERTAIN,
-            message or "Herdr observation state is uncertain",
-        ),
-    )
-
-
 def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelope:
-    """Execute a JSON command request through the existing command path."""
+    """Execute a JSON command request through the authoritative command path."""
     request, parse_error = parse_command_request(payload)
     if parse_error is not None:
-        envelope = CommandEnvelope.error(None, parse_error or error_value("invalid_request", "unknown parse error"))
         if request is not None:
-            envelope = CommandEnvelope.error(request, parse_error)
-        return envelope
+            return CommandEnvelope.error(request, parse_error)
+        return CommandEnvelope.error(
+            None,
+            parse_error or error_value("invalid_request", "unknown parse error"),
+        )
 
     validation_error = validate_request(request)
     if validation_error is not None:
         return CommandEnvelope.error(request, validation_error)
+
+    if request.action in {"send_instruction", "answer_pending"}:
+        from .command_submission import submit_command
+
+        return submit_command(config, payload)
 
     if request.action == "noop":
         return execute_command(
@@ -1349,78 +1189,32 @@ def command_envelope_from_payload(config: Config, payload: str) -> CommandEnvelo
             CommandContext(host_id=config.host_id, workers=[]),
         )
 
-    receipt_envelope = _reserve_command_receipt(config, request)
-    if receipt_envelope is not None:
-        return receipt_envelope
-
-    if request.action == "send_instruction" and not request.dry_run and config.herdr_backend != "socket":
-        envelope = CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_BACKEND_UNAVAILABLE,
-                "Herdr socket backend is not enabled",
-            ),
-        )
-        _save_command_receipt(config, request, envelope)
-        return envelope
-
-    stored_bindings: list[WorkerBinding] = []
-    if request.action == "send_instruction" and not request.dry_run:
-        stored_bindings = _load_worker_bindings(config)
-        observation = _fetch_command_observation_with_bindings(config, stored_bindings)
-        observation_error = _command_observation_error(request, observation)
-        if observation_error is not None:
-            _save_command_receipt(config, request, observation_error)
-            return observation_error
-        backend_health = list(getattr(observation, "backend_health", []) or [])
-        spaces, workers = observation.spaces, observation.workers
-        current_bindings = list(getattr(observation, "bindings", []) or [])
-        current_bindings = _persist_binding_observation(
+    stored_bindings = _load_worker_bindings(config)
+    spaces, workers, current_bindings, backend_health, _complete_barrier = (
+        _fetch_snapshot_observation_with_bindings(
             config,
-            current_bindings,
-            observed_at=current_bindings[0].observed_at if current_bindings else _health_observed_at(backend_health),
-            workers_present=bool(workers),
-            authoritative=_observation_health(observation).status == "healthy",
-        )
-        stored_after_refresh = _load_worker_bindings(config)
-        workers = rehydrate_workers_from_bindings(
-            workers,
-            current_bindings,
-            stored_after_refresh or stored_bindings,
-        )
-    else:
-        stored_bindings = _load_worker_bindings(config)
-        spaces, workers, current_bindings, backend_health, _complete_barrier = (
-            _fetch_snapshot_observation_with_bindings(
-                config,
-                stored_bindings,
-            )
-        )
-        workers = rehydrate_workers_from_bindings(
-            workers,
-            current_bindings,
             stored_bindings,
         )
+    )
+    workers = rehydrate_workers_from_bindings(
+        workers,
+        current_bindings,
+        stored_bindings,
+    )
     snapshot = project_from_observations(
         config,
         spaces=spaces,
         workers=workers,
         backend_health=backend_health,
     )
-
-    def backend_sender(target: dict[str, Any], instruction: dict[str, Any]) -> CommandEnvelope:
-        return herdr_send_instruction(config, target, instruction)
-
-    context = CommandContext(
-        host_id=config.host_id,
-        workers=workers,
-        snapshot=snapshot,
-        backend_sender=backend_sender,
+    return execute_command(
+        request,
+        CommandContext(
+            host_id=config.host_id,
+            workers=workers,
+            snapshot=snapshot,
+        ),
     )
-
-    envelope = execute_command(request, context)
-    _save_command_receipt(config, request, envelope)
-    return envelope
 
 
 def _command_exit_code(envelope: CommandEnvelope) -> int:
@@ -1428,7 +1222,7 @@ def _command_exit_code(envelope: CommandEnvelope) -> int:
 
 
 def _requires_daemon_for_mutating_command(config: Config, payload: str) -> Any | None:
-    """Return the validated mutating request that must not fall back to Herdr CLI."""
+    """Return a live mutating request that must not fall back from the daemon."""
     if config.socket_path is None and config.herdr_backend != "socket":
         return None
     request, parse_error = parse_command_request(payload)
@@ -1437,38 +1231,30 @@ def _requires_daemon_for_mutating_command(config: Config, payload: str) -> Any |
     validation_error = validate_request(request)
     if validation_error is not None:
         return None
-    if request.action == "send_instruction" and not request.dry_run:
+    if request.action in {"send_instruction", "answer_pending"} and not request.dry_run:
         return request
     return None
 
 
 def _daemon_backend_failure_envelope(
-    config: Config,
     request: Any,
     attempt: _DaemonAttempt,
 ) -> CommandEnvelope:
-    receipt_envelope = _reserve_command_receipt(config, request)
-    if receipt_envelope is not None:
-        return receipt_envelope
-    if attempt.error_kind in {"timeout", "protocol"}:
-        envelope = CommandEnvelope.error(
+    if attempt.request_started is not False:
+        return CommandEnvelope.error(
             request,
             error_value(
                 STATUS_REQUEST_STATE_UNCERTAIN,
                 "Tendwire daemon command state is uncertain",
             ),
         )
-        _save_command_receipt(config, request, envelope)
-        return envelope
-    envelope = CommandEnvelope.error(
+    return CommandEnvelope.error(
         request,
         error_value(
             STATUS_BACKEND_UNAVAILABLE,
             "Tendwire daemon backend is unavailable",
         ),
     )
-    _save_command_receipt(config, request, envelope)
-    return envelope
 
 
 def cmd_command(
@@ -1483,8 +1269,27 @@ def cmd_command(
             request_payload = json.loads(payload)
         except (json.JSONDecodeError, TypeError, ValueError):
             request_payload = None
+        parsed_request, parse_error = parse_command_request(payload)
+        validation_error = (
+            None
+            if parse_error is not None or parsed_request is None
+            else validate_request(parsed_request)
+        )
+        pure_mutation_dry_run = (
+            parse_error is None
+            and validation_error is None
+            and parsed_request is not None
+            and parsed_request.action in {"send_instruction", "answer_pending"}
+            and parsed_request.dry_run
+        )
         daemon_required_request = _requires_daemon_for_mutating_command(config, payload)
-        if isinstance(request_payload, dict):
+        daemon_eligible = (
+            isinstance(request_payload, dict)
+            and parse_error is None
+            and validation_error is None
+            and not pure_mutation_dry_run
+        )
+        if daemon_eligible:
             daemon_attempt = _try_daemon_attempt(config, "command.submit", request_payload)
             daemon_result = daemon_attempt.result
             if daemon_result is not None:
@@ -1492,7 +1297,6 @@ def cmd_command(
                 return 0 if bool(daemon_result.get("ok")) else 1
             if daemon_required_request is not None:
                 envelope = _daemon_backend_failure_envelope(
-                    config,
                     daemon_required_request,
                     daemon_attempt,
                 )
@@ -1631,6 +1435,9 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             snapshot_retention_count=config.snapshot_retention_count,
             maintenance_batch_size=config.snapshot_maintenance_batch_size,
             maintenance_cadence_seconds=config.store_maintenance_cadence_seconds,
+            command_retry_horizon_seconds=config.command_retry_horizon_seconds,
+            command_receipt_retention_seconds=config.command_receipt_retention_seconds,
+            command_receipt_retention_count=config.command_receipt_retention_count,
         )
     elif args.store_action == "events-tail":
         payload = tail_event_metadata(config.db_path, config.host_id, limit=args.limit)
@@ -1654,6 +1461,9 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
                 if args.acknowledged_final_retention_count is not None
                 else config.acknowledged_final_retention_count
             ),
+            command_retry_horizon_seconds=config.command_retry_horizon_seconds,
+            command_receipt_retention_seconds=config.command_receipt_retention_seconds,
+            command_receipt_retention_count=config.command_receipt_retention_count,
             dry_run=args.dry_run,
             snapshot_retention_days=args.snapshot_retention_days
             if args.snapshot_retention_days is not None

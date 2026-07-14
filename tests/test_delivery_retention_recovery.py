@@ -961,10 +961,10 @@ def _seed_v10_recovered_lineage(db_path: Path) -> tuple[str, str, str]:
     return turn_id, revision, failed_token
 
 
-def test_v11_migration_uses_effective_recovery_lineage_without_repost_or_hold(
+def test_v12_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "v11-recovered-lineage.db"
+    db_path = tmp_path / "v12-recovered-lineage.db"
     turn_id, revision, failed_token = _seed_v10_recovered_lineage(db_path)
 
     init_store(db_path)
@@ -973,7 +973,7 @@ def test_v11_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     api = ConnectorOutboxAPI(db_path, HOST_ID)
     assert api.poll({"name": FINAL_NAME, "limit": 100})["items"] == []
     with sqlite3.connect(str(db_path)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store_sqlite.STORE_SCHEMA_VERSION == 12
         anchor = conn.execute(
             """
             SELECT delivery_kind, status
@@ -1010,10 +1010,10 @@ def test_v11_migration_uses_effective_recovery_lineage_without_repost_or_hold(
     assert cleanup["deleted"] == 1
 
 
-def test_v11_migrated_recovery_lineage_survives_same_owner_worker_churn(
+def test_v12_migrated_recovery_lineage_survives_same_owner_worker_churn(
     tmp_path: Path,
 ) -> None:
-    db_path = tmp_path / "v11-recovered-lineage-owner-churn.db"
+    db_path = tmp_path / "v12-recovered-lineage-owner-churn.db"
     turn_id, revision, failed_token = _seed_v10_recovered_lineage(db_path)
     init_store(db_path)
 

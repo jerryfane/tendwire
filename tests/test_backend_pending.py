@@ -1428,11 +1428,11 @@ def test_cached_pending_projection_never_migrates_older_store(
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
-def test_current_v11_creation_has_exact_binding_and_claim_state(tmp_path: Path) -> None:
-    db = tmp_path / "current-v11.db"
+def test_current_v12_creation_has_exact_binding_and_claim_state(tmp_path: Path) -> None:
+    db = tmp_path / "current-v12.db"
     init_store(db)
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == STORE_SCHEMA_VERSION == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == STORE_SCHEMA_VERSION == 12
         columns = {
             str(row[1])
             for row in conn.execute("PRAGMA table_info(backend_pending)").fetchall()
@@ -1518,7 +1518,7 @@ def test_v9_pending_migration_preserves_public_row_but_leaves_it_unrouted(
         conn.execute("PRAGMA user_version = 9")
     init_store(db)
     with sqlite3.connect(db) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == STORE_SCHEMA_VERSION
         migrated = conn.execute(
             """
             SELECT payload_json, observation_state, freshness,

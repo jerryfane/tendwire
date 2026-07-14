@@ -151,6 +151,9 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         store_maintenance_cadence_seconds=3600,
         acknowledged_final_retention_days=36500,
         acknowledged_final_retention_count=100,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=11,
     )
     init_store(db_path)
     snapshot = project_from_raw(
@@ -203,6 +206,9 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         acknowledged_final_retention_count=(
             config.acknowledged_final_retention_count
         ),
+        command_retry_horizon_seconds=config.command_retry_horizon_seconds,
+        command_receipt_retention_seconds=config.command_receipt_retention_seconds,
+        command_receipt_retention_count=config.command_receipt_retention_count,
         cadence_seconds=config.store_maintenance_cadence_seconds,
         now="2026-01-10T00:00:00+00:00",
     )
@@ -215,6 +221,9 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         snapshot_retention_count=config.snapshot_retention_count,
         maintenance_batch_size=config.snapshot_maintenance_batch_size,
         maintenance_cadence_seconds=config.store_maintenance_cadence_seconds,
+        command_retry_horizon_seconds=config.command_retry_horizon_seconds,
+        command_receipt_retention_seconds=config.command_receipt_retention_seconds,
+        command_receipt_retention_count=config.command_receipt_retention_count,
     )
     cleanup = run_store_maintenance(
         db_path,
@@ -223,6 +232,9 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         max_outbox_attempts=10,
         acknowledged_final_retention_days=config.acknowledged_final_retention_days,
         acknowledged_final_retention_count=config.acknowledged_final_retention_count,
+        command_retry_horizon_seconds=config.command_retry_horizon_seconds,
+        command_receipt_retention_seconds=config.command_receipt_retention_seconds,
+        command_receipt_retention_count=config.command_receipt_retention_count,
         now="2026-01-10T00:00:00+00:00",
         dry_run=True,
         snapshot_retention_days=config.snapshot_retention_days,
@@ -280,6 +292,20 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "acknowledged_final_retention_days": 36500,
             "acknowledged_final_retention_count": 100,
         },
+        "command_requests": {
+            "ok": True,
+            "status": "ok",
+            "retry_horizon_seconds": 120,
+            "retention_seconds": 691_200,
+            "retention_count": 11,
+            "batch_size": 5,
+            "retry_cutoff_at": "2026-01-09T23:58:00+00:00",
+            "cutoff_at": "2026-01-02T00:00:00+00:00",
+            "examined": 0,
+            "stale_active": 0,
+            "deleted": 0,
+            "remaining_candidates": False,
+        },
         "batch_size": 5,
     }
     assert status["counts"]["snapshots"] == 1
@@ -303,6 +329,26 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         "acknowledged_final_retention_count": 100,
         "storage_pressure": False,
     }
+    assert status["command_requests"] == {
+        "total": 0,
+        "states": {
+            "reserved": 0,
+            "send_started": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "uncertain": 0,
+        },
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": 120,
+        "retention_seconds": 691_200,
+        "retention_count": 11,
+        "storage_pressure": False,
+    }
+    assert (
+        status["command_requests"]["retention_seconds"]
+        > status["command_requests"]["retry_horizon_seconds"]
+    )
     assert status["maintenance"] == {
         "last_completed_at": "2026-01-10T00:00:00+00:00",
         "status": "ok",
@@ -318,6 +364,20 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
     assert cleanup["snapshots"]["examined"] == 0
     assert cleanup["outbox"]["updated"] == 0
     assert cleanup["turn_content"]["examined"] == 0
+    assert cleanup["command_requests"] == {
+        "ok": True,
+        "status": "ok",
+        "retry_horizon_seconds": 120,
+        "retention_seconds": 691_200,
+        "retention_count": 11,
+        "batch_size": 100,
+        "retry_cutoff_at": "2026-01-09T23:58:00+00:00",
+        "cutoff_at": "2026-01-02T00:00:00+00:00",
+        "examined": 0,
+        "stale_active": 0,
+        "deleted": 0,
+        "remaining_candidates": False,
+    }
     assert cleanup["final_retention"] == {
         "dry_run": True,
         "acknowledged_final_retention_days": 36500,

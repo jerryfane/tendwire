@@ -2810,6 +2810,9 @@ def test_cli_store_status_passes_configured_maintenance_policy(
         "snapshot_retention_count": 211,
         "maintenance_batch_size": 37,
         "maintenance_cadence_seconds": 7200,
+        "command_retry_horizon_seconds": 604800,
+        "command_receipt_retention_seconds": 2592000,
+        "command_receipt_retention_count": 4096,
     }
 
 

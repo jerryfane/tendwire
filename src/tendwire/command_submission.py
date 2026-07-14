@@ -6,7 +6,6 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .config import Config
@@ -18,7 +17,7 @@ from .core.commands import (
     STATUS_BACKEND_FAILED,
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_BACKEND_UNSUPPORTED,
-    STATUS_DUPLICATE_INSTRUCTION,
+    STATUS_DRY_RUN,
     STATUS_DUPLICATE_REQUEST,
     STATUS_NOT_FOUND,
     STATUS_PENDING,
@@ -26,41 +25,42 @@ from .core.commands import (
     STATUS_REQUEST_STATE_UNCERTAIN,
     STATUS_RESOLVED,
     STATUS_STALE_TARGET,
+    CanonicalMutation,
     CommandEnvelope,
     CommandRequest,
+    build_canonical_mutation,
     error_value,
-    has_nonblank_request_id,
     parse_command_request,
     resolve_target,
     validate_request,
     worker_candidate,
 )
-from .core.models import BackendHealth, Snapshot, Worker, WorkerBinding, stable_json_dumps
+from .core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from .core.projector import project_from_observations
 from .store.sqlite import (
     abandon_backend_pending_choice_claim,
-    append_event,
+    backend_pending_choice_terminal_effect,
     claim_backend_pending_choice,
+    command_pending_turn_terminal_effect,
     envelope_to_receipt_json,
-    find_recent_matching_command_submission,
-    finish_backend_pending_choice_send,
+    finish_command_request,
+    get_command_request,
     latest_snapshot,
     list_worker_bindings,
-    reserve_command_receipt,
-    save_command_receipt,
+    mark_command_send_started,
+    reserve_command_request,
+    reserve_terminal_command_replay,
     start_backend_pending_choice_send,
-    upsert_command_pending_turn,
 )
 
 
 HERDR_BACKEND = "herdr"
 _MUTATING_ACTIONS = frozenset({"send_instruction", "answer_pending"})
+_LEGACY_V0_REPLAY_WORKER_ID = "legacy-v0-replay-only"
 _PENDING_CHANGED_MESSAGE = "pending interaction changed or is no longer answerable"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
 _SUBMIT_ENTER_DELAY_SECONDS = 0.2
-_DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS = 6 * 60 * 60
-_DUPLICATE_INSTRUCTION_MIN_CHARS = 40
 _PRIVATE_PANE_CLEAR_KEY_SEQUENCES = (
     ("ctrl+u",),
     ("ctrl+a", "ctrl+k"),
@@ -95,8 +95,6 @@ def _raw_payload_from_mapping(params: Mapping[str, Any]) -> str:
     )
 
 
-def _request_json(request: CommandRequest) -> str:
-    return stable_json_dumps(request.to_dict())
 
 
 def _default_socket_client_factory(config: Config) -> Any:
@@ -105,51 +103,6 @@ def _default_socket_client_factory(config: Config) -> Any:
     return HerdrSocketClient(timeout=config.herdr_timeout_seconds)
 
 
-def _safe_event_payload(
-    request: CommandRequest,
-    *,
-    status: str,
-    envelope: CommandEnvelope | None = None,
-    target_worker_id: str | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "schema_version": 1,
-        "action": request.action,
-        "request_id": request.request_id,
-        "dry_run": request.dry_run,
-        "status": status,
-    }
-    if target_worker_id:
-        payload["target"] = {"worker_id": target_worker_id}
-    if envelope is not None:
-        payload["envelope"] = envelope.to_dict()
-    return payload
-
-
-def _append_command_event(
-    config: Config,
-    event_type: str,
-    request: CommandRequest,
-    *,
-    status: str,
-    envelope: CommandEnvelope | None = None,
-    target_worker_id: str | None = None,
-) -> None:
-    if config.db_path is None or not has_nonblank_request_id(request.request_id):
-        return
-    append_event(
-        config.db_path,
-        config.host_id,
-        event_type,
-        _safe_event_payload(
-            request,
-            status=status,
-            envelope=envelope,
-            target_worker_id=target_worker_id,
-        ),
-        aggregate_type="command",
-        aggregate_id=request.request_id,
-    )
 
 
 def _backend_health(snapshot: Snapshot) -> BackendHealth:
@@ -307,11 +260,10 @@ def _binding_for_worker(
     return ResolvedCommandTarget(worker=worker, binding=binding)
 
 
-def _resolve_authoritative_target(
+def _resolve_authoritative_worker(
     request: CommandRequest,
     snapshot: Snapshot,
-    bindings: list[WorkerBinding],
-) -> ResolvedCommandTarget | CommandEnvelope:
+) -> Worker | CommandEnvelope:
     resolved, candidates, status = resolve_target(
         request.target,
         list(snapshot.workers),
@@ -321,13 +273,26 @@ def _resolve_authoritative_target(
     if status != STATUS_RESOLVED:
         return _target_resolution_error(request, status, candidates)
 
-    worker = next((item for item in snapshot.workers if item.id == (resolved or {}).get("worker_id")), None)
+    worker = next(
+        (item for item in snapshot.workers if item.id == (resolved or {}).get("worker_id")),
+        None,
+    )
     if worker is None:
         return _target_resolution_error(request, STATUS_NOT_FOUND, [])
-    if worker.status in _DISALLOWED_SEND_STATUSES:
-        return _target_resolution_error(request, STATUS_REJECTED, [worker_candidate(worker)])
+    return worker
 
-    return _binding_for_worker(request, worker, bindings)
+
+def _worker_status_error(
+    request: CommandRequest,
+    worker: Worker,
+) -> CommandEnvelope | None:
+    if worker.status not in _DISALLOWED_SEND_STATUSES:
+        return None
+    return _target_resolution_error(
+        request,
+        STATUS_REJECTED,
+        [worker_candidate(worker)],
+    )
 
 
 def _socket_request(client: Any, method: str, params: Mapping[str, Any], *, timeout: float) -> Any:
@@ -404,44 +369,6 @@ def _instruction_text(request: CommandRequest) -> str:
     return text if isinstance(text, str) else ""
 
 
-def _duplicate_instruction_since() -> str:
-    since = datetime.now(timezone.utc) - timedelta(seconds=_DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS)
-    return since.isoformat()
-
-
-def _duplicate_instruction_envelope(
-    config: Config,
-    request: CommandRequest,
-    worker: Worker,
-) -> CommandEnvelope | None:
-    if config.db_path is None:
-        return None
-    text = _instruction_text(request)
-    if len(text.strip()) < _DUPLICATE_INSTRUCTION_MIN_CHARS:
-        return None
-    match = find_recent_matching_command_submission(
-        config.db_path,
-        config.host_id,
-        action=request.action,
-        worker_id=worker.id,
-        worker_fingerprint=worker.fingerprint,
-        instruction_text=text,
-        since=_duplicate_instruction_since(),
-        exclude_request_id=request.request_id or "",
-    )
-    if match is None:
-        return None
-    return CommandEnvelope.from_result(
-        request,
-        ok=True,
-        status=STATUS_DUPLICATE_INSTRUCTION,
-        result={
-            "target": {"worker_id": worker.id},
-            "delivery_state": "duplicate_suppressed",
-            "deduplicated": True,
-            "replay_window_seconds": _DUPLICATE_INSTRUCTION_REPLAY_WINDOW_SECONDS,
-        },
-    )
 
 
 def _backend_failure(request: CommandRequest, message: str) -> CommandEnvelope:
@@ -462,124 +389,24 @@ def _backend_uncertain(request: CommandRequest, message: str) -> CommandEnvelope
     )
 
 
-def _socket_send_envelope(
-    config: Config,
-    request: CommandRequest,
-    resolved: ResolvedCommandTarget,
-    *,
-    socket_client_factory: SocketClientFactory | None = None,
-) -> CommandEnvelope:
-    instruction = request.instruction or {}
-    instruction_text = instruction.get("text")
-    if not isinstance(instruction_text, str) or not instruction_text:
-        return CommandEnvelope.from_result(
-            request,
-            ok=False,
-            status=STATUS_BACKEND_FAILED,
-            error=error_value(STATUS_BACKEND_FAILED, "instruction text is missing after validation"),
-        )
-
-    factory = socket_client_factory or _default_socket_client_factory
-    client: Any | None = None
-    try:
-        client = factory(config)
-        if not hasattr(client, "request"):
-            raise TypeError("socket client does not expose generic request")
-        if hasattr(client, "connect"):
-            client.connect()
-    except Exception:  # noqa: BLE001
-        if client is not None and hasattr(client, "close"):
-            try:
-                client.close()
-            except Exception:
-                pass
-        return _backend_unavailable(request, "Herdr socket could not be reached")
-
-    try:
-        pane_id = _private_pane_id_for_binding(
-            client,
-            resolved.binding,
-            timeout=config.herdr_timeout_seconds,
-        )
-    except Exception as exc:  # noqa: BLE001
-        from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
-        from .backends.herdr_socket import (
-            HerdrSocketConnectionError,
-            HerdrSocketDisconnectedError,
-            HerdrSocketTimeoutError,
-        )
-
-        if hasattr(client, "close"):
-            client.close()
-        if isinstance(exc, HerdrErrorResponse):
-            return _backend_failure(request, "Herdr socket could not resolve the private send target")
-        if isinstance(
-            exc,
-            HerdrSocketConnectionError
-            | HerdrSocketTimeoutError
-            | HerdrSocketDisconnectedError
-            | HerdrProtocolError,
-        ) or isinstance(exc, OSError):
-            return _backend_unavailable(request, "Herdr socket could not resolve the private send target")
-        if isinstance(exc, (TypeError, ValueError)):
-            return _backend_failure(request, "Herdr socket private send target is unsupported")
-        raise
-
-    if not pane_id:
-        if hasattr(client, "close"):
-            client.close()
-        return _backend_failure(request, "Herdr socket private send target has no pane")
-
-    _append_command_event(
-        config,
-        "command.send_started",
-        request,
-        status=STATUS_PENDING,
-        target_worker_id=resolved.worker.id,
-    )
-    try:
-        _submit_private_pane_input(
-            client,
-            pane_id,
-            instruction_text,
-            timeout=config.herdr_timeout_seconds,
-        )
-    except Exception as exc:  # noqa: BLE001
-        from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
-        from .backends.herdr_socket import (
-            HerdrSocketConnectionError,
-            HerdrSocketDisconnectedError,
-            HerdrSocketTimeoutError,
-        )
-
-        if isinstance(exc, HerdrErrorResponse):
-            return _backend_failure(request, "Herdr socket pane input returned an error response")
-        if isinstance(
-            exc,
-            HerdrSocketConnectionError
-            | HerdrSocketTimeoutError
-            | HerdrSocketDisconnectedError
-            | HerdrProtocolError,
-        ):
-            return _backend_uncertain(request, "Herdr socket pane input state is uncertain after send start")
-        if isinstance(exc, OSError):
-            return _backend_uncertain(request, "Herdr socket pane input state is uncertain after send start")
-        raise
-    finally:
-        if hasattr(client, "close"):
-            client.close()
-
+def _request_in_progress(request: CommandRequest) -> CommandEnvelope:
     return CommandEnvelope.from_result(
         request,
-        ok=True,
-        status=STATUS_ACCEPTED,
-        result={
-            "target": {"worker_id": resolved.worker.id},
-            "delivery_state": "submitted",
-            "transport_state": "submitted",
-            "target_state_at_send": _target_state_at_send(resolved.worker),
-            "observed_turn_state": "pending_observation",
-        },
+        ok=False,
+        status=STATUS_PENDING,
+        error=error_value(STATUS_PENDING, "request is already in progress"),
+    )
+
+
+def _duplicate_request(request: CommandRequest) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_DUPLICATE_REQUEST,
+        error=error_value(
+            STATUS_DUPLICATE_REQUEST,
+            "request_id reused with a different canonical mutation",
+        ),
     )
 
 
@@ -620,45 +447,33 @@ def _pending_public_result(
 
 def _pending_claim_has_exact_route(claim: Any) -> bool:
     return (
-        isinstance(claim.worker_id, str)
+        isinstance(getattr(claim, "worker_id", None), str)
         and bool(claim.worker_id)
-        and isinstance(claim.worker_fingerprint, str)
+        and isinstance(getattr(claim, "worker_fingerprint", None), str)
         and bool(claim.worker_fingerprint)
-        and isinstance(claim.binding_private_fingerprint, str)
+        and isinstance(getattr(claim, "binding_private_fingerprint", None), str)
         and bool(claim.binding_private_fingerprint)
-        and isinstance(claim.turn_target_value, str)
+        and isinstance(getattr(claim, "turn_target_value", None), str)
         and bool(claim.turn_target_value.strip())
-        and not isinstance(claim.picker_ordinal, bool)
+        and not isinstance(getattr(claim, "picker_ordinal", None), bool)
         and isinstance(claim.picker_ordinal, int)
         and claim.picker_ordinal >= 1
     )
 
 
-def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
-    if not claim_token:
-        return True
-    if config.db_path is None:
-        return False
-    try:
-        return abandon_backend_pending_choice_claim(
-            config.db_path,
-            config.host_id,
-            claim_token,
-        )
-    except Exception:
-        return False
-
-
-def _pending_claim_release_error(
-    config: Config,
-    request: CommandRequest,
-    claim_token: str | None,
-) -> CommandEnvelope | None:
-    if _abandon_pending_claim(config, claim_token):
-        return None
-    return _backend_uncertain(
-        request,
-        "pending answer claim could not be safely released",
+def _same_pending_route(left: Any, right: Any) -> bool:
+    return _pending_claim_has_exact_route(left) and _pending_claim_has_exact_route(right) and (
+        left.worker_id,
+        left.worker_fingerprint,
+        left.binding_private_fingerprint,
+        left.turn_target_value,
+        left.picker_ordinal,
+    ) == (
+        right.worker_id,
+        right.worker_fingerprint,
+        right.binding_private_fingerprint,
+        right.turn_target_value,
+        right.picker_ordinal,
     )
 
 
@@ -671,50 +486,24 @@ def _close_socket_client(client: Any | None) -> None:
         pass
 
 
-def _answer_pending_envelope(
-    config: Config,
-    request: CommandRequest,
-    *,
-    socket_client_factory: SocketClientFactory | None = None,
-) -> CommandEnvelope:
-    if config.db_path is None:
-        return _backend_unavailable(request, "pending state store is unavailable")
-    params = request.params or {}
+def _abandon_pending_claim(config: Config, claim_token: str | None) -> bool:
+    if config.db_path is None or not claim_token:
+        return False
     try:
-        claim = claim_backend_pending_choice(
+        return abandon_backend_pending_choice_claim(
             config.db_path,
             config.host_id,
-            str(params.get("pending_id") or ""),
-            str(params.get("pending_fingerprint") or ""),
-            str(params.get("choice_id") or ""),
-            claim=not request.dry_run,
+            claim_token,
         )
     except Exception:
-        if request.dry_run:
-            return _backend_unavailable(request, "pending state store is unavailable")
-        return _backend_uncertain(request, "pending answer claim state is uncertain")
-    expected_claim_status = "validated" if request.dry_run else "claimed"
-    if claim.status != expected_claim_status:
-        return _pending_changed_envelope(request)
-
-    claim_token = claim.claim_token if isinstance(claim.claim_token, str) else None
-    if not request.dry_run and not claim_token:
-        return _pending_changed_envelope(request)
-    if not _pending_claim_has_exact_route(claim):
-        release_error = _pending_claim_release_error(config, request, claim_token)
-        if release_error is not None:
-            return release_error
-        return _pending_changed_envelope(request)
-
-    if request.dry_run:
-        return CommandEnvelope.from_result(
-            request,
-            ok=True,
-            status="dry_run",
-            result=_pending_public_result(request, claim, delivery_state="not_submitted"),
-        )
+        return False
 
 
+def _connect_socket(
+    config: Config,
+    request: CommandRequest,
+    socket_client_factory: SocketClientFactory | None,
+) -> Any | CommandEnvelope:
     factory = socket_client_factory or _default_socket_client_factory
     client: Any | None = None
     try:
@@ -723,12 +512,711 @@ def _answer_pending_envelope(
             raise TypeError("socket client does not expose generic request")
         if hasattr(client, "connect"):
             client.connect()
-    except Exception:
+        return client
+    except Exception:  # noqa: BLE001
         _close_socket_client(client)
-        release_error = _pending_claim_release_error(config, request, claim_token)
-        if release_error is not None:
-            return release_error
         return _backend_unavailable(request, "Herdr socket could not be reached")
+
+
+def _resolve_private_pane(
+    config: Config,
+    request: CommandRequest,
+    client: Any,
+    binding: WorkerBinding,
+) -> str | CommandEnvelope:
+    try:
+        pane_id = _private_pane_id_for_binding(
+            client,
+            binding,
+            timeout=config.herdr_timeout_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from .backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
+        from .backends.herdr_socket import (
+            HerdrSocketConnectionError,
+            HerdrSocketDisconnectedError,
+            HerdrSocketTimeoutError,
+        )
+
+        if isinstance(exc, HerdrErrorResponse):
+            return _backend_failure(
+                request,
+                "Herdr socket could not resolve the private send target",
+            )
+        if isinstance(
+            exc,
+            HerdrSocketConnectionError
+            | HerdrSocketTimeoutError
+            | HerdrSocketDisconnectedError
+            | HerdrProtocolError,
+        ) or isinstance(exc, OSError):
+            return _backend_unavailable(
+                request,
+                "Herdr socket could not resolve the private send target",
+            )
+        if isinstance(exc, (TypeError, ValueError)):
+            return _backend_failure(
+                request,
+                "Herdr socket private send target is unsupported",
+            )
+        return _backend_failure(
+            request,
+            "Herdr socket private send target resolution failed",
+        )
+    if not pane_id:
+        return _backend_failure(request, "Herdr socket private send target has no pane")
+    return pane_id
+
+
+def _transition_payload(
+    request: CommandRequest,
+    *,
+    worker_id: str,
+    envelope: CommandEnvelope | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "action": request.action,
+        "request_id": request.request_id,
+        "target": {"worker_id": worker_id},
+    }
+    if envelope is not None:
+        payload["envelope"] = envelope.to_dict()
+    return payload
+
+
+def _receipt_is_canonical(
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+    receipt: Mapping[str, Any],
+) -> bool:
+    version = receipt.get("canonical_version")
+    common_identity = (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and receipt.get("request_id") == request.request_id
+        and receipt.get("action") == canonical.action
+    )
+    if not common_identity:
+        return False
+    if version == 0:
+        return (
+            receipt.get("legacy_collision") is False
+            and receipt.get("canonical_fingerprint") == request.payload_fingerprint()
+        )
+    return (
+        version == canonical.canonical_version
+        and receipt.get("canonical_fingerprint") == canonical.fingerprint
+        and receipt.get("canonical_request_json") == canonical.canonical_json
+        and receipt.get("public_worker_id") == canonical.public_worker_id
+    )
+
+
+def _stored_terminal_envelope(
+    request: CommandRequest,
+    receipt: Mapping[str, Any],
+) -> CommandEnvelope:
+    try:
+        data = json.loads(receipt["result_json"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return _backend_uncertain(
+            request,
+            "stored request result is unreadable; not retrying mutation",
+        )
+    if not isinstance(data, dict):
+        return _backend_uncertain(
+            request,
+            "stored request result is unreadable; not retrying mutation",
+        )
+    normalized = dict(data)
+    normalized.setdefault("status", receipt.get("status"))
+    error = normalized.get("error")
+    if isinstance(error, Mapping) and "code" not in error:
+        normalized["error"] = {**error, "code": receipt.get("status")}
+    try:
+        envelope = CommandEnvelope.from_dict(normalized)
+    except (TypeError, ValueError):
+        return _backend_uncertain(
+            request,
+            "stored request result is malformed; not retrying mutation",
+        )
+    if envelope.to_dict() != data:
+        return _backend_uncertain(
+            request,
+            "stored request result is malformed; not retrying mutation",
+        )
+    state = receipt.get("state")
+    status = receipt.get("status")
+    valid_identity = (
+        envelope.action == request.action
+        and envelope.request_id == request.request_id
+        and envelope.dry_run is False
+        and envelope.status == status
+    )
+    valid_terminal = (
+        state == "accepted"
+        and status == STATUS_ACCEPTED
+        and envelope.ok is True
+        or state == "rejected"
+        and status
+        not in {STATUS_PENDING, STATUS_ACCEPTED, STATUS_REQUEST_STATE_UNCERTAIN}
+        and envelope.ok is False
+    )
+    if not valid_identity or not valid_terminal:
+        return _backend_uncertain(
+            request,
+            "stored request result is inconsistent; not retrying mutation",
+        )
+    return envelope
+
+
+def _envelope_from_receipt(
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+    receipt: Any,
+) -> CommandEnvelope:
+    if not isinstance(receipt, Mapping):
+        return _backend_uncertain(
+            request,
+            "stored request receipt is missing or malformed; not retrying mutation",
+        )
+    required = {
+        "request_id",
+        "action",
+        "canonical_version",
+        "canonical_fingerprint",
+        "canonical_request_json",
+        "public_worker_id",
+        "state",
+        "status",
+        "result_json",
+        "legacy_collision",
+    }
+    if not required.issubset(receipt) or receipt.get("legacy_collision") is not False:
+        return _backend_uncertain(
+            request,
+            "stored request receipt is malformed; not retrying mutation",
+        )
+    if not _receipt_is_canonical(request, canonical, receipt):
+        return _duplicate_request(request)
+    state = receipt.get("state")
+    if state == "reserved":
+        if receipt.get("status") != STATUS_PENDING:
+            return _backend_uncertain(
+                request,
+                "stored request receipt is inconsistent; not retrying mutation",
+            )
+        return _request_in_progress(request)
+    if state in {"send_started", "uncertain"}:
+        return _backend_uncertain(
+            request,
+            "previous request state is uncertain; not retrying mutation",
+        )
+    if state in {"accepted", "rejected"}:
+        return _stored_terminal_envelope(request, receipt)
+    return _backend_uncertain(
+        request,
+        "stored request receipt has an illegal state; not retrying mutation",
+    )
+
+
+@dataclass(frozen=True)
+class ReservedCommandMutation:
+    canonical: CanonicalMutation
+    owner_token: str
+
+@dataclass(frozen=True)
+class PreparedInstructionMutation:
+    client: Any
+    pane_id: str
+    binding_fingerprint: str
+
+
+def _prepare_instruction(
+    config: Config,
+    request: CommandRequest,
+    worker: Worker,
+    *,
+    socket_client_factory: SocketClientFactory | None,
+) -> PreparedInstructionMutation | CommandEnvelope:
+    assert config.db_path is not None
+    try:
+        bindings = list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend=HERDR_BACKEND,
+        )
+    except Exception:
+        return _backend_unavailable(request, "private binding store is unavailable")
+    resolved = _binding_for_worker(request, worker, bindings)
+    if isinstance(resolved, CommandEnvelope):
+        return resolved
+
+    binding_fingerprint = str(resolved.binding.private_fingerprint or "").strip()
+    if not binding_fingerprint:
+        return _binding_error(
+            request,
+            STATUS_BACKEND_UNSUPPORTED,
+            "target private binding has no durable identity",
+        )
+
+    client_or_error = _connect_socket(config, request, socket_client_factory)
+    if isinstance(client_or_error, CommandEnvelope):
+        return client_or_error
+    client = client_or_error
+    pane_or_error = _resolve_private_pane(
+        config,
+        request,
+        client,
+        resolved.binding,
+    )
+    if isinstance(pane_or_error, CommandEnvelope):
+        _close_socket_client(client)
+        return pane_or_error
+    return PreparedInstructionMutation(
+        client=client,
+        pane_id=pane_or_error,
+        binding_fingerprint=binding_fingerprint,
+    )
+
+
+def _reserve_canonical_request(
+    config: Config,
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+) -> ReservedCommandMutation | CommandEnvelope:
+    if config.db_path is None:
+        return _backend_unavailable(request, "command receipt store is unavailable")
+    pending = _request_in_progress(request)
+    try:
+        reservation = reserve_command_request(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            action=canonical.action,
+            canonical_version=canonical.canonical_version,
+            canonical_fingerprint=canonical.fingerprint,
+            canonical_request_json=canonical.canonical_json,
+            public_worker_id=canonical.public_worker_id,
+            pending_result_json=envelope_to_receipt_json(pending),
+            legacy_raw_payload_fingerprint=request.payload_fingerprint(),
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            receipt = get_command_request(
+                config.db_path,
+                config.host_id,
+                request.request_id or "",
+            )
+        except Exception:
+            receipt = None
+        if receipt is not None:
+            return _envelope_from_receipt(request, canonical, receipt)
+        return _backend_unavailable(request, "command receipt store is unavailable")
+
+    if not isinstance(reservation, Mapping):
+        return _recover_request(config, request, canonical)
+    status = reservation.get("status")
+    if status == "request_id_conflict":
+        return _duplicate_request(request)
+    if status != "reserved":
+        return _envelope_from_receipt(
+            request,
+            canonical,
+            reservation.get("receipt"),
+        )
+    receipt = reservation.get("receipt")
+    owner_token = reservation.get("owner_token")
+    if (
+        not isinstance(receipt, Mapping)
+        or not _receipt_is_canonical(request, canonical, receipt)
+        or receipt.get("state") != "reserved"
+        or receipt.get("status") != STATUS_PENDING
+        or not isinstance(owner_token, str)
+        or not owner_token
+    ):
+        return _recover_request(config, request, canonical)
+    return ReservedCommandMutation(canonical=canonical, owner_token=owner_token)
+
+
+def _recover_request(
+    config: Config,
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+) -> CommandEnvelope:
+    if config.db_path is None:
+        return _backend_uncertain(request, "command request state could not be recovered")
+    try:
+        receipt = get_command_request(
+            config.db_path,
+            config.host_id,
+            request.request_id or "",
+        )
+    except Exception:
+        receipt = None
+    return _envelope_from_receipt(request, canonical, receipt)
+
+
+def _finish_request(
+    config: Config,
+    request: CommandRequest,
+    reservation: ReservedCommandMutation,
+    envelope: CommandEnvelope,
+    *,
+    expected_state: str,
+    terminal_state: str,
+    terminal_effect: Callable[[Any], Any] | None = None,
+) -> CommandEnvelope:
+    if config.db_path is None:
+        return _backend_uncertain(request, "command receipt store is unavailable")
+    try:
+        finished = finish_command_request(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            canonical_fingerprint=reservation.canonical.fingerprint,
+            owner_token=reservation.owner_token,
+            expected_state=expected_state,
+            terminal_state=terminal_state,
+            status=envelope.status,
+            result_json=envelope_to_receipt_json(envelope),
+            event_payload=_transition_payload(
+                request,
+                worker_id=reservation.canonical.public_worker_id,
+                envelope=envelope,
+            ),
+            terminal_effect=terminal_effect,
+        )
+    except Exception:  # noqa: BLE001
+        return _recover_request(
+            config,
+            request,
+            reservation.canonical,
+        )
+    if not isinstance(finished, Mapping):
+        return _recover_request(
+            config,
+            request,
+            reservation.canonical,
+        )
+    return _envelope_from_receipt(
+        request,
+        reservation.canonical,
+        finished.get("receipt"),
+    )
+
+
+def _finish_before_send(
+    config: Config,
+    request: CommandRequest,
+    reservation: ReservedCommandMutation,
+    envelope: CommandEnvelope,
+) -> CommandEnvelope:
+    terminal_state = (
+        "uncertain"
+        if envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+        else "rejected"
+    )
+    return _finish_request(
+        config,
+        request,
+        reservation,
+        envelope,
+        expected_state="reserved",
+        terminal_state=terminal_state,
+    )
+
+def _reserve_terminal_replay(
+    config: Config,
+    request: CommandRequest,
+    canonical: CanonicalMutation,
+    previous_receipt: Mapping[str, Any],
+    replay_envelope: CommandEnvelope,
+) -> CommandEnvelope:
+    if config.db_path is None:
+        return _backend_uncertain(request, "command receipt store is unavailable")
+    if (
+        previous_receipt.get("state") == "rejected"
+        and replay_envelope.ok is False
+        and replay_envelope.status
+        not in {STATUS_PENDING, STATUS_ACCEPTED, STATUS_REQUEST_STATE_UNCERTAIN}
+    ):
+        terminal = replay_envelope
+        terminal_state = "rejected"
+    else:
+        terminal = _backend_uncertain(
+            request,
+            "stored request evidence disappeared during replay; not retrying mutation",
+        )
+        terminal_state = "uncertain"
+    try:
+        replay = reserve_terminal_command_replay(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            action=canonical.action,
+            canonical_version=canonical.canonical_version,
+            canonical_fingerprint=canonical.fingerprint,
+            canonical_request_json=canonical.canonical_json,
+            public_worker_id=canonical.public_worker_id,
+            terminal_state=terminal_state,
+            status=terminal.status,
+            result_json=envelope_to_receipt_json(terminal),
+            legacy_raw_payload_fingerprint=request.payload_fingerprint(),
+            event_payload=_transition_payload(
+                request,
+                worker_id=canonical.public_worker_id,
+                envelope=terminal,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return _recover_request(config, request, canonical)
+    if not isinstance(replay, Mapping):
+        return _recover_request(config, request, canonical)
+    return _envelope_from_receipt(
+        request,
+        canonical,
+        replay.get("receipt"),
+    )
+
+
+def _mark_request_send_started(
+    config: Config,
+    request: CommandRequest,
+    reservation: ReservedCommandMutation,
+    *,
+    binding_fingerprint: str,
+) -> CommandEnvelope | None:
+    if config.db_path is None:
+        return _backend_uncertain(request, "command receipt store is unavailable")
+    try:
+        started = mark_command_send_started(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+            canonical_fingerprint=reservation.canonical.fingerprint,
+            owner_token=reservation.owner_token,
+            binding_fingerprint=binding_fingerprint,
+            event_payload=_transition_payload(
+                request,
+                worker_id=reservation.canonical.public_worker_id,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return _recover_request(
+            config,
+            request,
+            reservation.canonical,
+        )
+    if (
+        isinstance(started, Mapping)
+        and started.get("status") == "send_started"
+        and started.get("owner_token") == reservation.owner_token
+        and isinstance(started.get("receipt"), Mapping)
+        and started["receipt"].get("state") == "send_started"
+        and _receipt_is_canonical(request, reservation.canonical, started["receipt"])
+    ):
+        return None
+    if isinstance(started, Mapping) and isinstance(started.get("receipt"), Mapping):
+        embedded = _envelope_from_receipt(
+            request,
+            reservation.canonical,
+            started["receipt"],
+        )
+        if embedded.status != STATUS_REQUEST_STATE_UNCERTAIN:
+            return embedded
+        if started["receipt"].get("state") in {"send_started", "uncertain"}:
+            return embedded
+    return _recover_request(
+        config,
+        request,
+        reservation.canonical,
+    )
+
+
+def _accepted_send_envelope(
+    request: CommandRequest,
+    worker: Worker,
+) -> CommandEnvelope:
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "submitted",
+            "transport_state": "submitted",
+            "target_state_at_send": _target_state_at_send(worker),
+            "observed_turn_state": "pending_observation",
+        },
+    )
+
+
+def _submit_instruction(
+    config: Config,
+    request: CommandRequest,
+    worker: Worker,
+    reservation: ReservedCommandMutation,
+    prepared: PreparedInstructionMutation,
+) -> CommandEnvelope:
+    assert config.db_path is not None
+    try:
+        send_start_error = _mark_request_send_started(
+            config,
+            request,
+            reservation,
+            binding_fingerprint=prepared.binding_fingerprint,
+        )
+        if send_start_error is not None:
+            return send_start_error
+
+        try:
+            _submit_private_pane_input(
+                prepared.client,
+                prepared.pane_id,
+                _instruction_text(request),
+                timeout=config.herdr_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001
+            envelope = _backend_uncertain(
+                request,
+                "Herdr socket pane input state is uncertain after send start",
+            )
+            return _finish_request(
+                config,
+                request,
+                reservation,
+                envelope,
+                expected_state="send_started",
+                terminal_state="uncertain",
+            )
+    finally:
+        _close_socket_client(prepared.client)
+
+    accepted = _accepted_send_envelope(request, worker)
+    try:
+        effect = command_pending_turn_terminal_effect(
+            host_id=config.host_id,
+            worker=worker,
+            request_id=request.request_id or "",
+            instruction_text=_instruction_text(request),
+        )
+    except Exception:
+        return _recover_request(
+            config,
+            request,
+            reservation.canonical,
+        )
+    return _finish_request(
+        config,
+        request,
+        reservation,
+        accepted,
+        expected_state="send_started",
+        terminal_state="accepted",
+        terminal_effect=effect,
+    )
+
+
+def _validate_pending_choice(
+    config: Config,
+    request: CommandRequest,
+) -> Any | CommandEnvelope:
+    if config.db_path is None:
+        return _backend_unavailable(request, "pending state store is unavailable")
+    params = request.params or {}
+    try:
+        validated = claim_backend_pending_choice(
+            config.db_path,
+            config.host_id,
+            str(params.get("pending_id") or ""),
+            str(params.get("pending_fingerprint") or ""),
+            str(params.get("choice_id") or ""),
+            claim=False,
+        )
+    except Exception:
+        return _backend_unavailable(request, "pending state store is unavailable")
+    if validated.status != "validated" or not _pending_claim_has_exact_route(validated):
+        return _pending_changed_envelope(request)
+    return validated
+
+
+def _claim_pending_choice(
+    config: Config,
+    request: CommandRequest,
+    validated: Any,
+) -> Any | CommandEnvelope:
+    assert config.db_path is not None
+    params = request.params or {}
+    try:
+        claim = claim_backend_pending_choice(
+            config.db_path,
+            config.host_id,
+            str(params.get("pending_id") or ""),
+            str(params.get("pending_fingerprint") or ""),
+            str(params.get("choice_id") or ""),
+            claim=True,
+        )
+    except Exception:
+        return _backend_uncertain(request, "pending answer claim state is uncertain")
+    if (
+        claim.status != "claimed"
+        or not isinstance(getattr(claim, "claim_token", None), str)
+        or not claim.claim_token
+        or not _same_pending_route(validated, claim)
+    ):
+        return _pending_changed_envelope(request)
+    return claim
+
+
+def _uncertain_pending_effect(
+    config: Config,
+    claim_token: str,
+) -> Callable[[Any], Any] | None:
+    try:
+        return backend_pending_choice_terminal_effect(
+            host_id=config.host_id,
+            claim_token=claim_token,
+            accepted=False,
+        )
+    except Exception:
+        return None
+
+
+def _answer_pending(
+    config: Config,
+    request: CommandRequest,
+    validated: Any,
+    reservation: ReservedCommandMutation,
+    client: Any,
+) -> CommandEnvelope:
+    assert config.db_path is not None
+    claim = _claim_pending_choice(config, request, validated)
+    if isinstance(claim, CommandEnvelope):
+        _close_socket_client(client)
+        return _finish_before_send(config, request, reservation, claim)
+    claim_token = claim.claim_token
+
+    send_start_error = _mark_request_send_started(
+        config,
+        request,
+        reservation,
+        binding_fingerprint=claim.binding_private_fingerprint,
+    )
+    if send_start_error is not None:
+        _close_socket_client(client)
+        claim_released = _abandon_pending_claim(config, claim_token)
+        if send_start_error.status == STATUS_PENDING and not claim_released:
+            return _finish_before_send(
+                config,
+                request,
+                reservation,
+                _backend_uncertain(
+                    request,
+                    "pending answer claim could not be safely released",
+                ),
+            )
+        return send_start_error
 
     try:
         started = start_backend_pending_choice_send(
@@ -739,220 +1227,81 @@ def _answer_pending_envelope(
     except Exception:
         _close_socket_client(client)
         _abandon_pending_claim(config, claim_token)
-        return _backend_uncertain(request, "pending answer start state is uncertain")
-    if (
-        started.status != "started"
-        or started.worker_id != claim.worker_id
-        or started.worker_fingerprint != claim.worker_fingerprint
-        or started.binding_private_fingerprint != claim.binding_private_fingerprint
-        or started.turn_target_value != claim.turn_target_value
-        or started.picker_ordinal != claim.picker_ordinal
-    ):
-        _close_socket_client(client)
-        release_error = _pending_claim_release_error(config, request, claim_token)
-        if release_error is not None:
-            return release_error
-        return _pending_changed_envelope(request)
-
-    pane_id = started.turn_target_value.strip()
-    picker_ordinal = started.picker_ordinal
-    if isinstance(picker_ordinal, bool) or not isinstance(picker_ordinal, int) or picker_ordinal < 1:
-        try:
-            finish_backend_pending_choice_send(
-                config.db_path,
-                config.host_id,
-                claim_token,
-                accepted=False,
-            )
-        except Exception:
-            pass
-        _close_socket_client(client)
-        return _backend_uncertain(
+        return _finish_request(
+            config,
             request,
-            "pending answer state is uncertain after send start",
+            reservation,
+            _backend_uncertain(request, "pending answer start state is uncertain"),
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
+        )
+    if getattr(started, "status", None) != "started" or not _same_pending_route(claim, started):
+        _close_socket_client(client)
+        _abandon_pending_claim(config, claim_token)
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            _backend_uncertain(
+                request,
+                "pending answer state is uncertain after send start",
+            ),
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
         )
 
     try:
-        _append_command_event(
-            config,
-            "command.send_started",
-            request,
-            status=STATUS_PENDING,
-            target_worker_id=started.worker_id,
-        )
         _submit_private_pane_input(
             client,
-            pane_id,
-            str(picker_ordinal),
+            started.turn_target_value.strip(),
+            str(started.picker_ordinal),
             timeout=config.herdr_timeout_seconds,
         )
     except Exception:  # noqa: BLE001
-        try:
-            finish_backend_pending_choice_send(
-                config.db_path,
-                config.host_id,
-                claim_token,
-                accepted=False,
-            )
-        except Exception:
-            pass
-        return _backend_uncertain(
+        uncertain = _backend_uncertain(
             request,
             "Herdr socket pane input state is uncertain after send start",
+        )
+        return _finish_request(
+            config,
+            request,
+            reservation,
+            uncertain,
+            expected_state="send_started",
+            terminal_state="uncertain",
+            terminal_effect=_uncertain_pending_effect(config, claim_token),
         )
     finally:
         _close_socket_client(client)
 
-    try:
-        finished = finish_backend_pending_choice_send(
-            config.db_path,
-            config.host_id,
-            claim_token,
-            accepted=True,
-        )
-    except Exception:
-        finished = False
-    if not finished:
-        return _backend_uncertain(
-            request,
-            "pending answer state is uncertain after send completion",
-        )
-
-    return CommandEnvelope.from_result(
+    accepted = CommandEnvelope.from_result(
         request,
         ok=True,
         status=STATUS_ACCEPTED,
         result=_pending_public_result(request, started, delivery_state="submitted"),
     )
-
-
-def _envelope_from_receipt(request: CommandRequest, receipt: Mapping[str, Any]) -> CommandEnvelope:
-    if receipt.get("payload_fingerprint") != request.payload_fingerprint():
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_DUPLICATE_REQUEST,
-                "request_id reused with a different payload",
-            ),
-        )
-    if receipt.get("uncertain"):
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_REQUEST_STATE_UNCERTAIN,
-                "previous request state is uncertain; not retrying mutation",
-            ),
-        )
     try:
-        data = json.loads(str(receipt.get("result_json") or "{}"))
-    except json.JSONDecodeError:
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_REQUEST_STATE_UNCERTAIN,
-                "previous request result is unreadable; not retrying mutation",
-            ),
+        effect = backend_pending_choice_terminal_effect(
+            host_id=config.host_id,
+            claim_token=claim_token,
+            accepted=True,
         )
-    if not isinstance(data, dict):
-        return CommandEnvelope.error(
-            request,
-            error_value(
-                STATUS_REQUEST_STATE_UNCERTAIN,
-                "previous request result is unreadable; not retrying mutation",
-            ),
-        )
-    return CommandEnvelope.from_dict(data)
-
-
-def _reserve_mutating_request(config: Config, request: CommandRequest) -> CommandEnvelope | None:
-    if (
-        request.action not in _MUTATING_ACTIONS
-        or request.dry_run
-        or not has_nonblank_request_id(request.request_id)
-    ):
-        return None
-    if config.db_path is None:
-        return _backend_unavailable(request, "command receipt store is unavailable")
-
-    pending = CommandEnvelope.error(
-        request,
-        error_value(
-            STATUS_REQUEST_STATE_UNCERTAIN,
-            "request is pending backend mutation",
-        ),
-    )
-    reservation = reserve_command_receipt(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id,
-        action=request.action,
-        payload_fingerprint=request.payload_fingerprint(),
-        pending_result_json=envelope_to_receipt_json(pending),
-        status=STATUS_PENDING,
-        request_json=_request_json(request),
-    )
-    if reservation["reserved"]:
-        try:
-            _append_command_event(config, "command.reserved", request, status=STATUS_PENDING)
-        except Exception:
-            pass
-        return None
-
-    envelope = _envelope_from_receipt(request, reservation["receipt"])
-    event_type = "command.cached"
-    if envelope.status == STATUS_DUPLICATE_REQUEST:
-        event_type = "command.duplicate"
-    elif envelope.status == STATUS_REQUEST_STATE_UNCERTAIN:
-        event_type = "command.uncertain"
-    try:
-        _append_command_event(config, event_type, request, status=envelope.status, envelope=envelope)
     except Exception:
-        pass
-    return envelope
-
-
-def _save_mutating_result(
-    config: Config,
-    request: CommandRequest,
-    envelope: CommandEnvelope,
-    *,
-    worker: Worker | None = None,
-) -> None:
-    if (
-        request.action not in _MUTATING_ACTIONS
-        or request.dry_run
-        or not has_nonblank_request_id(request.request_id)
-    ):
-        return
-    if config.db_path is None:
-        return
-    save_command_receipt(
-        config.db_path,
-        host_id=config.host_id,
-        request_id=request.request_id,
-        action=request.action,
-        payload_fingerprint=request.payload_fingerprint(),
-        status=envelope.status,
-        result_json=envelope_to_receipt_json(envelope),
-        uncertain=envelope.status == STATUS_REQUEST_STATE_UNCERTAIN,
-    )
-    if request.action == "send_instruction" and envelope.status == STATUS_ACCEPTED and worker is not None:
-        upsert_command_pending_turn(
-            config.db_path,
-            config.host_id,
-            worker,
-            request_id=request.request_id,
-            instruction_text=_instruction_text(request),
+        return _recover_request(
+            config,
+            request,
+            reservation.canonical,
         )
-    event_type = "command.submitted"
-    if envelope.status == STATUS_DUPLICATE_INSTRUCTION:
-        event_type = "command.duplicate_instruction"
-    _append_command_event(
+    return _finish_request(
         config,
-        event_type,
         request,
-        status=envelope.status,
-        envelope=envelope,
+        reservation,
+        accepted,
+        expected_state="send_started",
+        terminal_state="accepted",
+        terminal_effect=effect,
     )
 
 
@@ -968,6 +1317,45 @@ def _execute_non_mutating(config: Config, request: CommandRequest) -> CommandEnv
             snapshot=snapshot,
         ),
     )
+def _mutation_dry_run(request: CommandRequest) -> CommandEnvelope:
+    """Preview a validated mutation without consulting mutable authority."""
+    if request.action == "send_instruction":
+        return CommandEnvelope.from_result(
+            request,
+            ok=True,
+            status=STATUS_DRY_RUN,
+            result={
+                "target": dict(request.target or {}),
+                "instruction": {"text": _instruction_text(request)},
+            },
+        )
+    params = request.params or {}
+    return CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_DRY_RUN,
+        result={
+            "pending": {
+                "id": params.get("pending_id"),
+                "fingerprint": params.get("pending_fingerprint"),
+            },
+            "choice": {"choice_id": params.get("choice_id")},
+            "delivery_state": "not_submitted",
+        },
+    )
+
+
+def _direct_replay_worker_id(request: CommandRequest) -> str | None:
+    """Return an exact explicit ID only when no mutable selector must resolve."""
+    target = request.target or {}
+    worker_id = target.get("worker_id")
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        return None
+    for field in ("name", "space_id", "worker_fingerprint"):
+        value = target.get(field)
+        if value is not None and str(value):
+            return None
+    return worker_id
 
 
 def submit_command(
@@ -991,48 +1379,195 @@ def submit_command(
     if request.action not in _MUTATING_ACTIONS:
         return _execute_non_mutating(config, request)
     if request.dry_run:
+        return _mutation_dry_run(request)
+
+    existing_receipt: Mapping[str, Any] | None = None
+    if config.db_path is not None:
+        try:
+            candidate = get_command_request(
+                config.db_path,
+                config.host_id,
+                request.request_id or "",
+            )
+        except Exception:
+            candidate = None
+        if isinstance(candidate, Mapping):
+            existing_receipt = candidate
+
+    # Terminal and post-send evidence is immutable. An exact worker_id-only
+    # retry can compare directly, but aliases and mutable preconditions must
+    # resolve against current healthy public authority before any replay.
+    if existing_receipt is not None and existing_receipt.get("state") != "reserved":
+        if existing_receipt.get("legacy_collision") is not False:
+            return _backend_uncertain(
+                request,
+                "stored request receipt is malformed; not retrying mutation",
+            )
+        if existing_receipt.get("action") != request.action:
+            return _duplicate_request(request)
+        if (
+            request.action == "answer_pending"
+            and existing_receipt.get("canonical_version") == 0
+            and existing_receipt.get("state") in {"accepted", "rejected"}
+            and existing_receipt.get("public_worker_id") == ""
+        ):
+            # Legacy answer requests had no target from which migration could
+            # recover a worker. The placeholder is used only to satisfy the
+            # canonical builder; v0 validation remains the exact raw request
+            # action and fingerprint and never persists this synthetic ID.
+            legacy_canonical = build_canonical_mutation(
+                request,
+                public_worker_id=_LEGACY_V0_REPLAY_WORKER_ID,
+            )
+            return _envelope_from_receipt(
+                request,
+                legacy_canonical,
+                existing_receipt,
+            )
         if request.action == "send_instruction":
-            return _execute_non_mutating(config, request)
-        snapshot = _current_snapshot(config)
-        envelope = _backend_health_error(config, request, snapshot)
-        if envelope is not None:
-            return envelope
-        return _answer_pending_envelope(
+            replay_worker_id = _direct_replay_worker_id(request)
+            if replay_worker_id is None:
+                snapshot = _current_snapshot(config)
+                health_error = _backend_health_error(config, request, snapshot)
+                if health_error is not None:
+                    return health_error
+                replay_worker = _resolve_authoritative_worker(request, snapshot)
+                if isinstance(replay_worker, CommandEnvelope):
+                    return replay_worker
+                replay_worker_id = replay_worker.id
+        else:
+            stored_worker_id = existing_receipt.get("public_worker_id")
+            if not isinstance(stored_worker_id, str) or not stored_worker_id:
+                return _backend_uncertain(
+                    request,
+                    "stored request receipt is malformed; not retrying mutation",
+                )
+            replay_worker_id = stored_worker_id
+        canonical = build_canonical_mutation(
+            request,
+            public_worker_id=replay_worker_id,
+        )
+        replay_envelope = _envelope_from_receipt(
+            request,
+            canonical,
+            existing_receipt,
+        )
+        return _reserve_terminal_replay(
             config,
             request,
-            socket_client_factory=socket_client_factory,
+            canonical,
+            existing_receipt,
+            replay_envelope,
         )
-
-    receipt_envelope = _reserve_mutating_request(config, request)
-    if receipt_envelope is not None:
-        return receipt_envelope
 
     snapshot = _current_snapshot(config)
-    envelope = _backend_health_error(config, request, snapshot)
-    resolved_worker: Worker | None = None
-    if envelope is None and request.action == "answer_pending":
-        envelope = _answer_pending_envelope(
+    health_error = _backend_health_error(config, request, snapshot)
+
+    if request.action == "send_instruction":
+        worker = _resolve_authoritative_worker(request, snapshot)
+        if isinstance(worker, CommandEnvelope):
+            # An unhealthy observation cannot authoritatively establish that a
+            # selector is absent, stale, or ambiguous, so keep the request ID
+            # retryable until a canonical worker can be proven.
+            if health_error is not None:
+                return health_error
+            return worker
+        canonical = build_canonical_mutation(request, public_worker_id=worker.id)
+        pre_send_error = _worker_status_error(request, worker) or health_error
+        prepared: PreparedInstructionMutation | CommandEnvelope | None = None
+        if pre_send_error is None:
+            prepared = _prepare_instruction(
+                config,
+                request,
+                worker,
+                socket_client_factory=socket_client_factory,
+            )
+        reservation = _reserve_canonical_request(config, request, canonical)
+        if isinstance(reservation, CommandEnvelope):
+            if isinstance(prepared, PreparedInstructionMutation):
+                _close_socket_client(prepared.client)
+            return reservation
+        if pre_send_error is not None:
+            return _finish_before_send(
+                config,
+                request,
+                reservation,
+                pre_send_error,
+            )
+        if isinstance(prepared, CommandEnvelope):
+            return _finish_before_send(config, request, reservation, prepared)
+        assert isinstance(prepared, PreparedInstructionMutation)
+        return _submit_instruction(
             config,
             request,
-            socket_client_factory=socket_client_factory,
+            worker,
+            reservation,
+            prepared,
         )
-    elif envelope is None:
-        bindings = []
-        if config.db_path is not None:
-            bindings = list_worker_bindings(config.db_path, config.host_id, backend=HERDR_BACKEND)
-        resolved = _resolve_authoritative_target(request, snapshot, bindings)
-        if isinstance(resolved, CommandEnvelope):
-            envelope = resolved
-        else:
-            resolved_worker = resolved.worker
-            envelope = _duplicate_instruction_envelope(config, request, resolved.worker)
-            if envelope is None:
-                envelope = _socket_send_envelope(
-                    config,
-                    request,
-                    resolved,
-                    socket_client_factory=socket_client_factory,
-                )
 
-    _save_mutating_result(config, request, envelope, worker=resolved_worker)
-    return envelope
+    answer_pre_send_error: CommandEnvelope | None = None
+    if existing_receipt is not None:
+        existing_worker_id = existing_receipt.get("public_worker_id")
+        if not isinstance(existing_worker_id, str) or not existing_worker_id:
+            return _backend_uncertain(
+                request,
+                "stored request receipt is malformed; not retrying mutation",
+            )
+        canonical = build_canonical_mutation(
+            request,
+            public_worker_id=existing_worker_id,
+        )
+        validated = _validate_pending_choice(config, request)
+        if isinstance(validated, CommandEnvelope):
+            answer_pre_send_error = validated
+        elif validated.worker_id != existing_worker_id:
+            answer_pre_send_error = _duplicate_request(request)
+    else:
+        validated = _validate_pending_choice(config, request)
+        if isinstance(validated, CommandEnvelope):
+            if health_error is not None:
+                return health_error
+            return validated
+        canonical = build_canonical_mutation(
+            request,
+            public_worker_id=validated.worker_id,
+        )
+
+    client_or_error: Any | CommandEnvelope | None = None
+    if answer_pre_send_error is None and health_error is None:
+        client_or_error = _connect_socket(config, request, socket_client_factory)
+
+    reservation = _reserve_canonical_request(config, request, canonical)
+    if isinstance(reservation, CommandEnvelope):
+        if client_or_error is not None and not isinstance(client_or_error, CommandEnvelope):
+            _close_socket_client(client_or_error)
+        return reservation
+    if answer_pre_send_error is not None:
+        return _finish_before_send(
+            config,
+            request,
+            reservation,
+            answer_pre_send_error,
+        )
+    if health_error is not None:
+        return _finish_before_send(
+            config,
+            request,
+            reservation,
+            health_error,
+        )
+    if isinstance(client_or_error, CommandEnvelope):
+        return _finish_before_send(
+            config,
+            request,
+            reservation,
+            client_or_error,
+        )
+    assert client_or_error is not None
+    return _answer_pending(
+        config,
+        request,
+        validated,
+        reservation,
+        client_or_error,
+    )

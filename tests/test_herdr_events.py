@@ -2163,6 +2163,9 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         store_maintenance_cadence_seconds=3600,
         acknowledged_final_retention_days=33,
         acknowledged_final_retention_count=456,
+        command_retry_horizon_seconds=120,
+        command_receipt_retention_seconds=691_200,
+        command_receipt_retention_count=77,
     )
     init_store(Path(config.db_path))
     maintenance_times = iter(
@@ -2174,7 +2177,7 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         )
     )
     maintenance_calls: list[
-        tuple[SnapshotRetentionPolicy, int, int, int, dict[str, Any]]
+        tuple[SnapshotRetentionPolicy, int, int, int, int, int, int, dict[str, Any]]
     ] = []
 
     def fixed_clock_maintenance(
@@ -2183,6 +2186,9 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         policy: SnapshotRetentionPolicy,
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
+        command_retry_horizon_seconds: int = 604_800,
+        command_receipt_retention_seconds: int = 2_592_000,
+        command_receipt_retention_count: int = 4096,
         cadence_seconds: int = 3600,
         now: str | None = None,
     ) -> dict[str, Any]:
@@ -2193,6 +2199,9 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
             cadence_seconds=cadence_seconds,
             acknowledged_final_retention_days=acknowledged_final_retention_days,
             acknowledged_final_retention_count=acknowledged_final_retention_count,
+            command_retry_horizon_seconds=command_retry_horizon_seconds,
+            command_receipt_retention_seconds=command_receipt_retention_seconds,
+            command_receipt_retention_count=command_receipt_retention_count,
             now=next(maintenance_times),
         )
         maintenance_calls.append(
@@ -2200,6 +2209,9 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
                 policy,
                 acknowledged_final_retention_days,
                 acknowledged_final_retention_count,
+                command_retry_horizon_seconds,
+                command_receipt_retention_seconds,
+                command_receipt_retention_count,
                 cadence_seconds,
                 result,
             )
@@ -2266,10 +2278,22 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
             policy.batch_size,
             final_days,
             final_count,
+            retry_horizon,
+            retention_seconds,
+            retention_count,
             cadence,
         )
-        for policy, final_days, final_count, cadence, _ in maintenance_calls
-    } == {(14, 1, 100, 33, 456, 3600)}
+        for (
+            policy,
+            final_days,
+            final_count,
+            retry_horizon,
+            retention_seconds,
+            retention_count,
+            cadence,
+            _,
+        ) in maintenance_calls
+    } == {(14, 1, 100, 33, 456, 120, 691_200, 77, 3600)}
     assert _table_count(backend.db_path, config.host_id, "snapshots") == 1
     assert _attention_lifecycle_rows(backend)[0][4] == "2026-01-01T01:00:10+00:00"
     assert backend.operational_status["automatic_maintenance"] == {

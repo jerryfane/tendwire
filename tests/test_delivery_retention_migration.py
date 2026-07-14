@@ -867,7 +867,7 @@ def _database_dump(db_path: Path) -> tuple[int, str]:
         return version, "\n".join(conn.iterdump())
 
 
-def test_v10_to_v11_migration_retains_finals_without_reposting_or_leaking(
+def test_v10_to_v12_migration_retains_finals_without_reposting_or_leaking(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "retention-v10.db"
@@ -875,7 +875,7 @@ def test_v10_to_v11_migration_retains_finals_without_reposting_or_leaking(
     finals = _seed_v10_finals(db_path)
 
     init_store(db_path)
-    assert store_sqlite.STORE_SCHEMA_VERSION == 11
+    assert store_sqlite.STORE_SCHEMA_VERSION == 12
 
     delivered_key = _final_key(*finals["delivered"])
     hold_keys = {_final_key(*finals[label]) for label in ("hold-a", "hold-b")}
@@ -1015,7 +1015,7 @@ def test_v10_to_v11_migration_retains_finals_without_reposting_or_leaking(
         {"stable_key": _STABLE_KEY, "stable_key_version": 2},
     ],
 )
-def test_v10_to_v11_missing_stable_key_pair_becomes_nonroutable_hold(
+def test_v10_to_v12_missing_stable_key_pair_becomes_nonroutable_hold(
     tmp_path: Path,
     invalid_meta: dict[str, object],
 ) -> None:
@@ -1093,7 +1093,7 @@ def test_v10_to_v11_missing_stable_key_pair_becomes_nonroutable_hold(
         "foreign_host_part",
     ],
 )
-def test_v10_to_v11_migration_requires_complete_host_bound_ack_proof(
+def test_v10_to_v12_migration_requires_complete_host_bound_ack_proof(
     tmp_path: Path,
     proof_gap: str,
 ) -> None:
@@ -1268,7 +1268,7 @@ def test_v10_failed_plan_links_only_with_exact_immutable_job_route(
 
 
 
-def test_v10_to_v11_migration_failure_rolls_back_the_entire_transition(
+def test_v10_to_v12_migration_failure_rolls_back_the_entire_transition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1335,7 +1335,7 @@ def test_v10_to_v11_migration_failure_rolls_back_the_entire_transition(
         ),
     ],
 )
-def test_v10_to_v11_then_same_owner_worker_churn_preserves_graph_without_repost(
+def test_v10_to_v12_then_same_owner_worker_churn_preserves_graph_without_repost(
     tmp_path: Path,
     root_state: str,
     delivered_proof: bool,

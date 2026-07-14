@@ -7,7 +7,9 @@ provided for optional persistence and is kept intentionally stdlib-only.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -105,9 +107,24 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 11
+STORE_SCHEMA_VERSION = 12
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
+COMMAND_RETRY_HORIZON_SECONDS = 604_800
+COMMAND_RECEIPT_RETENTION_SECONDS = 2_592_000
+COMMAND_RECEIPT_RETENTION_MIN_SECONDS = 691_200
+COMMAND_RECEIPT_RETENTION_COUNT = 4096
+COMMAND_RECEIPT_OWNER_LEASE_SECONDS = 30.0
+COMMAND_RECEIPT_RETENTION_BATCH_SIZE = 100
+_COMMAND_RECEIPT_RETENTION_BATCH_MAX = 1000
+_COMMAND_REQUEST_UNCERTAIN_RESULT_JSON = (
+    '{"ok":false,"status":"request_state_uncertain"}'
+)
+_COMMAND_REQUEST_STATES = frozenset(
+    {"reserved", "send_started", "accepted", "rejected", "uncertain"}
+)
+_COMMAND_REQUEST_ACTIVE_STATES = frozenset({"reserved", "send_started"})
+_COMMAND_REQUEST_TERMINAL_STATES = frozenset({"accepted", "rejected", "uncertain"})
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
 _MAX_RETENTION_DAYS = 365_000
 _MAX_TIMEDELTA_SECONDS = _MAX_RETENTION_DAYS * 24 * 60 * 60
@@ -337,7 +354,7 @@ INSERT INTO store_maintenance_state (
 ON CONFLICT(scope) DO NOTHING
 """
 
-CREATE_COMMAND_RECEIPTS_TABLE = """
+CREATE_LEGACY_COMMAND_RECEIPTS_TABLE = """
 CREATE TABLE IF NOT EXISTS command_receipts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     host_id TEXT NOT NULL,
@@ -352,13 +369,76 @@ CREATE TABLE IF NOT EXISTS command_receipts (
 );
 """
 
-CREATE_COMMAND_RECEIPT_INDEXES = (
+CREATE_COMMAND_RECEIPTS_TABLE = """
+CREATE TABLE IF NOT EXISTS command_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    canonical_version INTEGER NOT NULL CHECK (canonical_version >= 0),
+    canonical_fingerprint TEXT NOT NULL,
+    canonical_request_json TEXT NOT NULL,
+    public_worker_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('reserved', 'send_started', 'accepted', 'rejected', 'uncertain')
+    ),
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    owner_token_hash TEXT NOT NULL DEFAULT '',
+    owner_expires_at TEXT,
+    binding_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    reserved_at TEXT NOT NULL,
+    send_started_at TEXT,
+    terminal_at TEXT,
+    updated_at TEXT NOT NULL,
+    legacy_collision INTEGER NOT NULL DEFAULT 0 CHECK (legacy_collision IN (0, 1)),
+    legacy_collision_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        legacy_collision_count >= 0
+    ),
+    CHECK (
+        (
+            state IN ('reserved', 'send_started')
+            AND terminal_at IS NULL
+            AND owner_token_hash <> ''
+        )
+        OR (
+            state IN ('accepted', 'rejected', 'uncertain')
+            AND terminal_at IS NOT NULL
+            AND owner_token_hash = ''
+            AND owner_expires_at IS NULL
+        )
+    ),
+    CHECK (state NOT IN ('reserved', 'send_started') OR status = 'pending'),
+    CHECK (
+        state != 'accepted'
+        OR (status = 'accepted' AND send_started_at IS NOT NULL)
+    ),
+    CHECK (state != 'uncertain' OR status = 'request_state_uncertain'),
+    CHECK (
+        state != 'rejected'
+        OR status NOT IN ('pending', 'accepted', 'request_state_uncertain')
+    ),
+    CHECK (
+        legacy_collision = 0
+        OR (state = 'uncertain' AND legacy_collision_count >= 2)
+    )
+);
+"""
+
+CREATE_LEGACY_COMMAND_RECEIPT_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_command_receipts_host_request_action "
     "ON command_receipts(host_id, request_id, action)",
 )
-CREATE_COMMAND_RECEIPT_UNIQUE_INDEX = (
+CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_command_receipts_host_request_action "
     "ON command_receipts(host_id, request_id, action)"
+)
+CREATE_COMMAND_RECEIPT_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_command_receipts_host_request "
+    "ON command_receipts(host_id, request_id)",
+    "CREATE INDEX IF NOT EXISTS idx_command_receipts_host_state_terminal "
+    "ON command_receipts(host_id, state, terminal_at, id)",
 )
 
 CREATE_WORKER_BINDINGS_TABLE = """
@@ -757,7 +837,7 @@ CREATE_ATTENTION_LIFECYCLE_INDEXES = (
     ),
 )
 
-CREATE_COMMANDS_TABLE = """
+CREATE_LEGACY_COMMANDS_TABLE = """
 CREATE TABLE IF NOT EXISTS commands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     host_id TEXT NOT NULL,
@@ -773,6 +853,51 @@ CREATE TABLE IF NOT EXISTS commands (
     reserved_at TEXT,
     completed_at TEXT,
     updated_at TEXT NOT NULL
+);
+"""
+
+CREATE_COMMANDS_TABLE = """
+CREATE TABLE IF NOT EXISTS commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    canonical_version INTEGER NOT NULL CHECK (canonical_version >= 0),
+    canonical_fingerprint TEXT NOT NULL,
+    public_worker_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('reserved', 'send_started', 'accepted', 'rejected', 'uncertain')
+    ),
+    status TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reserved_at TEXT NOT NULL,
+    send_started_at TEXT,
+    terminal_at TEXT,
+    updated_at TEXT NOT NULL,
+    legacy_collision INTEGER NOT NULL DEFAULT 0 CHECK (legacy_collision IN (0, 1)),
+    legacy_collision_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        legacy_collision_count >= 0
+    ),
+    CHECK (
+        (state IN ('reserved', 'send_started') AND terminal_at IS NULL)
+        OR (state IN ('accepted', 'rejected', 'uncertain') AND terminal_at IS NOT NULL)
+    ),
+    CHECK (state NOT IN ('reserved', 'send_started') OR status = 'pending'),
+    CHECK (
+        state != 'accepted'
+        OR (status = 'accepted' AND send_started_at IS NOT NULL)
+    ),
+    CHECK (state != 'uncertain' OR status = 'request_state_uncertain'),
+    CHECK (
+        state != 'rejected'
+        OR status NOT IN ('pending', 'accepted', 'request_state_uncertain')
+    ),
+    CHECK (
+        legacy_collision = 0
+        OR (state = 'uncertain' AND legacy_collision_count >= 2)
+    )
 );
 """
 
@@ -860,6 +985,18 @@ CREATE_PR6_TABLES = (
     CREATE_TURNS_TABLE,
     CREATE_PENDING_INTERACTIONS_TABLE,
     CREATE_ATTENTION_ITEMS_TABLE,
+    CREATE_LEGACY_COMMANDS_TABLE,
+    CREATE_CONNECTOR_OUTBOX_TABLE,
+    CREATE_CONNECTOR_DELIVERIES_TABLE,
+    CREATE_BACKEND_HEALTH_TABLE,
+)
+CREATE_CURRENT_PR6_TABLES = (
+    CREATE_EVENTS_TABLE,
+    CREATE_SPACES_TABLE,
+    CREATE_WORKERS_TABLE,
+    CREATE_TURNS_TABLE,
+    CREATE_PENDING_INTERACTIONS_TABLE,
+    CREATE_ATTENTION_ITEMS_TABLE,
     CREATE_COMMANDS_TABLE,
     CREATE_CONNECTOR_OUTBOX_TABLE,
     CREATE_CONNECTOR_DELIVERIES_TABLE,
@@ -926,6 +1063,15 @@ CREATE_PR6_INDEXES = (
         "ON connector_deliveries(host_id, connector, delivery_key)"
     ),
     "CREATE INDEX IF NOT EXISTS idx_backend_health_host_status ON backend_health(host_id, status)",
+)
+CREATE_COMMAND_INDEXES = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_commands_host_request "
+    "ON commands(host_id, request_id)",
+    "CREATE INDEX IF NOT EXISTS idx_commands_host_state_updated "
+    "ON commands(host_id, state, updated_at, id)",
+)
+CREATE_CURRENT_PR6_INDEXES = (
+    CREATE_PR6_INDEXES[:16] + CREATE_PR6_INDEXES[18:] + CREATE_COMMAND_INDEXES
 )
 
 
@@ -6354,17 +6500,33 @@ def _content_fingerprint(data: Mapping[str, Any]) -> str:
 
 
 def _command_receipt_from_row(row: Any) -> dict[str, Any]:
+    """Return the public command receipt, excluding owner and binding evidence."""
     return {
-        "host_id": row[0],
-        "request_id": row[1],
-        "action": row[2],
-        "payload_fingerprint": row[3],
-        "status": row[4],
-        "result_json": row[5],
-        "created_at": row[6],
-        "completed_at": row[7],
-        "uncertain": bool(row[8]),
+        "host_id": str(row[1]),
+        "request_id": str(row[2]),
+        "action": str(row[3]),
+        "canonical_version": int(row[4]),
+        "canonical_fingerprint": str(row[5]),
+        "canonical_request_json": str(row[6]),
+        "public_worker_id": str(row[7]),
+        "state": str(row[8]),
+        "status": str(row[9]),
+        "result_json": str(row[10]),
+        "created_at": str(row[14]),
+        "reserved_at": str(row[15]),
+        "send_started_at": row[16],
+        "terminal_at": row[17],
+        "updated_at": str(row[18]),
+        "legacy_collision": bool(row[19]),
+        "legacy_collision_count": int(row[20]),
     }
+def _owner_token_hash(owner_token: str) -> str:
+    token = str(owner_token)
+    if not token:
+        return ""
+    return hashlib.sha256(
+        b"tendwire.command-owner.v1\x00" + token.encode("utf-8")
+    ).hexdigest()
 
 
 def _worker_binding_from_row(row: Any) -> WorkerBinding:
@@ -6428,33 +6590,43 @@ def _ensure_command_receipt_unique_index(conn: sqlite3.Connection) -> None:
         if index_name == "ux_command_receipts_host_request_action" and not is_unique:
             conn.execute("DROP INDEX ux_command_receipts_host_request_action")
             break
-    conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
+    conn.execute(CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX)
 
 
-def _latest_command_receipt_row(
+def _command_request_row(
     conn: sqlite3.Connection,
     host_id: str,
     request_id: str,
-    action: str,
 ) -> Any:
     return conn.execute(
         """
         SELECT
+            id,
             host_id,
             request_id,
             action,
-            payload_fingerprint,
+            canonical_version,
+            canonical_fingerprint,
+            canonical_request_json,
+            public_worker_id,
+            state,
             status,
             result_json,
+            owner_token_hash,
+            owner_expires_at,
+            binding_fingerprint,
             created_at,
-            completed_at,
-            uncertain
+            reserved_at,
+            send_started_at,
+            terminal_at,
+            updated_at,
+            legacy_collision,
+            legacy_collision_count
         FROM command_receipts
-        WHERE host_id = ? AND request_id = ? AND action = ?
-        ORDER BY id DESC
+        WHERE host_id = ? AND request_id = ?
         LIMIT 1
         """,
-        (str(host_id), str(request_id), str(action)),
+        (str(host_id), str(request_id)),
     ).fetchone()
 
 
@@ -8165,62 +8337,68 @@ def _upsert_command_audit_from_receipt_row(
     )
 
 
-def find_recent_matching_command_submission(
-    db_path: Path,
-    host_id: str,
-    *,
-    action: str,
-    worker_id: str,
-    worker_fingerprint: str = "",
-    instruction_text: str,
-    since: str,
-    exclude_request_id: str = "",
-) -> dict[str, Any] | None:
-    """Return a recent same-worker/same-text accepted command, if one exists."""
-    if not _sqlite_store_exists(db_path) or not str(worker_id).strip() or not str(instruction_text):
-        return None
-    with _connect(db_path) as conn:
-        _ensure_schema(conn)
-        rows = conn.execute(
-            """
-            SELECT request_id, status, request_json, created_at, updated_at
-            FROM commands
-            WHERE host_id = ?
-              AND action = ?
-              AND request_id != ?
-              AND status = 'accepted'
-              AND updated_at >= ?
-            ORDER BY updated_at DESC, id DESC
-            LIMIT 200
-            """,
-            (str(host_id), str(action), str(exclude_request_id), str(since)),
-        ).fetchall()
-    for row in rows:
-        try:
-            request = json.loads(str(row[2] or "{}"))
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(request, dict):
-            continue
-        target = request.get("target")
-        instruction = request.get("instruction")
-        if not isinstance(target, dict) or not isinstance(instruction, dict):
-            continue
-        if str(target.get("worker_id") or "").strip() != str(worker_id).strip():
-            continue
-        previous_fingerprint = str(target.get("worker_fingerprint") or "").strip()
-        current_fingerprint = str(worker_fingerprint or "").strip()
-        if previous_fingerprint and current_fingerprint and previous_fingerprint != current_fingerprint:
-            continue
-        if instruction.get("text") != instruction_text:
-            continue
-        return sanitize_public_value({
-            "request_id": str(row[0] or ""),
-            "status": str(row[1] or ""),
-            "created_at": str(row[3] or ""),
-            "updated_at": str(row[4] or ""),
-        })
-    return None
+
+
+def _project_command_request_conn(conn: sqlite3.Connection, row: Any) -> None:
+    """Replace the non-authoritative audit row from one authoritative receipt."""
+    conn.execute(
+        """
+        INSERT INTO commands (
+            host_id,
+            request_id,
+            action,
+            canonical_version,
+            canonical_fingerprint,
+            public_worker_id,
+            state,
+            status,
+            request_json,
+            result_json,
+            created_at,
+            reserved_at,
+            send_started_at,
+            terminal_at,
+            updated_at,
+            legacy_collision,
+            legacy_collision_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(host_id, request_id) DO UPDATE SET
+            action = excluded.action,
+            canonical_version = excluded.canonical_version,
+            canonical_fingerprint = excluded.canonical_fingerprint,
+            public_worker_id = excluded.public_worker_id,
+            state = excluded.state,
+            status = excluded.status,
+            request_json = excluded.request_json,
+            result_json = excluded.result_json,
+            created_at = excluded.created_at,
+            reserved_at = excluded.reserved_at,
+            send_started_at = excluded.send_started_at,
+            terminal_at = excluded.terminal_at,
+            updated_at = excluded.updated_at,
+            legacy_collision = excluded.legacy_collision,
+            legacy_collision_count = excluded.legacy_collision_count
+        """,
+        (
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            int(row[4]),
+            str(row[5]),
+            str(row[7]),
+            str(row[8]),
+            str(row[9]),
+            str(row[6]),
+            str(row[10]),
+            str(row[14]),
+            str(row[15]),
+            row[16],
+            row[17],
+            str(row[18]),
+            int(row[19]),
+            int(row[20]),
+        ),
+    )
 
 
 def _backfill_command_audit(conn: sqlite3.Connection) -> None:
@@ -8916,10 +9094,10 @@ def _migrate_v0_to_v1_conn(conn: sqlite3.Connection) -> None:
 
 def _migrate_v1_to_v2_conn(conn: sqlite3.Connection) -> None:
     _migrate_v0_to_v1_conn(conn)
-    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    conn.execute(CREATE_LEGACY_COMMAND_RECEIPTS_TABLE)
     _ensure_command_receipt_columns(conn)
     _dedupe_command_receipts(conn)
-    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+    for statement in CREATE_LEGACY_COMMAND_RECEIPT_INDEXES:
         conn.execute(statement)
     _ensure_command_receipt_unique_index(conn)
     conn.execute(CREATE_WORKER_BINDINGS_TABLE)
@@ -9741,7 +9919,7 @@ def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
     }
     if not present_legacy_tables:
         conn.execute(CREATE_SNAPSHOTS_TABLE)
-        conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+        conn.execute(CREATE_LEGACY_COMMAND_RECEIPTS_TABLE)
         conn.execute(CREATE_WORKER_BINDINGS_TABLE)
         for statement in CREATE_PR6_TABLES:
             conn.execute(statement)
@@ -9756,7 +9934,7 @@ def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_LIST_STATE_TABLE)
         conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
         for statements in (
-            CREATE_COMMAND_RECEIPT_INDEXES,
+            CREATE_LEGACY_COMMAND_RECEIPT_INDEXES,
             CREATE_WORKER_BINDING_INDEXES,
             CREATE_PR6_INDEXES,
             CREATE_TURN_LIST_INDEXES,
@@ -9768,7 +9946,7 @@ def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
         ):
             for statement in statements:
                 conn.execute(statement)
-        conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
+        conn.execute(CREATE_LEGACY_COMMAND_RECEIPT_UNIQUE_INDEX)
         conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
         conn.execute(INSERT_STORE_MAINTENANCE_STATE)
         _ensure_turn_list_state_conn(conn)
@@ -10156,6 +10334,297 @@ def _migrate_v10_to_v11_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _legacy_command_timestamp(
+    values: Iterable[Any],
+    *,
+    latest: bool,
+) -> str:
+    candidates = sorted(str(value) for value in values if str(value or "").strip())
+    if not candidates:
+        return "1970-01-01T00:00:00+00:00"
+    return candidates[-1] if latest else candidates[0]
+
+
+def _legacy_public_worker_id(request_json: Any) -> str:
+    request = _json_object(request_json)
+    target = request.get("target")
+    if not isinstance(target, Mapping):
+        return ""
+    return str(target.get("worker_id") or "")
+
+
+def _migrate_v11_to_v12_conn(conn: sqlite3.Connection) -> None:
+    """Rebuild action-scoped legacy rows into one fail-closed host request."""
+    receipt_columns = _table_columns(conn, "command_receipts")
+    command_columns = _table_columns(conn, "commands")
+    current_receipt_columns = {
+        "canonical_version",
+        "canonical_fingerprint",
+        "canonical_request_json",
+        "public_worker_id",
+        "state",
+        "owner_token_hash",
+        "owner_expires_at",
+        "binding_fingerprint",
+        "reserved_at",
+        "send_started_at",
+        "terminal_at",
+        "updated_at",
+        "legacy_collision",
+        "legacy_collision_count",
+    }
+    current_command_columns = {
+        "canonical_version",
+        "canonical_fingerprint",
+        "public_worker_id",
+        "state",
+        "send_started_at",
+        "terminal_at",
+        "legacy_collision",
+        "legacy_collision_count",
+    }
+    if current_receipt_columns <= receipt_columns:
+        if not current_command_columns <= command_columns:
+            raise StoreSchemaError("legacy_command_request_schema_ambiguous")
+        for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_COMMAND_INDEXES:
+            conn.execute(statement)
+        return
+    required_receipt_columns = {
+        "id",
+        "host_id",
+        "request_id",
+        "action",
+        "payload_fingerprint",
+        "status",
+        "result_json",
+        "created_at",
+        "completed_at",
+        "uncertain",
+    }
+    required_command_columns = {
+        "id",
+        "host_id",
+        "request_id",
+        "action",
+        "payload_fingerprint",
+        "status",
+        "uncertain",
+        "request_json",
+        "result_json",
+        "created_at",
+        "reserved_at",
+        "completed_at",
+        "updated_at",
+    }
+    if (
+        not required_receipt_columns <= receipt_columns
+        or not required_command_columns <= command_columns
+    ):
+        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
+    conflicting_tables = {
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('command_receipts_v11', 'commands_v11')
+            """
+        ).fetchall()
+    }
+    if conflicting_tables:
+        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    receipt_rows = conn.execute(
+        """
+        SELECT
+            id, host_id, request_id, action, payload_fingerprint, status,
+            result_json, created_at, completed_at, uncertain
+        FROM command_receipts
+        WHERE TRIM(host_id) <> '' AND TRIM(request_id) <> ''
+        ORDER BY host_id, request_id, id
+        """
+    ).fetchall()
+    for row in receipt_rows:
+        key = (str(row[1]), str(row[2]))
+        grouped.setdefault(key, []).append(
+            {
+                "source": "receipt",
+                "id": int(row[0]),
+                "action": str(row[3]),
+                "fingerprint": str(row[4]),
+                "status": str(row[5]),
+                "result_json": str(row[6]),
+                "created_at": str(row[7]),
+                "terminal_at": row[8],
+                "updated_at": row[8] or row[7],
+                "uncertain": bool(row[9]),
+                "public_worker_id": "",
+            }
+        )
+    command_rows = conn.execute(
+        """
+        SELECT
+            id, host_id, request_id, action, payload_fingerprint, status,
+            result_json, request_json, created_at, completed_at, updated_at,
+            uncertain
+        FROM commands
+        WHERE TRIM(host_id) <> '' AND TRIM(request_id) <> ''
+        ORDER BY host_id, request_id, id
+        """
+    ).fetchall()
+    for row in command_rows:
+        key = (str(row[1]), str(row[2]))
+        grouped.setdefault(key, []).append(
+            {
+                "source": "command",
+                "id": int(row[0]),
+                "action": str(row[3]),
+                "fingerprint": str(row[4]),
+                "status": str(row[5]),
+                "result_json": str(row[6]),
+                "created_at": str(row[8]),
+                "terminal_at": row[9],
+                "updated_at": row[10] or row[9] or row[8],
+                "uncertain": bool(row[11]),
+                "public_worker_id": _legacy_public_worker_id(row[7]),
+            }
+        )
+
+    normalized: list[tuple[Any, ...]] = []
+    for (host_id, request_id), rows in sorted(grouped.items()):
+        rows.sort(key=lambda item: (str(item["source"]), int(item["id"])))
+        pairs = {
+            (str(item["action"]), str(item["fingerprint"]))
+            for item in rows
+        }
+        evidence = {
+            (
+                str(item["status"]),
+                str(item["result_json"]),
+                bool(item["uncertain"]),
+            )
+            for item in rows
+        }
+        public_worker_ids = {
+            str(item["public_worker_id"])
+            for item in rows
+            if str(item["public_worker_id"])
+        }
+        malformed = any(
+            not str(item["action"]).strip()
+            or not str(item["fingerprint"]).strip()
+            for item in rows
+        )
+        collision = (
+            malformed
+            or len(pairs) != 1
+            or len(evidence) != 1
+            or len(public_worker_ids) > 1
+        )
+        created_at = _legacy_command_timestamp(
+            (item["created_at"] for item in rows),
+            latest=False,
+        )
+        terminal_at = _legacy_command_timestamp(
+            (
+                item["terminal_at"] or item["updated_at"] or item["created_at"]
+                for item in rows
+            ),
+            latest=True,
+        )
+        if collision:
+            action = "legacy_collision"
+            fingerprint = "legacy-collision"
+            state = "uncertain"
+            status = "request_state_uncertain"
+            result_json = (
+                '{"ok":false,"status":"request_state_uncertain"}'
+            )
+            collision_count = max(2, len(rows))
+            public_worker_id = ""
+        else:
+            action, fingerprint = next(iter(pairs))
+            first = rows[0]
+            legacy_status = str(first["status"])
+            result_json = str(first["result_json"])
+            uncertain = any(bool(item["uncertain"]) for item in rows)
+            if (
+                uncertain
+                or legacy_status in {"pending", "request_state_uncertain"}
+            ):
+                state = "uncertain"
+                status = "request_state_uncertain"
+            elif legacy_status == "accepted":
+                state = "accepted"
+                status = "accepted"
+            else:
+                state = "rejected"
+                status = legacy_status or "legacy_rejected"
+            collision_count = 0
+            public_worker_id = (
+                next(iter(public_worker_ids)) if public_worker_ids else ""
+            )
+        send_started_at = created_at if state == "accepted" else None
+        normalized.append(
+            (
+                host_id,
+                request_id,
+                action,
+                0,
+                fingerprint,
+                "{}",
+                public_worker_id,
+                state,
+                status,
+                result_json,
+                created_at,
+                created_at,
+                send_started_at,
+                terminal_at,
+                terminal_at,
+                int(collision),
+                collision_count,
+            )
+        )
+
+    conn.execute("ALTER TABLE command_receipts RENAME TO command_receipts_v11")
+    conn.execute("ALTER TABLE commands RENAME TO commands_v11")
+    conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
+    conn.execute(CREATE_COMMANDS_TABLE)
+    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+        conn.execute(statement)
+    for statement in CREATE_COMMAND_INDEXES:
+        conn.execute(statement)
+    for record in normalized:
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, canonical_version,
+                canonical_fingerprint, canonical_request_json, public_worker_id,
+                state, status, result_json, owner_token_hash, owner_expires_at,
+                binding_fingerprint, created_at, reserved_at, send_started_at,
+                terminal_at, updated_at, legacy_collision,
+                legacy_collision_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            record,
+        )
+        row = _command_request_row(conn, str(record[0]), str(record[1]))
+        if row is None:
+            raise StoreSchemaError("legacy_command_request_migration_failed")
+        _project_command_request_conn(conn, row)
+    conn.execute("DROP TABLE command_receipts_v11")
+    conn.execute("DROP TABLE commands_v11")
+    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+        conn.execute(statement)
+    for statement in CREATE_COMMAND_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -10168,6 +10637,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(8, 9, _migrate_v8_to_v9_conn),
     Migration(9, 10, _migrate_v9_to_v10_conn),
     Migration(10, 11, _migrate_v10_to_v11_conn),
+    Migration(11, 12, _migrate_v11_to_v12_conn),
 )
 
 
@@ -10200,7 +10670,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_SNAPSHOTS_TABLE)
         conn.execute(CREATE_COMMAND_RECEIPTS_TABLE)
         conn.execute(CREATE_WORKER_BINDINGS_TABLE)
-        for statement in CREATE_PR6_TABLES:
+        for statement in CREATE_CURRENT_PR6_TABLES:
             conn.execute(statement)
         conn.execute(CREATE_LEGACY_BACKEND_PENDING_TABLE)
         _migrate_v9_to_v10_conn(conn)
@@ -10216,11 +10686,10 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
-        conn.execute(CREATE_COMMAND_RECEIPT_UNIQUE_INDEX)
         for statement in CREATE_WORKER_BINDING_INDEXES:
             conn.execute(statement)
         conn.execute(CREATE_WORKER_BINDING_UNIQUE_INDEX)
-        for statement in CREATE_PR6_INDEXES:
+        for statement in CREATE_CURRENT_PR6_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_LIST_INDEXES:
             conn.execute(statement)
@@ -10323,6 +10792,151 @@ def init_store(db_path: Path) -> None:
         ensure_schema(conn)
 
 
+def _normalized_command_request_policy(
+    retry_horizon_seconds: Any,
+    retention_seconds: Any,
+    retention_count: Any,
+) -> tuple[int, int, int]:
+    values = (retry_horizon_seconds, retention_seconds, retention_count)
+    valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in values
+    )
+    valid = (
+        valid
+        and int(retry_horizon_seconds) <= COMMAND_RETRY_HORIZON_SECONDS
+        and int(retention_seconds) >= COMMAND_RECEIPT_RETENTION_MIN_SECONDS
+        and int(retention_seconds) <= _MAX_TIMEDELTA_SECONDS
+        and int(retention_seconds) > int(retry_horizon_seconds)
+        and int(retention_count) <= _SQLITE_MAX_INTEGER
+    )
+    if not valid:
+        return (
+            COMMAND_RETRY_HORIZON_SECONDS,
+            COMMAND_RECEIPT_RETENTION_SECONDS,
+            COMMAND_RECEIPT_RETENTION_COUNT,
+        )
+    return (
+        int(retry_horizon_seconds),
+        int(retention_seconds),
+        int(retention_count),
+    )
+
+
+def _command_request_status_empty(
+    *,
+    retry_horizon_seconds: int,
+    retention_seconds: int,
+    retention_count: int,
+) -> dict[str, Any]:
+    return {
+        "total": 0,
+        "states": {
+            "reserved": 0,
+            "send_started": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "uncertain": 0,
+        },
+        "stale_active": 0,
+        "eligible": 0,
+        "retry_horizon_seconds": int(retry_horizon_seconds),
+        "retention_seconds": int(retention_seconds),
+        "retention_count": int(retention_count),
+        "storage_pressure": False,
+    }
+
+
+def _command_request_status_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    retry_horizon_seconds: int,
+    retention_seconds: int,
+    retention_count: int,
+) -> dict[str, Any]:
+    result = _command_request_status_empty(
+        retry_horizon_seconds=retry_horizon_seconds,
+        retention_seconds=retention_seconds,
+        retention_count=retention_count,
+    )
+    states = dict(result["states"])
+    for state, count in conn.execute(
+        """
+        SELECT state, COUNT(*)
+        FROM command_receipts
+        WHERE host_id = ?
+        GROUP BY state
+        """,
+        (str(host_id),),
+    ).fetchall():
+        if str(state) in states:
+            states[str(state)] = int(count or 0)
+    current = datetime.now(timezone.utc)
+    current_at = current.isoformat(timespec="seconds")
+    retry_cutoff = (
+        current - timedelta(seconds=int(retry_horizon_seconds))
+    ).isoformat(timespec="seconds")
+    retention_cutoff = (
+        current - timedelta(seconds=int(retention_seconds))
+    ).isoformat(timespec="seconds")
+    stale_active = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM command_receipts
+            WHERE host_id = ?
+              AND state = 'send_started'
+              AND COALESCE(send_started_at, updated_at) < ?
+            """,
+            (str(host_id), retry_cutoff),
+        ).fetchone()[0]
+    )
+    eligible = int(
+        conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    COALESCE(terminal_at, updated_at) AS retention_at,
+                    ROW_NUMBER() OVER (
+                        ORDER BY COALESCE(terminal_at, updated_at) DESC, id DESC
+                    ) AS retention_rank
+                FROM command_receipts
+                WHERE host_id = ?
+                  AND (
+                      state IN ('accepted', 'rejected', 'uncertain')
+                      OR (
+                          state = 'reserved'
+                          AND owner_expires_at IS NOT NULL
+                          AND owner_expires_at <= ?
+                      )
+                  )
+            )
+            SELECT COUNT(*)
+            FROM ranked
+            WHERE retention_at < ?
+              AND retention_rank > ?
+            """,
+            (
+                str(host_id),
+                current_at,
+                retention_cutoff,
+                int(retention_count),
+            ),
+        ).fetchone()[0]
+    )
+    result.update(
+        {
+            "total": sum(states.values()),
+            "states": states,
+            "stale_active": stale_active,
+            "eligible": eligible,
+            "storage_pressure": bool(stale_active or eligible),
+        }
+    )
+    return result
+
+
 def store_status(
     db_path: Path,
     host_id: str,
@@ -10331,6 +10945,9 @@ def store_status(
     snapshot_retention_count: int = 4096,
     acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
     acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+    command_retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
+    command_receipt_retention_seconds: int = COMMAND_RECEIPT_RETENTION_SECONDS,
+    command_receipt_retention_count: int = COMMAND_RECEIPT_RETENTION_COUNT,
     maintenance_batch_size: int = 100,
     maintenance_cadence_seconds: int = 3600,
     require_current_schema: bool = False,
@@ -10354,6 +10971,15 @@ def store_status(
         retention_days=snapshot_retention_days,
         retention_count=snapshot_retention_count,
         batch_size=maintenance_batch_size,
+    )
+    (
+        command_retry_horizon_seconds,
+        command_receipt_retention_seconds,
+        command_receipt_retention_count,
+    ) = _normalized_command_request_policy(
+        command_retry_horizon_seconds,
+        command_receipt_retention_seconds,
+        command_receipt_retention_count,
     )
     maintenance_empty = {
         "last_completed_at": None,
@@ -10383,6 +11009,11 @@ def store_status(
         ),
         "storage_pressure": False,
     }
+    command_requests_empty = _command_request_status_empty(
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+    )
     def unavailable(status: str) -> dict[str, Any]:
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -10397,6 +11028,7 @@ def store_status(
                 "by_status": {},
             },
             "final_retention": final_retention_empty,
+            "command_requests": command_requests_empty,
             "maintenance": maintenance_empty,
         }))
 
@@ -10497,6 +11129,13 @@ def store_status(
                     acknowledged_final_retention_count
                 ),
             }
+            command_requests = _command_request_status_conn(
+                conn,
+                host_id=str(host_id),
+                retry_horizon_seconds=command_retry_horizon_seconds,
+                retention_seconds=command_receipt_retention_seconds,
+                retention_count=command_receipt_retention_count,
+            )
     except (LocalStateError, StoreSchemaError, sqlite3.Error):
         if require_current_schema:
             return unavailable("store_unavailable")
@@ -10536,7 +11175,11 @@ def store_status(
             else "not_initialized"
         ),
         "snapshot_count": snapshot_count,
-        "backlog": bool(backlog_ids) or bool(final_retention["storage_pressure"]),
+        "backlog": (
+            bool(backlog_ids)
+            or bool(final_retention["storage_pressure"])
+            or bool(command_requests["storage_pressure"])
+        ),
     }
     return sanitize_public_value({
         "schema_version": 1,
@@ -10548,6 +11191,7 @@ def store_status(
         "last_event_at": last_event_row[0] if last_event_row is not None else None,
         "last_snapshot_at": last_snapshot_row[0] if last_snapshot_row is not None else None,
         "final_retention": final_retention,
+        "command_requests": command_requests,
         "maintenance": maintenance,
     })
 
@@ -12677,12 +13321,42 @@ def compact_store(
             os.close(source_parent_fd)
 
 
+def _command_request_maintenance_summary(
+    result: Mapping[str, Any] | None,
+    *,
+    retry_horizon_seconds: int,
+    retention_seconds: int,
+    retention_count: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    data = result or {}
+    return {
+        "ok": bool(data.get("ok")) if result is not None else True,
+        "status": str(data.get("status") or ("ok" if result is None else "unknown")),
+        "retry_horizon_seconds": int(
+            data.get("retry_horizon_seconds") or retry_horizon_seconds
+        ),
+        "retention_seconds": int(data.get("retention_seconds") or retention_seconds),
+        "retention_count": int(data.get("retention_count") or retention_count),
+        "batch_size": int(data.get("batch_size") or batch_size),
+        "retry_cutoff_at": data.get("retry_cutoff_at"),
+        "cutoff_at": data.get("cutoff_at"),
+        "examined": int(data.get("examined") or 0),
+        "stale_active": int(data.get("stale_active") or 0),
+        "deleted": int(data.get("deleted") or 0),
+        "remaining_candidates": bool(data.get("remaining_candidates")),
+    }
+
+
 def maybe_run_automatic_store_maintenance(
     db_path: Path,
     *,
     policy: SnapshotRetentionPolicy,
     acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
     acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+    command_retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
+    command_receipt_retention_seconds: int = COMMAND_RECEIPT_RETENTION_SECONDS,
+    command_receipt_retention_count: int = COMMAND_RECEIPT_RETENTION_COUNT,
     cadence_seconds: int = 3600,
     now: str | None = None,
 ) -> dict[str, Any]:
@@ -12710,6 +13384,13 @@ def maybe_run_automatic_store_maintenance(
     ):
         raise ValueError("acknowledged final retention values are too large")
     current_at = _connector_now(now)
+    empty_command_requests = _command_request_maintenance_summary(
+        None,
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+        batch_size=policy.batch_size,
+    )
     if not _sqlite_store_exists(db_path):
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -12734,6 +13415,7 @@ def maybe_run_automatic_store_maintenance(
                     acknowledged_final_retention_count
                 ),
             },
+            "command_requests": empty_command_requests,
             "batch_size": policy.batch_size,
         }))
     cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
@@ -12789,6 +13471,7 @@ def maybe_run_automatic_store_maintenance(
                             acknowledged_final_retention_count
                         ),
                     },
+                    "command_requests": empty_command_requests,
                     "batch_size": policy.batch_size,
                 }))
             candidates, _ = _snapshot_retention_candidates_conn(
@@ -12897,10 +13580,25 @@ def maybe_run_automatic_store_maintenance(
         except Exception:
             conn.rollback()
             raise
+    command_request_result = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+        now=current_at,
+        batch_size=policy.batch_size,
+    )
+    command_requests = _command_request_maintenance_summary(
+        command_request_result,
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+        batch_size=policy.batch_size,
+    )
     return dict(sanitize_public_value({
         "schema_version": 1,
-        "ok": True,
-        "status": "ok",
+        "ok": bool(command_requests["ok"]),
+        "status": "ok" if command_requests["ok"] else command_requests["status"],
         "due": True,
         "last_completed_at": current_at,
         "next_due_at": _connector_add_seconds(current_at, cadence_seconds),
@@ -12920,6 +13618,7 @@ def maybe_run_automatic_store_maintenance(
                 acknowledged_final_retention_count
             ),
         },
+        "command_requests": command_requests,
         "batch_size": policy.batch_size,
     }))
 
@@ -14255,6 +14954,9 @@ def run_store_maintenance(
     max_outbox_attempts: int,
     acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
     acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
+    command_retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
+    command_receipt_retention_seconds: int = COMMAND_RECEIPT_RETENTION_SECONDS,
+    command_receipt_retention_count: int = COMMAND_RECEIPT_RETENTION_COUNT,
     now: str | None = None,
     dry_run: bool = False,
     content_batch_size: int = _TURN_CONTENT_MAINTENANCE_BATCH,
@@ -14305,12 +15007,30 @@ def run_store_maintenance(
         dry_run=dry_run,
         batch_size=content_batch_size,
     )
+    command_request_result = cleanup_command_request_retention(
+        db_path,
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+        host_id=str(host_id),
+        now=now,
+        dry_run=dry_run,
+        batch_size=content_batch_size,
+    )
+    command_requests = _command_request_maintenance_summary(
+        command_request_result,
+        retry_horizon_seconds=command_retry_horizon_seconds,
+        retention_seconds=command_receipt_retention_seconds,
+        retention_count=command_receipt_retention_count,
+        batch_size=content_batch_size,
+    )
     ok = (
         bool(retention.get("ok"))
         and bool(snapshots.get("ok"))
         and bool(outbox.get("ok"))
         and bool(final_retention.get("ok"))
         and bool(turn_content.get("ok"))
+        and bool(command_requests.get("ok"))
     )
     return sanitize_public_value({
         "schema_version": 1,
@@ -14386,6 +15106,7 @@ def run_store_maintenance(
                 }
             ),
         },
+        "command_requests": command_requests,
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),
             "retention_days": int(
@@ -15986,6 +16707,69 @@ def abandon_backend_pending_choice_claim(
             raise
 
 
+def _finish_backend_pending_choice_send_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    claim_token: str,
+    *,
+    accepted: bool,
+    observed_at: str | None = None,
+) -> bool:
+    if not accepted:
+        return False
+    current_time, _ = _pending_observed_time(observed_at)
+    row = conn.execute(
+        """
+        SELECT worker_id, revision_digest,
+               binding_private_fingerprint, turn_target_value
+        FROM backend_pending_claims
+        WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
+        """,
+        (str(host_id), str(claim_token)),
+    ).fetchone()
+    if row is None:
+        return False
+    updated = conn.execute(
+        """
+        UPDATE backend_pending
+        SET payload_json = '{}',
+            observed_at = ?,
+            revision_digest = '',
+            choice_routes_json = '{}',
+            observation_state = 'none',
+            freshness = 'fresh',
+            last_success_at = ?,
+            last_failure_at = NULL,
+            grace_deadline = NULL,
+            updated_at = ?
+        WHERE host_id = ?
+          AND worker_id = ?
+          AND revision_digest = ?
+          AND binding_private_fingerprint = ?
+          AND observed_turn_target_value = ?
+          AND observation_state IN ('open', 'failed')
+        """,
+        (
+            current_time,
+            current_time,
+            current_time,
+            str(host_id),
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+        ),
+    )
+    deleted = conn.execute(
+        """
+        DELETE FROM backend_pending_claims
+        WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
+        """,
+        (str(host_id), str(claim_token)),
+    )
+    return updated.rowcount == 1 and deleted.rowcount == 1
+
+
 def finish_backend_pending_choice_send(
     db_path: Path | str,
     host_id: str,
@@ -15997,66 +16781,44 @@ def finish_backend_pending_choice_send(
     """Tombstone an accepted exact revision; retain failed sends as uncertain."""
     if not accepted or not _sqlite_store_exists(db_path):
         return False
-    current_time, _ = _pending_observed_time(observed_at)
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                """
-                SELECT worker_id, revision_digest,
-                       binding_private_fingerprint, turn_target_value
-                FROM backend_pending_claims
-                WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
-                """,
-                (str(host_id), str(claim_token)),
-            ).fetchone()
-            if row is None:
-                conn.rollback()
-                return False
-            updated = conn.execute(
-                """
-                UPDATE backend_pending
-                SET payload_json = '{}',
-                    observed_at = ?,
-                    revision_digest = '',
-                    choice_routes_json = '{}',
-                    observation_state = 'none',
-                    freshness = 'fresh',
-                    last_success_at = ?,
-                    last_failure_at = NULL,
-                    grace_deadline = NULL,
-                    updated_at = ?
-                WHERE host_id = ?
-                  AND worker_id = ?
-                  AND revision_digest = ?
-                  AND binding_private_fingerprint = ?
-                  AND observed_turn_target_value = ?
-                  AND observation_state IN ('open', 'failed')
-                """,
-                (
-                    current_time,
-                    current_time,
-                    current_time,
-                    str(host_id),
-                    str(row[0]),
-                    str(row[1]),
-                    str(row[2]),
-                    str(row[3]),
-                ),
-            )
-            deleted = conn.execute(
-                """
-                DELETE FROM backend_pending_claims
-                WHERE host_id = ? AND claim_token = ? AND state = 'send_started'
-                """,
-                (str(host_id), str(claim_token)),
+            finished = _finish_backend_pending_choice_send_conn(
+                conn,
+                host_id,
+                claim_token,
+                accepted=accepted,
+                observed_at=observed_at,
             )
             conn.commit()
-            return updated.rowcount == 1 and deleted.rowcount == 1
+            return finished
         except Exception:
             conn.rollback()
             raise
+
+
+def backend_pending_choice_terminal_effect(
+    *,
+    host_id: str,
+    claim_token: str,
+    accepted: bool,
+) -> Callable[[sqlite3.Connection], None]:
+    """Build an accepted-choice effect for a command terminal transaction."""
+    def effect(conn: sqlite3.Connection) -> None:
+        if not accepted:
+            return
+        if not _finish_backend_pending_choice_send_conn(
+            conn,
+            host_id,
+            claim_token,
+            accepted=True,
+            observed_at=utc_timestamp(),
+        ):
+            raise StoreSchemaError("backend_pending_choice_terminal_effect_failed")
+
+    return effect
 
 
 def prune_backend_pending(
@@ -17437,14 +18199,15 @@ def _update_turn_row(
 
 
 
-def upsert_command_pending_turn(
-    db_path: Path,
+def _upsert_command_pending_turn_impl(
+    db_path: Path | None,
     host_id: str,
     worker: Any,
     *,
     request_id: str,
     instruction_text: str,
     observed_at: str | None = None,
+    _conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any] | None:
     """Upsert a public pending turn for an accepted command submission."""
     clean_request_id = str(request_id or "").strip()
@@ -17503,9 +18266,18 @@ def upsert_command_pending_turn(
             "turn_fingerprint": item.get("fingerprint"),
         }
     )
-    with _connect(db_path, prepare=True, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
+    owns_transaction = _conn is None
+    if owns_transaction and db_path is None:
+        raise ValueError("db_path is required without an existing connection")
+    connection_context = (
+        _connect(db_path, prepare=True, isolation_level=None)
+        if _conn is None
+        else nullcontext(_conn)
+    )
+    with connection_context as conn:
+        if owns_transaction:
+            _ensure_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
         try:
             owner_identity = _turn_continuity_identity(item)
             if owner_identity is not None:
@@ -17559,7 +18331,8 @@ def upsert_command_pending_turn(
                         persisted_item,
                         current,
                     )
-                    conn.commit()
+                    if owns_transaction:
+                        conn.commit()
                     return sanitize_public_mapping(existing_item)
                 command_rows = [
                     row
@@ -17653,7 +18426,8 @@ def upsert_command_pending_turn(
                         if current_row is not None
                         else None
                     )
-                    conn.commit()
+                    if owns_transaction:
+                        conn.commit()
                     return sanitize_public_mapping(
                         _turn_with_current_content(
                             persisted_item,
@@ -17725,11 +18499,76 @@ def upsert_command_pending_turn(
                 payload=item,
                 observed_at=current_time,
             )
-            conn.commit()
+            if owns_transaction:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if owns_transaction:
+                conn.rollback()
             raise
     return sanitize_public_mapping(item)
+
+
+def _upsert_command_pending_turn_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker: Any,
+    *,
+    request_id: str,
+    instruction_text: str,
+    observed_at: str | None = None,
+) -> dict[str, Any] | None:
+    return _upsert_command_pending_turn_impl(
+        None,
+        host_id,
+        worker,
+        request_id=request_id,
+        instruction_text=instruction_text,
+        observed_at=observed_at,
+        _conn=conn,
+    )
+
+
+def upsert_command_pending_turn(
+    db_path: Path,
+    host_id: str,
+    worker: Any,
+    *,
+    request_id: str,
+    instruction_text: str,
+    observed_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Upsert a public pending turn for an accepted command submission."""
+    return _upsert_command_pending_turn_impl(
+        db_path,
+        host_id,
+        worker,
+        request_id=request_id,
+        instruction_text=instruction_text,
+        observed_at=observed_at,
+    )
+
+
+def command_pending_turn_terminal_effect(
+    *,
+    host_id: str,
+    worker: Any,
+    request_id: str,
+    instruction_text: str,
+) -> Callable[[sqlite3.Connection], None]:
+    """Build a pending-turn effect for a command terminal transaction."""
+    def effect(conn: sqlite3.Connection) -> None:
+        item = _upsert_command_pending_turn_conn(
+            conn,
+            host_id,
+            worker,
+            request_id=request_id,
+            instruction_text=instruction_text,
+            observed_at=utc_timestamp(),
+        )
+        if item is None:
+            raise StoreSchemaError("command_pending_turn_terminal_effect_failed")
+
+    return effect
 
 
 def turns_payload_from_store(
@@ -19447,200 +20286,859 @@ def expire_stale_worker_bindings(
         )
 
 
-def get_command_receipt(
+def _command_request_now(value: str | None = None) -> str:
+    raw = str(value or utc_timestamp()).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("now must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _command_request_add_seconds(now: str, seconds: float) -> str:
+    return (
+        datetime.fromisoformat(now) + timedelta(seconds=float(seconds))
+    ).isoformat(timespec="seconds")
+
+
+def _command_request_response(
+    status: str,
+    row: Any,
+    *,
+    owner_token: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": str(status),
+        "owner_token": owner_token,
+        "receipt": None if row is None else _command_receipt_from_row(row),
+    }
+
+
+def _command_transition_event_conn(
+    conn: sqlite3.Connection,
+    row: Any,
+    *,
+    observed_at: str,
+    event_payload: Mapping[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "request_id": str(row[2]),
+        "action": str(row[3]),
+        "state": str(row[8]),
+        "status": str(row[9]),
+        "canonical_fingerprint": str(row[5]),
+        "public_worker_id": str(row[7]),
+    }
+    if event_payload is not None:
+        payload["detail"] = sanitize_public_mapping(event_payload)
+    _append_event_conn(
+        conn,
+        host_id=str(row[1]),
+        event_type=f"command.request.{row[8]}",
+        aggregate_type="command_request",
+        aggregate_id=str(row[2]),
+        observed_at=observed_at,
+        content_fingerprint=str(row[5]),
+        payload=payload,
+    )
+
+
+def _canonical_request_matches(
+    row: Any,
+    *,
+    action: str,
+    canonical_version: int,
+    canonical_fingerprint: str,
+    canonical_request_json: str,
+    public_worker_id: str,
+    legacy_raw_payload_fingerprint: str | None,
+) -> bool:
+    if str(row[3]) != str(action):
+        return False
+    if int(row[4]) == 0:
+        return (
+            legacy_raw_payload_fingerprint is not None
+            and str(row[5]) == str(legacy_raw_payload_fingerprint)
+        )
+    return (
+        int(row[4]) == int(canonical_version)
+        and str(row[5]) == str(canonical_fingerprint)
+        and str(row[6]) == str(canonical_request_json)
+        and str(row[7]) == str(public_worker_id)
+    )
+
+
+def get_command_request(
     db_path: Path,
     host_id: str,
     request_id: str,
-    action: str,
 ) -> dict[str, Any] | None:
-    """Return the latest command receipt for a host/request/action key, or None."""
+    """Return the authoritative public receipt for a host-wide request id."""
     if not _sqlite_store_exists(db_path):
         return None
     with _connect(db_path) as conn:
         _ensure_schema(conn)
-        row = _latest_command_receipt_row(conn, host_id, request_id, action)
-    if row is None:
-        return None
-    return _command_receipt_from_row(row)
+        row = _command_request_row(conn, host_id, request_id)
+    return None if row is None else _command_receipt_from_row(row)
 
 
-def reserve_command_receipt(
+def reserve_command_request(
     db_path: Path,
+    *,
     host_id: str,
     request_id: str,
     action: str,
-    payload_fingerprint: str,
+    canonical_version: int,
+    canonical_fingerprint: str,
+    canonical_request_json: str,
+    public_worker_id: str,
     pending_result_json: str,
-    *,
-    status: str = "pending",
-    request_json: str = "{}",
+    legacy_raw_payload_fingerprint: str | None = None,
+    owner_lease_seconds: float = COMMAND_RECEIPT_OWNER_LEASE_SECONDS,
+    now: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically reserve a mutating command receipt key if it is unused.
-
-    Returns {"reserved": True, "receipt": None} when this caller owns the
-    mutation attempt. If another receipt already exists for the same key, the
-    existing latest receipt is returned and no new row is inserted.
-    """
+    """Reserve or replay exactly one authoritative host/request mutation."""
+    values = {
+        "host_id": str(host_id).strip(),
+        "request_id": str(request_id).strip(),
+        "action": str(action).strip(),
+        "canonical_fingerprint": str(canonical_fingerprint).strip(),
+    }
+    if any(not value for value in values.values()):
+        raise ValueError("command request identity fields must be non-empty")
+    if isinstance(canonical_version, bool) or int(canonical_version) < 1:
+        raise ValueError("canonical_version must be an integer >= 1")
+    try:
+        canonical_payload = json.loads(str(canonical_request_json))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical_request_json must be a JSON object") from exc
+    if not isinstance(canonical_payload, Mapping):
+        raise ValueError("canonical_request_json must be a JSON object")
+    try:
+        lease_seconds = float(owner_lease_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("owner_lease_seconds must be positive and finite") from exc
+    if (
+        isinstance(owner_lease_seconds, bool)
+        or not math.isfinite(lease_seconds)
+        or lease_seconds <= 0
+        or lease_seconds > COMMAND_RETRY_HORIZON_SECONDS
+    ):
+        raise ValueError("owner_lease_seconds must be positive and finite")
+    current = _command_request_now(now)
+    owner_token = secrets.token_urlsafe(32)
+    owner_hash = _owner_token_hash(owner_token)
+    owner_expires_at = _command_request_add_seconds(current, lease_seconds)
     conn = _connect(db_path, isolation_level=None, prepare=True)
     try:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
-        row = _latest_command_receipt_row(conn, host_id, request_id, action)
+        row = _command_request_row(conn, values["host_id"], values["request_id"])
         if row is not None:
-            _upsert_command_audit_from_receipt_row(conn, row)
-            conn.execute("COMMIT")
-            return {"reserved": False, "receipt": _command_receipt_from_row(row)}
-        now = utc_timestamp()
-        conn.execute(
-            """
-            INSERT INTO command_receipts (
-                host_id,
-                request_id,
-                action,
-                payload_fingerprint,
-                status,
-                result_json,
-                created_at,
-                completed_at,
-                uncertain
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(host_id),
-                str(request_id),
-                str(action),
-                str(payload_fingerprint),
-                str(status),
-                str(pending_result_json),
-                now,
-                None,
-                1,
-            ),
-        )
-        _upsert_command_audit(
-            conn,
-            host_id=str(host_id),
-            request_id=str(request_id),
-            action=str(action),
-            payload_fingerprint=str(payload_fingerprint),
-            status=str(status),
-            result_json=str(pending_result_json),
-            created_at=now,
-            reserved_at=now,
-            completed_at=None,
-            uncertain=True,
-            request_json=str(request_json),
-        )
-        conn.execute("COMMIT")
-        return {"reserved": True, "receipt": None}
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
-
-
-def save_command_receipt(
-    db_path: Path,
-    host_id: str,
-    request_id: str,
-    action: str,
-    payload_fingerprint: str,
-    status: str,
-    result_json: str,
-    *,
-    uncertain: bool = False,
-) -> None:
-    """Persist a neutral command receipt for idempotency tracking.
-
-    Dry-runs must not call this function. The receipt records the final or
-    pending state of a mutating command so repeated requests can be detected
-    and rejected instead of retried blindly.
-    """
-    now = utc_timestamp()
-    conn = _connect(db_path, isolation_level=None, prepare=True)
-    try:
-        _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            """
-            SELECT id, payload_fingerprint
-            FROM command_receipts
-            WHERE host_id = ? AND request_id = ? AND action = ?
-            LIMIT 1
-            """,
-            (str(host_id), str(request_id), str(action)),
-        ).fetchone()
-        completed_at = None if uncertain else now
-        if row is not None:
-            if str(row[1]) != str(payload_fingerprint):
-                raise ValueError("receipt payload fingerprint mismatch")
-            conn.execute(
+            if bool(row[19]):
+                conn.commit()
+                return _command_request_response("terminal", row)
+            if not _canonical_request_matches(
+                row,
+                action=values["action"],
+                canonical_version=int(canonical_version),
+                canonical_fingerprint=values["canonical_fingerprint"],
+                canonical_request_json=str(canonical_request_json),
+                public_worker_id=str(public_worker_id),
+                legacy_raw_payload_fingerprint=legacy_raw_payload_fingerprint,
+            ):
+                conn.commit()
+                return _command_request_response("request_id_conflict", row)
+            if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+                conn.commit()
+                return _command_request_response("terminal", row)
+            if str(row[8]) == "send_started":
+                conn.commit()
+                return _command_request_response("in_progress", row)
+            expires_at = str(row[12] or "")
+            if expires_at and datetime.fromisoformat(expires_at) > datetime.fromisoformat(current):
+                conn.commit()
+                return _command_request_response("in_progress", row)
+            updated = conn.execute(
                 """
                 UPDATE command_receipts
-                SET
-                    status = ?,
+                SET owner_token_hash = ?,
+                    owner_expires_at = ?,
+                    binding_fingerprint = NULL,
+                    status = 'pending',
                     result_json = ?,
-                    completed_at = ?,
-                    uncertain = ?
-                WHERE id = ? AND payload_fingerprint = ?
+                    reserved_at = ?,
+                    send_started_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state = 'reserved'
                 """,
                 (
-                    str(status),
-                    str(result_json),
-                    completed_at,
-                    int(uncertain),
+                    owner_hash,
+                    owner_expires_at,
+                    str(pending_result_json),
+                    current,
+                    current,
                     int(row[0]),
-                    str(payload_fingerprint),
                 ),
             )
+            if int(updated.rowcount or 0) != 1:
+                row = _command_request_row(
+                    conn, values["host_id"], values["request_id"]
+                )
+                conn.commit()
+                return _command_request_response("in_progress", row)
         else:
             conn.execute(
                 """
                 INSERT INTO command_receipts (
-                    host_id,
-                    request_id,
-                    action,
-                    payload_fingerprint,
-                    status,
-                    result_json,
-                    created_at,
-                    completed_at,
-                    uncertain
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    host_id, request_id, action, canonical_version,
+                    canonical_fingerprint, canonical_request_json,
+                    public_worker_id, state, status, result_json,
+                    owner_token_hash, owner_expires_at, binding_fingerprint,
+                    created_at, reserved_at, send_started_at, terminal_at,
+                    updated_at, legacy_collision, legacy_collision_count
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'reserved', 'pending', ?, ?, ?, NULL,
+                    ?, ?, NULL, NULL, ?, 0, 0
+                )
                 """,
                 (
-                    str(host_id),
-                    str(request_id),
-                    str(action),
-                    str(payload_fingerprint),
-                    str(status),
-                    str(result_json),
-                    now,
-                    completed_at,
-                    int(uncertain),
+                    values["host_id"],
+                    values["request_id"],
+                    values["action"],
+                    int(canonical_version),
+                    values["canonical_fingerprint"],
+                    str(canonical_request_json),
+                    str(public_worker_id),
+                    str(pending_result_json),
+                    owner_hash,
+                    owner_expires_at,
+                    current,
+                    current,
+                    current,
                 ),
             )
-        _upsert_command_audit(
-            conn,
-            host_id=str(host_id),
-            request_id=str(request_id),
-            action=str(action),
-            payload_fingerprint=str(payload_fingerprint),
-            status=str(status),
-            result_json=str(result_json),
-            created_at=now,
-            reserved_at=now,
-            completed_at=completed_at,
-            uncertain=uncertain,
-        )
-        conn.execute("COMMIT")
+        row = _command_request_row(conn, values["host_id"], values["request_id"])
+        if row is None:
+            raise RuntimeError("command request reservation disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(conn, row, observed_at=current)
+        conn.commit()
+        return _command_request_response("reserved", row, owner_token=owner_token)
     except Exception:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.rollback()
         raise
     finally:
         conn.close()
 
+
+def reserve_terminal_command_replay(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    action: str,
+    canonical_version: int,
+    canonical_fingerprint: str,
+    canonical_request_json: str,
+    public_worker_id: str,
+    terminal_state: str,
+    status: str,
+    result_json: str,
+    legacy_raw_payload_fingerprint: str | None = None,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Atomically preserve known terminal evidence when retention removed its row."""
+    values = {
+        "host_id": str(host_id).strip(),
+        "request_id": str(request_id).strip(),
+        "action": str(action).strip(),
+        "canonical_fingerprint": str(canonical_fingerprint).strip(),
+    }
+    if any(not value for value in values.values()):
+        raise ValueError("command request identity fields must be non-empty")
+    if isinstance(canonical_version, bool) or int(canonical_version) < 1:
+        raise ValueError("canonical_version must be an integer >= 1")
+    try:
+        canonical_payload = json.loads(str(canonical_request_json))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical_request_json must be a JSON object") from exc
+    if not isinstance(canonical_payload, Mapping):
+        raise ValueError("canonical_request_json must be a JSON object")
+
+    terminal = str(terminal_state)
+    terminal_status = str(status)
+    if terminal not in {"rejected", "uncertain"}:
+        raise ValueError("terminal replay state must be rejected or uncertain")
+    if terminal == "uncertain" and terminal_status != "request_state_uncertain":
+        raise ValueError(
+            "uncertain terminal state requires request_state_uncertain status"
+        )
+    if terminal == "rejected" and terminal_status in {
+        "pending",
+        "accepted",
+        "request_state_uncertain",
+    }:
+        raise ValueError("rejected terminal state requires a rejection status")
+
+    current = _command_request_now(now)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, values["host_id"], values["request_id"])
+        if row is not None:
+            if bool(row[19]):
+                conn.commit()
+                return _command_request_response("terminal", row)
+            if not _canonical_request_matches(
+                row,
+                action=values["action"],
+                canonical_version=int(canonical_version),
+                canonical_fingerprint=values["canonical_fingerprint"],
+                canonical_request_json=str(canonical_request_json),
+                public_worker_id=str(public_worker_id),
+                legacy_raw_payload_fingerprint=legacy_raw_payload_fingerprint,
+            ):
+                conn.commit()
+                return _command_request_response("request_id_conflict", row)
+            if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+                conn.commit()
+                return _command_request_response("terminal", row)
+            conn.commit()
+            return _command_request_response("in_progress", row)
+
+        conn.execute(
+            """
+            INSERT INTO command_receipts (
+                host_id, request_id, action, canonical_version,
+                canonical_fingerprint, canonical_request_json,
+                public_worker_id, state, status, result_json,
+                owner_token_hash, owner_expires_at, binding_fingerprint,
+                created_at, reserved_at, send_started_at, terminal_at,
+                updated_at, legacy_collision, legacy_collision_count
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL,
+                ?, ?, NULL, ?, ?, 0, 0
+            )
+            """,
+            (
+                values["host_id"],
+                values["request_id"],
+                values["action"],
+                int(canonical_version),
+                values["canonical_fingerprint"],
+                str(canonical_request_json),
+                str(public_worker_id),
+                terminal,
+                terminal_status,
+                str(result_json),
+                current,
+                current,
+                current,
+                current,
+            ),
+        )
+        row = _command_request_row(conn, values["host_id"], values["request_id"])
+        if row is None:
+            raise RuntimeError("terminal command replay disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response(terminal, row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def mark_command_send_started(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    owner_token: str,
+    binding_fingerprint: str,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """CAS the exact reserved owner to send_started before external mutation."""
+    if not str(binding_fingerprint).strip():
+        raise ValueError("binding_fingerprint must be non-empty")
+    current = _command_request_now(now)
+    owner_hash = _owner_token_hash(owner_token)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if str(row[8]) != "reserved":
+            conn.commit()
+            return _command_request_response("invalid_state", row)
+        if not owner_hash or not secrets.compare_digest(str(row[11]), owner_hash):
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET state = 'send_started',
+                binding_fingerprint = ?,
+                send_started_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = 'reserved'
+              AND canonical_fingerprint = ?
+              AND owner_token_hash = ?
+            """,
+            (
+                str(binding_fingerprint),
+                current,
+                current,
+                int(row[0]),
+                str(canonical_fingerprint),
+                owner_hash,
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("command request send-start disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response(
+            "send_started", row, owner_token=str(owner_token)
+        )
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finish_command_request(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    owner_token: str,
+    expected_state: str,
+    terminal_state: str,
+    status: str,
+    result_json: str,
+    event_payload: Mapping[str, Any] | None = None,
+    terminal_effect: Callable[[sqlite3.Connection], Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """CAS the sole terminal writer without inserting or rewriting evidence."""
+    expected = str(expected_state)
+    terminal = str(terminal_state)
+    allowed = {
+        "reserved": {"rejected", "uncertain"},
+        "send_started": {"accepted", "uncertain"},
+    }
+    if expected not in allowed or terminal not in allowed[expected]:
+        raise ValueError("illegal command request transition")
+    if terminal == "accepted" and str(status) != "accepted":
+        raise ValueError("accepted terminal state requires accepted status")
+    if terminal == "uncertain" and str(status) != "request_state_uncertain":
+        raise ValueError(
+            "uncertain terminal state requires request_state_uncertain status"
+        )
+    if terminal == "rejected" and str(status) in {
+        "pending",
+        "accepted",
+        "request_state_uncertain",
+    }:
+        raise ValueError("rejected terminal state requires a rejection status")
+    current = _command_request_now(now)
+    owner_hash = _owner_token_hash(owner_token)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if str(row[8]) != expected:
+            conn.commit()
+            return _command_request_response("invalid_state", row)
+        if not owner_hash or not secrets.compare_digest(str(row[11]), owner_hash):
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET state = ?,
+                status = ?,
+                result_json = ?,
+                owner_token_hash = '',
+                owner_expires_at = NULL,
+                terminal_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = ?
+              AND canonical_fingerprint = ?
+              AND owner_token_hash = ?
+            """,
+            (
+                terminal,
+                str(status),
+                str(result_json),
+                current,
+                current,
+                int(row[0]),
+                expected,
+                str(canonical_fingerprint),
+                owner_hash,
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        if terminal_effect is not None:
+            terminal_effect(conn)
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("command request terminal row disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response(terminal, row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def cleanup_command_request_retention(
+    db_path: Path,
+    *,
+    retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
+    retention_seconds: int = COMMAND_RECEIPT_RETENTION_SECONDS,
+    retention_count: int = COMMAND_RECEIPT_RETENTION_COUNT,
+    host_id: str | None = None,
+    now: str | None = None,
+    dry_run: bool = False,
+    batch_size: int = COMMAND_RECEIPT_RETENTION_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Bound all inactive request evidence beyond both age and count floors."""
+    policy_values = (
+        retry_horizon_seconds,
+        retention_seconds,
+        retention_count,
+        batch_size,
+    )
+    valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in policy_values
+    )
+    valid = (
+        valid
+        and retry_horizon_seconds <= COMMAND_RETRY_HORIZON_SECONDS
+        and retention_seconds >= COMMAND_RECEIPT_RETENTION_MIN_SECONDS
+        and retention_seconds <= _MAX_TIMEDELTA_SECONDS
+        and retention_seconds > retry_horizon_seconds
+        and retention_count <= _SQLITE_MAX_INTEGER
+        and batch_size <= _COMMAND_RECEIPT_RETENTION_BATCH_MAX
+    )
+    current = _command_request_now(now)
+    cutoff_at = (
+        datetime.fromisoformat(current)
+        - timedelta(
+            seconds=(
+                retention_seconds
+                if valid
+                else COMMAND_RECEIPT_RETENTION_SECONDS
+            )
+        )
+    ).isoformat(timespec="seconds")
+    retry_cutoff_at = (
+        datetime.fromisoformat(current)
+        - timedelta(
+            seconds=(
+                retry_horizon_seconds
+                if valid
+                else COMMAND_RETRY_HORIZON_SECONDS
+            )
+        )
+    ).isoformat(timespec="seconds")
+    base_result = {
+        "schema_version": 1,
+        "host_id": None if host_id is None else str(host_id),
+        "dry_run": bool(dry_run),
+        "retry_horizon_seconds": (
+            int(retry_horizon_seconds)
+            if valid
+            else COMMAND_RETRY_HORIZON_SECONDS
+        ),
+        "retention_seconds": (
+            int(retention_seconds)
+            if valid
+            else COMMAND_RECEIPT_RETENTION_SECONDS
+        ),
+        "retention_count": (
+            int(retention_count)
+            if valid
+            else COMMAND_RECEIPT_RETENTION_COUNT
+        ),
+        "batch_size": (
+            int(batch_size)
+            if valid
+            else COMMAND_RECEIPT_RETENTION_BATCH_SIZE
+        ),
+        "cutoff_at": cutoff_at,
+        "retry_cutoff_at": retry_cutoff_at,
+    }
+    if not valid:
+        return dict(
+            base_result,
+            ok=False,
+            status="invalid_policy",
+            examined=0,
+            stale_active=0,
+            deleted=0,
+            remaining_candidates=False,
+        )
+    if not _sqlite_store_exists(db_path):
+        return dict(
+            base_result,
+            ok=False,
+            status="store_unavailable",
+            examined=0,
+            stale_active=0,
+            deleted=0,
+            remaining_candidates=False,
+        )
+    scope_sql = "" if host_id is None else "AND host_id = :host_id"
+    params: dict[str, Any] = {
+        "cutoff_at": cutoff_at,
+        "current": current,
+        "retry_cutoff_at": retry_cutoff_at,
+        "retention_count": int(retention_count),
+        "host_id": None if host_id is None else str(host_id),
+    }
+    conn = _connect(db_path, isolation_level=None)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        stale_rows = conn.execute(
+            f"""
+            SELECT id
+            FROM command_receipts
+            WHERE state = 'send_started'
+              AND COALESCE(send_started_at, updated_at) < :retry_cutoff_at
+              {scope_sql}
+            ORDER BY updated_at, host_id, id
+            LIMIT :candidate_limit
+            """,
+            dict(params, candidate_limit=int(batch_size) + 1),
+        ).fetchall()
+        stale_ids = [int(row[0]) for row in stale_rows[: int(batch_size)]]
+        remaining_capacity = int(batch_size) - len(stale_ids)
+        stale_overflow = len(stale_rows) > len(stale_ids)
+        if not dry_run:
+            for receipt_id in stale_ids:
+                conn.execute(
+                    """
+                    UPDATE command_receipts
+                    SET state = 'uncertain',
+                        status = 'request_state_uncertain',
+                        result_json = ?,
+                        owner_token_hash = '',
+                        owner_expires_at = NULL,
+                        terminal_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND state = 'send_started'
+                    """,
+                    (
+                        _COMMAND_REQUEST_UNCERTAIN_RESULT_JSON,
+                        current,
+                        current,
+                        receipt_id,
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT
+                        id, host_id, request_id, action, canonical_version,
+                        canonical_fingerprint, canonical_request_json,
+                        public_worker_id, state, status, result_json,
+                        owner_token_hash, owner_expires_at, binding_fingerprint,
+                        created_at, reserved_at, send_started_at, terminal_at,
+                        updated_at, legacy_collision, legacy_collision_count
+                    FROM command_receipts
+                    WHERE id = ?
+                    """,
+                    (receipt_id,),
+                ).fetchone()
+                if row is not None:
+                    _project_command_request_conn(conn, row)
+                    _command_transition_event_conn(
+                        conn,
+                        row,
+                        observed_at=current,
+                        event_payload={"reason": "retention_stale_active"},
+                    )
+        deletion_rows: list[Any] = []
+        deletion_overflow = False
+        if remaining_capacity > 0 and not stale_overflow:
+            deletion_rows = conn.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT
+                        id,
+                        host_id,
+                        request_id,
+                        state,
+                        COALESCE(terminal_at, updated_at) AS retention_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY host_id
+                            ORDER BY COALESCE(terminal_at, updated_at) DESC, id DESC
+                        ) AS retention_rank
+                    FROM command_receipts
+                    WHERE (
+                        state IN ('accepted', 'rejected', 'uncertain')
+                        OR (
+                            state = 'reserved'
+                            AND owner_expires_at IS NOT NULL
+                            AND owner_expires_at <= :current
+                        )
+                    )
+                    {scope_sql}
+                )
+                SELECT id, host_id, request_id
+                FROM ranked
+                WHERE retention_at < :cutoff_at
+                  AND retention_rank > :retention_count
+                ORDER BY retention_at, host_id, id
+                LIMIT :candidate_limit
+                """,
+                dict(params, candidate_limit=remaining_capacity + 1),
+            ).fetchall()
+            deletion_overflow = len(deletion_rows) > remaining_capacity
+            deletion_rows = deletion_rows[:remaining_capacity]
+        if remaining_capacity == 0 and not stale_overflow:
+            deletion_overflow = bool(
+                conn.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT
+                            id,
+                            COALESCE(terminal_at, updated_at) AS retention_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY host_id
+                                ORDER BY COALESCE(terminal_at, updated_at) DESC, id DESC
+                            ) AS retention_rank
+                        FROM command_receipts
+                        WHERE (
+                            state IN ('accepted', 'rejected', 'uncertain')
+                            OR (
+                                state = 'reserved'
+                                AND owner_expires_at IS NOT NULL
+                                AND owner_expires_at <= :current
+                            )
+                        )
+                        {scope_sql}
+                    )
+                    SELECT 1
+                    FROM ranked
+                    WHERE retention_at < :cutoff_at
+                      AND retention_rank > :retention_count
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+            )
+        if not dry_run:
+            for receipt_id, receipt_host_id, receipt_request_id in deletion_rows:
+                conn.execute(
+                    "DELETE FROM commands WHERE host_id = ? AND request_id = ?",
+                    (str(receipt_host_id), str(receipt_request_id)),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM command_receipts
+                    WHERE id = ?
+                      AND (
+                          state IN ('accepted', 'rejected', 'uncertain')
+                          OR (
+                              state = 'reserved'
+                              AND owner_expires_at IS NOT NULL
+                              AND owner_expires_at <= ?
+                          )
+                      )
+                    """,
+                    (int(receipt_id), current),
+                )
+            conn.commit()
+        else:
+            conn.rollback()
+        remaining = stale_overflow or deletion_overflow
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return dict(
+        base_result,
+        ok=True,
+        status="ok",
+        examined=len(stale_ids) + len(deletion_rows),
+        stale_active=len(stale_ids),
+        deleted=len(deletion_rows),
+        remaining_candidates=bool(remaining),
+    )
 
 def envelope_to_receipt_json(envelope: CommandEnvelope) -> str:
     """Serialize a command envelope for storage in a receipt."""
