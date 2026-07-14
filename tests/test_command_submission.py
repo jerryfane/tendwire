@@ -1129,9 +1129,10 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     ]
 
 
-def test_submit_command_non_id_selector_replay_requires_authoritative_snapshot(
+def test_submit_command_unprovable_selector_spelling_fails_closed(
     tmp_path: Path,
 ) -> None:
+    """A spelling the receipt cannot vouch for is never resolved by a degraded snapshot."""
     config = _config(tmp_path)
     worker = Worker(
         id="w-1",
@@ -1157,6 +1158,9 @@ def test_submit_command_non_id_selector_replay_requires_authoritative_snapshot(
             backend_health=[_degraded_backend()],
         ),
     )
+    # The receipt was issued for an explicit worker ID, so it holds no proof of
+    # either alias. Only a healthy observation could show they mean the same
+    # worker, and a degraded one may not stand in for it.
     by_name = _request(request_id="selector-unavailable")
     by_name["target"] = {"name": "Alpha"}
     by_space = _request(request_id="selector-unavailable")
@@ -1166,9 +1170,14 @@ def test_submit_command_non_id_selector_replay_requires_authoritative_snapshot(
     space_replay = submit_command(config, by_space, socket_client_factory=_factory(calls))
 
     assert first.status == STATUS_ACCEPTED
-    assert name_replay.status == STATUS_BACKEND_UNAVAILABLE
-    assert space_replay.status == STATUS_BACKEND_UNAVAILABLE
+    assert name_replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert name_replay.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert space_replay.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert space_replay.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert calls == _expected_submit_calls()
+    receipt = get_command_request(config.db_path, config.host_id, "selector-unavailable")
+    assert receipt is not None
+    assert (receipt["state"], receipt["status"]) == ("accepted", STATUS_ACCEPTED)
 
 
 def test_submit_command_equivalent_resolved_selectors_replay_once(
@@ -1216,10 +1225,11 @@ def test_submit_command_equivalent_resolved_selectors_replay_once(
 
 
 @pytest.mark.parametrize("selector_kind", ["name", "space_id"])
-def test_submit_command_changed_resolved_selector_conflicts_without_backend(
+def test_submit_command_exact_selector_retry_survives_selector_reuse(
     tmp_path: Path,
     selector_kind: str,
 ) -> None:
+    """A reused name or space is worker churn, not a changed request."""
     config = _config(tmp_path / selector_kind)
     first_worker = Worker(
         id="w-1",
@@ -1235,11 +1245,12 @@ def test_submit_command_changed_resolved_selector_conflicts_without_backend(
     )
     _seed(config, [first_worker, second_worker], [_binding(first_worker)])
     selector = {"name": "Alpha"} if selector_kind == "name" else {"space_id": "space-1"}
-    request = _request(request_id=f"selector-changed-{selector_kind}")
+    request = _request(request_id=f"selector-reused-{selector_kind}")
     request["target"] = selector
     calls: list[dict[str, Any]] = []
 
     accepted = submit_command(config, request, socket_client_factory=_factory(calls))
+    # The selector the caller spelled now names a different public worker.
     if selector_kind == "name":
         changed_workers = [
             Worker(id="w-1", name="Former", status="active", space_id="space-1"),
@@ -1260,17 +1271,79 @@ def test_submit_command_changed_resolved_selector_conflicts_without_backend(
             backend_health=[_healthy_backend()],
         ),
     )
-    conflict = submit_command(
+    replay = submit_command(
         config,
         request,
         socket_client_factory=lambda _config: pytest.fail(
-            "changed selector resolution must not create a socket client"
+            "an exact retry must not create a socket client"
+        ),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    # Re-resolving the selector would deliver the instruction a second time, to
+    # a worker the caller never addressed. The receipt outranks the snapshot.
+    assert replay.to_dict() == accepted.to_dict()
+    assert replay.result is not None
+    assert replay.result["target"] == {"worker_id": "w-1"}
+    assert calls == _expected_submit_calls()
+
+
+@pytest.mark.parametrize(
+    ("selector_kind", "changed_selector"),
+    [
+        ("name", {"name": "Beta"}),
+        ("space_id", {"space_id": "space-2"}),
+        ("name_and_space", {"name": "Beta", "space_id": "space-2"}),
+    ],
+)
+def test_submit_command_changed_selector_conflicts_without_backend(
+    tmp_path: Path,
+    selector_kind: str,
+    changed_selector: dict[str, Any],
+) -> None:
+    """Reusing a request ID with a different selector cannot claim its result."""
+    config = _config(tmp_path / selector_kind)
+    first_worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        space_id="space-1",
+    )
+    second_worker = Worker(
+        id="w-2",
+        name="Beta",
+        status="active",
+        space_id="space-2",
+    )
+    _seed(config, [first_worker, second_worker], [_binding(first_worker)])
+    request = _request(request_id=f"selector-changed-{selector_kind}")
+    request["target"] = {"name": "Alpha"}
+    calls: list[dict[str, Any]] = []
+
+    accepted = submit_command(config, request, socket_client_factory=_factory(calls))
+    changed = _request(request_id=f"selector-changed-{selector_kind}")
+    changed["target"] = changed_selector
+    conflict = submit_command(
+        config,
+        changed,
+        socket_client_factory=lambda _config: pytest.fail(
+            "a changed selector must not create a socket client"
         ),
     )
 
     assert accepted.status == STATUS_ACCEPTED
     assert conflict.status == STATUS_DUPLICATE_REQUEST
+    assert conflict.disposition == DISPOSITION_TERMINAL_REJECTED
     assert calls == _expected_submit_calls()
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        f"selector-changed-{selector_kind}",
+    )
+    assert receipt is not None
+    assert (receipt["state"], receipt["status"]) == ("accepted", STATUS_ACCEPTED)
+    assert json.loads(receipt["result_json"]) == accepted.to_dict()
 
 
 def test_submit_command_migrated_v11_exact_raw_request_replays(
@@ -1602,6 +1675,8 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
         assert replay.disposition == DISPOSITION_IN_PROGRESS
         assert len(clients) == 1
     else:
+        # The reservation is still owned, so both retries are decided by the
+        # receipt alone: no second client, no second private observation.
         replay = submit_command(
             config,
             _request(request_id="send-start-loss"),
@@ -1615,10 +1690,8 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
             socket_client_factory=factory,
         )
         assert conflict.status == STATUS_DUPLICATE_REQUEST
-        assert [client.close_count for client in clients] == [1, 1, 1]
+        assert [client.close_count for client in clients] == [1]
         assert calls == [
-            {"method": "agent.get", "params": {"target": "agent-secret"}},
-            {"method": "agent.get", "params": {"target": "agent-secret"}},
             {"method": "agent.get", "params": {"target": "agent-secret"}},
         ]
     assert not any(call["method"] == "pane.send_text" for call in calls)

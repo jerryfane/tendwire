@@ -54,7 +54,7 @@ from ..local_state import (
     verify_created_private_sqlite_replacement_at,
     verify_entry_identity,
 )
-from ..core.commands import CommandEnvelope
+from ..core.commands import CommandEnvelope, is_selector_proof
 from ..core.models import (
     FINGERPRINT_HEX_CHARS,
     SCHEMA_VERSION,
@@ -107,7 +107,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 12
+STORE_SCHEMA_VERSION = 13
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -396,6 +396,10 @@ CREATE TABLE IF NOT EXISTS command_receipts (
     legacy_collision_count INTEGER NOT NULL DEFAULT 0 CHECK (
         legacy_collision_count >= 0
     ),
+    -- Private evidence of the immutable selector this request was spelled with.
+    -- Empty means legacy evidence that cannot prove an alias retry. Declared
+    -- last so a v12 ALTER and a fresh CREATE agree on column order.
+    selector_proof TEXT NOT NULL DEFAULT '',
     CHECK (
         (
             state IN ('reserved', 'send_started')
@@ -6500,7 +6504,12 @@ def _content_fingerprint(data: Mapping[str, Any]) -> str:
 
 
 def _command_receipt_from_row(row: Any) -> dict[str, Any]:
-    """Return the public command receipt, excluding owner and binding evidence."""
+    """Return the authoritative command receipt, excluding owner-token and binding evidence.
+
+    ``selector_proof`` and ``owner_expires_at`` are private submission-path
+    evidence. They let a caller decide a retry from stored truth alone, and they
+    must never reach an envelope, event, audit row, or connector payload.
+    """
     return {
         "host_id": str(row[1]),
         "request_id": str(row[2]),
@@ -6512,6 +6521,7 @@ def _command_receipt_from_row(row: Any) -> dict[str, Any]:
         "state": str(row[8]),
         "status": str(row[9]),
         "result_json": str(row[10]),
+        "owner_expires_at": row[12],
         "created_at": str(row[14]),
         "reserved_at": str(row[15]),
         "send_started_at": row[16],
@@ -6519,7 +6529,37 @@ def _command_receipt_from_row(row: Any) -> dict[str, Any]:
         "updated_at": str(row[18]),
         "legacy_collision": bool(row[19]),
         "legacy_collision_count": int(row[20]),
+        "selector_proof": str(row[21]),
     }
+
+
+def command_reservation_is_live(
+    receipt: Mapping[str, Any],
+    *,
+    now: str | None = None,
+) -> bool:
+    """Return whether a reservation still has an unexpired mutation owner.
+
+    A live reservation means another caller may still be sending, so a retry
+    must replay in-progress rather than re-drive the mutation. An unreadable or
+    absent deadline is treated as live: refusing to re-send is always the safe
+    direction.
+    """
+    if not isinstance(receipt, Mapping):
+        return True
+    if str(receipt.get("state") or "") not in {"reserved", "send_started"}:
+        return False
+    expires_at = receipt.get("owner_expires_at")
+    if not isinstance(expires_at, str) or not expires_at.strip():
+        return True
+    try:
+        deadline = datetime.fromisoformat(_command_request_now(expires_at))
+        current = datetime.fromisoformat(_command_request_now(now))
+    except ValueError:
+        return True
+    return deadline > current
+
+
 def _owner_token_hash(owner_token: str) -> str:
     token = str(owner_token)
     if not token:
@@ -6621,7 +6661,8 @@ def _command_request_row(
             terminal_at,
             updated_at,
             legacy_collision,
-            legacy_collision_count
+            legacy_collision_count,
+            selector_proof
         FROM command_receipts
         WHERE host_id = ? AND request_id = ?
         LIMIT 1
@@ -10625,6 +10666,27 @@ def _migrate_v11_to_v12_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v12_to_v13_conn(conn: sqlite3.Connection) -> None:
+    """Add private selector-proof evidence without inventing it for old rows.
+
+    A v12 receipt records the worker a request resolved to, never how the caller
+    spelled that target, so no existing row's selector can be reconstructed. Any
+    guess here would let a changed target replay an unrelated accepted result.
+    Every legacy row therefore keeps an empty proof, which the submission path
+    reads as "cannot prove an alias retry" and fails closed on.
+    """
+    columns = _table_columns(conn, "command_receipts")
+    if not columns:
+        raise StoreSchemaError("legacy_command_request_schema_ambiguous")
+    if "selector_proof" not in columns:
+        conn.execute(
+            "ALTER TABLE command_receipts "
+            "ADD COLUMN selector_proof TEXT NOT NULL DEFAULT ''"
+        )
+    for statement in CREATE_COMMAND_RECEIPT_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -10638,6 +10700,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(9, 10, _migrate_v9_to_v10_conn),
     Migration(10, 11, _migrate_v10_to_v11_conn),
     Migration(11, 12, _migrate_v11_to_v12_conn),
+    Migration(12, 13, _migrate_v12_to_v13_conn),
 )
 
 
@@ -20398,6 +20461,7 @@ def reserve_command_request(
     canonical_request_json: str,
     public_worker_id: str,
     pending_result_json: str,
+    selector_proof: str = "",
     legacy_raw_payload_fingerprint: str | None = None,
     owner_lease_seconds: float = COMMAND_RECEIPT_OWNER_LEASE_SECONDS,
     now: str | None = None,
@@ -20413,6 +20477,9 @@ def reserve_command_request(
         raise ValueError("command request identity fields must be non-empty")
     if isinstance(canonical_version, bool) or int(canonical_version) < 1:
         raise ValueError("canonical_version must be an integer >= 1")
+    proof = str(selector_proof or "")
+    if proof and not is_selector_proof(proof):
+        raise ValueError("selector_proof must be a supported selector proof")
     try:
         canonical_payload = json.loads(str(canonical_request_json))
     except (TypeError, json.JSONDecodeError) as exc:
@@ -20464,6 +20531,9 @@ def reserve_command_request(
             if expires_at and datetime.fromisoformat(expires_at) > datetime.fromisoformat(current):
                 conn.commit()
                 return _command_request_response("in_progress", row)
+            # Re-drive an abandoned reservation without rewriting selector_proof:
+            # the original spelling stays the evidence, even when this caller
+            # proved equivalence with a different one.
             updated = conn.execute(
                 """
                 UPDATE command_receipts
@@ -20501,10 +20571,11 @@ def reserve_command_request(
                     public_worker_id, state, status, result_json,
                     owner_token_hash, owner_expires_at, binding_fingerprint,
                     created_at, reserved_at, send_started_at, terminal_at,
-                    updated_at, legacy_collision, legacy_collision_count
+                    updated_at, legacy_collision, legacy_collision_count,
+                    selector_proof
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, 'reserved', 'pending', ?, ?, ?, NULL,
-                    ?, ?, NULL, NULL, ?, 0, 0
+                    ?, ?, NULL, NULL, ?, 0, 0, ?
                 )
                 """,
                 (
@@ -20521,6 +20592,7 @@ def reserve_command_request(
                     current,
                     current,
                     current,
+                    proof,
                 ),
             )
         row = _command_request_row(conn, values["host_id"], values["request_id"])
@@ -20551,6 +20623,7 @@ def reserve_terminal_command_replay(
     terminal_state: str,
     status: str,
     result_json: str,
+    selector_proof: str = "",
     legacy_raw_payload_fingerprint: str | None = None,
     event_payload: Mapping[str, Any] | None = None,
     now: str | None = None,
@@ -20566,6 +20639,9 @@ def reserve_terminal_command_replay(
         raise ValueError("command request identity fields must be non-empty")
     if isinstance(canonical_version, bool) or int(canonical_version) < 1:
         raise ValueError("canonical_version must be an integer >= 1")
+    proof = str(selector_proof or "")
+    if proof and not is_selector_proof(proof):
+        raise ValueError("selector_proof must be a supported selector proof")
     try:
         canonical_payload = json.loads(str(canonical_request_json))
     except (TypeError, json.JSONDecodeError) as exc:
@@ -20623,10 +20699,11 @@ def reserve_terminal_command_replay(
                 public_worker_id, state, status, result_json,
                 owner_token_hash, owner_expires_at, binding_fingerprint,
                 created_at, reserved_at, send_started_at, terminal_at,
-                updated_at, legacy_collision, legacy_collision_count
+                updated_at, legacy_collision, legacy_collision_count,
+                selector_proof
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL,
-                ?, ?, NULL, ?, ?, 0, 0
+                ?, ?, NULL, ?, ?, 0, 0, ?
             )
             """,
             (
@@ -20644,6 +20721,7 @@ def reserve_terminal_command_replay(
                 current,
                 current,
                 current,
+                proof,
             ),
         )
         row = _command_request_row(conn, values["host_id"], values["request_id"])

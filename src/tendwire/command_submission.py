@@ -34,7 +34,9 @@ from .core.commands import (
     CommandEnvelope,
     CommandRequest,
     build_canonical_mutation,
+    build_selector_proof,
     error_value,
+    is_selector_proof,
     parse_command_request,
     resolve_target,
     validate_request,
@@ -47,6 +49,7 @@ from .store.sqlite import (
     backend_pending_choice_terminal_effect,
     claim_backend_pending_choice,
     command_pending_turn_terminal_effect,
+    command_reservation_is_live,
     envelope_to_receipt_json,
     finish_command_request,
     get_command_request,
@@ -839,6 +842,7 @@ def _reserve_canonical_request(
             canonical_request_json=canonical.canonical_json,
             public_worker_id=canonical.public_worker_id,
             pending_result_json=envelope_to_receipt_json(pending),
+            selector_proof=_selector_proof(request),
             legacy_raw_payload_fingerprint=request.payload_fingerprint(),
         )
     except Exception:  # noqa: BLE001
@@ -1028,6 +1032,10 @@ def _reserve_terminal_replay(
             terminal_state=terminal_state,
             status=terminal.status,
             result_json=envelope_to_receipt_json(terminal),
+            # Preserve the original spelling's evidence. This caller may have
+            # proven equivalence with a different one, and overwriting it would
+            # strand a later retry of the request as it was actually issued.
+            selector_proof=_stored_selector_proof(previous_receipt),
             legacy_raw_payload_fingerprint=request.payload_fingerprint(),
             event_payload=_transition_payload(
                 request,
@@ -1424,6 +1432,152 @@ def _direct_replay_worker_id(request: CommandRequest) -> str | None:
     return worker_id
 
 
+@dataclass(frozen=True)
+class _ReceiptTakeover:
+    """An abandoned reservation this caller may re-drive to a terminal state."""
+
+    public_worker_id: str
+
+
+def _receipt_malformed(request: CommandRequest) -> CommandEnvelope:
+    return _backend_uncertain(
+        request,
+        "stored request receipt is malformed; not retrying mutation",
+    )
+
+
+def _receipt_target_unprovable(request: CommandRequest) -> CommandEnvelope:
+    return _backend_uncertain(
+        request,
+        "stored request target cannot be proven; not retrying mutation",
+    )
+
+
+def _selector_proof(request: CommandRequest) -> str:
+    """Return the request's selector proof, or empty when none can be built."""
+    try:
+        return build_selector_proof(request)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _stored_selector_proof(receipt: Mapping[str, Any]) -> str:
+    """Return the receipt's selector proof, or empty when it proves nothing.
+
+    An absent, malformed, or unsupported-version proof is evidence this path
+    cannot interpret, so it must decide nothing rather than decide wrongly.
+    """
+    proof = receipt.get("selector_proof")
+    return proof if is_selector_proof(proof) else ""
+
+
+def _proven_replay_worker_id(
+    config: Config,
+    request: CommandRequest,
+    receipt: Mapping[str, Any],
+    *,
+    allow_current_authority: bool = True,
+) -> str | CommandEnvelope | None:
+    """Prove which public worker an existing receipt's retry belongs to.
+
+    Returns the receipt's stored public worker ID when this retry is the same
+    request, a fail-closed envelope when it provably is not, or None when no
+    available evidence can decide. Stored evidence always outranks mutable
+    authority, so a vanished or churned worker cannot hide a live receipt.
+    """
+    version = receipt.get("canonical_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        return _receipt_malformed(request)
+    stored = receipt.get("public_worker_id")
+    stored_worker_id = stored if isinstance(stored, str) and stored else ""
+
+    # A v0 receipt is validated against the exact raw request payload, which
+    # already pins the original selector spelling. It needs no resolution, and
+    # a changed payload fails its canonical check rather than replaying here.
+    if version == 0:
+        return stored_worker_id or _LEGACY_V0_REPLAY_WORKER_ID
+    if not stored_worker_id:
+        return _receipt_malformed(request)
+    if request.action != "send_instruction":
+        return stored_worker_id
+
+    # 1. An explicit worker ID names the canonical worker outright. A refreshed
+    #    worker_fingerprint beside it stays noncanonical.
+    explicit_worker_id = _direct_replay_worker_id(request)
+    if explicit_worker_id is not None:
+        if explicit_worker_id != stored_worker_id:
+            return _duplicate_request(request)
+        return stored_worker_id
+
+    # 2. An exact selector proof recognizes the original spelling of a name or
+    #    space alias even after the resolved worker left current authority.
+    stored_proof = _stored_selector_proof(receipt)
+    if stored_proof and stored_proof == _selector_proof(request):
+        return stored_worker_id
+
+    # 3. Only a current, healthy observation can prove that a different spelling
+    #    names the same canonical worker. A degraded one proves nothing, and a
+    #    legacy receipt carries no proof to fall back on.
+    if not allow_current_authority:
+        return None
+    snapshot = _current_snapshot(config)
+    if _backend_health_error(config, request, snapshot) is not None:
+        return None
+    worker = _resolve_authoritative_worker(request, snapshot)
+    if isinstance(worker, CommandEnvelope):
+        return None
+    if worker.id != stored_worker_id:
+        return _duplicate_request(request)
+    return stored_worker_id
+
+
+def _receipt_authority(
+    config: Config,
+    request: CommandRequest,
+    receipt: Mapping[str, Any],
+) -> CommandEnvelope | _ReceiptTakeover:
+    """Decide one existing host/request from stored evidence before authority.
+
+    Returns the envelope this retry must get, or a takeover marker when the
+    stored reservation was abandoned before any send and the normal path may
+    re-drive it.
+    """
+    if receipt.get("legacy_collision") is not False:
+        return _receipt_malformed(request)
+    if receipt.get("action") != request.action:
+        return _duplicate_request(request)
+
+    proven = _proven_replay_worker_id(config, request, receipt)
+    if isinstance(proven, CommandEnvelope):
+        return proven
+    if proven is None:
+        return _receipt_target_unprovable(request)
+
+    try:
+        canonical = build_canonical_mutation(request, public_worker_id=proven)
+    except (TypeError, ValueError):
+        return _receipt_malformed(request)
+
+    replay = _envelope_from_receipt(request, canonical, receipt)
+    state = receipt.get("state")
+    if state in {"accepted", "rejected", "uncertain"}:
+        if replay.status == STATUS_DUPLICATE_REQUEST:
+            # A changed canonical mutation never rewrites the original receipt.
+            return replay
+        if receipt.get("canonical_version") == 0:
+            # Legacy evidence cannot be re-expressed as a canonical v1 row, so
+            # replay it as read instead of inventing one.
+            return replay
+        return _reserve_terminal_replay(config, request, canonical, receipt, replay)
+    if replay.status != STATUS_PENDING:
+        return replay
+    if state == "send_started" or command_reservation_is_live(receipt):
+        return replay
+    # An abandoned reservation never reached a send. Re-driving it is the
+    # existing state machine's recovery, not a replay of a finished mutation.
+    return _ReceiptTakeover(public_worker_id=proven)
+
+
 def replay_command_receipt(
     config: Config,
     params: Mapping[str, Any] | str,
@@ -1445,49 +1599,27 @@ def replay_command_receipt(
         return None
     if not isinstance(receipt, Mapping):
         return None
+    if receipt.get("legacy_collision") is not False:
+        return _receipt_malformed(request)
     if receipt.get("action") != request.action:
         return _duplicate_request(request)
-    stored_worker_id = receipt.get("public_worker_id")
-    canonical_version = receipt.get("canonical_version")
-    if request.action == "send_instruction":
-        explicit_worker_id = _direct_replay_worker_id(request)
-        if explicit_worker_id is None:
-            return None
-        if canonical_version != 0:
-            if not isinstance(stored_worker_id, str) or not stored_worker_id:
-                return _backend_uncertain(
-                    request,
-                    "stored request receipt is malformed; not retrying mutation",
-                )
-            if explicit_worker_id != stored_worker_id:
-                return _duplicate_request(request)
-            public_worker_id = stored_worker_id
-        else:
-            public_worker_id = (
-                stored_worker_id
-                if isinstance(stored_worker_id, str) and stored_worker_id
-                else explicit_worker_id
-            )
-    else:
-        if not isinstance(stored_worker_id, str) or not stored_worker_id:
-            if canonical_version != 0:
-                return _backend_uncertain(
-                    request,
-                    "stored request receipt is malformed; not retrying mutation",
-                )
-            public_worker_id = _LEGACY_V0_REPLAY_WORKER_ID
-        else:
-            public_worker_id = stored_worker_id
+    proven = _proven_replay_worker_id(
+        config,
+        request,
+        receipt,
+        allow_current_authority=False,
+    )
+    if isinstance(proven, CommandEnvelope):
+        return proven
+    if proven is None:
+        # Proving that a different selector spelling names the stored worker
+        # would need a current observation, and this path must never observe
+        # private sources. Leave the result unresolved for the caller instead.
+        return None
     try:
-        canonical = build_canonical_mutation(
-            request,
-            public_worker_id=public_worker_id,
-        )
+        canonical = build_canonical_mutation(request, public_worker_id=proven)
     except (TypeError, ValueError):
-        return _backend_uncertain(
-            request,
-            "stored request receipt is malformed; not retrying mutation",
-        )
+        return _receipt_malformed(request)
     return _envelope_from_receipt(request, canonical, receipt)
 
 
@@ -1527,89 +1659,17 @@ def submit_command(
         if isinstance(candidate, Mapping):
             existing_receipt = candidate
 
-    # Terminal and post-send evidence is immutable. A retry with an explicit
-    # worker_id, optionally accompanied by a noncanonical worker fingerprint,
-    # can compare with the stored public worker ID before current authority is
-    # consulted. Aliases still require current healthy public resolution.
-    if existing_receipt is not None and existing_receipt.get("state") != "reserved":
-        if existing_receipt.get("legacy_collision") is not False:
-            return _backend_uncertain(
-                request,
-                "stored request receipt is malformed; not retrying mutation",
-            )
-        if existing_receipt.get("action") != request.action:
-            return _duplicate_request(request)
-        if (
-            request.action == "answer_pending"
-            and existing_receipt.get("canonical_version") == 0
-            and existing_receipt.get("state") in {"accepted", "rejected"}
-            and existing_receipt.get("public_worker_id") == ""
-        ):
-            # Legacy answer requests had no target from which migration could
-            # recover a worker. The placeholder is used only to satisfy the
-            # canonical builder; v0 validation remains the exact raw request
-            # action and fingerprint and never persists this synthetic ID.
-            legacy_canonical = build_canonical_mutation(
-                request,
-                public_worker_id=_LEGACY_V0_REPLAY_WORKER_ID,
-            )
-            return _envelope_from_receipt(
-                request,
-                legacy_canonical,
-                existing_receipt,
-            )
-        if request.action == "send_instruction":
-            explicit_worker_id = _direct_replay_worker_id(request)
-            if explicit_worker_id is None:
-                snapshot = _current_snapshot(config)
-                health_error = _backend_health_error(config, request, snapshot)
-                if health_error is not None:
-                    return health_error
-                replay_worker = _resolve_authoritative_worker(request, snapshot)
-                if isinstance(replay_worker, CommandEnvelope):
-                    return replay_worker
-                replay_worker_id = replay_worker.id
-            else:
-                stored_worker_id = existing_receipt.get("public_worker_id")
-                if existing_receipt.get("canonical_version") != 0:
-                    if not isinstance(stored_worker_id, str) or not stored_worker_id:
-                        return _backend_uncertain(
-                            request,
-                            "stored request receipt is malformed; not retrying mutation",
-                        )
-                    if explicit_worker_id != stored_worker_id:
-                        return _duplicate_request(request)
-                    replay_worker_id = stored_worker_id
-                else:
-                    replay_worker_id = (
-                        stored_worker_id
-                        if isinstance(stored_worker_id, str) and stored_worker_id
-                        else explicit_worker_id
-                    )
-        else:
-            stored_worker_id = existing_receipt.get("public_worker_id")
-            if not isinstance(stored_worker_id, str) or not stored_worker_id:
-                return _backend_uncertain(
-                    request,
-                    "stored request receipt is malformed; not retrying mutation",
-                )
-            replay_worker_id = stored_worker_id
-        canonical = build_canonical_mutation(
-            request,
-            public_worker_id=replay_worker_id,
-        )
-        replay_envelope = _envelope_from_receipt(
-            request,
-            canonical,
-            existing_receipt,
-        )
-        return _reserve_terminal_replay(
-            config,
-            request,
-            canonical,
-            existing_receipt,
-            replay_envelope,
-        )
+    # An existing receipt is the authority for its request ID. It decides the
+    # retry from stored evidence before any mutable worker snapshot is read, so
+    # a vanished, renamed, or recycled worker can never downgrade a live receipt
+    # to a no-receipt failure or drive a second backend mutation. Only an
+    # abandoned reservation returns here, to be re-driven by the normal path.
+    takeover: _ReceiptTakeover | None = None
+    if existing_receipt is not None:
+        decided = _receipt_authority(config, request, existing_receipt)
+        if isinstance(decided, CommandEnvelope):
+            return decided
+        takeover = decided
 
     snapshot = _current_snapshot(config)
     health_error = _backend_health_error(config, request, snapshot)
@@ -1617,12 +1677,20 @@ def submit_command(
     if request.action == "send_instruction":
         worker = _resolve_authoritative_worker(request, snapshot)
         if isinstance(worker, CommandEnvelope):
+            if takeover is not None:
+                # The receipt says this request is reserved and unsent. Mutable
+                # authority may not restate that as a no-receipt failure.
+                return _request_in_progress(request)
             # An unhealthy observation cannot authoritatively establish that a
             # selector is absent, stale, or ambiguous, so keep the request ID
             # retryable until a canonical worker can be proven.
             if health_error is not None:
                 return health_error
             return worker
+        if takeover is not None and worker.id != takeover.public_worker_id:
+            # The abandoned reservation named a different worker, so this is a
+            # changed target. Fail before any socket or backend work.
+            return _duplicate_request(request)
         canonical = build_canonical_mutation(request, public_worker_id=worker.id)
         pre_send_error = _worker_status_error(request, worker) or health_error
         prepared: PreparedInstructionMutation | CommandEnvelope | None = None
@@ -1657,13 +1725,11 @@ def submit_command(
         )
 
     answer_pre_send_error: CommandEnvelope | None = None
-    if existing_receipt is not None:
-        existing_worker_id = existing_receipt.get("public_worker_id")
-        if not isinstance(existing_worker_id, str) or not existing_worker_id:
-            return _backend_uncertain(
-                request,
-                "stored request receipt is malformed; not retrying mutation",
-            )
+    if takeover is not None:
+        # Re-driving an abandoned answer reservation: the receipt already fixed
+        # which worker this request answers, so a pending interaction that now
+        # routes elsewhere is a changed target, not a new one.
+        existing_worker_id = takeover.public_worker_id
         canonical = build_canonical_mutation(
             request,
             public_worker_id=existing_worker_id,

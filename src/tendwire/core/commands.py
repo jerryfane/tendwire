@@ -8,6 +8,7 @@ backends, stores, Herdr, Herdres, Telegram, or connector modules.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -450,6 +451,76 @@ def build_canonical_mutation(
         canonical_json=stable_json_dumps(canonical_payload),
         fingerprint=stable_fingerprint(canonical_payload),
     )
+
+
+SELECTOR_PROOF_VERSION = 1
+_SELECTOR_PROOF_DOMAIN = b"tendwire.command-selector-proof.v1"
+_SELECTOR_PROOF_RE = re.compile(r"v1:[0-9a-f]{64}", re.ASCII)
+
+
+def is_selector_proof(value: Any) -> bool:
+    """Return whether a value is a supported, well-formed selector proof.
+
+    Unknown proof versions and malformed digests are not supported here, so a
+    caller can only fall back to a conservative decision instead of silently
+    accepting evidence it cannot interpret.
+    """
+    return isinstance(value, str) and _SELECTOR_PROOF_RE.fullmatch(value) is not None
+
+
+def build_selector_proof(request: CommandRequest) -> str:
+    """Return the private, bounded proof of one request's immutable selector.
+
+    The canonical mutation records which worker a request resolved to, not how
+    the caller spelled that target. This proof records the spelling, so an exact
+    retry of a name or space selector can be recognized after the resolved
+    worker disappears from current authority.
+
+    ``worker_fingerprint`` is deliberately excluded: it is a mutable observation
+    precondition, not command identity. The proof is a fixed-width digest, so it
+    is bounded independently of untrusted input, carries no private binding or
+    backend-routing data, and is never part of any public surface.
+    """
+    if not isinstance(request, CommandRequest):
+        raise TypeError("request must be a CommandRequest")
+    if request.action not in {"send_instruction", "answer_pending"}:
+        raise ValueError("selector proofs require send_instruction or answer_pending")
+    if request.dry_run is not False:
+        raise ValueError("selector proofs require a non-dry-run request")
+    request_error = validate_request(request)
+    if request_error is not None:
+        raise ValueError(str(request_error.get("message") or "invalid command request"))
+
+    target = request.target
+    if target is None:
+        selector: dict[str, Any] = {"shape": "none"}
+    else:
+        # Mirror resolve_target's accepted value semantics exactly, so a stored
+        # proof and a live resolution can never disagree about what a selector
+        # says. A missing space_id is null and an empty one is "", because
+        # resolution treats those as different filters.
+        selector = {
+            "shape": "target",
+            "worker_id": _string_value(target.get("worker_id")),
+            "name": _string_value(target.get("name")),
+            "space_id": _optional_string(target.get("space_id")),
+        }
+    payload = {
+        "proof_version": SELECTOR_PROOF_VERSION,
+        "action": request.action,
+        "selector": selector,
+    }
+    digest = hashlib.sha256(
+        _SELECTOR_PROOF_DOMAIN
+        + b"\x00"
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"v{SELECTOR_PROOF_VERSION}:{digest}"
 
 
 def validate_request(request: CommandRequest) -> dict[str, Any] | None:
