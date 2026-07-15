@@ -934,6 +934,8 @@ def test_cli_turn_content_get_preserves_exact_page_and_params(
 
     assert code == 0
     assert captured.err == ""
+    assert payload["turn_id"] == "turn-public"
+    assert payload["segment_id"] == "twseg1.public"
     assert payload["text"] == page_text
     assert calls == [
         (

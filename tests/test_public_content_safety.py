@@ -284,6 +284,12 @@ def test_shared_public_value_sanitizer_blocks_full_nested_corpus() -> None:
             id="canonical-turn",
         ),
         pytest.param(
+            "segment_id",
+            "twseg1.public-segment",
+            "provider_segment_id",
+            id="content-segment",
+        ),
+        pytest.param(
             "origin_command_id",
             "command-public",
             "raw_command_id",

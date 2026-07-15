@@ -448,6 +448,7 @@ _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
         "raw_status",
         "request_id",
         "row_id",
+        "segment_id",
         "source_turn_id",
         "space_id",
         "transport_state",
