@@ -1824,6 +1824,56 @@ def test_run_forever_reconnect_accepts_identical_idless_event_again(tmp_path: Pa
     assert snapshot.workers[0].status == "active"
 
 
+def test_run_forever_retains_complete_reconcile_when_event_stream_disconnects(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "reconcile-before-stream-disconnect")
+    init_store(Path(config.db_path))
+
+    class DisconnectingClient(_StaticClient):
+        def __init__(self) -> None:
+            super().__init__(workspaces=[{"id": "space-1", "name": "Build"}])
+
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def subscribe(
+            self,
+            method: str,
+            params: Mapping[str, Any],
+            *,
+            timeout: float | None = None,
+            event_timeout: float | None = None,
+        ) -> Any:
+            return SimpleNamespace(subscription_id="disconnect-sub")
+
+        def read_event(
+            self,
+            subscription_id: str,
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            backend.stop_event.set()
+            raise HerdrSocketDisconnectedError("event stream closed")
+
+    backend = HerdrEventBackend(
+        config,
+        client_factory=lambda _config: DisconnectingClient(),
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+
+    backend.run_forever()
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.backend_health[0].status == "healthy"
+    assert snapshot.backend_health[0].outcome == "healthy_non_empty"
+
+
 def test_start_stop_are_idempotent_and_bounded_for_idle_subscription(tmp_path: Path) -> None:
     config = Config(
         host_id="bounded-stop",

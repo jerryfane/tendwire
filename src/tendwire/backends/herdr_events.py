@@ -803,10 +803,12 @@ class HerdrEventBackend:
 
     def run_forever(self) -> None:
         while not self.stop_event.is_set():
+            reconciled = False
             try:
                 client = self.client_factory(self.config)
                 try:
                     self.reconcile_once(client=client)
+                    reconciled = True
                     self._ready.set()
                     if self.stop_event.is_set():
                         break
@@ -820,7 +822,11 @@ class HerdrEventBackend:
             except HerdrSocketTimeoutError:
                 self._mark_unhealthy_safe("timeout")
             except (HerdrSocketDisconnectedError, HerdrSocketConnectionError):
-                self._mark_unhealthy_safe("socket_disconnected")
+                # A complete list reconciliation is authoritative. The event
+                # stream only accelerates later observations, so its closure
+                # must not replace that healthy snapshot with unavailable.
+                if not reconciled:
+                    self._mark_unhealthy_safe("socket_disconnected")
             except (HerdrMalformedLineError, HerdrEnvelopeError, HerdrProtocolError, ValueError, TypeError):
                 self._mark_unhealthy_safe("protocol_error")
             except Exception:
