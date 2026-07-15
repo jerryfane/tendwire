@@ -20,6 +20,7 @@ _INSTALLATION_KEY_SENTINEL_CONTENT = b"1"
 STABLE_KEY_VERSION = 1
 STABLE_KEY_PREFIX = "wsk1_"
 _HERDR_PUBLIC_ID_ALPHABET = frozenset("123456789ABCDEFGHJKMNPQRSTVWXYZ0")
+_HERDR_HEX_WORKSPACE_ID_LENGTH = 14
 _STABLE_KEY_DOMAIN = "tendwire.worker-stable-key"
 
 
@@ -32,10 +33,14 @@ def canonical_herdr_pane_identity(workspace_id: str | None, pane_id: str | None)
     if not isinstance(workspace_id, str) or not workspace_id.startswith("w"):
         return None
     workspace_number = workspace_id[1:]
-    if not workspace_number or any(
-        character not in _HERDR_PUBLIC_ID_ALPHABET
-        for character in workspace_number
-    ):
+    legacy_workspace = bool(workspace_number) and all(
+        character in _HERDR_PUBLIC_ID_ALPHABET for character in workspace_number
+    )
+    current_hex_workspace = (
+        len(workspace_number) == _HERDR_HEX_WORKSPACE_ID_LENGTH
+        and all(character in "0123456789abcdef" for character in workspace_number)
+    )
+    if not legacy_workspace and not current_hex_workspace:
         return None
     if not isinstance(pane_id, str):
         return None

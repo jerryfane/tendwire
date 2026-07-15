@@ -199,6 +199,16 @@ def test_exact_format_version_and_domain_separated_hmac(
         ("w1", "w1:p1", ("w1", "w1:p1")),
         ("wZ", "wZ:pZ", ("wZ", "wZ:pZ")),
         (
+            "w65383a2e877513",
+            "w65383a2e877513:p4",
+            ("w65383a2e877513", "w65383a2e877513:p4"),
+        ),
+        (
+            "w653e50b41be581",
+            "w653e50b41be581:pC",
+            ("w653e50b41be581", "w653e50b41be581:pC"),
+        ),
+        (
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789:"
             "p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
@@ -215,6 +225,10 @@ def test_exact_format_version_and_domain_separated_hmac(
         ("W1", "W1:p1", None),
         ("wwA", "wwA:pA", None),
         ("wa", "wa:pA", None),
+        ("w65383a2e87751", "w65383a2e87751:pA", None),
+        ("w65383a2e8775133", "w65383a2e8775133:pA", None),
+        ("w65383A2e877513", "w65383A2e877513:pA", None),
+        ("w65383g2e877513", "w65383g2e877513:pA", None),
         ("wAa", "wAa:pA", None),
         ("wA-B", "wA-B:pA", None),
         ("wA_B", "wA_B:pA", None),
@@ -246,6 +260,8 @@ def test_exact_format_version_and_domain_separated_hmac(
         "zero-boundary",
         "one-boundary",
         "uppercase-boundary",
+        "current-hex-workspace-numbered-pane",
+        "current-hex-workspace-uppercase-pane",
         "full-authoritative-alphabet",
         "missing-workspace",
         "missing-pane",
@@ -254,6 +270,10 @@ def test_exact_format_version_and_domain_separated_hmac(
         "uppercase-structural-prefix",
         "extra-workspace-prefix",
         "lowercase-workspace-suffix",
+        "short-current-hex-workspace",
+        "long-current-hex-workspace",
+        "mixed-current-hex-workspace",
+        "nonhex-current-workspace",
         "mixed-case-workspace-suffix",
         "hyphenated-workspace-suffix",
         "underscored-workspace-suffix",
@@ -296,6 +316,8 @@ def test_canonical_herdr_pane_identity_uses_exact_authoritative_grammar(
         ("w0", "w0:p0"),
         ("w1", "w1:p1"),
         ("wZ", "wZ:pZ"),
+        ("w65383a2e877513", "w65383a2e877513:p4"),
+        ("w653e50b41be581", "w653e50b41be581:pC"),
         (
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789:"

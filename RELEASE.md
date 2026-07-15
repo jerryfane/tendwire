@@ -6,6 +6,12 @@ contract. The package version is defined once in `src/tendwire/_version.py`;
 Hatch reads that value, and `scripts/release_artifacts.py` validates the
 resulting metadata.
 
+Stable Herdr continuity accepts both public workspace formats emitted by the
+supported Herdr runtime: legacy Crockford-style IDs and current 14-character
+lowercase hexadecimal workspace suffixes. Pane IDs must still contain the exact
+workspace ID and a valid public pane number; private terminal/session values are
+never continuity inputs.
+
 Automatic CI is intentionally one cancellable job. It compiles, runs the full
 hermetic suite and offline Herdr fixture, builds and scans both artifacts, and
 smokes clean wheel and sdist installs. This is the minimum billed gate; it does
