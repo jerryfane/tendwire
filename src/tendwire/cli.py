@@ -67,7 +67,7 @@ from .store.sqlite import (
 
 _HERDR_BACKEND = "herdr"
 _DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
-_DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 0.35
+_DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 2.0
 _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS = 10.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS = 2.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS = 0.5
@@ -806,18 +806,49 @@ def cmd_snapshot(
 ) -> int:
     """Build and print a neutral snapshot."""
     if json_output:
-        daemon_result = None if store_snapshot else _try_daemon_result(config, "snapshot.get")
-        if daemon_result is not None:
-            print(public_json_dumps(daemon_result, indent=2))
+        daemon_attempt = (
+            _DaemonAttempt(error_kind="unavailable", request_started=False)
+            if store_snapshot
+            else _try_daemon_attempt(config, "snapshot.get")
+        )
+        if daemon_attempt.result is not None:
+            payload = daemon_attempt.result
+            code = 0
+        elif daemon_attempt.response_error is not None:
+            payload = daemon_attempt.response_error
+            code = 1
+        elif daemon_attempt.request_started is False:
+            payload = observe_public_snapshot(config, store_snapshot=store_snapshot).to_dict()
+            code = 0
+        elif daemon_attempt.error_kind == "timeout":
+            payload = {
+                "schema_version": 2,
+                "ok": False,
+                "status": "daemon_timeout",
+                "error": {
+                    "code": "daemon_timeout",
+                    "message": "Tendwire daemon request timed out",
+                },
+            }
+            code = 1
         else:
-            snapshot = observe_public_snapshot(config, store_snapshot=store_snapshot)
-            print(snapshot.to_json(indent=2))
+            payload = {
+                "schema_version": 2,
+                "ok": False,
+                "status": "daemon_protocol_error",
+                "error": {
+                    "code": "daemon_protocol_error",
+                    "message": "Tendwire daemon returned an invalid response",
+                },
+            }
+            code = 1
+        print(public_json_dumps(payload, indent=2))
     else:
         # Non-JSON output is out of scope; reject cleanly.
         print("error: only --json output is supported", file=sys.stderr)
         return 2
 
-    return 0
+    return code
 
 
 def _restore_cli_turn_list_text(

@@ -159,6 +159,52 @@ def test_cli_snapshot_no_herdr_works() -> None:
     assert code == 0
 
 
+def test_cli_snapshot_post_send_timeout_never_observes_source(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    class TimeoutClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(self, _method: str, _params: dict[str, Any] | None = None) -> dict[str, Any]:
+            raise DaemonUnavailable(
+                "timed out",
+                timed_out=True,
+                request_started=True,
+            )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("post-send timeout must not observe Herdr or mutate the store")
+
+    monkeypatch.setattr("tendwire.daemon_api.DaemonAPIClient", TimeoutClient)
+    monkeypatch.setattr("tendwire.cli.observe_public_snapshot", forbidden)
+
+    code = main(
+        [
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "snapshot",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert payload == {
+        "schema_version": 2,
+        "ok": False,
+        "status": "daemon_timeout",
+        "error": {
+            "code": "daemon_timeout",
+            "message": "Tendwire daemon request timed out",
+        },
+    }
+
+
 def test_cli_socket_group_option_is_daemon_only_and_normalized(monkeypatch) -> None:
     captured: list[Config] = []
 
