@@ -451,6 +451,7 @@ _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
         "source_turn_id",
         "space_id",
         "transport_state",
+        "turn_id",
         "worker_fingerprint",
         "worker_id",
     }

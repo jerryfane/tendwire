@@ -273,6 +273,7 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
                             "ref": "twref1.publicSafeRef",
                             "payload": {
                                 "safe": "kept",
+                                "turn_id": "turn-public-final",
                                 "chat_id": "sentinel-private-chat",
                                 "raw_payload": "sentinel-private-raw",
                             },
@@ -302,10 +303,53 @@ def test_cli_daemon_connector_result_is_sanitized_before_printing(
 
     assert code == 0
     assert captured.err == ""
-    assert payload["items"][0]["payload"] == {"safe": "kept"}
+    assert payload["items"][0]["payload"] == {
+        "safe": "kept",
+        "turn_id": "turn-public-final",
+    }
     assert "sentinel-private" not in encoded
     assert "raw_payload" not in encoded
     _assert_json_only_and_safe(payload)
+
+
+def test_daemon_connector_preserves_public_turn_id_for_final_ready() -> None:
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="host-a"),
+        get_health=lambda: {},
+        submit_command=lambda _params: {},
+        connector_call=lambda _method, _params: {
+            "schema_version": 1,
+            "ok": True,
+            "status": "ok",
+            "items": [
+                {
+                    "key": "turn-final:revision:twfinal1.public",
+                    "ref": "twref1.publicSafeRef",
+                    "payload": {
+                        "schema_version": 2,
+                        "operation": "final_ready",
+                        "turn_id": "turn-public-final",
+                        "pane_id": "sentinel-private-pane",
+                        "session_id": "sentinel-private-session",
+                        "terminal_id": "sentinel-private-terminal",
+                        "topic_id": "sentinel-private-topic",
+                        "message_id": "sentinel-private-message",
+                    },
+                }
+            ],
+        },
+    )
+
+    response = api.dispatch(
+        {"method": "connector.poll", "params": {"name": "turn-final"}}
+    )
+
+    assert response["result"]["items"][0]["payload"] == {
+        "schema_version": 2,
+        "operation": "final_ready",
+        "turn_id": "turn-public-final",
+    }
+    _assert_json_only_and_safe(response)
 
 
 def test_connector_api_store_unavailable_returns_safe_error() -> None:

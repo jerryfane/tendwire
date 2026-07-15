@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -275,6 +276,12 @@ def test_shared_public_value_sanitizer_blocks_full_nested_corpus() -> None:
             "turnsrc-" + ("1" * 24),
             "session_id",
             id="source-turn",
+        ),
+        pytest.param(
+            "turn_id",
+            "turn-" + ("8" * 24),
+            "backend_turn_id",
+            id="canonical-turn",
         ),
         pytest.param(
             "origin_command_id",
@@ -960,7 +967,15 @@ def test_cli_json_output_applies_the_final_public_value_boundary(tmp_path, monke
         "values": list(corpus.values()),
         "dynamic_keys": dynamic_keys,
     }
-    monkeypatch.setattr("tendwire.cli._try_daemon_result", lambda *_args, **_kwargs: daemon_result)
+    monkeypatch.setattr(
+        "tendwire.cli._try_daemon_attempt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            result=daemon_result,
+            response_error=None,
+            request_started=True,
+            error_kind=None,
+        ),
+    )
 
     exit_code = cmd_snapshot(
         Config(host_id="public-cli-host", data_dir=tmp_path, db_path=tmp_path / "cli.db"),
