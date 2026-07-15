@@ -1788,7 +1788,8 @@ def _codex_apply_complete_line(
     raw: bytes,
     start: int,
     end: int,
-) -> None:
+) -> _CodexSemanticEvent | None:
+    event = None
     if raw.strip():
         record = _codex_decode_record(raw)
         event = _codex_record_event(record)
@@ -1798,6 +1799,7 @@ def _codex_apply_complete_line(
             _CodexRecordSpan(start, end),
         )
     state_value.committed_offset = end + 1
+    return event
 
 
 def _read_codex_incremental(
@@ -1829,7 +1831,8 @@ def _read_codex_incremental(
             if newline > _CODEX_RECORD_MAX_BYTES:
                 raise ValueError("oversized Codex record")
             raw = bytes(buffer[:newline])
-            _codex_apply_complete_line(
+            was_final = state_value.final_seen
+            event = _codex_apply_complete_line(
                 state_value,
                 raw,
                 line_start,
@@ -1837,6 +1840,26 @@ def _read_codex_incremental(
             )
             del buffer[: newline + 1]
             line_start = state_value.committed_offset
+            if (
+                event is not None
+                and event.kind == "final"
+                and not was_final
+                and state_value.final_seen
+            ):
+                # Publish each newly completed turn before consuming a later
+                # turn already present in the same append batch. Bytes after
+                # this record may already have been read into ``buffer``; do
+                # not checkpoint them. The next refresh rereads from the exact
+                # committed newline and advances to the following turn.
+                state_value.partial_record = b""
+                state_value.observed_size = state_value.committed_offset
+                state_value.mtime_ns = int(opened.st_mtime_ns)
+                state_value.ctime_ns = int(opened.st_ctime_ns)
+                return (
+                    _codex_content_from_work(state_value),
+                    _codex_freeze_work(state_value),
+                    bytes_read,
+                )
     state_value.partial_record = bytes(buffer)
     state_value.observed_size = target_size
     state_value.mtime_ns = int(opened.st_mtime_ns)

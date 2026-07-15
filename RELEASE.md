@@ -1,7 +1,7 @@
-# Release checklist (Tendwire 0.1.0rc1 / Herdres 0.7.0rc1)
+# Release checklist (Tendwire 0.1.0rc2 / Herdres 0.7.0rc3)
 
-The supported RC runtime is Python 3.13. Tendwire `0.1.0rc1` must be paired
-with Herdres `0.7.0rc1` or a reviewed descendant preserving its source
+The supported RC runtime is Python 3.13. Tendwire `0.1.0rc2` must be paired
+with Herdres `0.7.0rc3` or a reviewed descendant preserving its source
 contract. The package version is defined once in `src/tendwire/_version.py`;
 Hatch reads that value, and `scripts/release_artifacts.py` validates the
 resulting metadata.
@@ -246,6 +246,9 @@ Warm append-only reads consume only appended bytes and an unchanged poll reads
 zero source bytes. Truncation, rotation, replacement, or missing state uses the
 same bounded recovery rather than a whole-file fallback; malformed/oversized
 input or no recoverable boundary fails without advancing the prior checkpoint.
+When a delayed append batch contains a completed turn followed by a new turn,
+the completed turn must publish first and the checkpoint must stop at that
+final record. The following refresh consumes the later turn.
 
 Codex parser-state requests are capped at 12 MiB, and each Codex response
 remains one frame capped at 64 MiB. A response is only a candidate: content

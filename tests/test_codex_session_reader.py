@@ -446,6 +446,78 @@ def test_sparse_cold_read_and_warm_append_are_bounded(
     assert observed[-1] == 0
 
 
+def test_delayed_incremental_poll_publishes_completed_turn_before_next_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "codex"
+    first_turn = "turn-before-gap"
+    next_turn = "turn-after-gap"
+    path = _write_session(
+        home,
+        [
+            _event("task_started", first_turn),
+            _message(first_turn, "user", "first prompt"),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    opened = herdr_turns._read_codex_session_turn(SESSION_A)
+    assert opened["source_turn_id"] == first_turn
+    assert opened["complete"] is False
+
+    final_record = _message(
+        first_turn,
+        "assistant",
+        "first final",
+        phase="final_answer",
+    )
+    first_batch = _jsonl(
+        _message(first_turn, "assistant", "first progress", phase="commentary"),
+        final_record,
+    )
+    later_batch = _jsonl(
+        _event("task_started", next_turn),
+        _message(next_turn, "user", "next prompt"),
+        _message(next_turn, "assistant", "next progress", phase="commentary"),
+    )
+    with path.open("ab") as handle:
+        handle.write(first_batch)
+        handle.write(later_batch)
+
+    completed = herdr_turns._read_codex_session_turn(SESSION_A)
+    assert completed == {
+        # The coordinate-only checkpoint deliberately retains no canonical
+        # prompt body. Store merge preserves the previously persisted prompt.
+        "user_text": None,
+        "assistant_stream_text": None,
+        "assistant_final_text": "first final",
+        "complete": True,
+        "has_open_turn": False,
+        "source_turn_id": first_turn,
+    }
+    cache_key = (str((home / "sessions").resolve()), SESSION_A)
+    expected_offset = len(
+        _jsonl(
+            _event("task_started", first_turn),
+            _message(first_turn, "user", "first prompt"),
+        )
+    ) + len(first_batch)
+    with herdr_turns._CODEX_SESSION_CACHE_LOCK:
+        completed_state = herdr_turns._CODEX_SESSION_CACHE[cache_key]
+    assert completed_state.committed_offset == expected_offset
+    assert completed_state.observed_size == expected_offset
+    assert completed_state.partial_record == b""
+
+    following = herdr_turns._read_codex_session_turn(SESSION_A)
+    assert following["source_turn_id"] == next_turn
+    assert following["user_text"] == "next prompt"
+    assert following["assistant_stream_text"] == "next progress"
+    assert following["assistant_final_text"] is None
+    assert following["complete"] is False
+    assert herdr_turns._read_codex_session_turn(SESSION_A) is None
+
+
 def test_malformed_and_oversized_records_block_without_checkpoint_advance(
     tmp_path: Path,
     monkeypatch,

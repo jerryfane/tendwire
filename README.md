@@ -1,6 +1,6 @@
 # Tendwire
 
-Current release candidate: `0.1.0rc1`, paired with Herdres `0.7.0rc1` on
+Current release candidate: `0.1.0rc2`, paired with Herdres `0.7.0rc3` on
 Python 3.13. Routine CI intentionally uses one Python 3.13 job with
 concurrency cancellation to conserve GitHub Actions minutes. Cross-repository
 and live-provider proofs remain explicit release-owner operations rather than
@@ -473,6 +473,10 @@ an unchanged poll reads zero source bytes. Truncation, rotation, replacement,
 or lost state triggers the same bounded recovery rather than a whole-file
 fallback; malformed/oversized input or failure to find a boundary fails the
 read without advancing the prior checkpoint.
+If one delayed append read contains both a newly completed turn and the start
+of a later turn, ingestion publishes and checkpoints the completed turn first.
+The next refresh resumes at the following record. A delayed poll therefore
+cannot silently replace an unpersisted final with the newer open turn.
 No Codex session ID, rollout path, file identity/coordinate, parser/cache state,
 or raw record enters public JSON.
 
