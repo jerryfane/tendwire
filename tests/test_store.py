@@ -10163,6 +10163,136 @@ def test_direct_empty_creation_does_not_replay_migration_registry(
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-turn-sequence.db"
+    observed_at = "2026-07-15T00:00:00+00:00"
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._run_migrations(conn, target_version=13)
+        conn.execute("DROP TABLE turns")
+        conn.execute(
+            store_sqlite.CREATE_TURNS_TABLE.replace(
+                " CHECK (list_sequence > 0)",
+                "",
+            )
+        )
+        for statement in store_sqlite.CREATE_TURN_LIST_INDEXES:
+            conn.execute(statement)
+        for turn_id, sequence in (("turn-valid", 5), ("turn-invalid", 0)):
+            payload = {
+                "id": turn_id,
+                "worker_id": "worker-a",
+                "status": "complete",
+                "kind": "prompt",
+                "source": "snapshot",
+                "updated_at": observed_at,
+            }
+            conn.execute(
+                """
+                INSERT INTO turns (
+                    host_id, turn_id, worker_id, worker_fingerprint, space_id,
+                    status, kind, updated_at, fingerprint,
+                    snapshot_content_fingerprint, observed_at, payload_json,
+                    list_sequence
+                ) VALUES (?, ?, 'worker-a', NULL, NULL, 'complete', 'prompt',
+                          ?, '', '', ?, ?, ?)
+                """,
+                (
+                    "legacy-host",
+                    turn_id,
+                    observed_at,
+                    observed_at,
+                    json.dumps(payload),
+                    sequence,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO turn_list_hosts (
+                host_id, next_sequence, traversal_generation
+            ) VALUES ('legacy-host', 6, 7)
+            """
+        )
+        conn.commit()
+    os.chmod(tmp_path, 0o700)
+    os.chmod(db_path, 0o600)
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 14
+        assert conn.execute(
+            """
+            SELECT turn_id, list_sequence
+            FROM turns
+            WHERE host_id = 'legacy-host'
+            ORDER BY list_sequence
+            """
+        ).fetchall() == [("turn-valid", 5), ("turn-invalid", 6)]
+        assert conn.execute(
+            """
+            SELECT next_sequence, traversal_generation
+            FROM turn_list_hosts
+            WHERE host_id = 'legacy-host'
+            """
+        ).fetchone() == (7, 8)
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name LIKE 'trg_turns_positive_list_sequence_%'
+            """
+        ).fetchone() == (2,)
+        with pytest.raises(sqlite3.IntegrityError, match="invalid turn list sequence"):
+            conn.execute(
+                """
+                UPDATE turns SET list_sequence = 0
+                WHERE host_id = 'legacy-host' AND turn_id = 'turn-valid'
+                """
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="invalid turn list sequence"):
+            conn.execute(
+                """
+                INSERT INTO turns (
+                    host_id, turn_id, worker_id, status, kind, fingerprint,
+                    snapshot_content_fingerprint, observed_at, payload_json,
+                    list_sequence
+                ) VALUES (
+                    'legacy-host', 'turn-recurrence', 'worker-a', 'complete',
+                    'prompt', '', '', ?, '{}', 0
+                )
+                """,
+                (observed_at,),
+            )
+        conn.rollback()
+
+    first = turns_payload_from_store(
+        db_path,
+        "legacy-host",
+        schema_version=2,
+        limit=1,
+        now=1_800_000_000,
+    )
+    assert first["has_more"] is True
+    assert isinstance(first["next_cursor"], str)
+    second = turns_payload_from_store(
+        db_path,
+        "legacy-host",
+        schema_version=2,
+        limit=1,
+        cursor=first["next_cursor"],
+        now=1_800_000_001,
+    )
+    assert second["has_more"] is False
+    assert [item["id"] for item in first["turns"] + second["turns"]] == [
+        "turn-invalid",
+        "turn-valid",
+    ]
+
+
 @pytest.mark.parametrize("source_version", range(store_sqlite.STORE_SCHEMA_VERSION))
 def test_migration_registry_transition_rolls_back_resumes_and_reruns(
     tmp_path: Path,

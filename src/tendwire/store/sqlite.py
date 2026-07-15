@@ -107,7 +107,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 13
+STORE_SCHEMA_VERSION = 14
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -568,6 +568,25 @@ CREATE_TURN_LIST_INDEXES = (
         "CREATE INDEX IF NOT EXISTS idx_turns_host_worker_list_sequence "
         "ON turns(host_id, worker_id, list_sequence DESC, turn_id)"
     ),
+)
+
+CREATE_TURN_LIST_SEQUENCE_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turns_positive_list_sequence_insert
+    BEFORE INSERT ON turns
+    WHEN NEW.list_sequence <= 0
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid turn list sequence');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turns_positive_list_sequence_update
+    BEFORE UPDATE OF list_sequence ON turns
+    WHEN NEW.list_sequence <= 0
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid turn list sequence');
+    END
+    """,
 )
 
 CREATE_TURN_CONTENT_REVISIONS_TABLE = """
@@ -10687,6 +10706,77 @@ def _migrate_v12_to_v13_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v13_to_v14_conn(conn: sqlite3.Connection) -> None:
+    """Repair legacy nonpositive turn-list coordinates and reject recurrence."""
+    columns = _table_columns(conn, "turns")
+    if not columns:
+        return
+    if "list_sequence" not in columns:
+        raise StoreSchemaError("legacy_turn_list_schema_ambiguous")
+    affected_hosts = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT host_id
+            FROM turns
+            WHERE list_sequence <= 0
+            ORDER BY host_id
+            """
+        ).fetchall()
+    ]
+    for host_id in affected_hosts:
+        _ensure_turn_list_host_state_conn(conn, host_id)
+        state = conn.execute(
+            """
+            SELECT next_sequence
+            FROM turn_list_hosts
+            WHERE host_id = ?
+            """,
+            (host_id,),
+        ).fetchone()
+        if state is None:
+            raise StoreSchemaError("turn_list_host_state_unavailable")
+        high_row = conn.execute(
+            """
+            SELECT COALESCE(MAX(list_sequence), 0)
+            FROM turns
+            WHERE host_id = ? AND list_sequence > 0
+            """,
+            (host_id,),
+        ).fetchone()
+        next_sequence = max(int(state[0]), int(high_row[0]) + 1)
+        invalid_rows = conn.execute(
+            """
+            SELECT turn_id
+            FROM turns
+            WHERE host_id = ? AND list_sequence <= 0
+            ORDER BY COALESCE(updated_at, observed_at, ''), turn_id
+            """,
+            (host_id,),
+        ).fetchall()
+        for row in invalid_rows:
+            conn.execute(
+                """
+                UPDATE turns
+                SET list_sequence = ?
+                WHERE host_id = ? AND turn_id = ? AND list_sequence <= 0
+                """,
+                (next_sequence, host_id, str(row[0])),
+            )
+            next_sequence += 1
+        conn.execute(
+            """
+            UPDATE turn_list_hosts
+            SET next_sequence = ?,
+                traversal_generation = traversal_generation + 1
+            WHERE host_id = ?
+            """,
+            (next_sequence, host_id),
+        )
+    for statement in CREATE_TURN_LIST_SEQUENCE_TRIGGERS:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -10701,6 +10791,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(10, 11, _migrate_v10_to_v11_conn),
     Migration(11, 12, _migrate_v11_to_v12_conn),
     Migration(12, 13, _migrate_v12_to_v13_conn),
+    Migration(13, 14, _migrate_v13_to_v14_conn),
 )
 
 
@@ -10755,6 +10846,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_CURRENT_PR6_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_LIST_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_LIST_SEQUENCE_TRIGGERS:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)
