@@ -9,6 +9,7 @@ candidate.  Only one compact aggregate JSON object is written to stdout.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import copy
 import hashlib
@@ -253,7 +254,17 @@ def _build_versioned_wheel(
         "project"
     ]
     name = str(project["name"]).replace("-", "_")
-    version = str(project["version"])
+    version_tree = ast.parse(
+        (checkout / "src/tendwire/_version.py").read_text(encoding="utf-8")
+    )
+    version = ""
+    for node in version_tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in node.targets
+        ):
+            version = str(ast.literal_eval(node.value))
+            break
     if not version or "/" in version or "\\" in version:
         raise RuntimeError("candidate_version_invalid")
     wheel_path = wheel_dir / f"{name}-{version}-py3-none-any.whl"
@@ -363,6 +374,8 @@ def _argument_values(namespace: argparse.Namespace) -> None:
         raise _ArgumentError("timeout_out_of_range")
     if not namespace.json:
         raise _ArgumentError("json_required")
+    if namespace.herdres_root is None or not namespace.herdres_root.is_dir():
+        raise _ArgumentError("herdres_root_required")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -372,7 +385,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--requests-per-method", type=int, default=DEFAULT_REQUESTS)
     parser.add_argument("--herdres-sync-passes", type=int, default=3)
     parser.add_argument("--phase-timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--herdres-root", type=Path, default=Path("/home/smith/herdres"))
+    configured_herdres_root = os.environ.get("TENDWIRE_BENCHMARK_HERDRES_ROOT")
+    parser.add_argument(
+        "--herdres-root",
+        type=Path,
+        default=Path(configured_herdres_root) if configured_herdres_root else None,
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--candidate-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--candidate-python", type=Path, help=argparse.SUPPRESS)

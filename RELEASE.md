@@ -1,4 +1,18 @@
-# Release checklist (Tendwire source-only RC)
+# Release checklist (Tendwire/Herdres 0.1.0rc1)
+
+The supported RC runtime is Python 3.13. Tendwire `0.1.0rc1` must be paired
+with Herdres commit `1194250` or a reviewed descendant preserving its source
+contract. The package version is defined once in `src/tendwire/_version.py`;
+Hatch reads that value, and `scripts/release_artifacts.py` validates the
+resulting metadata.
+
+Automatic CI is intentionally one cancellable job. It compiles, runs the full
+hermetic suite and offline Herdr fixture, builds and scans both artifacts, and
+smokes clean wheel and sdist installs. This is the minimum billed gate; it does
+not perform deployment, use secrets, or contact live services.
+The job checks out paired Herdres source once because the existing installed-
+candidate benchmark executes its real source adapter; the benchmark path comes
+from `TENDWIRE_BENCHMARK_HERDRES_ROOT`, never a user-home default.
 
 Build release artifacts from a **clean git checkout only**. Never zip the working
 directory directly — it can contain `__pycache__/`, `*.pyc`, `.pytest_cache/`,
@@ -11,7 +25,8 @@ guarantees a clean artifact.
 
 ```sh
 git status --porcelain            # must be empty
-python -m py_compile $(find src tests -name '*.py')
+python scripts/release_artifacts.py source
+python -m compileall -q src tests scripts
 python -m pytest -q               # all green
 ```
 
@@ -31,16 +46,12 @@ python -m build
 
 ## 3. Verify the artifact is clean
 
-The following must print nothing:
+The checked-in validator must return `status: ok` and write `dist/manifest.json`:
 
 ```sh
-git archive --format=tar HEAD | tar -t | grep -E '__pycache__|\.pyc$|\.pytest_cache|\.db$|(^|/)installation\.key(\.sha256|\.initialized)?$'
-```
-
-For sdist/wheel:
-
-```sh
-tar -tf dist/*.tar.gz | grep -E '__pycache__|\.pyc$|\.pytest_cache|\.db$|(^|/)installation\.key(\.sha256|\.initialized)?$' || echo clean
+python scripts/release_artifacts.py artifacts dist
+python scripts/release_artifacts.py install-smoke dist/*.whl
+python scripts/release_artifacts.py install-smoke dist/*.tar.gz
 ```
 
 ## 4. Coherent backup and continuity verification
@@ -376,11 +387,11 @@ The driver removes `PYTHONPATH`, deterministically builds a versioned wheel from
 this isolated source checkout, installs it with `pip --no-index --no-deps` into
 a private temporary virtual environment, and re-executes the candidate with
 isolated Python. It verifies that the imported package originates in that
-private installation and not the mutable `/home/smith/tendwire` checkout.
+private installation and not a mutable source checkout.
 Provenance binds base revision
 `c0ebff7cfba401f6c13da1b58a00abf8ff0b5f36` to packaged-source SHA-256
 `15b1ca262f6051b191d1587d353c465cc74fd6c6a9d0676eb9348eafef35ff87`;
-the installed `0.1.0` wheel SHA-256 is
+the historical installed Goal 08B wheel SHA-256 was
 `7be0f975b0241aaf092a9bba38ace2e3e2efd2f91996f02b2cbcb24b93fac02d`.
 
 The frozen run exited `0` with 256 bounded family preparations, 384 scheduled
@@ -533,3 +544,44 @@ find . -name '*.pyc' -not -path './.git/*' -delete
   see the README "Send transport" section. No `pane_id`/`send_keys` is exposed.
 - `tests/test_release_readiness.py` guards the public JSON contract (zero
   forbidden keys, no pseudo pane ids).
+
+## 11. Paired RC proof and deployment
+
+The automatic Tendwire workflow does not clone Herdres and does not spend a
+second repository's Actions minutes. Before tagging or deployment, run locally
+from the accepted clean checkouts:
+
+```sh
+# Tendwire
+python3 scripts/release_artifacts.py source
+python3 -m compileall -q src tests scripts
+python3 -m pytest -q
+python3 scripts/herdr_smoke.py --fixture-dir tests/fixtures/herdr/live_smoke/ok
+python3 -m build
+python3 scripts/release_artifacts.py artifacts dist
+
+# Herdres
+python3 -m compileall -q herdres.py herdres_gateway.py herdres_connector tests
+python3 -m pytest -q
+```
+
+Then run the paired Herdres source fixtures against the exact Tendwire checkout
+and record both commits. They must prove `direct_herdr_calls=0`, exact turn and
+pending schemas, stable-worker migration, command disposition validation,
+connector outbox behavior, and two independent no-op forced syncs.
+
+Deployment is a separate owner-authorized step. Before changing installed
+artifacts, stop writers and capture a coherent private backup of the Tendwire
+database family, installation identity, and Herdres state. Install the exact
+wheel and paired Herdres files, reload user units, start Tendwire before
+Herdres/gateway, and never restart Herdr. If migration, integrity, source-mode,
+or command smoke fails, stop the writers, restore the complete backup and prior
+artifacts, reload units, and re-run read-only health checks.
+
+The final live record must include: exact commits and artifact digests; SQLite
+integrity; private filesystem modes; Herdr status without restart; Tendwire and
+Herdres service status; `source-smoke --with-outbox`; two zero-operation forced
+syncs; no `Closed by User` spam; legacy timer inactive and disabled; one inbound
+Telegram-to-Tendwire command with duplicate guard; one lossless multipart
+final; and a zero-finding public JSON scan. Missing evidence means the RC is not
+complete.

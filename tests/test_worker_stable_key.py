@@ -200,10 +200,12 @@ def test_exact_format_version_and_domain_separated_hmac(
         ("wZ", "wZ:pZ", ("wZ", "wZ:pZ")),
         (
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
-            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:"
+            "p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
             (
                 "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
-                "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+                "wABCDEFGHJKMNPQRSTVWXYZ0123456789:"
+                "p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
             ),
         ),
         (None, "wA:pA", None),
@@ -296,7 +298,8 @@ def test_canonical_herdr_pane_identity_uses_exact_authoritative_grammar(
         ("wZ", "wZ:pZ"),
         (
             "wABCDEFGHJKMNPQRSTVWXYZ0123456789",
-            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
+            "wABCDEFGHJKMNPQRSTVWXYZ0123456789:"
+            "p9876543210ZYXWVTSRQPNMKJHGFEDCBA",
         ),
     ],
 )

@@ -505,7 +505,8 @@ def test_goal08b_release_contract_and_artifact_references_are_audited() -> None:
 
     for artifact in _GOAL08B_ARTIFACTS:
         assert artifact in section
-    assert "/home/smith/tendwire" in section
+    assert "/home/smith/tendwire" not in section
+    assert "not a mutable source checkout" in section
     assert "exactly two no-op syncs" in section
     for accounting in (
         "file-descriptor",
@@ -563,7 +564,7 @@ def test_goal08b_release_commands_and_sdist_driver_are_exact() -> None:
     )
     assert sdist is not None
     includes = ast.literal_eval(f"[{sdist.group(1)}]")
-    assert "/scripts/sqlite_sidecar_race_benchmark.py" in includes
+    assert "/scripts" in includes
 
 
 def test_goal08b_frozen_evidence_records_installed_candidate_and_cleanup() -> None:

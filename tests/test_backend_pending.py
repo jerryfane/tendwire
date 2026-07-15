@@ -100,9 +100,10 @@ def test_merge_and_prune_backend_pending(tmp_path: Path):
 # --- Regression tests for the PR#3 review fixes ---------------------------------------------
 
 _GOOGLE_API_KEY_SENTINEL = "AI" + "zaSyD-ExampleKey1234567890abcdefghijk"
+_OPENAI_KEY_SENTINEL = "sk-" + "live-SENTINELSECRET123ABC"
 
 _SENTINELS = [
-    "sk-live-SENTINELSECRET123ABC",             # sk- secret token
+    _OPENAI_KEY_SENTINEL,                        # sk- secret token
     "/run/user/1000/herdr/sock-abcdef123456",   # socket path
     "w4V:p1",                                    # pseudo pane id
     "/home/smith/.ssh/id_rsa",                  # absolute fs path
@@ -126,7 +127,11 @@ def _leaky_decision_turn() -> dict:
                 "notify alice.jones@internal-corp.example on db 10.4.2.9:5432 at home/alice/.ssh/id_rsa"
             ),
             "options": [
-                {"id": "approve", "label": "Use secret sk-live-SENTINELSECRET123ABC", "send_text": "sk-live-SENTINELSECRET123ABC"},
+                {
+                    "id": "approve",
+                    "label": f"Use secret {_OPENAI_KEY_SENTINEL}",
+                    "send_text": _OPENAI_KEY_SENTINEL,
+                },
                 {"id": "postgres", "label": "Postgres", "send_text": "Postgres"},
                 {"id": "run", "label": "Deploy to 10.4.2.9:5432", "send_text": "tmux send-keys -t w4V:p1 'rm -rf /home/smith/.ssh'"},
                 {"id": "shell", "label": "bash -lc 'echo untrusted option'", "send_text": "echo untrusted option"},

@@ -1,5 +1,11 @@
 # Tendwire
 
+Current release candidate: `0.1.0rc1`, paired with the accepted Herdres source
+contract on Python 3.13. Routine CI intentionally uses one Python 3.13 job with
+concurrency cancellation to conserve GitHub Actions minutes. Cross-repository
+and live-provider proofs remain explicit release-owner operations rather than
+automatic workflows.
+
 Tendwire is a **local-first control plane for Herdr-managed terminal agents**.
 It observes a local Herdr session, stores neutral snapshots and command
 receipts, and exposes a public-safe Tendwire API for local clients. Neutral

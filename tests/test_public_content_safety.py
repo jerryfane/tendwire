@@ -379,7 +379,7 @@ def test_public_host_id_provenance_preserves_opaque_field_name_words(host_id: st
             id="backend-target",
         ),
         pytest.param("bash -lc whoami", id="raw-command"),
-        pytest.param("sk-proj-PUBLICSAFETY1234567890", id="provider-credential"),
+        pytest.param("sk-" + "proj-PUBLICSAFETY1234567890", id="provider-credential"),
     ),
 )
 def test_public_structural_field_provenance_still_rejects_private_value_shapes(

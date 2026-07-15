@@ -1,7 +1,9 @@
 # Install
 
-Tendwire can be run from a checkout or installed as a Python package. Python
-3.10 or newer is required.
+Tendwire can be run from a checkout or installed as a Python package. The
+`0.1.0rc1` release candidate supports Python 3.13. The deliberately narrow RC
+runtime avoids spending four times the GitHub Actions minutes on a compatibility
+matrix that has not been independently release-qualified.
 
 ## From A Checkout
 
@@ -11,6 +13,16 @@ python3 -m venv .venv
 python -m pip install -e .
 tendwire doctor --json
 ```
+
+For release development and artifact checks, install the bounded tool extra:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
+The installed-candidate sidecar benchmark requires an explicit paired Herdres
+checkout via `--herdres-root` or `TENDWIRE_BENCHMARK_HERDRES_ROOT`; it has no
+user-specific source-tree default.
 
 For direct module execution from a source tree without installing:
 
