@@ -66,3 +66,11 @@ def test_sdist_declares_release_and_script_assets() -> None:
         "scripts/herdr_smoke.py",
         "scripts/release_artifacts.py",
     }
+
+
+def test_clean_install_doctor_accepts_only_documented_health_states() -> None:
+    assert release_artifacts.INSTALL_SMOKE_DOCTOR_STATUSES == {
+        "ok",
+        "degraded",
+        "unavailable",
+    }

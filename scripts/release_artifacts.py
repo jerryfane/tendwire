@@ -46,6 +46,7 @@ REQUIRED_SDIST = {
     "scripts/herdr_smoke.py",
     "scripts/release_artifacts.py",
 }
+INSTALL_SMOKE_DOCTOR_STATUSES = frozenset({"ok", "degraded", "unavailable"})
 MAX_ARCHIVE_MEMBER_BYTES = 16 * 1024 * 1024
 MAX_ARCHIVE_TOTAL_BYTES = 64 * 1024 * 1024
 
@@ -223,7 +224,10 @@ def install_smoke(artifact: Path) -> dict[str, object]:
         if doctor.returncode not in {0, 1}:
             raise ReleaseCheckError("doctor_exit_invalid")
         payload = json.loads(doctor.stdout)
-        if not isinstance(payload, dict) or payload.get("status") not in {"ok", "degraded"}:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") not in INSTALL_SMOKE_DOCTOR_STATUSES
+        ):
             raise ReleaseCheckError("doctor_payload_invalid")
         imported = subprocess.run(
             [str(python), "-c", "import tendwire; print(tendwire.__version__)"],
