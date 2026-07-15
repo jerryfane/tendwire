@@ -489,6 +489,47 @@ def _same_pending_route(left: Any, right: Any) -> bool:
     )
 
 
+class PreSendCertainty(Enum):
+    """How a pre-send failure must be classified before any external mutation.
+
+    The distinction is which stage's evidence produced the failure, not the
+    status text. An authoritative snapshot observation or proven target
+    unsuitability is deterministic and may terminalize; a failed local or
+    backend *operation* proves nothing durable and must stay retryable.
+    """
+
+    #: Proven target unsuitability -- a disallowed worker status, an unavailable
+    #: backend, a missing/stale/ambiguous private binding, or a definite backend
+    #: answer (Herdr rejection, unsupported target, no resolvable pane). A durable
+    #: rejection is justified and a same-ID retry replays it.
+    PERMANENT = "permanent"
+    #: A local or backend operation failed before any send: the binding store,
+    #: socket connect, pane-resolution read, or receipt-store open raised. No
+    #: external mutation began and no durable authority exists, so the request ID
+    #: stays retryable with no receipt written.
+    SAFE_TRANSIENT = "safe_transient"
+
+
+@dataclass(frozen=True)
+class PreSendFailure:
+    """A classified failure that occurred before any external mutation began."""
+
+    envelope: CommandEnvelope
+    certainty: PreSendCertainty
+
+    @property
+    def is_transient(self) -> bool:
+        return self.certainty is PreSendCertainty.SAFE_TRANSIENT
+
+
+def _permanent_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
+    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.PERMANENT)
+
+
+def _safe_transient_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
+    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.SAFE_TRANSIENT)
+
+
 def _close_socket_client(client: Any | None) -> None:
     if client is None or not hasattr(client, "close"):
         return
@@ -535,7 +576,7 @@ def _resolve_private_pane(
     request: CommandRequest,
     client: Any,
     binding: WorkerBinding,
-) -> str | CommandEnvelope:
+) -> str | PreSendFailure:
     try:
         pane_id = _private_pane_id_for_binding(
             client,
@@ -550,11 +591,22 @@ def _resolve_private_pane(
             HerdrSocketTimeoutError,
         )
 
+        # A definite error response from Herdr is an authoritative answer that
+        # this target cannot be resolved; a same-ID retry would get the same
+        # answer, so it terminalizes rather than looping to the retry horizon.
+        # It is checked before the transport branch because HerdrErrorResponse
+        # subclasses HerdrProtocolError and must not be mistaken for framing loss.
         if isinstance(exc, HerdrErrorResponse):
-            return _backend_failure(
-                request,
-                "Herdr socket could not resolve the private send target",
+            return _permanent_pre_send(
+                _backend_failure(
+                    request,
+                    "Herdr socket could not resolve the private send target",
+                )
             )
+        # A transport read that could not complete -- timeout, disconnect,
+        # connection loss, protocol framing, or an OS-level socket error --
+        # proves nothing about the target and never began a send, so it stays
+        # retryable.
         if isinstance(
             exc,
             HerdrSocketConnectionError
@@ -562,21 +614,35 @@ def _resolve_private_pane(
             | HerdrSocketDisconnectedError
             | HerdrProtocolError,
         ) or isinstance(exc, OSError):
-            return _backend_unavailable(
-                request,
-                "Herdr socket could not resolve the private send target",
+            return _safe_transient_pre_send(
+                _backend_unavailable(
+                    request,
+                    "Herdr socket could not resolve the private send target",
+                )
             )
+        # A malformed or unsupported resolution response is a proven target
+        # property, not a transient operation failure.
         if isinstance(exc, (TypeError, ValueError)):
-            return _backend_failure(
-                request,
-                "Herdr socket private send target is unsupported",
+            return _permanent_pre_send(
+                _backend_failure(
+                    request,
+                    "Herdr socket private send target is unsupported",
+                )
             )
-        return _backend_failure(
-            request,
-            "Herdr socket private send target resolution failed",
+        # An unclassifiable resolution error is not proven safe to retry, so it
+        # retains the prior terminal behavior rather than looping indefinitely.
+        return _permanent_pre_send(
+            _backend_failure(
+                request,
+                "Herdr socket private send target resolution failed",
+            )
         )
     if not pane_id:
-        return _backend_failure(request, "Herdr socket private send target has no pane")
+        # Herdr answered, and the answer is that the target has no resolvable
+        # pane. That is authoritative target unsuitability, not a read failure.
+        return _permanent_pre_send(
+            _backend_failure(request, "Herdr socket private send target has no pane")
+        )
     return pane_id
 
 
@@ -776,46 +842,6 @@ class PreparedInstructionMutation:
     binding_fingerprint: str
 
 
-class PreSendCertainty(Enum):
-    """How a pre-send failure must be classified before any external mutation.
-
-    The distinction is which stage's evidence produced the failure, not the
-    status text. An authoritative snapshot observation or proven target
-    unsuitability is deterministic and may terminalize; a failed local or
-    backend *operation* proves nothing durable and must stay retryable.
-    """
-
-    #: Proven target unsuitability -- a disallowed worker status, an unavailable
-    #: backend, or a missing/stale/ambiguous private binding read from current
-    #: data. A durable rejection is justified and a same-ID retry replays it.
-    PERMANENT = "permanent"
-    #: A local or backend operation failed before any send: the binding store,
-    #: socket connect, pane resolution, or receipt-store open raised. No external
-    #: mutation began and no durable authority exists, so the request ID stays
-    #: retryable with no receipt written.
-    SAFE_TRANSIENT = "safe_transient"
-
-
-@dataclass(frozen=True)
-class PreSendFailure:
-    """A classified failure that occurred before any external mutation began."""
-
-    envelope: CommandEnvelope
-    certainty: PreSendCertainty
-
-    @property
-    def is_transient(self) -> bool:
-        return self.certainty is PreSendCertainty.SAFE_TRANSIENT
-
-
-def _permanent_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
-    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.PERMANENT)
-
-
-def _safe_transient_pre_send(envelope: CommandEnvelope) -> PreSendFailure:
-    return PreSendFailure(envelope=envelope, certainty=PreSendCertainty.SAFE_TRANSIENT)
-
-
 def _prepare_instruction(
     config: Config,
     request: CommandRequest,
@@ -852,22 +878,24 @@ def _prepare_instruction(
             )
         )
 
-    # Everything past here is a backend operation performed before the send. A
-    # failed connect or pane resolution proves nothing durable, so it stays
-    # retryable rather than burning the request ID.
+    # A socket that cannot be reached is an operation failure before any send,
+    # so it stays retryable rather than burning the request ID.
     client_or_error = _connect_socket(config, request, socket_client_factory)
     if isinstance(client_or_error, CommandEnvelope):
         return _safe_transient_pre_send(client_or_error)
     client = client_or_error
+    # Pane resolution classifies its own outcome: a transport read failure is a
+    # safe transient, while a definite backend answer (rejection, unsupported,
+    # or no pane) is a proven-permanent target failure.
     pane_or_error = _resolve_private_pane(
         config,
         request,
         client,
         resolved.binding,
     )
-    if isinstance(pane_or_error, CommandEnvelope):
+    if isinstance(pane_or_error, PreSendFailure):
         _close_socket_client(client)
-        return _safe_transient_pre_send(pane_or_error)
+        return pane_or_error
     return PreparedInstructionMutation(
         client=client,
         pane_id=pane_or_error,

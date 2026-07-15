@@ -145,9 +145,11 @@ class _FakeSocketClient:
         calls: list[dict[str, Any]],
         *,
         agent_get_raises: BaseException | None = None,
+        agent_get_response: dict[str, Any] | None = None,
     ) -> None:
         self.calls = calls
         self.agent_get_raises = agent_get_raises
+        self.agent_get_response = agent_get_response
 
     def connect(self) -> "_FakeSocketClient":
         return self
@@ -163,6 +165,8 @@ class _FakeSocketClient:
         if method == "agent.get":
             if self.agent_get_raises is not None:
                 raise self.agent_get_raises
+            if self.agent_get_response is not None:
+                return self.agent_get_response
             return {"result": {"agent": {"pane_id": "pane-w-1"}}}
         return {"accepted": True}
 
@@ -499,6 +503,98 @@ def test_authoritative_degraded_backend_is_terminal(
     receipt = _receipt(config, "degraded")
     assert receipt is not None
     assert receipt["state"] == "rejected"
+
+
+def _pane_resolution_factory(kind: str, calls: list[dict[str, Any]]):
+    """A socket factory whose pane resolution fails in a specific way."""
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    def make_client(config: Config) -> _FakeSocketClient:
+        if kind == "no_pane":
+            # Herdr answered, but the agent has no resolvable pane.
+            return _FakeSocketClient(calls, agent_get_response={"result": {"agent": {}}})
+        if kind == "herdr_error_response":
+            # Herdr returned an authoritative error response.
+            return _FakeSocketClient(
+                calls,
+                agent_get_raises=HerdrErrorResponse({"message": "no such agent"}, "rid"),
+            )
+        if kind == "unsupported":
+            # The resolution response was malformed / unsupported.
+            return _FakeSocketClient(calls, agent_get_raises=ValueError("bad agent info"))
+        raise AssertionError(f"unknown pane failure {kind!r}")
+
+    return make_client
+
+
+@pytest.mark.parametrize("kind", ["no_pane", "herdr_error_response", "unsupported"])
+def test_authoritative_pane_resolution_failure_is_terminal(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """A definite backend answer during pane resolution is a proven target failure.
+
+    These are not transport read failures: Herdr answered (or the response was
+    unusable), and a same-ID retry would get the same answer. They must stay
+    terminal so the connector advances instead of retrying to its horizon.
+    """
+    config = _config(tmp_path)
+    worker = _worker()
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    factory = _pane_resolution_factory(kind, calls)
+    request_id = f"pane-{kind}"
+
+    first = submit_command(config, _request(request_id=request_id), socket_client_factory=factory)
+    replay = submit_command(
+        config, _request(request_id=request_id), socket_client_factory=_forbidden_factory
+    )
+
+    # A durable terminal rejection, replayed on retry, with no send.
+    assert first.ok is False
+    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert first.status in {"backend_failed", "backend_unavailable"}
+    assert replay.to_dict() == first.to_dict()
+    assert _sent_texts(calls) == []
+    receipt = _receipt(config, request_id)
+    assert receipt is not None
+    assert receipt["state"] == "rejected"
+    # The pane read was attempted exactly once and never repeated by the replay.
+    assert [call["method"] for call in calls].count("agent.get") == 1
+
+
+def test_transient_pane_read_failure_stays_retryable(
+    tmp_path: Path,
+) -> None:
+    """A pane-read timeout is a transport failure, not an authoritative answer."""
+    config = _config(tmp_path)
+    worker = _worker()
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    connect_ok = {"value": False}
+
+    def flaky_factory(config: Config) -> _FakeSocketClient:
+        if not connect_ok["value"]:
+            return _FakeSocketClient(
+                calls,
+                agent_get_raises=HerdrSocketTimeoutError("pane read timeout"),
+            )
+        return _FakeSocketClient(calls)
+
+    first = submit_command(
+        config, _request(request_id="pane-timeout"), socket_client_factory=flaky_factory
+    )
+    assert first.status == STATUS_BACKEND_UNAVAILABLE
+    assert first.disposition == DISPOSITION_NO_RECEIPT
+    assert _receipt(config, "pane-timeout") is None
+    assert _sent_texts(calls) == []
+
+    connect_ok["value"] = True
+    recovered = submit_command(
+        config, _request(request_id="pane-timeout"), socket_client_factory=flaky_factory
+    )
+    assert recovered.status == STATUS_ACCEPTED
+    assert _sent_texts(calls) == ["hello"]
 
 
 def test_transient_binding_store_never_masks_a_permanent_rejection(
