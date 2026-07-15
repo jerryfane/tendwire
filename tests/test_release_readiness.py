@@ -505,7 +505,7 @@ def test_goal08b_release_contract_and_artifact_references_are_audited() -> None:
 
     for artifact in _GOAL08B_ARTIFACTS:
         assert artifact in section
-    assert "/home/smith/tendwire" not in section
+    assert str(Path.home() / "tendwire") not in section
     assert "not a mutable source checkout" in section
     assert "exactly two no-op syncs" in section
     for accounting in (

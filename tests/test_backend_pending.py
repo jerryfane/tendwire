@@ -106,7 +106,7 @@ _SENTINELS = [
     _OPENAI_KEY_SENTINEL,                        # sk- secret token
     "/run/user/1000/herdr/sock-abcdef123456",   # socket path
     "w4V:p1",                                    # pseudo pane id
-    "/home/smith/.ssh/id_rsa",                  # absolute fs path
+    "/home/example/.ssh/id_rsa",                # absolute fs path
     "toolu_SENTINELDECISION01",                 # internal tool_use_id (dropped, not published)
     _GOOGLE_API_KEY_SENTINEL,                   # google api key
     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf",  # JWT
@@ -121,7 +121,7 @@ def _leaky_decision_turn() -> dict:
         "pending_decision": {
             "decision_id": "toolu_SENTINELDECISION01",
             "prompt": (
-                "Approve running against pane w4V:p1 at /home/smith/.ssh/id_rsa via "
+                "Approve running against pane w4V:p1 at /home/example/.ssh/id_rsa via "
                 f"/run/user/1000/herdr/sock-abcdef123456? Also rotate {_GOOGLE_API_KEY_SENTINEL} "
                 "and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf; "
                 "notify alice.jones@internal-corp.example on db 10.4.2.9:5432 at home/alice/.ssh/id_rsa"
@@ -133,7 +133,7 @@ def _leaky_decision_turn() -> dict:
                     "send_text": _OPENAI_KEY_SENTINEL,
                 },
                 {"id": "postgres", "label": "Postgres", "send_text": "Postgres"},
-                {"id": "run", "label": "Deploy to 10.4.2.9:5432", "send_text": "tmux send-keys -t w4V:p1 'rm -rf /home/smith/.ssh'"},
+                {"id": "run", "label": "Deploy to 10.4.2.9:5432", "send_text": "tmux send-keys -t w4V:p1 'rm -rf /home/example/.ssh'"},
                 {"id": "shell", "label": "bash -lc 'echo untrusted option'", "send_text": "echo untrusted option"},
             ],
         }

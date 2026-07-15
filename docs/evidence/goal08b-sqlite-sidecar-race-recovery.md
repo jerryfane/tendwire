@@ -2,7 +2,7 @@
 
 ## Scope and isolation
 
-This evidence was recorded on 2026-07-13 from the dedicated isolated checkout at `/tmp/tendwire-goal08b`. The driver built a deterministic, versioned `tendwire-0.1.0-py3-none-any.whl` directly from that checkout, installed it with `pip --no-index --no-deps` into a private temporary virtual environment, re-executed the measured phases with that environment's isolated Python, and required the imported `tendwire` package to resolve beneath the private installation rather than the mutable `/home/smith/tendwire` checkout.
+This evidence was recorded on 2026-07-13 from the dedicated isolated checkout at `/tmp/tendwire-goal08b`. The driver built a deterministic, versioned `tendwire-0.1.0-py3-none-any.whl` directly from that checkout, installed it with `pip --no-index --no-deps` into a private temporary virtual environment, re-executed the measured phases with that environment's isolated Python, and required the imported `tendwire` package to resolve beneath the private installation rather than a mutable user checkout.
 
 The base Git revision is recorded together with a SHA-256 over every packaged source path, length, and byte sequence and the final wheel SHA-256. `source_revision` is therefore the base revision, not a claim that the worktree was clean; `source_tree_sha256` cryptographically identifies the exact package source used to build the measured wheel, and `wheel_sha256` identifies the installed artifact.
 
