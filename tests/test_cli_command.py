@@ -590,7 +590,7 @@ def test_cli_daemon_client_uses_method_specific_timeouts(
         == 0
     )
 
-    assert calls[0] == ("snapshot.get", 0.35)
+    assert calls[0] == ("snapshot.get", 2.0)
     assert calls[1][0] == "command.submit"
     assert calls[1][1] > calls[0][1]
     assert calls[1][1] >= 5.0

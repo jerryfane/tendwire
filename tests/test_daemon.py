@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import gc
 import io
 import json
 import os
@@ -5427,6 +5428,10 @@ def test_isolated_daemon_survives_deterministic_real_wal_retirement_without_reso
             )
         return targets
 
+    # Earlier SQLite fixtures may leave unreachable cyclic connections pending
+    # collection. Stabilize the process-wide descriptor baseline before this
+    # test attributes later changes to the daemon under test.
+    gc.collect()
     baseline_fds = fd_targets()
     baseline_threads = {id(thread) for thread in threading.enumerate()}
     baseline_children = direct_child_processes()

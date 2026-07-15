@@ -1,7 +1,7 @@
 # Tendwire
 
-Current release candidate: `0.1.0rc1`, paired with the accepted Herdres source
-contract on Python 3.13. Routine CI intentionally uses one Python 3.13 job with
+Current release candidate: `0.1.0rc1`, paired with Herdres `0.7.0rc1` on
+Python 3.13. Routine CI intentionally uses one Python 3.13 job with
 concurrency cancellation to conserve GitHub Actions minutes. Cross-repository
 and live-provider proofs remain explicit release-owner operations rather than
 automatic workflows.
@@ -862,7 +862,7 @@ worker status alone does not create one.
 
 ## SQLite store
 
-The current store schema is version 12 (`PRAGMA user_version=12`). Migration is
+The current store schema is version 14 (`PRAGMA user_version=14`). Migration is
 idempotent and transactional. Schema v6 introduced immutable canonical turn
 content revisions and backfilled legacy rows, marking a legacy `[truncated]`
 value `known_incomplete` rather than claiming recovery. Schema v7 added
@@ -891,6 +891,14 @@ and the explicit `reserved`, `send_started`, `accepted`, `rejected`, and
 `uncertain` lifecycle. The transactional v11-to-v12 migration converts
 ambiguous legacy action-scoped collisions into terminal uncertainty rather
 than selecting one mutation as authoritative.
+
+Schema v13 adds a private selector proof to new command receipts so exact alias
+retries can replay durable outcomes after worker churn without trusting a
+mutable snapshot. Migrated v12 receipts receive no invented proof and therefore
+fail closed when their original selector cannot be established. Schema v14
+repairs legacy nonpositive turn-list coordinates transactionally and preserves
+the durable per-host sequence high-water mark, preventing cursor recurrence
+after deletion or migration.
 
 A missing, partial, malformed, boolean-valued, or unsupported owner pair creates
 a nonroutable `schema_version=1` `final_migration_hold`/`dead_letter`.

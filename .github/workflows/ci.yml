@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: plotarmordev/herdres
+          repository: luminexord/herdres
           ref: main
           path: paired/herdres
           persist-credentials: false

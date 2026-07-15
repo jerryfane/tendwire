@@ -1,7 +1,7 @@
-# Release checklist (Tendwire/Herdres 0.1.0rc1)
+# Release checklist (Tendwire 0.1.0rc1 / Herdres 0.7.0rc1)
 
 The supported RC runtime is Python 3.13. Tendwire `0.1.0rc1` must be paired
-with Herdres commit `1194250` or a reviewed descendant preserving its source
+with Herdres `0.7.0rc1` or a reviewed descendant preserving its source
 contract. The package version is defined once in `src/tendwire/_version.py`;
 Hatch reads that value, and `scripts/release_artifacts.py` validates the
 resulting metadata.
@@ -102,7 +102,7 @@ automatically reused.
 
 ## 5. Goal 07/09 ingestion and pending verification
 
-The release contract uses store schema v12. Its transactional v8-to-v9
+The release contract uses store schema v14. Its transactional v8-to-v9
 migration backfills immutable positive `list_sequence` values independently per
 host and creates the uniqueness/paging state used by stable `turn.list`
 traversal. The v9-to-v10 migration preserves public pending rows while adding

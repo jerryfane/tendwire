@@ -35,7 +35,7 @@ def test_ci_uses_one_cancellable_bounded_python_job() -> None:
     assert "cancel-in-progress: true" in workflow
     assert "timeout-minutes: 30" in workflow
     assert workflow.count("runs-on:") == 1
-    assert workflow.count("repository: plotarmordev/herdres") == 1
+    assert workflow.count("repository: luminexord/herdres") == 1
     assert "TENDWIRE_BENCHMARK_HERDRES_ROOT:" in workflow
     assert "permissions:\n  contents: read" in workflow
     assert "python -m pytest -q" in workflow

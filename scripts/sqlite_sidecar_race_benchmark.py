@@ -1036,7 +1036,16 @@ def _run_herdres_phase(
     for _ in range(3):
         expected_commands.extend(
             (["--socket-path", str(socket_path), "snapshot", "--json"],
-             ["--socket-path", str(socket_path), "turns", "--schema-version", "2", "--json"],
+             [
+                 "--socket-path",
+                 str(socket_path),
+                 "turns",
+                 "--schema-version",
+                 "2",
+                 "--limit",
+                 "50",
+                 "--json",
+             ],
              ["--socket-path", str(socket_path), "pending", "--json"])
         )
     commands_exact = records == expected_commands

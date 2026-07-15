@@ -509,7 +509,7 @@ window with all Tendwire, connector, and other SQLite writers stopped. The
 dry-run mode is strictly read-only: it does not initialize or migrate a store,
 repair permissions, checkpoint WAL, create a backup, prune rows, build a
 replacement, update a marker or timestamp, or change the database family. It
-requires current schema v12 and rejects both `--acknowledge-offline` and
+requires current schema v14 and rejects both `--acknowledge-offline` and
 `--backup-path`.
 
 Follow this order exactly:
@@ -600,9 +600,11 @@ Goal 05B through Goal 11 are a paired producer/consumer contract. Install or
 upgrade Tendwire with a Herdres revision that explicitly supports all of the
 following together:
 
-- Tendwire SQLite store schema v12, including transactional migration of v8
+- Tendwire SQLite store schema v14, including transactional migration of v8
   turns, v9 pending rows, typed final-root columns/indexes, the private per-host
-  fair-maintenance cursor table, and the v11-to-v12 command-receipt rebuild. A
+  fair-maintenance cursor table, the v11-to-v12 command-receipt rebuild, the
+  v12-to-v13 selector-proof addition, and v13-to-v14 turn-list coordinate
+  repair. A
   partial legacy final-table set, invalid recovery edge, descriptor/route
   failure, or later migration error rolls back every schema/root/cursor change
   for that step. Ambiguous legacy action-scoped rows for one host/request ID
