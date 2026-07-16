@@ -555,9 +555,8 @@ find . -name '*.pyc' -not -path './.git/*' -delete
 
 ## 11. Paired RC proof and deployment
 
-The automatic Tendwire workflow does not clone Herdres and does not spend a
-second repository's Actions minutes. Before tagging or deployment, run locally
-from the accepted clean checkouts:
+Before tagging or deployment, run the paired proof locally from the accepted
+clean checkouts:
 
 ```sh
 # Tendwire

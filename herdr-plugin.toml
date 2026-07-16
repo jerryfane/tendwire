@@ -2,7 +2,7 @@ id = "plotarmordev.tendwire"
 name = "Tendwire"
 version = "0.1.0rc5"
 min_herdr_version = "0.7.0"
-description = "Local API for connecting Herdr coding agents to apps and automations"
+description = "Local API for integrating Herdr coding agents with apps, automations, and local systems"
 platforms = ["linux"]
 
 [[actions]]
