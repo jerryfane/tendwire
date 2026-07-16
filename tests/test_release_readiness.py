@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -644,3 +645,22 @@ def test_goal08b_operator_docs_keep_family_authority_explicit() -> None:
     for artifact in _GOAL08B_ARTIFACTS:
         assert artifact in readme or artifact in install
     assert "diagnostics/status do not create or repair family members" in env_example
+
+
+def test_herdr_plugin_manifest_exposes_only_read_only_actions() -> None:
+    manifest_path = _PROJECT_ROOT / "herdr-plugin.toml"
+    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert manifest["id"] == "plotarmordev.tendwire"
+    assert manifest["version"] == "0.1.0rc5"
+    assert manifest["min_herdr_version"] == "0.7.0"
+    assert manifest["platforms"] == ["linux"]
+    actions = {item["id"]: item for item in manifest["actions"]}
+    assert set(actions) == {"doctor", "snapshot", "turns", "pending"}
+    assert all(
+        item["command"][:2] == ["python3", "scripts/herdr_plugin.py"]
+        for item in actions.values()
+    )
+    serialized = json.dumps(manifest, sort_keys=True)
+    assert "/home/" not in serialized
+    assert "telegram" not in serialized.lower()

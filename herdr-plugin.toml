@@ -1,0 +1,30 @@
+id = "plotarmordev.tendwire"
+name = "Tendwire"
+version = "0.1.0rc5"
+min_herdr_version = "0.7.0"
+description = "Local-first API and control plane for Herdr coding agents"
+platforms = ["linux"]
+
+[[actions]]
+id = "doctor"
+title = "Check Tendwire"
+description = "Run Tendwire's public-safe diagnostics"
+command = ["python3", "scripts/herdr_plugin.py", "doctor"]
+
+[[actions]]
+id = "snapshot"
+title = "Show Tendwire snapshot"
+description = "Print the current neutral Herdr snapshot as JSON"
+command = ["python3", "scripts/herdr_plugin.py", "snapshot"]
+
+[[actions]]
+id = "turns"
+title = "List Tendwire turns"
+description = "Print the current cached turn list as schema-v2 JSON"
+command = ["python3", "scripts/herdr_plugin.py", "turns"]
+
+[[actions]]
+id = "pending"
+title = "List Tendwire pending input"
+description = "Print current pending interactions as JSON"
+command = ["python3", "scripts/herdr_plugin.py", "pending"]

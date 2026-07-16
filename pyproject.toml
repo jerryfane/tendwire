@@ -48,6 +48,7 @@ include = [
     "/INSTALL.md",
     "/.env.example",
     "/README.md",
+    "/herdr-plugin.toml",
     "/pyproject.toml",
     "/RELEASE.md",
     "/scripts",

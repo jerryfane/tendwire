@@ -13,6 +13,21 @@ connector jobs, statuses, and aggregates are public-safe operational state;
 concrete-provider delivery bookkeeping, raw terminal controls, socket paths,
 and private Herdr identifiers are not part of public JSON.
 
+## Herdr plugin
+
+Tendwire is listed as a community Herdr plugin. Install the source checkout and
+its read-only actions with:
+
+```sh
+herdr plugin install plotarmordev/tendwire
+herdr plugin action invoke plotarmordev.tendwire.doctor
+```
+
+The plugin actions expose public-safe diagnostics, snapshots, schema-v2 turns,
+and pending interactions. They run from Herdr's managed checkout and require
+Python 3.13 or newer. Plugin installation does not silently create or start the
+background daemon; use [INSTALL.md](INSTALL.md) for persistent service setup.
+
 ## Relationship to Herdr, Herdres, and connectors
 
 Herdr is the only concrete runtime backend documented here. Tendwire can observe
