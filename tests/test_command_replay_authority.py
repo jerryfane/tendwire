@@ -688,6 +688,37 @@ def test_legacy_receipt_without_selector_proof_fails_closed_on_alias_retry(
     assert _receipt_rows(config) == rows_before
 
 
+def test_legacy_alias_receipt_fails_closed_when_current_authority_store_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient authority read cannot erase a receipt or permit a resend."""
+    config = _config(tmp_path)
+    worker = _worker()
+    _seed(config, [worker], [_binding(worker)])
+    payload = _request(request_id="legacy-store-race", target=_selector("name", worker))
+    calls: list[dict[str, Any]] = []
+
+    accepted = submit_command(config, payload, socket_client_factory=_factory(calls))
+    assert accepted.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute("UPDATE command_receipts SET selector_proof = ''")
+
+    def contended_snapshot(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(command_submission, "latest_snapshot", contended_snapshot)
+    rows_before = _receipt_rows(config)
+
+    retry = submit_command(config, payload, socket_client_factory=_forbidden_factory)
+
+    assert retry.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert retry.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert _sent_texts(calls) == ["hello"]
+    assert _receipt_rows(config) == rows_before
+
+
 def test_legacy_receipt_without_selector_proof_replays_explicit_worker_id(
     tmp_path: Path,
 ) -> None:

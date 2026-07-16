@@ -222,7 +222,21 @@ class _TransientInjection:
         calls: list[dict[str, Any]],
     ) -> Any:
         real_bindings = command_submission.list_worker_bindings
+        real_latest_snapshot = command_submission.latest_snapshot
         real_reserve = command_submission.reserve_command_request
+
+        if self.kind == "snapshot_store_local_state":
+            def latest_snapshot(*a: Any, **k: Any) -> Any:
+                if self.armed:
+                    raise LocalStateError(
+                        LocalStateErrorCode.ENTRY_CHANGED,
+                        LocalStateErrorCode.ENTRY_CHANGED,
+                        "local-state entry changed during validation",
+                    )
+                return real_latest_snapshot(*a, **k)
+
+            monkeypatch.setattr(command_submission, "latest_snapshot", latest_snapshot)
+            return _factory(calls)
 
         if self.kind == "binding_store_sqlite":
             def bindings(*a: Any, **k: Any) -> Any:
@@ -277,6 +291,7 @@ class _TransientInjection:
 
 
 TRANSIENT_KINDS = [
+    "snapshot_store_local_state",
     "binding_store_sqlite",
     "binding_store_local_state",
     "receipt_store_open",

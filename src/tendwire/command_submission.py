@@ -1606,7 +1606,14 @@ def _proven_replay_worker_id(
     #    legacy receipt carries no proof to fall back on.
     if not allow_current_authority:
         return None
-    snapshot = _current_snapshot(config)
+    try:
+        snapshot = _current_snapshot(config)
+    except Exception:  # noqa: BLE001
+        # Current authority is optional evidence for alias equivalence. A
+        # transient store/open race cannot erase the existing receipt or make a
+        # second send safe, so leave the target unproven and fail closed through
+        # the receipt-authority path.
+        return None
     if _backend_health_error(config, request, snapshot) is not None:
         return None
     worker = _resolve_authoritative_worker(request, snapshot)
@@ -1757,7 +1764,18 @@ def submit_command(
             return decided
         takeover = decided
 
-    snapshot = _current_snapshot(config)
+    try:
+        snapshot = _current_snapshot(config)
+    except Exception:  # noqa: BLE001
+        # No external mutation has begun. Store/open contention while reading
+        # current authority is safely retryable when no receipt exists. An
+        # abandoned reservation remains authoritative and stays in progress.
+        if takeover is not None:
+            return _request_in_progress(request)
+        return _backend_unavailable(
+            request,
+            "Current worker authority is temporarily unavailable",
+        )
     health_error = _backend_health_error(config, request, snapshot)
 
     if request.action == "send_instruction":
