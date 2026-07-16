@@ -189,7 +189,7 @@ def _sent_texts(calls: list[dict[str, Any]]) -> list[str]:
     return [
         str(call["params"].get("text"))
         for call in calls
-        if call["method"] == "pane.send_text"
+        if call["method"] == "pane.send_input"
     ]
 
 
@@ -790,7 +790,6 @@ def test_transient_racing_send_start_cas_sends_once(
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
     calls_lock = threading.Lock()
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     real_mark = command_submission.mark_command_send_started
     at_send_start = threading.Event()
     let_send_start_proceed = threading.Event()
@@ -853,7 +852,6 @@ def test_retry_after_abandoned_reservation_with_transient_reports_in_progress(
     worker = _worker()
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
 
     # Reserve then crash before send by losing the send-start response.
     real_mark = command_submission.mark_command_send_started
@@ -902,7 +900,6 @@ def test_process_response_loss_after_send_replays_without_second_send(
     worker = _worker()
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     real_finish = command_submission.finish_command_request
     finished_state: dict[str, Any] = {}
 

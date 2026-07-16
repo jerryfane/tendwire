@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -69,7 +68,6 @@ _LEGACY_V0_REPLAY_WORKER_ID = "legacy-v0-replay-only"
 _PENDING_CHANGED_MESSAGE = "pending interaction changed or is no longer answerable"
 _DISALLOWED_SEND_STATUSES = frozenset({"closed", "failed", "unknown"})
 _AMBIGUOUS_BINDING_REASONS = frozenset({"duplicate_backend_target", "not_unique"})
-_SUBMIT_ENTER_DELAY_SECONDS = 0.2
 _PRIVATE_PANE_CLEAR_KEY_SEQUENCES = (
     ("ctrl+u",),
     ("ctrl+a", "ctrl+k"),
@@ -336,15 +334,9 @@ def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout
 
 
 def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str, *, timeout: float) -> None:
-    # Keep the reliable Telegram contract from the legacy path: clear any stale
-    # staged input, write literal text, then press Enter to submit it. Herdr's
-    # pane.send_input can leave text staged in some TUI states, while send_text
-    # plus Enter matches the older CLI path Herdres used successfully. The
-    # small delay mirrors the process/IO gap in that CLI path; without it, some
-    # panes acknowledge Enter before the text is visible to the foreground app.
-    # A single ctrl+u is not reliable across all foreground TUIs. Use a small
-    # readline-compatible sequence before writing new text so a later Enter
-    # cannot submit stale text left by an earlier uncertain send.
+    # A single ctrl+u is not reliable across all foreground TUIs. Clear stale
+    # input first, then submit text and Enter in one Herdr operation so the
+    # foreground application cannot observe a staged prompt between requests.
     for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
         _socket_request(
             client,
@@ -354,15 +346,8 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
         )
     _socket_request(
         client,
-        "pane.send_text",
-        {"pane_id": pane_id, "text": instruction_text},
-        timeout=timeout,
-    )
-    time.sleep(_SUBMIT_ENTER_DELAY_SECONDS)
-    _socket_request(
-        client,
-        "pane.send_keys",
-        {"pane_id": pane_id, "keys": ["enter"]},
+        "pane.send_input",
+        {"pane_id": pane_id, "text": instruction_text, "keys": ["Enter"]},
         timeout=timeout,
     )
 

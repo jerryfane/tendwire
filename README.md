@@ -1,6 +1,6 @@
 # Tendwire
 
-Current release candidate: `0.1.0rc4`, paired with Herdres `0.7.0rc3` on
+Current release candidate: `0.1.0rc5`, paired with Herdres `0.7.0rc4` on
 Python 3.13. Routine CI intentionally uses one Python 3.13 job with
 concurrency cancellation to conserve GitHub Actions minutes. Cross-repository
 and live-provider proofs remain explicit release-owner operations rather than

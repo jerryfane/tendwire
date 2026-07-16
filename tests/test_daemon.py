@@ -4565,8 +4565,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
-            {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
+            {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello", "keys": ["Enter"]}},
         ]
         receipt = get_command_request(db_path, "cmd-host", "req-1")
         assert receipt is not None
@@ -4604,7 +4603,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert cli_result == replay["result"]
         assert cli_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
         _assert_no_public_json_forbidden(cli_result)
-        assert len([call for call in calls if call["method"] == "pane.send_text"]) == 1
+        assert len([call for call in calls if call["method"] == "pane.send_input"]) == 1
         for response in [*responses, replay]:
             encoded = json.dumps(response)
             assert "agent-private" not in encoded

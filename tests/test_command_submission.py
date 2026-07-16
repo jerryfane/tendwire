@@ -216,7 +216,7 @@ class _FakeSocketClient:
 
     def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         self.calls.append({"method": method, "params": dict(params)})
-        if self.raises is not None and method == "pane.send_text":
+        if self.raises is not None and method == "pane.send_input":
             raise self.raises
         if method == "agent.get":
             return {"result": {"agent": {"pane_id": self.pane_id}}}
@@ -237,8 +237,10 @@ def _expected_submit_calls(target: str = "agent-secret", *, pane_id: str = "pane
     return [
         {"method": "agent.get", "params": {"target": target}},
         *_expected_private_clear_calls(pane_id),
-        {"method": "pane.send_text", "params": {"pane_id": pane_id, "text": "hello"}},
-        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
+        {
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": "hello", "keys": ["Enter"]},
+        },
     ]
 
 
@@ -399,7 +401,7 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
     )
     assert recovered.status == STATUS_ACCEPTED
     assert recovered.disposition == DISPOSITION_TERMINAL_ACCEPTED
-    assert [call["method"] for call in recovery_calls].count("pane.send_text") == 1
+    assert [call["method"] for call in recovery_calls].count("pane.send_input") == 1
     receipt = get_command_request(config.db_path, "cmd-host", f"setup-{label}")
     assert receipt is not None
     assert receipt["state"] == "accepted"
@@ -434,7 +436,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
     ]
     assert config.db_path is not None
     receipt = _receipt_for_action(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
@@ -589,8 +591,7 @@ def test_submit_command_sends_identical_100_character_instructions_with_distinct
     expected_send = [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
     ]
     assert calls == [*expected_send, *expected_send]
 
@@ -675,12 +676,10 @@ def test_submit_command_allows_same_instruction_after_worker_fingerprint_changes
     assert calls == [
         {"method": "agent.get", "params": {"target": "old-agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
         {"method": "agent.get", "params": {"target": "new-agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": text}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
     ]
 
 
@@ -764,19 +763,11 @@ def test_submit_command_terminal_worker_id_and_fingerprint_replays_after_healthy
     assert calls == _expected_submit_calls()
 
 
-def test_submit_command_waits_for_text_to_stage_before_enter(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_submit_command_sends_text_and_enter_atomically(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-
-    monkeypatch.setattr(
-        "tendwire.command_submission.time.sleep",
-        lambda seconds: calls.append({"sleep": seconds}),
-    )
 
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
 
@@ -784,10 +775,13 @@ def test_submit_command_waits_for_text_to_stage_before_enter(
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
-        {"sleep": 0.2},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-secret", "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
     ]
+    assert not any(call["method"] == "pane.send_text" for call in calls)
+    assert not any(
+        call["method"] == "pane.send_keys" and call["params"].get("keys") == ["Enter"]
+        for call in calls
+    )
 
 
 def test_submit_command_reports_submitted_transport_and_worker_state(tmp_path: Path) -> None:
@@ -853,8 +847,7 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
         *_expected_private_clear_calls("pane-private"),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-private", "text": "hello"}},
-        {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello", "keys": ["Enter"]}},
     ]
     public_json = json.dumps(envelope.to_dict())
     assert "pane-private" not in public_json
@@ -1120,7 +1113,7 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "hello"}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
     ]
 
     assert config.db_path is not None
@@ -1561,7 +1554,6 @@ def test_submit_command_private_preparation_over_30_second_budget_precedes_reser
     config = _config(tmp_path, timeout=31)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     pane_lookup_started = Event()
     release_pane_lookup = Event()
     first_calls: list[dict[str, Any]] = []
@@ -1624,7 +1616,7 @@ def test_submit_command_private_preparation_over_30_second_budget_precedes_reser
             "WHERE host_id = ? AND request_id = ? AND state = 'accepted'",
             (config.host_id, "concurrent-1"),
         ).fetchone()[0] == 1
-    assert sum(call["method"] == "pane.send_text" for call in first_calls + second_calls) == 1
+    assert sum(call["method"] == "pane.send_input" for call in first_calls + second_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -1644,7 +1636,6 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
     config = _config(tmp_path / expected_state)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     real_mark = command_submission.mark_command_send_started
     calls: list[dict[str, Any]] = []
     clients: list[_FakeSocketClient] = []
@@ -1711,7 +1702,7 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-secret"}},
         ]
-    assert not any(call["method"] == "pane.send_text" for call in calls)
+    assert not any(call["method"] == "pane.send_input" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -1732,7 +1723,6 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
     worker_status = "active" if initial_kind == "accepted" else "closed"
     worker = Worker(id="w-1", name="Alpha", status=worker_status)
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     initial_calls: list[dict[str, Any]] = []
     first = submit_command(
         config,
@@ -1829,7 +1819,7 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
     assert receipt is not None
     assert receipt["state"] == expected_state
     assert receipt["state"] != "reserved"
-    assert sum(call["method"] == "pane.send_text" for call in initial_calls) == (
+    assert sum(call["method"] == "pane.send_input" for call in initial_calls) == (
         1 if initial_kind == "accepted" else 0
     )
 
@@ -1879,7 +1869,7 @@ def test_submit_command_timeout_before_send_start_stays_retryable(
         socket_client_factory=_factory(recovery_calls),
     )
     assert recovered.status == STATUS_ACCEPTED
-    assert [call["method"] for call in recovery_calls].count("pane.send_text") == 1
+    assert [call["method"] for call in recovery_calls].count("pane.send_input") == 1
     receipt = get_command_request(config.db_path, config.host_id, "before-timeout")
     assert receipt is not None
     assert receipt["state"] == "accepted"
@@ -1893,7 +1883,6 @@ def test_submit_command_finalization_timeout_after_send_is_uncertain_and_not_ret
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     calls: list[dict[str, Any]] = []
 
     def timeout_finish(*args: Any, **kwargs: Any) -> Any:
@@ -1948,7 +1937,6 @@ def test_submit_command_accepted_finalization_response_loss_replays_accepted(
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     calls: list[dict[str, Any]] = []
     real_finish = command_submission.finish_command_request
 
@@ -2121,7 +2109,6 @@ def test_submit_command_illegal_or_malformed_terminal_receipt_fails_closed(
     config = _config(tmp_path / damage)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     calls: list[dict[str, Any]] = []
     request_id = f"damaged-{damage}"
     accepted = submit_command(
@@ -2472,7 +2459,6 @@ def _patch_pending_store_flow(
         finish_effect,
     )
     monkeypatch.setattr(command_submission, "abandon_backend_pending_choice_claim", abandon)
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
     return transitions
 
 
@@ -2483,8 +2469,7 @@ def _expected_answer_calls(
 ) -> list[dict[str, Any]]:
     return [
         *_expected_private_clear_calls(pane_id),
-        {"method": "pane.send_text", "params": {"pane_id": pane_id, "text": str(ordinal)}},
-        {"method": "pane.send_keys", "params": {"pane_id": pane_id, "keys": ["enter"]}},
+        {"method": "pane.send_input", "params": {"pane_id": pane_id, "text": str(ordinal), "keys": ["Enter"]}},
     ]
 
 
@@ -2846,7 +2831,7 @@ def test_answer_pending_post_send_failure_is_uncertain_and_not_retried(
     assert transitions[-1] == ("finish", "claim-private", False)
     assert calls == [
         *_expected_private_clear_calls(),
-        {"method": "pane.send_text", "params": {"pane_id": "pane-secret", "text": "2"}},
+        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "2", "keys": ["Enter"]}},
     ]
     assert config.db_path is not None
     receipt = _receipt_for_action(config.db_path,
@@ -2969,7 +2954,6 @@ def test_answer_pending_integrates_with_durable_two_phase_claim(
     assert len(pending_before["pending_interactions"]) == 1
     interaction = pending_before["pending_interactions"][0]
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
 
     envelope = submit_command(
         config,

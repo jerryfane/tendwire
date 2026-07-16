@@ -215,7 +215,7 @@ class _FakeSocketClient:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         self.calls.append({"method": method, "params": dict(params)})
-        if self.raises is not None and method == "pane.send_text":
+        if self.raises is not None and method == "pane.send_input":
             raise self.raises
         if method == "agent.get":
             return {"result": {"agent": {"pane_id": "pane-secret"}}}
@@ -253,7 +253,7 @@ def _sent_texts(calls: list[dict[str, Any]]) -> list[str]:
     return [
         str(call["params"].get("text"))
         for call in calls
-        if call["method"] == "pane.send_text"
+        if call["method"] == "pane.send_input"
     ]
 
 
@@ -274,7 +274,6 @@ def _drive_to_state(
     if state == "rejected":
         return submit_command(config, payload, socket_client_factory=_factory(calls))
     if state == "uncertain":
-        monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
         return submit_command(
             config,
             payload,
@@ -764,7 +763,6 @@ def test_abandoned_reservation_is_redriven_not_replayed(
             "UPDATE command_receipts SET owner_expires_at = ? WHERE request_id = ?",
             ("2020-01-01T00:00:00+00:00", "abandoned"),
         )
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
 
     recovered = submit_command(config, payload, socket_client_factory=_factory(calls))
 
@@ -867,7 +865,6 @@ def test_exact_retry_racing_a_live_mutation_never_sends_twice(
     request_id = f"race-{stage}-{selector_kind}"
     payload = _request(request_id=request_id, target=_selector(selector_kind, worker))
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(command_submission, "_SUBMIT_ENTER_DELAY_SECONDS", 0)
 
     reached = threading.Event()
     release = threading.Event()
