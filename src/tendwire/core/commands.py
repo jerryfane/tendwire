@@ -34,7 +34,14 @@ COMMAND_REQUEST_SCHEMA_VERSION = 1
 COMMAND_ENVELOPE_SCHEMA_VERSION = 2
 
 ALLOWED_ACTIONS = frozenset(
-    {"noop", "read_snapshot", "resolve_target", "send_instruction", "answer_pending"}
+    {
+        "noop",
+        "read_snapshot",
+        "resolve_target",
+        "send_instruction",
+        "answer_pending",
+        "answer_decision",
+    }
 )
 REQUEST_ALLOWED_FIELDS = frozenset(
     {"schema_version", "action", "request_id", "dry_run", "target", "instruction", "params"}
@@ -58,6 +65,10 @@ STATUS_DUPLICATE_REQUEST = "duplicate_request"
 STATUS_REQUEST_STATE_UNCERTAIN = "request_state_uncertain"
 STATUS_INVALID_REQUEST = "invalid_request"
 STATUS_PENDING = "pending"
+STATUS_DECISION_NOT_PENDING = "decision_not_pending"
+STATUS_UNKNOWN_WORKER = "unknown_worker"
+STATUS_INVALID_SELECTION = "invalid_selection"
+STATUS_UNSUPPORTED_DECISION = "unsupported_decision"
 
 CommandDisposition = Literal[
     "no_receipt",
@@ -101,6 +112,10 @@ VALID_STATUSES = frozenset(
         STATUS_REQUEST_STATE_UNCERTAIN,
         STATUS_INVALID_REQUEST,
         STATUS_PENDING,
+        STATUS_DECISION_NOT_PENDING,
+        STATUS_UNKNOWN_WORKER,
+        STATUS_INVALID_SELECTION,
+        STATUS_UNSUPPORTED_DECISION,
     }
 )
 
@@ -116,6 +131,10 @@ TERMINAL_MUTATION_REJECTION_STATUSES = frozenset(
         STATUS_AMBIGUOUS_BACKEND_TARGET,
         STATUS_BACKEND_FAILED,
         STATUS_DUPLICATE_REQUEST,
+        STATUS_DECISION_NOT_PENDING,
+        STATUS_UNKNOWN_WORKER,
+        STATUS_INVALID_SELECTION,
+        STATUS_UNSUPPORTED_DECISION,
     }
 )
 
@@ -133,6 +152,10 @@ LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
         STATUS_BACKEND_UNSUPPORTED,
         STATUS_AMBIGUOUS_BACKEND_TARGET,
         STATUS_BACKEND_FAILED,
+        STATUS_DECISION_NOT_PENDING,
+        STATUS_UNKNOWN_WORKER,
+        STATUS_INVALID_SELECTION,
+        STATUS_UNSUPPORTED_DECISION,
     }
 )
 
@@ -141,6 +164,7 @@ LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
 DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES = frozenset(
     {
         STATUS_INVALID_REQUEST,
+        STATUS_INVALID_SELECTION,
         STATUS_REJECTED,
         STATUS_NOT_FOUND,
         STATUS_AMBIGUOUS_TARGET,
@@ -162,6 +186,7 @@ INSTRUCTION_ALLOWED_FIELDS = frozenset({"text"})
 ANSWER_PENDING_PARAM_FIELDS = frozenset(
     {"pending_id", "pending_fingerprint", "choice_id"}
 )
+ANSWER_DECISION_PARAM_FIELDS = frozenset({"decision_ref", "selection"})
 
 # Connector, low-level terminal, routing, and private fields rejected anywhere in a request.
 FORBIDDEN_REQUEST_FIELDS = FORBIDDEN_FIELD_NAMES
@@ -394,11 +419,12 @@ class CommandRequest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CommandRequest":
+        action = data.get("action", "")
         return cls(
-            action=data.get("action", ""),
+            action=action,
             schema_version=data.get("schema_version", COMMAND_REQUEST_SCHEMA_VERSION),
             request_id=data.get("request_id"),
-            dry_run=data.get("dry_run", True),
+            dry_run=data.get("dry_run", action != "answer_decision"),
             target=data.get("target"),
             instruction=data.get("instruction"),
             params=data.get("params"),
@@ -432,8 +458,10 @@ def build_canonical_mutation(
     """
     if not isinstance(request, CommandRequest):
         raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_pending"}:
-        raise ValueError("canonical mutations require send_instruction or answer_pending")
+    if request.action not in {"send_instruction", "answer_pending", "answer_decision"}:
+        raise ValueError(
+            "canonical mutations require send_instruction, answer_pending, or answer_decision"
+        )
     if request.dry_run is not False:
         raise ValueError("canonical mutations require a non-dry-run request")
     request_error = validate_request(request)
@@ -451,7 +479,7 @@ def build_canonical_mutation(
             "instruction": {"text": request.instruction["text"]},
             "options": {},
         }
-    else:
+    elif request.action == "answer_pending":
         assert request.params is not None
         canonical_payload = {
             "canonical_version": CANONICAL_MUTATION_VERSION,
@@ -461,6 +489,28 @@ def build_canonical_mutation(
                 "pending_id": request.params["pending_id"],
                 "pending_fingerprint": request.params["pending_fingerprint"],
                 "choice_id": request.params["choice_id"],
+            },
+            "options": {},
+        }
+    else:
+        assert request.params is not None
+        selection = request.params["selection"]
+        if "option_refs" in selection:
+            canonical_selection: dict[str, Any] = {
+                "option_refs": sorted(
+                    selection["option_refs"],
+                    key=lambda ref: int(ref) if str(ref).isdigit() else -1,
+                )
+            }
+        else:
+            canonical_selection = {"text": selection["text"]}
+        canonical_payload = {
+            "canonical_version": CANONICAL_MUTATION_VERSION,
+            "action": "answer_decision",
+            "target": {"worker_id": public_worker_id},
+            "decision": {
+                "decision_ref": request.params["decision_ref"],
+                "selection": canonical_selection,
             },
             "options": {},
         }
@@ -510,8 +560,10 @@ def build_selector_proof(request: CommandRequest) -> str:
     """
     if not isinstance(request, CommandRequest):
         raise TypeError("request must be a CommandRequest")
-    if request.action not in {"send_instruction", "answer_pending"}:
-        raise ValueError("selector proofs require send_instruction or answer_pending")
+    if request.action not in {"send_instruction", "answer_pending", "answer_decision"}:
+        raise ValueError(
+            "selector proofs require send_instruction, answer_pending, or answer_decision"
+        )
     if request.dry_run is not False:
         raise ValueError("selector proofs require a non-dry-run request")
     request_error = validate_request(request)
@@ -580,7 +632,7 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
             details={"field": "action", "allowed": sorted(ALLOWED_ACTIONS)},
         )
     if (
-        request.action in {"send_instruction", "answer_pending"}
+        request.action in {"send_instruction", "answer_pending", "answer_decision"}
         and request.dry_run is False
         and not is_valid_request_id(request.request_id)
     ):
@@ -668,6 +720,70 @@ def validate_request(request: CommandRequest) -> dict[str, Any] | None:
                     f"answer_pending requires nonblank params.{field}",
                     details={"field": f"params.{field}"},
                 )
+
+    if request.action == "answer_decision":
+        if request.target is None or set(request.target) != {"worker_id"}:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_decision requires exactly target.worker_id",
+                details={"field": "target"},
+            )
+        worker_id = request.target.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_decision requires nonblank target.worker_id",
+                details={"field": "target.worker_id"},
+            )
+        if request.instruction is not None:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_decision does not accept an instruction",
+                details={"field": "instruction"},
+            )
+        if not isinstance(request.params, dict) or set(request.params) != ANSWER_DECISION_PARAM_FIELDS:
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_decision params must contain exactly decision_ref and selection",
+                details={"field": "params"},
+            )
+        decision_ref = request.params.get("decision_ref")
+        if not isinstance(decision_ref, str) or not decision_ref.strip():
+            return error_value(
+                STATUS_INVALID_REQUEST,
+                "answer_decision requires nonblank params.decision_ref",
+                details={"field": "params.decision_ref"},
+            )
+        selection = request.params.get("selection")
+        if not isinstance(selection, Mapping) or len(selection) != 1:
+            return error_value(
+                STATUS_INVALID_SELECTION,
+                "selection must contain exactly one selection form",
+                details={"field": "params.selection"},
+            )
+        if set(selection) == {"option_refs"}:
+            option_refs = selection.get("option_refs")
+            if not isinstance(option_refs, list) or not option_refs or any(
+                not isinstance(ref, str) or not ref.strip() for ref in option_refs
+            ):
+                return error_value(
+                    STATUS_INVALID_SELECTION,
+                    "selection.option_refs must be a nonempty array of strings",
+                    details={"field": "params.selection.option_refs"},
+                )
+        elif set(selection) == {"text"}:
+            if validate_instruction_text(selection.get("text")) is not None:
+                return error_value(
+                    STATUS_INVALID_SELECTION,
+                    "selection.text must be nonempty safe text",
+                    details={"field": "params.selection.text"},
+                )
+        else:
+            return error_value(
+                STATUS_INVALID_SELECTION,
+                "selection must contain option_refs or text",
+                details={"field": "params.selection"},
+            )
 
     return None
 
@@ -788,7 +904,11 @@ class CommandEnvelope:
                 f"command envelope schema_version must be {COMMAND_ENVELOPE_SCHEMA_VERSION}"
             )
 
-        mutating = self.action in {"send_instruction", "answer_pending"}
+        mutating = self.action in {
+            "send_instruction",
+            "answer_pending",
+            "answer_decision",
+        }
         live_mutation = mutating and self.dry_run is False
         if live_mutation and not is_valid_request_id(self.request_id):
             raise ValueError("non-dry-run mutation requires a valid request_id")
@@ -939,7 +1059,11 @@ class CommandEnvelope:
                 result=None,
                 error=error,
             )
-        mutating = request.action in {"send_instruction", "answer_pending"}
+        mutating = request.action in {
+            "send_instruction",
+            "answer_pending",
+            "answer_decision",
+        }
         valid_mutation_id = is_valid_request_id(request.request_id)
         request_id = (
             request.request_id

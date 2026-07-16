@@ -388,6 +388,9 @@ def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
 
 _PENDING_MAX_CHOICES = 12
 _PENDING_TEXT_MAX = 2000
+_SINGLE_WRITE_IN_OPTION_IDS = frozenset(
+    {"custom", "other", "writein", "write_in", "write-in"}
+)
 
 
 def _private_pending_revision(value: Mapping[str, Any]) -> str:
@@ -409,7 +412,7 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
             return PendingObservation("read_succeeded_invalid_prompt")
         revision = _private_pending_revision(decision)
         question = redact_private_prompt_text(
-            decision.get("prompt"),
+            decision.get("prompt") or decision.get("question"),
             max_chars=_PENDING_TEXT_MAX,
         )
         options = decision.get("options")
@@ -442,12 +445,61 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
             for option in options
             if isinstance(option, Mapping)
         }
+        raw_kind = str(
+            decision.get("kind")
+            or decision.get("tool_name")
+            or decision.get("name")
+            or ""
+        ).strip().lower().replace("-", "_")
+        compact_kind = raw_kind.replace("_", "")
+        raw_multi_select = decision.get(
+            "multi_select",
+            decision.get("multiSelect", False),
+        )
+        if not isinstance(raw_multi_select, bool):
+            return PendingObservation("read_succeeded_invalid_prompt")
+        if compact_kind in {"exitplanmode", "plan"} or (
+            not compact_kind and "approve" in option_ids
+        ):
+            decision_kind: Literal["single", "multi", "plan"] = "plan"
+        elif raw_multi_select or compact_kind in {"multi", "multiselect"}:
+            decision_kind = "multi"
+        else:
+            decision_kind = "single"
+        raw_question_count = decision.get("question_count")
+        if raw_question_count is None:
+            raw_questions = decision.get("questions")
+            raw_question_count = len(raw_questions) if isinstance(raw_questions, list) else 1
+        if (
+            not isinstance(raw_question_count, int)
+            or isinstance(raw_question_count, bool)
+            or raw_question_count < 1
+        ):
+            return PendingObservation("read_succeeded_invalid_prompt")
+        decision_option_labels = [choice.label for choice in choices]
+        if (
+            decision_kind == "single"
+            and options
+            and isinstance(options[len(decision_option_labels) - 1], Mapping)
+            and str(
+                options[len(decision_option_labels) - 1].get("id") or ""
+            ).strip().lower()
+            in _SINGLE_WRITE_IN_OPTION_IDS
+        ):
+            decision_option_labels.pop()
+        decision_options = tuple(decision_option_labels)
+        if not decision_options:
+            return PendingObservation("read_succeeded_invalid_prompt")
         return PendingObservation(
             "open_prompt",
             question=question,
             pending_kind="approval" if "approve" in option_ids else "question",
             choices=tuple(choices),
             revision_digest=revision,
+            decision_kind=decision_kind,
+            decision_options=decision_options,
+            decision_multi_select=decision_kind == "multi",
+            decision_question_count=raw_question_count,
         )
     interaction = turn.get("pending_interaction")
     if interaction is not None:
@@ -481,6 +533,24 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
     observation = _pending_observation_from_turn(turn)
     if observation.kind != "open_prompt":
         return None
+    meta: dict[str, Any] = {"source": "backend"}
+    if observation.decision_kind is not None:
+        meta["decision"] = {
+            "decision_ref": (
+                "decision-"
+                + stable_fingerprint(
+                    {"decision_revision": observation.revision_digest}
+                )
+            ),
+            "kind": observation.decision_kind,
+            "prompt": observation.question,
+            "options": [
+                {"ref": str(ordinal), "label": label}
+                for ordinal, label in enumerate(observation.decision_options, 1)
+            ],
+            "multi_select": observation.decision_multi_select,
+            "question_count": observation.decision_question_count,
+        }
     return {
         "question": observation.question,
         "kind": observation.pending_kind or "question",
@@ -488,7 +558,7 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
             {"choice_id": choice.choice_id, "label": choice.label}
             for choice in observation.choices
         ],
-        "meta": {"source": "backend"},
+        "meta": meta,
     }
 
 

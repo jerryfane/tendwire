@@ -191,6 +191,7 @@ def test_allowed_actions_frozen() -> None:
         "resolve_target",
         "send_instruction",
         "answer_pending",
+        "answer_decision",
     }
 
 
@@ -557,7 +558,9 @@ def test_command_envelope_rejects_inconsistent_receipt_tuples(
         )
 
 
-@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize(
+    "action", ["send_instruction", "answer_pending", "answer_decision"]
+)
 @pytest.mark.parametrize("request_id", [None, "", "not canonical"])
 def test_command_envelope_live_mutations_require_canonical_request_ids(
     action: str,
@@ -567,7 +570,7 @@ def test_command_envelope_live_mutations_require_canonical_request_ids(
         action=action,
         request_id=request_id,
         dry_run=False,
-        target={"worker_id": "w-1"} if action == "send_instruction" else None,
+        target={"worker_id": "w-1"} if action != "answer_pending" else None,
         instruction={"text": "hello"} if action == "send_instruction" else None,
         params=(
             {
@@ -576,7 +579,14 @@ def test_command_envelope_live_mutations_require_canonical_request_ids(
                 "choice_id": "choice-1",
             }
             if action == "answer_pending"
-            else None
+            else (
+                {
+                    "decision_ref": "decision-1",
+                    "selection": {"option_refs": ["1"]},
+                }
+                if action == "answer_decision"
+                else None
+            )
         ),
     )
 
@@ -638,6 +648,10 @@ def test_mutation_disposition_status_sets_are_explicit_and_fail_closed() -> None
         "ambiguous_backend_target",
         "backend_failed",
         "duplicate_request",
+        "decision_not_pending",
+        "unknown_worker",
+        "invalid_selection",
+        "unsupported_decision",
     }
     assert LIVE_MUTATION_NO_RECEIPT_REJECTION_STATUSES == {
         "invalid_request",
@@ -649,9 +663,14 @@ def test_mutation_disposition_status_sets_are_explicit_and_fail_closed() -> None
         "backend_unsupported",
         "ambiguous_backend_target",
         "backend_failed",
+        "decision_not_pending",
+        "unknown_worker",
+        "invalid_selection",
+        "unsupported_decision",
     }
     assert DRY_RUN_MUTATION_NO_RECEIPT_REJECTION_STATUSES == {
         "invalid_request",
+        "invalid_selection",
         "rejected",
         "not_found",
         "ambiguous_target",
@@ -659,7 +678,9 @@ def test_mutation_disposition_status_sets_are_explicit_and_fail_closed() -> None
     }
 
 
-@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize(
+    "action", ["send_instruction", "answer_pending", "answer_decision"]
+)
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("status", sorted(VALID_STATUSES))
 def test_command_envelope_from_dict_enforces_terminal_rejected_matrix(
@@ -688,7 +709,9 @@ def test_command_envelope_from_dict_enforces_terminal_rejected_matrix(
             CommandEnvelope.from_dict(payload)
 
 
-@pytest.mark.parametrize("action", ["send_instruction", "answer_pending"])
+@pytest.mark.parametrize(
+    "action", ["send_instruction", "answer_pending", "answer_decision"]
+)
 @pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry-run"])
 @pytest.mark.parametrize("ok", [False, True])
 @pytest.mark.parametrize("status", sorted(VALID_STATUSES))
