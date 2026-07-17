@@ -423,7 +423,10 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
             options = []
         if not isinstance(options, list):
             return PendingObservation("read_succeeded_invalid_prompt")
-        if len(options) > PENDING_DECISION_MAX_OPTIONS:
+        # A single-choice Claude prompt may have one trailing write-in row in
+        # addition to the digit-addressable options. Validate the effective
+        # selectable rows after the decision kind and write-in shape are known.
+        if len(options) > PENDING_DECISION_MAX_OPTIONS + 1:
             return PendingObservation("read_succeeded_unsupported_decision")
         choices: list[PendingObservedChoice] = []
         for ordinal, option in enumerate(options, 1):
@@ -529,6 +532,8 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
         decision_options = tuple(decision_option_labels)
         if not decision_options:
             return PendingObservation("read_succeeded_invalid_prompt")
+        if len(decision_options) > PENDING_DECISION_MAX_OPTIONS:
+            return PendingObservation("read_succeeded_unsupported_decision")
         return PendingObservation(
             "open_prompt",
             question=question,

@@ -37,10 +37,12 @@ Supported shapes are:
 - `plan`: exactly one option;
 - `multi`: one or more options from a single question.
 
-Tendwire supports at most 11 source option rows. A source decision with more
-than 11 rows, including a custom/write-in row beyond that boundary, is not
-truncated. Unknown decision kinds, over-bound decisions, and multi-question
-decisions do not produce `meta.decision` and cannot be sent.
+Tendwire supports at most 9 digit-addressable option rows. A single-choice
+decision may additionally contain one recognized trailing custom/write-in row;
+that row is not exposed as an option reference. A source decision with more
+than 9 selectable rows is not truncated. Unknown decision kinds, over-bound
+decisions, and multi-question decisions do not produce `meta.decision` and
+cannot be sent.
 
 ## Command request
 
@@ -82,7 +84,7 @@ The four typed validation failures are terminal for that attempted decision:
 - `unsupported_decision`.
 
 All fail before pane input. `unsupported_decision` covers multiple question
-groups, more than 11 source rows, and unknown kinds.
+groups, more than 9 selectable rows, and unknown kinds.
 
 ## Concurrency and retries
 

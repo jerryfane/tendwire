@@ -430,16 +430,38 @@ def test_decision_option_bound_accepts_exactly_nine(tmp_path: Path) -> None:
     assert len(row["meta"]["decision"]["options"]) == PENDING_DECISION_MAX_OPTIONS
 
 
+def test_decision_option_bound_accepts_nine_plus_trailing_write_in(
+    tmp_path: Path,
+) -> None:
+    config, worker, _decision_ref = _seed_pending_decision(
+        tmp_path,
+        turn=_bounded_decision_turn(
+            PENDING_DECISION_MAX_OPTIONS,
+            custom_last=True,
+        ),
+    )
+    assert config.db_path is not None
+    payload = pending_payload_from_store(config.db_path, config.host_id)
+    row = next(
+        item for item in payload["pending_interactions"]
+        if item["worker_id"] == worker.id
+    )
+    assert len(row["meta"]["decision"]["options"]) == PENDING_DECISION_MAX_OPTIONS
+
+
 @pytest.mark.parametrize(
     "turn",
     [
         _bounded_decision_turn(PENDING_DECISION_MAX_OPTIONS + 1),
-        _bounded_decision_turn(PENDING_DECISION_MAX_OPTIONS, custom_last=True),
+        _bounded_decision_turn(
+            PENDING_DECISION_MAX_OPTIONS + 1,
+            custom_last=True,
+        ),
         _unknown_decision_turn(),
     ],
     ids=[
-        "twelve-real-options",
-        "custom-row-after-eleven-real-options",
+        "ten-real-options",
+        "custom-row-after-ten-real-options",
         "unknown-kind",
     ],
 )
