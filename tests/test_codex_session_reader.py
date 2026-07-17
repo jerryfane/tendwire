@@ -950,6 +950,78 @@ def test_internal_turn_remains_suppressed_when_later_commentary_arrives(
     assert state.stream_spans == ()
 
 
+def test_real_user_after_environment_context_makes_turn_public(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "codex"
+    turn_id = "context-then-user"
+    _write_session(
+        home,
+        [
+            _event("task_started", turn_id),
+            _message(
+                turn_id,
+                "user",
+                "<environment_context>\n  <cwd>/private/path</cwd>\n</environment_context>",
+            ),
+            _message(turn_id, "user", "fix the Telegram delivery"),
+            _message(
+                turn_id,
+                "assistant",
+                "Tracing the delivery path.",
+                phase="commentary",
+            ),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    content = herdr_turns._read_codex_session_turn(SESSION_A)
+
+    assert content == {
+        "user_text": "fix the Telegram delivery",
+        "assistant_stream_text": "Tracing the delivery path.",
+        "assistant_final_text": None,
+        "complete": False,
+        "has_open_turn": True,
+        "source_turn_id": turn_id,
+    }
+    assert "/private/path" not in json.dumps(content)
+
+
+def test_internal_context_after_real_user_does_not_hide_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "codex"
+    turn_id = "user-then-context"
+    _write_session(
+        home,
+        [
+            _event("task_started", turn_id),
+            _message(turn_id, "user", "keep this prompt"),
+            _message(
+                turn_id,
+                "user",
+                "<system-reminder>private runtime metadata</system-reminder>",
+            ),
+            _message(
+                turn_id,
+                "assistant",
+                "Visible progress.",
+                phase="commentary",
+            ),
+        ],
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+
+    content = herdr_turns._read_codex_session_turn(SESSION_A)
+
+    assert content["user_text"] == "keep this prompt"
+    assert content["assistant_stream_text"] == "Visible progress."
+    assert "private runtime metadata" not in json.dumps(content)
+
+
 def test_empty_task_complete_preserves_existing_open_turn_semantics(
     tmp_path: Path,
     monkeypatch,

@@ -1625,14 +1625,17 @@ def _apply_codex_event(
         state_value.final_text = None
     if event.kind == "user":
         if _is_internal_user_text(event.text):
-            state_value.internal_turn = True
-            state_value.last_content_turn_id = turn_id
-            state_value.stream_items.clear()
-            state_value.user_text = None
-            state_value.final_text = None
+            # Codex may emit environment or command context before the real
+            # user message under the same turn ID. Suppress that context
+            # without allowing later internal metadata to erase a user turn
+            # that has already become public.
+            if state_value.user_text is None:
+                state_value.internal_turn = True
+                state_value.last_content_turn_id = turn_id
+                state_value.stream_items.clear()
+                state_value.final_text = None
             return
-        if state_value.internal_turn:
-            return
+        state_value.internal_turn = False
         state_value.user_text = event.text
         state_value.last_content_turn_id = turn_id
         state_value.turn_open = not state_value.final_seen
