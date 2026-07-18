@@ -319,6 +319,97 @@ def _aggressive_cleanup(db_path: Path, *, batch_size: int = 100) -> dict[str, An
     )
 
 
+def test_dead_letter_final_blocks_only_its_stable_owner(tmp_path: Path) -> None:
+    db_path = tmp_path / "dead-letter-owner-isolation.db"
+    second_worker_id = "worker-2"
+    second_stable_key = "wsk1_" + ("b" * 64)
+    snapshot = project_from_raw(
+        Config(host_id=HOST_ID, db_path=db_path),
+        workers=[
+            {
+                "id": WORKER_ID,
+                "name": "First Worker",
+                "status": "active",
+                "space_id": "space-1",
+                "meta": {
+                    "stable_key": STABLE_KEY,
+                    "stable_key_version": 1,
+                },
+            },
+            {
+                "id": second_worker_id,
+                "name": "Second Worker",
+                "status": "active",
+                "space_id": "space-2",
+                "meta": {
+                    "stable_key": second_stable_key,
+                    "stable_key_version": 1,
+                },
+            },
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    _merge_final(
+        db_path,
+        snapshot,
+        source_turn_id="first-owner-failed",
+        final_text="first owner failed final",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+
+    api = ConnectorOutboxAPI(db_path, HOST_ID, max_attempts=1)
+    failed = _poll_one_source(api)
+    assert api.fail(
+        {
+            "name": FINAL_NAME,
+            "ref": failed["ref"],
+            "delay_seconds": 0,
+        }
+    )["ok"] is True
+
+    _merge_final(
+        db_path,
+        snapshot,
+        source_turn_id="first-owner-later",
+        final_text="first owner later final",
+        observed_at="2026-01-01T00:01:00+00:00",
+    )
+    assert merge_turn_content(
+        db_path,
+        HOST_ID,
+        second_worker_id,
+        {
+            "assistant_final_text": "second owner final",
+            "complete": True,
+            "has_open_turn": False,
+            "source_turn_id": "second-owner-ready",
+        },
+        observed_at="2026-01-01T00:02:00+00:00",
+    ) == 1
+
+    unrelated = api.poll(
+        {"name": FINAL_NAME, "limit": 100, "lease_seconds": 60}
+    )
+    assert unrelated["ok"] is True
+    assert len(unrelated["items"]) == 1
+    assert unrelated["items"][0]["payload"]["stable_key"] == second_stable_key
+
+    with sqlite3.connect(str(db_path)) as conn:
+        first_owner_states = conn.execute(
+            """
+            SELECT status
+            FROM connector_outbox
+            WHERE connector = ?
+              AND delivery_kind = 'final_ready'
+              AND json_extract(payload_json, '$.stable_key') = ?
+            ORDER BY id
+            """,
+            (FINAL_NAME, STABLE_KEY),
+        ).fetchall()
+    assert first_owner_states == [("dead_letter",), ("queued",)]
+
+
 def test_acknowledged_prefix_is_cleaned_but_failed_suffix_and_exact_final_survive(
     tmp_path: Path,
 ) -> None:
