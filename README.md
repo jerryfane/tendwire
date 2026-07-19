@@ -470,7 +470,7 @@ also validates the rollout inode. A root identity change immediately clears
 that root's cached path results and complete index.
 
 The complete Codex index is bounded to 100,000 visited filesystem entries,
-32,768 session identities, and 8 MiB retained; its path-result LRU is bounded
+100,000 session identities, and 16 MiB retained; its path-result LRU is bounded
 to 256 entries and 256 KiB. Negative results live for 2 seconds. A lookup
 rebuilds the complete index once its snapshot is 60 seconds old. This
 deliberately avoids a 20,000-file walk on each poll, so a duplicate created

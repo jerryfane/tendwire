@@ -229,8 +229,8 @@ Every cache hit validates the current sessions-root device/inode; a found result
 also validates the rollout inode. A root identity change immediately clears
 that root's cached path results and complete index.
 
-The complete index is bounded to 100,000 filesystem visits, 32,768 session
-identities, and 8 MiB retained; its path-result LRU is bounded to 256 entries
+The complete index is bounded to 100,000 filesystem visits, 100,000 session
+identities, and 16 MiB retained; its path-result LRU is bounded to 256 entries
 and 256 KiB. Negative results expire after 2 seconds. A lookup rebuilds the
 complete index once its snapshot is 60 seconds old. That interval is the
 documented bounded-work tradeoff: a duplicate created after a successful lookup
