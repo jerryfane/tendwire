@@ -1531,6 +1531,171 @@ def test_cli_pending_post_send_failure_never_reads_or_retries(
     }
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [
+        ("timeout", "daemon_timeout"),
+        ("protocol", "daemon_protocol_error"),
+        ("post_send_unavailable", "daemon_protocol_error"),
+    ],
+)
+def test_cli_connector_post_send_failure_never_mutates_store_fallback(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+    mode: str,
+    expected_status: str,
+) -> None:
+    from tendwire.daemon_api import DaemonProtocolError, DaemonUnavailable
+
+    calls = 0
+
+    class FailingClient:
+        def __init__(
+            self,
+            _socket_path: Any,
+            *,
+            timeout_seconds: float,
+            **_kwargs: Any,
+        ) -> None:
+            assert timeout_seconds == 10.0
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            assert method == "connector.poll"
+            assert params == {
+                "name": "turn-final",
+                "limit": 1,
+                "lease_seconds": 60,
+            }
+            if mode == "timeout":
+                raise DaemonUnavailable(
+                    "timed out",
+                    timed_out=True,
+                    request_started=True,
+                )
+            if mode == "protocol":
+                raise DaemonProtocolError(
+                    "invalid frame",
+                    request_started=True,
+                )
+            raise DaemonUnavailable(
+                "connection lost",
+                request_started=True,
+            )
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError(
+            "post-send connector failure must not execute store fallback"
+        )
+
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        FailingClient,
+    )
+    monkeypatch.setattr("tendwire.store.sqlite.init_store", forbidden)
+
+    code = main(
+        [
+            "--host-id",
+            "connector-timeout-host",
+            "--socket-path",
+            str(tmp_path / "daemon.sock"),
+            "connector",
+            "poll",
+            "--db-path",
+            str(tmp_path / "cache.db"),
+            "--name",
+            "turn-final",
+            "--limit",
+            "1",
+            "--lease-seconds",
+            "60",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 1
+    assert calls == 1
+    assert payload == {
+        "schema_version": 1,
+        "ok": False,
+        "status": expected_status,
+        "host_id": "connector-timeout-host",
+        "name": "turn-final",
+        "error": {
+            "code": expected_status,
+            "message": (
+                "Tendwire daemon request timed out"
+                if expected_status == "daemon_timeout"
+                else "Tendwire daemon returned an invalid response"
+            ),
+        },
+    }
+
+
+def test_cli_connector_pre_send_unavailable_uses_store_fallback(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    db_path = tmp_path / "connector-fallback.db"
+
+    class UnavailableClient:
+        def __init__(self, _socket_path: Any, **_kwargs: Any) -> None:
+            pass
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            assert method == "connector.poll"
+            raise DaemonUnavailable(
+                "not listening",
+                request_started=False,
+            )
+
+    monkeypatch.setattr(
+        "tendwire.daemon_api.DaemonAPIClient",
+        UnavailableClient,
+    )
+
+    code = main(
+        [
+            "--host-id",
+            "connector-fallback-host",
+            "--socket-path",
+            str(tmp_path / "missing.sock"),
+            "connector",
+            "poll",
+            "--db-path",
+            str(db_path),
+            "--name",
+            "turn-final",
+            "--limit",
+            "1",
+            "--lease-seconds",
+            "60",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["schema_version"] == 1
+    assert payload["ok"] is True
+    assert payload["host_id"] == "connector-fallback-host"
+    assert payload["name"] == "turn-final"
+    assert payload["items"] == []
+
+
 def test_cli_store_hooks_print_json_only_and_support_dry_run(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "store-cli.db"
     init_store(db_path)
