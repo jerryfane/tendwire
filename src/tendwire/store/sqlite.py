@@ -27,6 +27,7 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlsplit
 
 from ..config import (
+    DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
     DEFAULT_PENDING_STALE_GRACE_SECONDS,
     DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
 )
@@ -111,7 +112,8 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 15
+STORE_SCHEMA_VERSION = 16
+CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
@@ -167,6 +169,19 @@ def _configured_turn_claim_hard_ttl_seconds() -> int:
         raise StoreSchemaError("turn_claim_hard_ttl_invalid") from exc
     if configured <= 0:
         raise StoreSchemaError("turn_claim_hard_ttl_invalid")
+    return configured
+
+
+def _configured_connector_ack_ttl_seconds() -> int:
+    raw = os.environ.get("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS")
+    if raw is None:
+        return CONNECTOR_ACK_TTL_SECONDS
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise StoreSchemaError("connector_ack_ttl_invalid") from exc
+    if configured <= 0:
+        raise StoreSchemaError("connector_ack_ttl_invalid")
     return configured
 
 
@@ -745,6 +760,11 @@ CREATE_FINAL_DELIVERY_INDEXES = (
     ),
 )
 
+CREATE_CONNECTOR_ORDERING_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_connector_outbox_final_ordering "
+    "ON connector_outbox(host_id, connector, ordering_key, delivery_kind, status, id)"
+)
+
 
 CREATE_TURN_PRESENTATION_PLANS_TABLE = """
 CREATE TABLE IF NOT EXISTS turn_presentation_plans (
@@ -1000,6 +1020,7 @@ CREATE TABLE IF NOT EXISTS connector_outbox (
     delivery_kind TEXT NOT NULL DEFAULT 'generic',
     turn_id TEXT,
     content_revision TEXT,
+    ordering_key TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     private_state_json TEXT NOT NULL DEFAULT '{}',
@@ -1899,6 +1920,7 @@ def _connector_response(
     key: str | None = None,
     attempt: int | None = None,
     available_at: str | None = None,
+    leased_until: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -1915,6 +1937,8 @@ def _connector_response(
         payload["attempt"] = int(attempt)
     if available_at is not None:
         payload["available_at"] = str(available_at)
+    if leased_until is not None:
+        payload["leased_until"] = str(leased_until)
     return sanitize_public_value(payload)
 
 
@@ -2018,6 +2042,201 @@ def _connector_reclaim_expired_leases_conn(
                 outbox_status=terminal_status,
                 now=now,
             )
+        reclaimed += 1
+    reclaimed += _connector_reclaim_expired_awaiting_ack_conn(
+        conn,
+        host_id=str(host_id),
+        name=str(name) if name is not None else None,
+        now=str(now),
+    )
+    return reclaimed
+
+
+def _connector_reclaim_expired_awaiting_ack_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    name: str | None,
+    now: str,
+) -> int:
+    clauses = ["outbox.host_id = ?", "outbox.status = 'awaiting_ack'"]
+    params: list[Any] = [str(host_id)]
+    if name is not None:
+        clauses.append("outbox.connector = ?")
+        params.append(str(name))
+    rows = conn.execute(
+        f"""
+        SELECT outbox.id, outbox.connector, outbox.private_state_json
+        FROM connector_outbox AS outbox
+        WHERE {" AND ".join(clauses)}
+        ORDER BY outbox.id
+        """,
+        params,
+    ).fetchall()
+    reclaimed = 0
+    now_dt = _connector_datetime(now)
+    for outbox_id, connector, private_state_json in rows:
+        outbox_state = _json_object(private_state_json)
+        deadline = str(outbox_state.get("ack_deadline_at") or "")
+        delivery = conn.execute(
+            """
+            SELECT id, private_state_json
+            FROM connector_deliveries
+            WHERE outbox_id = ? AND status = 'awaiting_ack'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(outbox_id),),
+        ).fetchone()
+        if not deadline and delivery is not None:
+            deadline = str(
+                _json_object(delivery[1]).get("ack_deadline_at") or ""
+            )
+        if not deadline or _connector_datetime(deadline) > now_dt:
+            continue
+
+        plan = conn.execute(
+            """
+            SELECT id, state, generation
+            FROM turn_presentation_plans
+            WHERE source_outbox_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(outbox_id),),
+        ).fetchone()
+        if plan is not None and str(plan[1]) == "completed":
+            if delivery is not None:
+                conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET status = 'delivered', delivered_at = COALESCE(delivered_at, ?)
+                    WHERE id = ? AND status = 'awaiting_ack'
+                    """,
+                    (str(now), int(delivery[0])),
+                )
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = 'delivered', next_attempt_at = NULL,
+                    updated_at = ?, private_state_json = ?
+                WHERE id = ? AND status = 'awaiting_ack'
+                """,
+                (
+                    str(now),
+                    _connector_private_clear_current(private_state_json),
+                    int(outbox_id),
+                ),
+            )
+            reclaimed += 1
+            continue
+
+        recoverable = plan is not None and str(plan[1]) in {
+            "active",
+            "waiting_predecessor",
+            "failed",
+        }
+        if recoverable:
+            plan_id = int(plan[0])
+            conn.execute(
+                "UPDATE turn_presentation_plans SET state = 'failed' WHERE id = ?",
+                (plan_id,),
+            )
+            job_rows = conn.execute(
+                """
+                SELECT outbox.id, outbox.private_state_json
+                FROM turn_presentation_jobs AS jobs
+                JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
+                WHERE jobs.plan_id = ?
+                  AND outbox.status NOT IN ('delivered', 'superseded', 'dead_letter')
+                """,
+                (plan_id,),
+            ).fetchall()
+            for job_outbox_id, job_private in job_rows:
+                conn.execute(
+                    """
+                    UPDATE connector_deliveries
+                    SET status = 'failed', response_json = ?, delivered_at = ?
+                    WHERE outbox_id = ? AND status = 'leased'
+                    """,
+                    (
+                        _canonical_json(
+                            {"schema_version": 1, "status": "ack_deadline_expired"}
+                        ),
+                        str(now),
+                        int(job_outbox_id),
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE connector_outbox
+                    SET status = 'dead_letter', next_attempt_at = NULL,
+                        updated_at = ?, private_state_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(now),
+                        _connector_private_clear_current(job_private),
+                        int(job_outbox_id),
+                    ),
+                )
+            source_state = _json_object(
+                _connector_private_clear_current(private_state_json)
+            )
+            source_state["presentation_generation"] = max(
+                int(source_state.get("presentation_generation") or 1),
+                int(plan[2] or 1) + 1,
+            )
+            source_status = "queued"
+        else:
+            source_state = _json_object(
+                _connector_private_clear_current(private_state_json)
+            )
+            source_status = _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+
+        if delivery is not None:
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET status = 'failed', response_json = ?, delivered_at = ?
+                WHERE id = ? AND status = 'awaiting_ack'
+                """,
+                (
+                    _canonical_json(
+                        {
+                            "schema_version": 1,
+                            "status": (
+                                "ack_deadline_expired"
+                                if recoverable
+                                else "plan_unrecoverable"
+                            ),
+                        }
+                    ),
+                    str(now),
+                    int(delivery[0]),
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE connector_outbox
+            SET status = ?, next_attempt_at = ?, updated_at = ?,
+                private_state_json = ?
+            WHERE id = ? AND status = 'awaiting_ack'
+            """,
+            (
+                source_status,
+                str(now) if source_status == "queued" else None,
+                str(now),
+                _canonical_json(source_state),
+                int(outbox_id),
+            ),
+        )
+        _activate_waiting_presentation_plans_conn(
+            conn,
+            host_id=str(host_id),
+            name=str(connector),
+            now=str(now),
+        )
         reclaimed += 1
     return reclaimed
 
@@ -2215,6 +2434,30 @@ def _valid_final_stable_key(value: Any) -> bool:
         and len(value) == 69
         and all(char in "0123456789abcdef" for char in value[5:])
     )
+
+
+def _turn_ordering_key_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    turn_id: str,
+) -> str:
+    row = conn.execute(
+        "SELECT worker_id, payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    if row is None:
+        return ""
+    payload = _json_object(row[1])
+    meta = _json_object(payload.get("meta"))
+    stable_key = meta.get("stable_key")
+    if (
+        _valid_final_stable_key(stable_key)
+        and type(meta.get("stable_key_version")) is int
+        and meta.get("stable_key_version") == 1
+    ):
+        return str(stable_key)
+    return str(row[0] or "")
 
 
 def _final_content_field_descriptor(
@@ -2883,6 +3126,11 @@ def _ensure_final_ready_anchor_conn(
         else "queued"
     )
     payload_json = _canonical_json(payload)
+    ordering_key = _turn_ordering_key_conn(
+        conn,
+        host_id=str(host_id),
+        turn_id=str(turn_id),
+    )
     if existing is not None:
         existing_state = _json_object(existing[2])
         activated_after = (
@@ -2931,13 +3179,14 @@ def _ensure_final_ready_anchor_conn(
             delivery_kind,
             turn_id,
             content_revision,
+            ordering_key,
             status,
             payload_json,
             private_state_json,
             created_at,
             updated_at,
             next_attempt_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, NULL)
         ON CONFLICT(host_id, connector, delivery_key) DO NOTHING
         """,
         (
@@ -2947,6 +3196,7 @@ def _ensure_final_ready_anchor_conn(
             delivery_kind,
             str(turn_id),
             str(content_revision_value),
+            ordering_key,
             initial_status,
             payload_json,
             str(now),
@@ -3668,14 +3918,25 @@ def _materialize_connector_plan_job_conn(
 ) -> int:
     plan_identity = conn.execute(
         """
-        SELECT turn_id, content_revision
-        FROM turn_presentation_plans
-        WHERE id = ?
+        SELECT plans.turn_id, plans.content_revision, source.ordering_key
+        FROM turn_presentation_plans AS plans
+        LEFT JOIN connector_outbox AS source
+          ON source.id = plans.source_outbox_id
+        WHERE plans.id = ?
         """,
         (int(plan_id),),
     ).fetchone()
     if plan_identity is None:
         raise StoreSchemaError("presentation_plan_not_found")
+    ordering_key = (
+        str(plan_identity[2])
+        if plan_identity[2] is not None
+        else _turn_ordering_key_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(plan_identity[0]),
+        )
+    )
     cursor = conn.execute(
         """
         INSERT INTO connector_outbox (
@@ -3685,13 +3946,14 @@ def _materialize_connector_plan_job_conn(
             delivery_kind,
             turn_id,
             content_revision,
+            ordering_key,
             status,
             payload_json,
             private_state_json,
             created_at,
             updated_at,
             next_attempt_at
-        ) VALUES (?, ?, ?, 'final_part', ?, ?, 'queued', ?, '{}', ?, ?, NULL)
+        ) VALUES (?, ?, ?, 'final_part', ?, ?, ?, 'queued', ?, '{}', ?, ?, NULL)
         """,
         (
             str(host_id),
@@ -3699,6 +3961,7 @@ def _materialize_connector_plan_job_conn(
             str(delivery_key),
             str(plan_identity[0]),
             str(plan_identity[1]),
+            ordering_key,
             _canonical_json(dict(payload)),
             str(created_at),
             str(created_at),
@@ -4254,6 +4517,7 @@ def prepare_connector_plan_commit(
     name: str,
     plan_token: str,
     source_ref: str | None = None,
+    ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Atomically validate exact coverage and materialize one plan's ordered jobs."""
@@ -4278,6 +4542,10 @@ def prepare_connector_plan_commit(
             name=name,
         )
     current_time = _connector_now(now)
+    ack_deadline_at = _connector_add_seconds(
+        current_time,
+        max(1, int(ack_ttl_seconds)),
+    )
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
@@ -4626,11 +4894,18 @@ def prepare_connector_plan_commit(
                 ).fetchone()
                 if source_private is None:
                     raise StoreSchemaError("presentation_source_not_live")
+                source_delivery_private = conn.execute(
+                    "SELECT private_state_json FROM connector_deliveries WHERE id = ?",
+                    (int(source_delivery[0]),),
+                ).fetchone()
+                if source_delivery_private is None:
+                    raise StoreSchemaError("presentation_source_not_live")
                 delivery_cursor = conn.execute(
                     """
                     UPDATE connector_deliveries
                     SET status = 'awaiting_ack',
                         response_json = ?,
+                        private_state_json = ?,
                         delivered_at = NULL
                     WHERE id = ? AND outbox_id = ? AND status = 'leased'
                     """,
@@ -4641,6 +4916,12 @@ def prepare_connector_plan_commit(
                                 "status": "prepared",
                             }
                         ),
+                        _canonical_json(
+                            {
+                                **_json_object(source_delivery_private[0]),
+                                "ack_deadline_at": ack_deadline_at,
+                            }
+                        ),
                         int(source_delivery[0]),
                         source_outbox_id,
                     ),
@@ -4649,6 +4930,7 @@ def prepare_connector_plan_commit(
                     _connector_private_clear_current(source_private[0])
                 )
                 next_source_state["presentation_generation"] = int(plan[7])
+                next_source_state["ack_deadline_at"] = ack_deadline_at
                 next_source_state["presentation_max_part_count"] = max(
                     int(
                         next_source_state.get(
@@ -5294,10 +5576,13 @@ def poll_connector_outbox(
                               WHERE earlier_final.host_id = outbox.host_id
                                 AND earlier_final.connector = outbox.connector
                                 AND earlier_final.delivery_kind = 'final_ready'
+                                AND earlier_final.ordering_key = outbox.ordering_key
                                 AND earlier_final.id < outbox.id
                                 AND earlier_final.status NOT IN (
                                     'delivered',
-                                    'superseded'
+                                    'superseded',
+                                    'dead_letter',
+                                    'awaiting_ack'
                                 )
                           )
                           AND NOT EXISTS (
@@ -5317,6 +5602,52 @@ def poll_connector_outbox(
                                     OR active_outbox.status != 'delivered'
                                 )
                           )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM turn_presentation_plans AS earlier_plan
+                              JOIN connector_outbox AS earlier_source
+                                ON earlier_source.id = earlier_plan.source_outbox_id
+                              WHERE earlier_plan.host_id = outbox.host_id
+                                AND earlier_plan.name = outbox.connector
+                                AND earlier_plan.state IN (
+                                    'active',
+                                    'waiting_predecessor'
+                                )
+                                AND earlier_source.ordering_key = outbox.ordering_key
+                                AND earlier_source.id < outbox.id
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM turn_presentation_jobs AS earlier_job
+                                    LEFT JOIN connector_outbox AS earlier_job_outbox
+                                      ON earlier_job_outbox.id = earlier_job.outbox_id
+                                    WHERE earlier_job.plan_id = earlier_plan.id
+                                      AND (
+                                          earlier_job_outbox.id IS NULL
+                                          OR earlier_job_outbox.status NOT IN (
+                                              'delivered',
+                                              'superseded',
+                                              'dead_letter'
+                                          )
+                                      )
+                                )
+                          )
+                      )
+                  )
+                  AND (
+                      outbox.delivery_kind != 'final_part'
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM connector_outbox AS earlier_part
+                          WHERE earlier_part.host_id = outbox.host_id
+                            AND earlier_part.connector = outbox.connector
+                            AND earlier_part.delivery_kind = 'final_part'
+                            AND earlier_part.ordering_key = outbox.ordering_key
+                            AND earlier_part.id < outbox.id
+                            AND earlier_part.status NOT IN (
+                                'delivered',
+                                'superseded',
+                                'dead_letter'
+                            )
                       )
                   )
                   AND (
@@ -5543,6 +5874,188 @@ def _connector_validate_live_ref_conn(
             return row, "expired_ref"
         return row, None
     return None, "invalid_ref"
+
+
+def renew_connector_delivery(
+    db_path: Path,
+    *,
+    host_id: str,
+    name: str,
+    ref: str,
+    lease_seconds: int,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Extend one live connector lease without creating another attempt."""
+    if not _sqlite_store_exists(db_path):
+        return _connector_error_response(
+            status="store_unavailable", host_id=host_id, name=name, ref=ref
+        )
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _connector_reclaim_expired_leases_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                now=current_time,
+            )
+            row, error = _connector_validate_live_ref_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                ref=str(ref),
+                now=current_time,
+            )
+            if error is not None or row is None:
+                conn.rollback()
+                return _connector_error_response(
+                    status=error or "invalid_ref",
+                    host_id=host_id,
+                    name=name,
+                    ref=ref,
+                )
+            delivery_state = _json_object(row[7])
+            outbox_state = _json_object(row[9])
+            current_expiry = str(delivery_state.get("lease_expires_at") or current_time)
+            requested_expiry = _connector_datetime(
+                _connector_add_seconds(current_time, max(1, int(lease_seconds)))
+            )
+            leased_until = _connector_iso(
+                max(
+                    _connector_datetime(current_expiry),
+                    requested_expiry,
+                )
+            )
+            delivery_state["lease_expires_at"] = leased_until
+            outbox_state["lease_expires_at"] = leased_until
+            conn.execute(
+                "UPDATE connector_deliveries SET private_state_json = ? WHERE id = ?",
+                (_canonical_json(delivery_state), int(row[0])),
+            )
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET private_state_json = ?, updated_at = ?
+                WHERE id = ? AND status = 'leased'
+                """,
+                (_canonical_json(outbox_state), current_time, int(row[1])),
+            )
+            conn.commit()
+            return _connector_response(
+                ok=True,
+                status="renewed",
+                host_id=host_id,
+                name=name,
+                ref=ref,
+                key=str(row[4]),
+                attempt=int(row[5] or 0),
+                leased_until=leased_until,
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def release_connector_delivery(
+    db_path: Path,
+    *,
+    host_id: str,
+    name: str,
+    ref: str,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Release one live lease and make its outbox row immediately available."""
+    if not _sqlite_store_exists(db_path):
+        return _connector_error_response(
+            status="store_unavailable", host_id=host_id, name=name, ref=ref
+        )
+    current_time = _connector_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _connector_reclaim_expired_leases_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                now=current_time,
+            )
+            row, error = _connector_validate_live_ref_conn(
+                conn,
+                host_id=str(host_id),
+                name=str(name),
+                ref=str(ref),
+                now=current_time,
+            )
+            if error is not None or row is None:
+                conn.rollback()
+                return _connector_error_response(
+                    status=error or "invalid_ref",
+                    host_id=host_id,
+                    name=name,
+                    ref=ref,
+                )
+            terminal_after_lease = bool(
+                _json_object(row[9]).get("terminal_after_lease")
+            )
+            next_status = (
+                _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
+                if terminal_after_lease
+                else "queued"
+            )
+            result_status = "superseded" if terminal_after_lease else "released"
+            conn.execute(
+                """
+                UPDATE connector_deliveries
+                SET status = ?, response_json = ?, delivered_at = ?
+                WHERE id = ? AND status = 'leased'
+                """,
+                (
+                    result_status,
+                    _canonical_json(
+                        {"schema_version": 1, "status": result_status}
+                    ),
+                    current_time,
+                    int(row[0]),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE connector_outbox
+                SET status = ?, next_attempt_at = ?, updated_at = ?,
+                    private_state_json = ?
+                WHERE id = ? AND status = 'leased'
+                """,
+                (
+                    next_status,
+                    None if terminal_after_lease else current_time,
+                    current_time,
+                    _connector_private_clear_current(row[9]),
+                    int(row[1]),
+                ),
+            )
+            _update_presentation_plan_after_outbox_conn(
+                conn,
+                outbox_id=int(row[1]),
+                outbox_status=next_status,
+                now=current_time,
+            )
+            conn.commit()
+            return _connector_response(
+                ok=True,
+                status=result_status,
+                host_id=host_id,
+                name=name,
+                ref=ref,
+                key=str(row[4]),
+                attempt=int(row[5] or 0),
+                available_at=None if terminal_after_lease else current_time,
+            )
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _connector_update_ref(
@@ -10972,6 +11485,116 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         _increment_turn_list_generation_conn(conn, host_id)
 
 
+def _legacy_outbox_ordering_key(
+    *,
+    outbox_payload: Mapping[str, Any],
+    worker_id: Any,
+    turn_payload: Mapping[str, Any],
+) -> str:
+    meta = _json_object(turn_payload.get("meta"))
+    stable_key = meta.get("stable_key")
+    if (
+        _valid_final_stable_key(stable_key)
+        and type(meta.get("stable_key_version")) is int
+        and meta.get("stable_key_version") == 1
+    ):
+        return str(stable_key)
+    nested_turn = outbox_payload.get("turn")
+    route = dict(nested_turn) if isinstance(nested_turn, Mapping) else outbox_payload
+    route_stable_key = route.get("stable_key")
+    if (
+        _valid_final_stable_key(route_stable_key)
+        and type(route.get("stable_key_version")) is int
+        and route.get("stable_key_version") == 1
+    ):
+        return str(route_stable_key)
+    return str(worker_id or route.get("worker_id") or "")
+
+
+def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
+    """Partition final FIFO order and bound legacy awaiting-ack plans."""
+    columns = _table_columns(conn, "connector_outbox")
+    if not columns:
+        conn.execute(CREATE_CONNECTOR_OUTBOX_TABLE)
+    elif "ordering_key" not in columns:
+        conn.execute(
+            "ALTER TABLE connector_outbox "
+            "ADD COLUMN ordering_key TEXT NOT NULL DEFAULT ''"
+        )
+    if _table_columns(conn, "turns"):
+        rows = conn.execute(
+            """
+            SELECT outbox.id, outbox.payload_json, turns.worker_id, turns.payload_json
+            FROM connector_outbox AS outbox
+            LEFT JOIN turns
+              ON turns.host_id = outbox.host_id
+             AND turns.turn_id = outbox.turn_id
+            WHERE outbox.turn_id IS NOT NULL
+              AND outbox.turn_id != ''
+              AND outbox.ordering_key = ''
+            ORDER BY outbox.id
+            """
+        ).fetchall()
+    else:
+        rows = [
+            (row[0], row[1], None, None)
+            for row in conn.execute(
+                """
+                SELECT id, payload_json
+                FROM connector_outbox
+                WHERE turn_id IS NOT NULL AND turn_id != '' AND ordering_key = ''
+                ORDER BY id
+                """
+            ).fetchall()
+        ]
+    for outbox_id, outbox_payload, worker_id, turn_payload in rows:
+        conn.execute(
+            "UPDATE connector_outbox SET ordering_key = ? WHERE id = ?",
+            (
+                _legacy_outbox_ordering_key(
+                    outbox_payload=_json_object(outbox_payload),
+                    worker_id=worker_id,
+                    turn_payload=_json_object(turn_payload),
+                ),
+                int(outbox_id),
+            ),
+        )
+    deadline = _connector_add_seconds(
+        utc_timestamp(),
+        _configured_connector_ack_ttl_seconds(),
+    )
+    awaiting_rows = conn.execute(
+        "SELECT id, private_state_json FROM connector_outbox WHERE status = 'awaiting_ack'"
+    ).fetchall()
+    for outbox_id, private_state_json in awaiting_rows:
+        state = _json_object(private_state_json)
+        state["ack_deadline_at"] = deadline
+        conn.execute(
+            "UPDATE connector_outbox SET private_state_json = ? WHERE id = ?",
+            (_canonical_json(state), int(outbox_id)),
+        )
+        delivery_rows = (
+            conn.execute(
+                """
+                SELECT id, private_state_json
+                FROM connector_deliveries
+                WHERE outbox_id = ? AND status = 'awaiting_ack'
+                """,
+                (int(outbox_id),),
+            ).fetchall()
+            if _table_columns(conn, "connector_deliveries")
+            else []
+        )
+        for delivery_id, delivery_private in delivery_rows:
+            delivery_state = _json_object(delivery_private)
+            delivery_state["ack_deadline_at"] = deadline
+            conn.execute(
+                "UPDATE connector_deliveries SET private_state_json = ? WHERE id = ?",
+                (_canonical_json(delivery_state), int(delivery_id)),
+            )
+    conn.execute(CREATE_CONNECTOR_ORDERING_INDEX)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -10988,6 +11611,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(12, 13, _migrate_v12_to_v13_conn),
     Migration(13, 14, _migrate_v13_to_v14_conn),
     Migration(14, 15, _migrate_v14_to_v15_conn),
+    Migration(15, 16, _migrate_v15_to_v16_conn),
 )
 
 
@@ -11053,6 +11677,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
         for statement in CREATE_FINAL_DELIVERY_INDEXES:
             conn.execute(statement)
+        conn.execute(CREATE_CONNECTOR_ORDERING_INDEX)
         for statement in CREATE_SNAPSHOT_INDEXES:
             conn.execute(statement)
         conn.execute(INSERT_STORE_MAINTENANCE_STATE)

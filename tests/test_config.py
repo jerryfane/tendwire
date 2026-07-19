@@ -34,6 +34,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
         "TENDWIRE_MAX_WORKERS",
         "TENDWIRE_MAX_OUTBOX_ATTEMPTS",
         "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
+        "TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS",
+        "TENDWIRE_CONNECTOR_ACK_TTL_SECONDS",
         "TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS",
         "TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS",
         "TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT",
@@ -49,6 +51,8 @@ def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:
     assert config.max_workers == 512
     assert config.max_outbox_attempts == 10
     assert config.connector_claim_ttl_seconds == 60
+    assert config.connector_max_claim_ttl_seconds == 300
+    assert config.connector_ack_ttl_seconds == 300
     assert config.command_retry_horizon_seconds == 604_800
     assert config.command_receipt_retention_seconds == 2_592_000
     assert config.command_receipt_retention_count == 4096
@@ -62,6 +66,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     monkeypatch.setenv("TENDWIRE_MAX_WORKERS", "64")
     monkeypatch.setenv("TENDWIRE_MAX_OUTBOX_ATTEMPTS", "3")
     monkeypatch.setenv("TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS", "45")
+    monkeypatch.setenv("TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS", "240")
+    monkeypatch.setenv("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS", "180")
     monkeypatch.setenv("TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS", "120")
     monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS", "691200")
     monkeypatch.setenv("TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT", "99")
@@ -75,6 +81,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         max_workers="9",
         max_outbox_attempts="4",
         connector_claim_ttl_seconds="15",
+        connector_max_claim_ttl_seconds="120",
+        connector_ack_ttl_seconds="90",
         command_retry_horizon_seconds="60",
         command_receipt_retention_seconds="691200",
         command_receipt_retention_count="12",
@@ -86,6 +94,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert env_config.max_workers == 64
     assert env_config.max_outbox_attempts == 3
     assert env_config.connector_claim_ttl_seconds == 45
+    assert env_config.connector_max_claim_ttl_seconds == 240
+    assert env_config.connector_ack_ttl_seconds == 180
     assert env_config.command_retry_horizon_seconds == 120
     assert env_config.command_receipt_retention_seconds == 691_200
     assert env_config.command_receipt_retention_count == 99
@@ -96,6 +106,8 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
     assert explicit.max_workers == 9
     assert explicit.max_outbox_attempts == 4
     assert explicit.connector_claim_ttl_seconds == 15
+    assert explicit.connector_max_claim_ttl_seconds == 120
+    assert explicit.connector_ack_ttl_seconds == 90
     assert explicit.command_retry_horizon_seconds == 60
     assert explicit.command_receipt_retention_seconds == 691_200
     assert explicit.command_receipt_retention_count == 12
@@ -111,6 +123,12 @@ def test_pr16_runtime_knobs_accept_constructor_and_env(monkeypatch) -> None:
         ("max_workers", 0, "max_workers must be >= 1"),
         ("max_outbox_attempts", 0, "max_outbox_attempts must be >= 1"),
         ("connector_claim_ttl_seconds", 0, "connector_claim_ttl_seconds must be >= 1"),
+        (
+            "connector_max_claim_ttl_seconds",
+            0,
+            "connector_max_claim_ttl_seconds must be >= 1",
+        ),
+        ("connector_ack_ttl_seconds", 0, "connector_ack_ttl_seconds must be >= 1"),
     ],
 )
 def test_pr16_runtime_knobs_reject_invalid_values(field: str, value: object, message: str) -> None:

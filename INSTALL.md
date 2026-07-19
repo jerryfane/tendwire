@@ -631,10 +631,11 @@ following together:
 - `turn.list` schema v2 with descriptor schema v1, 1,000-character previews and
   insertion-stable paging; schema-v1 `turn.content.get` with a 49,152-byte
   UTF-8 page ceiling;
-- range-only schema-v1 `connector.prepare` begin/part/commit/recover, root-wide
-  leases, independent part ACKs, and immutable schema-v2 source-less route
-  lineage. Cleanup retains bounded delivered tombstones so repeated snapshots
-  cannot recreate/repost removed acknowledged roots; and
+- range-only schema-v1 `connector.prepare` begin/part/commit/recover, per-worker
+  ordered roots and parts, bounded renewable/releasable leases, deadline-based
+  awaiting-ACK recovery, independent part ACKs, and immutable schema-v2
+  source-less route lineage. Cleanup retains bounded delivered tombstones so
+  repeated snapshots cannot recreate/repost removed acknowledged roots; and
 - fair dead-letter inspection, exact root/failed-plan retry including
   source-less recovery, retained ACK prefix, cumulative attempts, request-ID
   idempotency, immutable recovery audit, and no provider-perfect exactly-once

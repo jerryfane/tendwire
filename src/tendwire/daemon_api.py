@@ -152,6 +152,8 @@ REQUIRED_METHODS = frozenset(
         "connector.ack",
         "connector.fail",
         "connector.defer",
+        "connector.renew",
+        "connector.release",
         "connector.reclaim",
         "connector.retry",
         "connector.inspect",
@@ -935,6 +937,8 @@ class UnixSocketJSONServer:
         request_workers: int = 8,
         max_in_flight_requests: int = 32,
         shutdown_grace_seconds: float = 6.0,
+        periodic_callback: Callable[[], Any] | None = None,
+        periodic_interval_seconds: float = 1.0,
     ) -> None:
         if (
             not isinstance(request_workers, int)
@@ -969,6 +973,12 @@ class UnixSocketJSONServer:
         self.request_workers = request_workers
         self.max_in_flight_requests = max_in_flight_requests
         self.shutdown_grace_seconds = float(shutdown_grace_seconds)
+        self.periodic_callback = periodic_callback
+        self.periodic_interval_seconds = max(
+            self.accept_timeout_seconds,
+            float(periodic_interval_seconds),
+        )
+        self._next_periodic_at = time.monotonic() + self.periodic_interval_seconds
         self._listener: socket.socket | None = None
         self._identity: EntryIdentity | None = None
         self._pin_fd: int | None = None
@@ -1142,6 +1152,7 @@ class UnixSocketJSONServer:
         self.start()
         try:
             while not self.stop_event.is_set():
+                self._run_periodic_callback_if_due()
                 listener = self._listener
                 if listener is None:
                     break
@@ -1158,6 +1169,17 @@ class UnixSocketJSONServer:
                 self._submit_connection(conn)
         finally:
             self.close()
+
+    def _run_periodic_callback_if_due(self) -> None:
+        callback = self.periodic_callback
+        if callback is None or time.monotonic() < self._next_periodic_at:
+            return
+        self._next_periodic_at = time.monotonic() + self.periodic_interval_seconds
+        try:
+            callback()
+        except Exception:
+            # Periodic maintenance is best-effort and must not stop the API loop.
+            return
 
     def _submit_connection(self, conn: socket.socket) -> None:
         if not self._admission.acquire(blocking=False):

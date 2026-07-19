@@ -22,6 +22,8 @@ from ..store.sqlite import (
     prepare_connector_plan_recover,
     prepare_connector_plan_part,
     reclaim_expired_connector_leases,
+    release_connector_delivery,
+    renew_connector_delivery,
     retry_final_ready_delivery,
 )
 
@@ -198,7 +200,7 @@ def _request_id(value: Any) -> str:
 
 
 class ConnectorOutboxAPI:
-    """Public-neutral facade for connector.poll/ack/fail/defer."""
+    """Public-neutral facade for connector delivery and lease operations."""
 
     def __init__(
         self,
@@ -206,11 +208,15 @@ class ConnectorOutboxAPI:
         host_id: str,
         *,
         default_lease_seconds: int = 60,
+        max_lease_seconds: int = 300,
+        ack_ttl_seconds: int = 300,
         max_attempts: int = 10,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else None
         self.host_id = str(host_id)
         self.default_lease_seconds = max(1, int(default_lease_seconds))
+        self.max_lease_seconds = max(1, int(max_lease_seconds))
+        self.ack_ttl_seconds = max(1, int(ack_ttl_seconds))
         self.max_attempts = max(1, int(max_attempts))
 
     def _require_store(self, name: str = "") -> dict[str, Any] | None:
@@ -327,6 +333,7 @@ class ConnectorOutboxAPI:
                 name=name,
                 plan_token=token,
                 source_ref=source_ref,
+                ack_ttl_seconds=self.ack_ttl_seconds,
             )
 
         if set(data) != {
@@ -405,7 +412,11 @@ class ConnectorOutboxAPI:
                 data.get("lease_seconds"),
                 self.default_lease_seconds,
                 minimum=1,
-                maximum=86400,
+                maximum=(
+                    self.max_lease_seconds
+                    if name == _PREPARE_NAME
+                    else 86400
+                ),
             ),
             max_attempts=self.max_attempts,
         )
@@ -486,6 +497,51 @@ class ConnectorOutboxAPI:
 
     def defer(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return self._schedule("defer", params)
+
+    def renew(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        data, name, live_ref = self._mutation_parts(params)
+        if not name:
+            return _error("invalid_params", host_id=self.host_id)
+        if live_ref is None:
+            return _error("invalid_ref", host_id=self.host_id, name=name)
+        unavailable = self._require_store(name)
+        if unavailable is not None:
+            return unavailable
+        assert self.db_path is not None
+        lease_seconds = _int(
+            data.get("lease_seconds"),
+            self.default_lease_seconds,
+            minimum=1,
+            maximum=(
+                self.max_lease_seconds
+                if name == _PREPARE_NAME
+                else 86400
+            ),
+        )
+        return renew_connector_delivery(
+            self.db_path,
+            host_id=self.host_id,
+            name=name,
+            ref=live_ref,
+            lease_seconds=lease_seconds,
+        )
+
+    def release(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        _data, name, live_ref = self._mutation_parts(params)
+        if not name:
+            return _error("invalid_params", host_id=self.host_id)
+        if live_ref is None:
+            return _error("invalid_ref", host_id=self.host_id, name=name)
+        unavailable = self._require_store(name)
+        if unavailable is not None:
+            return unavailable
+        assert self.db_path is not None
+        return release_connector_delivery(
+            self.db_path,
+            host_id=self.host_id,
+            name=name,
+            ref=live_ref,
+        )
 
     def _schedule(self, action: str, params: Mapping[str, Any] | None) -> dict[str, Any]:
         data, name, live_ref = self._mutation_parts(params)
@@ -600,6 +656,10 @@ class ConnectorOutboxAPI:
             return self.fail(params)
         if method == "connector.defer":
             return self.defer(params)
+        if method == "connector.renew":
+            return self.renew(params)
+        if method == "connector.release":
+            return self.release(params)
         if method == "connector.reclaim":
             return self.reclaim(params)
         if method == "connector.inspect":
