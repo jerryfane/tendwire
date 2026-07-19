@@ -81,6 +81,14 @@ from ..core.turns import (
     Turn,
     TURN_CONTENT_PAGE_MAX_UTF8_BYTES,
     TURN_CONTENT_PREVIEW_MAX_CHARS,
+    TURN_DELTA_BOOTSTRAP_MAX_PAGES,
+    TURN_DELTA_BOOTSTRAP_MAX_ROWS,
+    TURN_DELTA_CURSOR_TTL_SECONDS,
+    TURN_DELTA_DEFAULT_LIMIT,
+    TURN_DELTA_MAX_BATCH_SEQUENCES,
+    TURN_DELTA_MAX_LIMIT,
+    TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+    TURN_DELTA_SCHEMA_VERSION,
     TURN_LIST_CURSOR_TTL_SECONDS,
     TURN_LIST_DEFAULT_LIMIT,
     TURN_LIST_MAX_LIMIT,
@@ -93,6 +101,8 @@ from ..core.turns import (
     content_revision,
     content_segment_id,
     decode_content_cursor,
+    decode_turn_delta_cursor,
+    decode_turn_delta_watermark,
     decode_turn_list_cursor,
     decode_turn_since_token,
     is_internal_automation_turn_payload,
@@ -103,6 +113,8 @@ from ..core.turns import (
     recompute_pending_content_fingerprint,
     segment_canonical_text,
     turn_final_delivery_identity,
+    turn_delta_cursor,
+    turn_delta_watermark,
     turn_list_cursor,
     turn_since_token,
     turn_source_id_candidates,
@@ -112,10 +124,13 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 17
+STORE_SCHEMA_VERSION = 18
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
+TURN_CHANGE_RETENTION_DAYS = 7
+TURN_CHANGE_RETENTION_COUNT = 100_000
+TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
@@ -345,6 +360,30 @@ class TurnContentWorkCounters:
             "page_blob_reads": self.page_blob_reads,
             "page_bytes_examined": self.page_bytes_examined,
             "page_chars_examined": self.page_chars_examined,
+            "max_response_utf8_bytes": self.max_response_utf8_bytes,
+        }
+
+
+@dataclass
+class TurnDeltaWorkCounters:
+    """Bounded aggregate work observed by turn.delta; never carries identities."""
+
+    journal_queries: int = 0
+    journal_rows_scanned: int = 0
+    projection_queries: int = 0
+    projection_rows_read: int = 0
+    list_pages_read: int = 0
+    content_pages_read: int = 0
+    max_response_utf8_bytes: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "journal_queries": self.journal_queries,
+            "journal_rows_scanned": self.journal_rows_scanned,
+            "projection_queries": self.projection_queries,
+            "projection_rows_read": self.projection_rows_read,
+            "list_pages_read": self.list_pages_read,
+            "content_pages_read": self.content_pages_read,
             "max_response_utf8_bytes": self.max_response_utf8_bytes,
         }
 
@@ -654,6 +693,135 @@ CREATE_TURN_LIST_SEQUENCE_TRIGGERS = (
     WHEN NEW.list_sequence <= 0
     BEGIN
         SELECT RAISE(ABORT, 'invalid turn list sequence');
+    END
+    """,
+)
+
+CREATE_TURN_CHANGE_JOURNAL_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_change_journal (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('upsert', 'remove')),
+    changed_at TEXT NOT NULL
+);
+"""
+
+CREATE_TURN_CHANGE_FLOOR_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_change_floor (
+    host_id TEXT PRIMARY KEY,
+    floor_seq INTEGER NOT NULL CHECK (floor_seq >= 0)
+);
+"""
+
+CREATE_TURN_CHANGE_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_change_state (
+    scope TEXT PRIMARY KEY CHECK (scope = 'turn-delta'),
+    store_epoch TEXT NOT NULL
+);
+"""
+
+CREATE_TURN_CHANGE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_turn_change_journal_host_seq "
+    "ON turn_change_journal(host_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_turn_change_journal_host_turn_seq "
+    "ON turn_change_journal(host_id, turn_id, seq DESC)",
+)
+
+CREATE_TURN_CHANGE_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_after_insert
+    AFTER INSERT ON turns
+    BEGIN
+        INSERT INTO turn_change_journal(host_id, turn_id, op, changed_at)
+        VALUES (
+            NEW.host_id,
+            NEW.turn_id,
+            CASE WHEN COALESCE(
+                json_extract(NEW.payload_json, '$.superseded_at'), ''
+            ) = '' THEN 'upsert' ELSE 'remove' END,
+            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_after_update
+    AFTER UPDATE ON turns
+    WHEN OLD.worker_id IS NOT NEW.worker_id
+      OR OLD.worker_fingerprint IS NOT NEW.worker_fingerprint
+      OR OLD.space_id IS NOT NEW.space_id
+      OR OLD.status IS NOT NEW.status
+      OR OLD.kind IS NOT NEW.kind
+      OR OLD.updated_at IS NOT NEW.updated_at
+      OR OLD.fingerprint IS NOT NEW.fingerprint
+      OR OLD.payload_json IS NOT NEW.payload_json
+    BEGIN
+        INSERT INTO turn_change_journal(host_id, turn_id, op, changed_at)
+        VALUES (
+            NEW.host_id,
+            NEW.turn_id,
+            CASE WHEN COALESCE(
+                json_extract(NEW.payload_json, '$.superseded_at'), ''
+            ) = '' THEN 'upsert' ELSE 'remove' END,
+            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_after_delete
+    AFTER DELETE ON turns
+    WHEN COALESCE(json_extract(OLD.payload_json, '$.superseded_at'), '') = ''
+    BEGIN
+        INSERT INTO turn_change_journal(host_id, turn_id, op, changed_at)
+        VALUES (
+            OLD.host_id,
+            OLD.turn_id,
+            'remove',
+            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_revision_current
+    AFTER UPDATE OF is_current ON turn_content_revisions
+    WHEN NEW.is_current = 1
+    BEGIN
+        INSERT INTO turn_change_journal(host_id, turn_id, op, changed_at)
+        SELECT
+            NEW.host_id,
+            NEW.turn_id,
+            CASE WHEN COALESCE(
+                json_extract(turns.payload_json, '$.superseded_at'), ''
+            ) = '' THEN 'upsert' ELSE 'remove' END,
+            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+        FROM turns
+        WHERE turns.host_id = NEW.host_id
+          AND turns.turn_id = NEW.turn_id;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_revision_insert_current
+    AFTER INSERT ON turn_content_revisions
+    WHEN NEW.is_current = 1
+    BEGIN
+        INSERT INTO turn_change_journal(host_id, turn_id, op, changed_at)
+        SELECT
+            NEW.host_id,
+            NEW.turn_id,
+            CASE WHEN COALESCE(
+                json_extract(turns.payload_json, '$.superseded_at'), ''
+            ) = '' THEN 'upsert' ELSE 'remove' END,
+            strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+        FROM turns
+        WHERE turns.host_id = NEW.host_id
+          AND turns.turn_id = NEW.turn_id;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_turn_change_journal_no_update
+    BEFORE UPDATE ON turn_change_journal
+    BEGIN
+        SELECT RAISE(ABORT, 'turn change journal rows are immutable');
     END
     """,
 )
@@ -10553,6 +10721,39 @@ def _turn_list_store_epoch_conn(conn: sqlite3.Connection) -> str:
     return str(row[0])
 
 
+def _ensure_turn_change_state_conn(conn: sqlite3.Connection) -> str:
+    conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
+    ).fetchone()
+    if row is not None and str(row[0]):
+        return str(row[0])
+    epoch = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO turn_change_state(scope, store_epoch)
+        VALUES ('turn-delta', ?)
+        ON CONFLICT(scope) DO NOTHING
+        """,
+        (epoch,),
+    )
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_change_state_unavailable")
+    return str(row[0])
+
+
+def _turn_change_store_epoch_conn(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT store_epoch FROM turn_change_state WHERE scope = 'turn-delta'"
+    ).fetchone()
+    if row is None or not str(row[0]):
+        raise StoreSchemaError("turn_change_state_unavailable")
+    return str(row[0])
+
+
 def _ensure_turn_list_host_states_conn(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
     conn.execute(
@@ -11898,6 +12099,29 @@ def _migrate_v16_to_v17_conn(conn: sqlite3.Connection) -> None:
         )
 
 
+def _create_available_turn_change_triggers_conn(conn: sqlite3.Connection) -> None:
+    """Install capture triggers whose legacy source tables are present."""
+    has_turns = bool(_table_columns(conn, "turns"))
+    has_revisions = bool(_table_columns(conn, "turn_content_revisions"))
+    for index, statement in enumerate(CREATE_TURN_CHANGE_TRIGGERS):
+        if index < 3 and not has_turns:
+            continue
+        if index in {3, 4} and not (has_turns and has_revisions):
+            continue
+        conn.execute(statement)
+
+
+def _migrate_v17_to_v18_conn(conn: sqlite3.Connection) -> None:
+    """Install the empty, trigger-backed public turn change journal."""
+    conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
+    conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
+    conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
+    for statement in CREATE_TURN_CHANGE_INDEXES:
+        conn.execute(statement)
+    _ensure_turn_change_state_conn(conn)
+    _create_available_turn_change_triggers_conn(conn)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -11916,6 +12140,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(14, 15, _migrate_v14_to_v15_conn),
     Migration(15, 16, _migrate_v15_to_v16_conn),
     Migration(16, 17, _migrate_v16_to_v17_conn),
+    Migration(17, 18, _migrate_v17_to_v18_conn),
 )
 
 
@@ -11962,6 +12187,9 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_STORE_MAINTENANCE_CURSORS_TABLE)
         conn.execute(CREATE_TURN_LIST_STATE_TABLE)
         conn.execute(CREATE_TURN_LIST_HOSTS_TABLE)
+        conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
+        conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
+        conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
         for statement in CREATE_WORKER_BINDING_INDEXES:
@@ -11972,6 +12200,10 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_LIST_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_LIST_SEQUENCE_TRIGGERS:
+            conn.execute(statement)
+        for statement in CREATE_TURN_CHANGE_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_CHANGE_TRIGGERS:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)
@@ -11986,6 +12218,7 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
             conn.execute(statement)
         conn.execute(INSERT_STORE_MAINTENANCE_STATE)
         _ensure_turn_list_state_conn(conn)
+        _ensure_turn_change_state_conn(conn)
         conn.execute(f"PRAGMA user_version = {STORE_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
@@ -16254,6 +16487,88 @@ def cleanup_turn_content_retention(
     })
 
 
+def compact_turn_change_journal(
+    db_path: Path | str,
+    host_id: str,
+    *,
+    retention_days: int = TURN_CHANGE_RETENTION_DAYS,
+    retention_count: int = TURN_CHANGE_RETENTION_COUNT,
+    batch_size: int = TURN_CHANGE_COMPACTION_BATCH_SIZE,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Delete one bounded host batch older than both retention guarantees."""
+    days = max(1, int(retention_days))
+    count = max(1, int(retention_count))
+    bounded_batch = min(10_000, max(1, int(batch_size)))
+    current = _connector_datetime(now or utc_timestamp())
+    cutoff_at = (current - timedelta(days=days)).isoformat()
+    if not _sqlite_store_exists(db_path):
+        return {
+            "schema_version": 1, "ok": False, "status": "store_unavailable",
+            "host_id": str(host_id), "examined": 0, "deleted": 0,
+        }
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            boundary = conn.execute(
+                """
+                SELECT seq FROM turn_change_journal
+                WHERE host_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?
+                """,
+                (str(host_id), count - 1),
+            ).fetchone()
+            candidates = [] if boundary is None else conn.execute(
+                """
+                SELECT seq FROM turn_change_journal
+                WHERE host_id = ? AND seq < ?
+                  AND julianday(changed_at) IS NOT NULL
+                  AND julianday(changed_at) < julianday(?)
+                ORDER BY seq ASC LIMIT ?
+                """,
+                (str(host_id), int(boundary[0]), cutoff_at, bounded_batch),
+            ).fetchall()
+            sequences = [int(row[0]) for row in candidates]
+            if sequences:
+                placeholders = ",".join("?" for _ in sequences)
+                conn.execute(
+                    f"DELETE FROM turn_change_journal WHERE host_id = ? AND seq IN ({placeholders})",
+                    (str(host_id), *sequences),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO turn_change_floor(host_id, floor_seq) VALUES (?, ?)
+                    ON CONFLICT(host_id) DO UPDATE SET
+                        floor_seq = MAX(turn_change_floor.floor_seq, excluded.floor_seq)
+                    """,
+                    (str(host_id), max(sequences)),
+                )
+            remaining = bool(boundary is not None and conn.execute(
+                """
+                SELECT 1 FROM turn_change_journal
+                WHERE host_id = ? AND seq < ?
+                  AND julianday(changed_at) IS NOT NULL
+                  AND julianday(changed_at) < julianday(?) LIMIT 1
+                """,
+                (str(host_id), int(boundary[0]), cutoff_at),
+            ).fetchone())
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {
+        "schema_version": 1, "ok": True, "status": "ok",
+        "host_id": str(host_id), "dry_run": bool(dry_run),
+        "retention_days": days, "retention_count": count,
+        "batch_size": bounded_batch, "examined": len(sequences),
+        "deleted": len(sequences), "remaining_candidates": remaining,
+    }
+
+
 def run_store_maintenance(
     db_path: Path,
     host_id: str,
@@ -16272,6 +16587,9 @@ def run_store_maintenance(
     snapshot_retention_days: int = 14,
     snapshot_retention_count: int = 4096,
     snapshot_batch_size: int = 100,
+    turn_change_retention_days: int = TURN_CHANGE_RETENTION_DAYS,
+    turn_change_retention_count: int = TURN_CHANGE_RETENTION_COUNT,
+    turn_change_batch_size: int = TURN_CHANGE_COMPACTION_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Run one bounded batch for every online store-maintenance class."""
     retention = cleanup_event_retention(
@@ -16332,6 +16650,15 @@ def run_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=content_batch_size,
     )
+    turn_changes = compact_turn_change_journal(
+        db_path,
+        host_id,
+        retention_days=turn_change_retention_days,
+        retention_count=turn_change_retention_count,
+        batch_size=turn_change_batch_size,
+        now=now,
+        dry_run=dry_run,
+    )
     ok = (
         bool(retention.get("ok"))
         and bool(snapshots.get("ok"))
@@ -16339,6 +16666,7 @@ def run_store_maintenance(
         and bool(final_retention.get("ok"))
         and bool(turn_content.get("ok"))
         and bool(command_requests.get("ok"))
+        and bool(turn_changes.get("ok"))
     )
     return sanitize_public_value({
         "schema_version": 1,
@@ -16415,6 +16743,15 @@ def run_store_maintenance(
             ),
         },
         "command_requests": command_requests,
+        "turn_changes": {
+            "dry_run": bool(turn_changes.get("dry_run")),
+            "retention_days": int(turn_changes.get("retention_days") or turn_change_retention_days),
+            "retention_count": int(turn_changes.get("retention_count") or turn_change_retention_count),
+            "batch_size": int(turn_changes.get("batch_size") or turn_change_batch_size),
+            "examined": int(turn_changes.get("examined") or 0),
+            "deleted": int(turn_changes.get("deleted") or 0),
+            "remaining_candidates": bool(turn_changes.get("remaining_candidates")),
+        },
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),
             "retention_days": int(
@@ -19431,16 +19768,16 @@ def _replace_current_turn_content_conn(
             user_state=user_state,
             final_state=final_state,
             created_at=current_time,
+            is_current=False,
         )
-    else:
-        conn.execute(
-            """
-            UPDATE turn_content_revisions
-            SET is_current = 1, superseded_at = NULL
-            WHERE host_id = ? AND turn_id = ? AND content_revision = ?
-            """,
-            (str(host_id), str(turn_id), revision),
-        )
+    conn.execute(
+        """
+        UPDATE turn_content_revisions
+        SET is_current = 1, superseded_at = NULL
+        WHERE host_id = ? AND turn_id = ? AND content_revision = ?
+        """,
+        (str(host_id), str(turn_id), revision),
+    )
     return True
 
 
@@ -21018,6 +21355,461 @@ def delete_command_pending_turn_claim_effect(
         )
 
     return effect
+
+
+_TURN_DELTA_PROJECTION_SELECT = """
+    turns.payload_json, turns.observed_at, turns.turn_id, turns.worker_id,
+    turns.list_sequence, revisions.content_revision, revisions.user_state,
+    revisions.user_char_length, revisions.user_byte_length,
+    CASE WHEN revisions.user_state = 'complete' THEN revisions.user_page_count ELSE 0 END,
+    CASE WHEN revisions.user_state = 'complete'
+              AND revisions.user_char_length BETWEEN 1 AND :text_max
+         THEN revisions.user_text END,
+    CASE WHEN revisions.user_state != 'absent'
+              AND NOT (revisions.user_state = 'complete'
+                       AND revisions.user_char_length BETWEEN 1 AND :text_max)
+         THEN substr(revisions.user_text, 1, :preview_max) END,
+    revisions.final_state, revisions.final_char_length, revisions.final_byte_length,
+    CASE WHEN revisions.final_state = 'complete' THEN revisions.final_page_count ELSE 0 END,
+    CASE WHEN revisions.final_state = 'complete'
+              AND revisions.final_char_length BETWEEN 1 AND :text_max
+         THEN revisions.assistant_final_text END,
+    CASE WHEN revisions.final_state != 'absent'
+              AND NOT (revisions.final_state = 'complete'
+                       AND revisions.final_char_length BETWEEN 1 AND :text_max)
+         THEN substr(revisions.assistant_final_text, 1, :preview_max) END
+"""
+
+
+def _turn_delta_projection(
+    row: tuple[Any, ...],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Apply the same sanitizer and schema-v2 content projector as turn.list."""
+    (
+        payload_json, _observed_at, turn_id, _worker_id, _list_sequence,
+        revision, user_state, user_char_length, user_byte_length, user_page_count,
+        user_inline, user_preview, final_state, final_char_length,
+        final_byte_length, final_page_count, final_inline, final_preview,
+    ) = row[:18]
+    try:
+        loaded = json.loads(str(payload_json or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        loaded = {}
+    if not isinstance(loaded, Mapping):
+        loaded = {}
+    turn_payload = sanitize_public_mapping(loaded)
+    if not turn_payload or is_internal_automation_turn_payload(turn_payload):
+        return None, dict(loaded)
+    serialized = Turn.from_dict(turn_payload).to_dict()
+    item = _strip_canonical_turn_payload(serialized)
+    item["id"] = str(turn_id)
+    source_turn_id = str(turn_payload.get("source_turn_id") or "").strip()
+    stored_meta = turn_payload.get("meta")
+    if source_turn_id and isinstance(stored_meta, Mapping):
+        if source_turn_id in turn_source_id_candidates(
+            source_turn_id,
+            meta=stored_meta,
+            source=turn_payload.get("source"),
+            kind=turn_payload.get("kind"),
+        ):
+            item["source_turn_id"] = source_turn_id
+    if revision is not None:
+        item.update(project_persisted_turn_content(
+            str(revision),
+            user_state=str(user_state), user_char_length=int(user_char_length),
+            user_byte_length=int(user_byte_length), user_page_count=int(user_page_count),
+            user_inline=user_inline, user_preview=user_preview,
+            final_state=str(final_state), final_char_length=int(final_char_length),
+            final_byte_length=int(final_byte_length), final_page_count=int(final_page_count),
+            final_inline=final_inline, final_preview=final_preview,
+        ))
+    else:
+        legacy_user, legacy_user_state = _legacy_canonical_field(serialized.get("user_text"))
+        legacy_final, legacy_final_state = _legacy_canonical_field(
+            serialized.get("assistant_final_text")
+        )
+        if legacy_user_state != "absent" or legacy_final_state != "absent":
+            item.update(project_turn_content(
+                str(turn_id), legacy_user, legacy_final,
+                user_state=legacy_user_state, final_state=legacy_final_state,
+            ))
+    item["schema_version"] = TURN_DELTA_PROJECTION_SCHEMA_VERSION
+    return item, dict(loaded)
+
+
+def _turn_delta_remove(
+    turn_id: str,
+    *,
+    changed_at: str,
+    payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        clean_turn = Turn.from_dict(payload or {})
+    except (TypeError, ValueError):
+        clean_turn = None
+    change: dict[str, Any] = {
+        "op": "remove",
+        "turn_id": str(turn_id),
+        "removed_at": str(
+            (clean_turn.superseded_at if clean_turn is not None else None)
+            or changed_at
+            or utc_timestamp()
+        ),
+    }
+    replacement = (
+        clean_turn.superseded_by_turn_id if clean_turn is not None else None
+    )
+    if replacement:
+        change["superseded_by_turn_id"] = replacement
+    return change
+
+
+def _turn_delta_payload_from_store(
+    db_path: Path | str,
+    host_id: str,
+    *,
+    watermark: str | None = None,
+    cursor: str | None = None,
+    limit: int = TURN_DELTA_DEFAULT_LIMIT,
+    now: float | int | None = None,
+    work_counters: TurnDeltaWorkCounters | None = None,
+    batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
+    bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
+    bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
+) -> dict[str, Any]:
+    """Return one atomic, frozen, byte-bounded public turn-delta page."""
+    started = time.perf_counter()
+    host = str(host_id)
+    error_base = {
+        "schema_version": TURN_DELTA_SCHEMA_VERSION,
+        "projection_schema_version": TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+        "host_id": host,
+        "ok": False,
+    }
+    if (
+        not isinstance(limit, int) or isinstance(limit, bool)
+        or not 1 <= limit <= TURN_DELTA_MAX_LIMIT
+        or watermark is not None and cursor is not None
+        or watermark is not None and (not isinstance(watermark, str) or not watermark)
+        or cursor is not None and (not isinstance(cursor, str) or not cursor)
+    ):
+        return {
+            **error_base,
+            "status": "invalid_cursor" if cursor is not None else "invalid_watermark",
+        }
+    if not _sqlite_store_exists(db_path):
+        return {**error_base, "status": "store_unavailable"}
+    clock = time.time() if now is None else float(now)
+    try:
+        decoded_watermark = (
+            decode_turn_delta_watermark(watermark, host_id=host)
+            if watermark is not None else None
+        )
+        decoded_cursor = (
+            decode_turn_delta_cursor(cursor, host_id=host, limit=limit, now=clock)
+            if cursor is not None else None
+        )
+    except ValueError as exc:
+        status = str(exc)
+        allowed = {
+            "invalid_watermark", "expired_watermark", "cross_host_watermark",
+            "incompatible_schema", "invalid_cursor", "expired_cursor",
+        }
+        return {
+            **error_base,
+            "status": status if status in allowed else (
+                "invalid_cursor" if cursor is not None else "invalid_watermark"
+            ),
+        }
+
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN")
+        try:
+            store_epoch = _turn_change_store_epoch_conn(conn)
+            floor_row = conn.execute(
+                "SELECT floor_seq FROM turn_change_floor WHERE host_id = ?", (host,)
+            ).fetchone()
+            floor = int(floor_row[0]) if floor_row is not None else 0
+            journal_high = int(conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM turn_change_journal WHERE host_id = ?",
+                (host,),
+            ).fetchone()[0] or 0)
+            insertion_high, _generation = _turn_list_host_state_conn(conn, host)
+            if decoded_cursor is not None:
+                mode = decoded_cursor.mode
+                if decoded_cursor.store_epoch != store_epoch:
+                    conn.rollback()
+                    return {**error_base, "status": "invalid_cursor"}
+                if (
+                    decoded_cursor.mode == "changes"
+                    and decoded_cursor.accepted_sequence < floor
+                ):
+                    conn.rollback()
+                    return {**error_base, "status": "expired_cursor"}
+                accepted = decoded_cursor.accepted_sequence
+                batch_high = decoded_cursor.batch_high
+                insertion_high = decoded_cursor.insertion_high
+                expires_at = decoded_cursor.expires_at
+                page_number = decoded_cursor.page_number + 1
+                if mode == "bootstrap" and page_number > max(1, int(bootstrap_max_pages)):
+                    conn.rollback()
+                    return {**error_base, "status": "bootstrap_too_large"}
+            elif decoded_watermark is not None:
+                mode = "changes"
+                if (
+                    decoded_watermark.store_epoch != store_epoch
+                    or decoded_watermark.sequence > journal_high
+                ):
+                    conn.rollback()
+                    return {**error_base, "status": "invalid_watermark"}
+                if decoded_watermark.sequence < floor:
+                    conn.rollback()
+                    return {**error_base, "status": "expired_watermark"}
+                accepted = decoded_watermark.sequence
+                batch_high = min(
+                    journal_high,
+                    accepted + max(1, int(batch_sequence_ceiling)),
+                )
+                expires_at = int(clock) + TURN_DELTA_CURSOR_TTL_SECONDS
+                page_number = 1
+            else:
+                mode = "bootstrap"
+                accepted = 0
+                batch_high = journal_high
+                expires_at = int(clock) + TURN_DELTA_CURSOR_TTL_SECONDS
+                page_number = 1
+                bootstrap_count = int(conn.execute(
+                    """
+                    SELECT COUNT(*) FROM turns
+                    WHERE host_id = ? AND list_sequence <= ?
+                      AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
+                    """,
+                    (host, insertion_high),
+                ).fetchone()[0] or 0)
+                if (
+                    bootstrap_count > max(1, int(bootstrap_max_rows))
+                    or math.ceil(bootstrap_count / limit)
+                    > max(1, int(bootstrap_max_pages))
+                ):
+                    conn.rollback()
+                    return {**error_base, "status": "bootstrap_too_large"}
+
+            params: dict[str, Any] = {
+                "host_id": host,
+                "text_max": TURN_TEXT_MAX_CHARS,
+                "preview_max": TURN_CONTENT_PREVIEW_MAX_CHARS,
+                "limit": limit + 1,
+            }
+            if mode == "bootstrap":
+                continuation = ""
+                if decoded_cursor is not None:
+                    continuation = """
+                      AND (turns.worker_id > :position_worker
+                           OR (turns.worker_id = :position_worker AND (
+                               turns.list_sequence < :position_sequence
+                               OR (turns.list_sequence = :position_sequence
+                                   AND turns.turn_id > :position_turn))))
+                    """
+                    params.update({
+                        "position_worker": decoded_cursor.position_worker_id,
+                        "position_sequence": decoded_cursor.position_sequence,
+                        "position_turn": decoded_cursor.position_turn_id,
+                    })
+                params["insertion_high"] = insertion_high
+                rows = conn.execute(f"""
+                    SELECT {_TURN_DELTA_PROJECTION_SELECT}
+                    FROM turns
+                    LEFT JOIN turn_content_revisions AS revisions
+                      ON revisions.host_id = turns.host_id
+                     AND revisions.turn_id = turns.turn_id
+                     AND revisions.is_current = 1
+                    WHERE turns.host_id = :host_id
+                      AND turns.list_sequence <= :insertion_high
+                      AND COALESCE(json_extract(turns.payload_json, '$.superseded_at'), '') = ''
+                      {continuation}
+                    ORDER BY turns.worker_id, turns.list_sequence DESC, turns.turn_id
+                    LIMIT :limit
+                """, params).fetchall()
+            else:
+                continuation = ""
+                if decoded_cursor is not None:
+                    continuation = """
+                    WHERE collapsed.seq > :position_sequence
+                       OR (collapsed.seq = :position_sequence
+                           AND collapsed.turn_id > :position_turn)
+                    """
+                    params.update({
+                        "position_sequence": decoded_cursor.position_sequence,
+                        "position_turn": decoded_cursor.position_turn_id,
+                    })
+                params.update({"accepted": accepted, "batch_high": batch_high})
+                rows = conn.execute(f"""
+                    WITH collapsed AS (
+                        SELECT turn_id, MAX(seq) AS seq
+                        FROM turn_change_journal
+                        WHERE host_id = :host_id
+                          AND seq > :accepted AND seq <= :batch_high
+                        GROUP BY turn_id
+                    ), positioned AS (
+                        SELECT collapsed.turn_id, collapsed.seq FROM collapsed
+                        {continuation}
+                        ORDER BY collapsed.seq, collapsed.turn_id
+                        LIMIT :limit
+                    )
+                    SELECT {_TURN_DELTA_PROJECTION_SELECT},
+                           positioned.seq, positioned.turn_id, journal.changed_at
+                    FROM positioned
+                    JOIN turn_change_journal AS journal
+                      ON journal.host_id = :host_id
+                     AND journal.turn_id = positioned.turn_id
+                     AND journal.seq = positioned.seq
+                    LEFT JOIN turns
+                      ON turns.host_id = :host_id
+                     AND turns.turn_id = positioned.turn_id
+                    LEFT JOIN turn_content_revisions AS revisions
+                      ON revisions.host_id = turns.host_id
+                     AND revisions.turn_id = turns.turn_id
+                     AND revisions.is_current = 1
+                    ORDER BY positioned.seq, positioned.turn_id
+                """, params).fetchall()
+            if work_counters is not None:
+                if mode == "changes":
+                    work_counters.journal_queries += 1
+                    work_counters.journal_rows_scanned += len(rows)
+                work_counters.projection_queries += 1
+                work_counters.projection_rows_read += len(rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    changes: list[dict[str, Any]] = []
+    positions: list[tuple[str, int, str]] = []
+    accumulated_bytes = 0
+    has_more = False
+    last_scanned: tuple[str, int, str] | None = None
+    for index, row in enumerate(rows):
+        if index >= limit:
+            has_more = True
+            break
+        if mode == "bootstrap":
+            worker, sequence, turn_id = str(row[3]), int(row[4]), str(row[2])
+            changed_at = str(row[1] or utc_timestamp())
+        else:
+            worker, sequence, turn_id = "", int(row[18]), str(row[19])
+            changed_at = str(row[20] or utc_timestamp())
+        projected, raw_payload = _turn_delta_projection(tuple(row[:18]))
+        tombstoned = bool(str(raw_payload.get("superseded_at") or "").strip())
+        if mode == "changes" and (row[2] is None or tombstoned):
+            change = _turn_delta_remove(turn_id, changed_at=changed_at, payload=raw_payload)
+        elif projected is None:
+            last_scanned = (worker, sequence, turn_id)
+            continue
+        else:
+            change = {
+                "op": "upsert", "turn_id": turn_id,
+                "changed_at": changed_at, "turn": projected,
+            }
+        item_bytes = len(_canonical_json(change).encode("utf-8")) + 1
+        if changes and accumulated_bytes + item_bytes > 850_000:
+            has_more = True
+            break
+        changes.append(change)
+        positions.append((worker, sequence, turn_id))
+        last_scanned = (worker, sequence, turn_id)
+        accumulated_bytes += item_bytes
+
+    next_cursor: str | None = None
+    if has_more and last_scanned is not None:
+        next_cursor = turn_delta_cursor(
+            host, mode=mode, limit=limit, accepted_sequence=accepted,
+            batch_high=batch_high, insertion_high=insertion_high,
+            page_number=page_number, position_worker_id=last_scanned[0],
+            position_sequence=last_scanned[1], position_turn_id=last_scanned[2],
+            store_epoch=store_epoch, expires_at=expires_at,
+        )
+    else:
+        has_more = False
+    checkpoint = None if has_more else turn_delta_watermark(
+        host, sequence=batch_high, store_epoch=store_epoch
+    )
+    duration_ms = min(
+        2_147_483_647,
+        max(0, int((time.perf_counter() - started) * 1000)),
+    )
+    payload: dict[str, Any] = {
+        "schema_version": TURN_DELTA_SCHEMA_VERSION,
+        "projection_schema_version": TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+        "host_id": host,
+        "mode": mode,
+        "changes": changes,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "checkpoint": checkpoint,
+        "aggregate": {
+            "journal_rows_scanned": len(rows) if mode == "changes" else 0,
+            "projection_rows_read": len(rows),
+            "changes_returned": len(changes),
+            "duration_ms": duration_ms,
+        },
+    }
+    while len(_canonical_json(payload).encode("utf-8")) >= 1024 * 1024 and len(changes) > 1:
+        changes.pop()
+        last_worker, last_sequence, last_turn = positions[len(changes) - 1]
+        payload["has_more"] = True
+        payload["checkpoint"] = None
+        payload["next_cursor"] = turn_delta_cursor(
+            host, mode=mode, limit=limit, accepted_sequence=accepted,
+            batch_high=batch_high, insertion_high=insertion_high,
+            page_number=page_number, position_worker_id=last_worker,
+            position_sequence=last_sequence, position_turn_id=last_turn,
+            store_epoch=store_epoch, expires_at=expires_at,
+        )
+        payload["aggregate"]["changes_returned"] = len(changes)
+    if work_counters is not None:
+        work_counters.max_response_utf8_bytes = max(
+            work_counters.max_response_utf8_bytes,
+            len(_canonical_json(payload).encode("utf-8")),
+        )
+    return payload
+
+
+def turn_delta_payload_from_store(
+    db_path: Path | str,
+    host_id: str,
+    *,
+    watermark: str | None = None,
+    cursor: str | None = None,
+    limit: int = TURN_DELTA_DEFAULT_LIMIT,
+    now: float | int | None = None,
+    work_counters: TurnDeltaWorkCounters | None = None,
+    batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
+    bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
+    bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
+) -> dict[str, Any]:
+    """Fail closed to the documented public outcome for unavailable stores."""
+    try:
+        return _turn_delta_payload_from_store(
+            db_path,
+            host_id,
+            watermark=watermark,
+            cursor=cursor,
+            limit=limit,
+            now=now,
+            work_counters=work_counters,
+            batch_sequence_ceiling=batch_sequence_ceiling,
+            bootstrap_max_rows=bootstrap_max_rows,
+            bootstrap_max_pages=bootstrap_max_pages,
+        )
+    except (sqlite3.Error, StoreSchemaError, LocalStateError, OSError):
+        return {
+            "schema_version": TURN_DELTA_SCHEMA_VERSION,
+            "projection_schema_version": TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+            "host_id": str(host_id),
+            "ok": False,
+            "status": "store_unavailable",
+        }
 
 
 def turns_payload_from_store(

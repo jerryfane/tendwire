@@ -38,6 +38,9 @@ DEFAULT_SNAPSHOT_RETENTION_DAYS = 14
 DEFAULT_SNAPSHOT_RETENTION_COUNT = 4096
 DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 100
 DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS = 3600
+DEFAULT_TURN_CHANGE_RETENTION_DAYS = 7
+DEFAULT_TURN_CHANGE_RETENTION_COUNT = 100_000
+DEFAULT_TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
 MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 MAX_RETENTION_DAYS = 365_000
 MAX_SQLITE_INTEGER = (1 << 63) - 1
@@ -77,6 +80,9 @@ class Config:
     snapshot_retention_count: int = DEFAULT_SNAPSHOT_RETENTION_COUNT
     snapshot_maintenance_batch_size: int = DEFAULT_SNAPSHOT_MAINTENANCE_BATCH_SIZE
     store_maintenance_cadence_seconds: int = DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS
+    turn_change_retention_days: int = DEFAULT_TURN_CHANGE_RETENTION_DAYS
+    turn_change_retention_count: int = DEFAULT_TURN_CHANGE_RETENTION_COUNT
+    turn_change_compaction_batch_size: int = DEFAULT_TURN_CHANGE_COMPACTION_BATCH_SIZE
     socket_group: str | None = None
 
     def __post_init__(self) -> None:
@@ -294,6 +300,33 @@ class Config:
                 maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
             ),
         )
+        object.__setattr__(
+            self,
+            "turn_change_retention_days",
+            _bounded_positive_int(
+                self.turn_change_retention_days,
+                "turn_change_retention_days",
+                maximum=MAX_RETENTION_DAYS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "turn_change_retention_count",
+            _bounded_positive_int(
+                self.turn_change_retention_count,
+                "turn_change_retention_count",
+                maximum=MAX_SQLITE_INTEGER,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "turn_change_compaction_batch_size",
+            _bounded_positive_int(
+                self.turn_change_compaction_batch_size,
+                "turn_change_compaction_batch_size",
+                maximum=10_000,
+            ),
+        )
 
     @property
     def installation_key_path(self) -> Path:
@@ -401,6 +434,9 @@ def load_config(
     snapshot_retention_count: int | str | None = None,
     snapshot_maintenance_batch_size: int | str | None = None,
     store_maintenance_cadence_seconds: int | str | None = None,
+    turn_change_retention_days: int | str | None = None,
+    turn_change_retention_count: int | str | None = None,
+    turn_change_compaction_batch_size: int | str | None = None,
 ) -> Config:
     """Build a Config from explicit args, then environment, then defaults."""
     env_host_id = os.environ.get("TENDWIRE_HOST_ID")
@@ -574,6 +610,21 @@ def load_config(
             store_maintenance_cadence_seconds,
             "TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS",
             DEFAULT_STORE_MAINTENANCE_CADENCE_SECONDS,
+        ),
+        turn_change_retention_days=_resolve_value(
+            turn_change_retention_days,
+            "TENDWIRE_TURN_CHANGE_RETENTION_DAYS",
+            DEFAULT_TURN_CHANGE_RETENTION_DAYS,
+        ),
+        turn_change_retention_count=_resolve_value(
+            turn_change_retention_count,
+            "TENDWIRE_TURN_CHANGE_RETENTION_COUNT",
+            DEFAULT_TURN_CHANGE_RETENTION_COUNT,
+        ),
+        turn_change_compaction_batch_size=_resolve_value(
+            turn_change_compaction_batch_size,
+            "TENDWIRE_TURN_CHANGE_COMPACTION_BATCH_SIZE",
+            DEFAULT_TURN_CHANGE_COMPACTION_BATCH_SIZE,
         ),
         socket_group=resolved_socket_group,
     )

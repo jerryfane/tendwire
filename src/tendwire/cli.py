@@ -13,7 +13,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .backends.herdr_cli import (
     bindings_from_workers,
@@ -43,6 +43,8 @@ from .core.models import (
     separate_duplicate_worker_bindings,
 )
 from .core.turns import (
+    TURN_DELTA_DEFAULT_LIMIT,
+    TURN_DELTA_MAX_LIMIT,
     TURN_LIST_DEFAULT_LIMIT,
     TURN_LIST_MAX_LIMIT,
     turns_payload_from_snapshot,
@@ -61,6 +63,7 @@ from .store.sqlite import (
     store_status,
     tail_event_metadata,
     turns_payload_from_store,
+    turn_delta_payload_from_store,
     upsert_worker_bindings,
 )
 
@@ -103,6 +106,18 @@ def _turn_list_limit(value: str) -> int:
     if not 1 <= limit <= TURN_LIST_MAX_LIMIT:
         raise argparse.ArgumentTypeError(
             f"limit must be between 1 and {TURN_LIST_MAX_LIMIT}"
+        )
+    return limit
+
+
+def _turn_delta_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("limit must be an integer") from exc
+    if not 1 <= limit <= TURN_DELTA_MAX_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"limit must be between 1 and {TURN_DELTA_MAX_LIMIT}"
         )
     return limit
 
@@ -263,6 +278,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     content_get.add_argument("--cursor", default=None)
     content_get.add_argument("--db-path", dest="db_path", default=None)
+    delta_parser = turn_actions.add_parser(
+        "delta",
+        help="Read one cache-only public turn change page.",
+    )
+    delta_parser.add_argument("--json", dest="json_output", action="store_true", default=True)
+    delta_parser.add_argument(
+        "--limit", type=_turn_delta_limit, default=TURN_DELTA_DEFAULT_LIMIT,
+    )
+    delta_position = delta_parser.add_mutually_exclusive_group()
+    delta_position.add_argument("--watermark", default=None)
+    delta_position.add_argument("--cursor", default=None)
+    delta_parser.add_argument("--db-path", dest="db_path", default=None)
 
     pending_parser = subparsers.add_parser(
         "pending",
@@ -765,6 +792,8 @@ def _try_daemon_attempt(
             _restore_cli_content_text(sanitized, result)
         if method == "turn.list":
             _restore_cli_turn_list_text(sanitized, result)
+        if method == "turn.delta":
+            _restore_cli_turn_delta_text(sanitized, result)
         if method.startswith("connector."):
             _restore_cli_plan_token(sanitized, result)
         return _DaemonAttempt(result=sanitized, request_started=True)
@@ -898,6 +927,41 @@ def _restore_cli_turn_list_text(
 def _turn_list_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
     sanitized = sanitize_public_mapping(payload)
     _restore_cli_turn_list_text(sanitized, payload)
+    return json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        indent=indent,
+    )
+
+
+def _restore_cli_turn_delta_text(
+    sanitized: dict[str, Any],
+    original: Mapping[str, Any],
+) -> None:
+    """Restore trusted schema-v2 inline fields inside delta upserts."""
+    original_changes = original.get("changes")
+    target_changes = sanitized.get("changes")
+    if not isinstance(original_changes, list) or not isinstance(target_changes, list):
+        return
+    for original_change, target_change in zip(
+        original_changes, target_changes, strict=False
+    ):
+        if not isinstance(original_change, Mapping) or not isinstance(target_change, dict):
+            continue
+        original_turn = original_change.get("turn")
+        target_turn = target_change.get("turn")
+        if isinstance(original_turn, Mapping) and isinstance(target_turn, dict):
+            _restore_cli_turn_list_text(
+                {"turns": [target_turn]},
+                {"schema_version": 2, "turns": [original_turn]},
+            )
+
+
+def _turn_delta_payload_json(payload: dict[str, Any], *, indent: int | None = None) -> str:
+    sanitized = sanitize_public_mapping(payload)
+    _restore_cli_turn_delta_text(sanitized, payload)
     return json.dumps(
         sanitized,
         ensure_ascii=False,
@@ -1193,6 +1257,48 @@ def cmd_pending(
             },
         }
     print(public_json_dumps(payload, indent=2))
+    return 0 if payload.get("ok") is not False else 1
+
+
+def cmd_turn_delta(config: Config, args: argparse.Namespace) -> int:
+    """Read one delta page via daemon, with read-only store fallback."""
+    params = {
+        "limit": args.limit,
+        "watermark": args.watermark,
+        "cursor": args.cursor,
+    }
+    daemon_attempt = _try_daemon_attempt(config, "turn.delta", params)
+    if daemon_attempt.result is not None:
+        payload = daemon_attempt.result
+    elif daemon_attempt.response_error is not None:
+        payload = daemon_attempt.response_error
+    elif (
+        daemon_attempt.error_kind in {"unavailable", "timeout"}
+        and daemon_attempt.request_started is False
+        and config.db_path is not None
+    ):
+        payload = turn_delta_payload_from_store(
+            config.db_path,
+            config.host_id,
+            watermark=args.watermark,
+            cursor=args.cursor,
+            limit=args.limit,
+        )
+    elif daemon_attempt.error_kind == "timeout":
+        payload = {
+            "schema_version": 1,
+            "projection_schema_version": 2,
+            "ok": False,
+            "status": "daemon_timeout",
+        }
+    else:
+        payload = {
+            "schema_version": 1,
+            "projection_schema_version": 2,
+            "ok": False,
+            "status": "store_unavailable" if config.db_path is None else "daemon_protocol_error",
+        }
+    print(_turn_delta_payload_json(payload, indent=2))
     return 0 if payload.get("ok") is not False else 1
 
 
@@ -1597,6 +1703,9 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
             snapshot_batch_size=args.snapshot_batch_size
             if args.snapshot_batch_size is not None
             else config.snapshot_maintenance_batch_size,
+            turn_change_retention_days=config.turn_change_retention_days,
+            turn_change_retention_count=config.turn_change_retention_count,
+            turn_change_batch_size=config.turn_change_compaction_batch_size,
         )
     elif args.store_action == "compact":
         try:
@@ -1703,6 +1812,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "turn":
+        if args.turn_action == "delta":
+            return cmd_turn_delta(config, args)
         return cmd_turn_content_get(config, args)
 
     if args.command == "pending":

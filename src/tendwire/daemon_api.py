@@ -26,6 +26,8 @@ from .core.models import (
     sanitize_public_mapping,
 )
 from .core.turns import (
+    TURN_DELTA_DEFAULT_LIMIT,
+    TURN_DELTA_MAX_LIMIT,
     TURN_LIST_DEFAULT_LIMIT,
     TURN_LIST_MAX_LIMIT,
     pending_payload_from_snapshot,
@@ -144,6 +146,7 @@ REQUIRED_METHODS = frozenset(
         "snapshot.get",
         "attention.list",
         "turn.list",
+        "turn.delta",
         "turn.content.get",
         "pending.list",
         "command.submit",
@@ -310,6 +313,7 @@ class TendwireDaemonAPI:
         submit_command: Callable[[Mapping[str, Any]], Mapping[str, Any] | CommandEnvelope],
         get_attention: Callable[[], Mapping[str, Any]] | None = None,
         get_turns: Callable[..., Mapping[str, Any]] | None = None,
+        get_turn_delta: Callable[..., Mapping[str, Any]] | None = None,
         get_turn_content: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         get_pending: Callable[[], Mapping[str, Any]] | None = None,
         connector_call: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
@@ -319,6 +323,7 @@ class TendwireDaemonAPI:
         self._submit_command = submit_command
         self._get_attention = get_attention
         self._get_turns = get_turns
+        self._get_turn_delta = get_turn_delta
         self._get_turn_content = get_turn_content
         self._get_pending = get_pending
         self._connector_call = connector_call
@@ -465,6 +470,68 @@ class TendwireDaemonAPI:
                         turn_result = turns_payload_from_snapshot(snapshot, schema_version=2)
                 response = success_response(turn_result, request_id=request_id)
                 _restore_turn_list_text(response, turn_result)
+                return response
+            if method == "turn.delta":
+                allowed_delta_params = {"watermark", "cursor", "limit"}
+                unknown_delta = sorted(
+                    str(key) for key in params if str(key) not in allowed_delta_params
+                )
+                if unknown_delta:
+                    return error_response(
+                        "invalid_params",
+                        "turn.delta contains unknown parameters",
+                        details={"field_count": len(unknown_delta)},
+                        request_id=request_id,
+                    )
+                delta_limit = params.get("limit", TURN_DELTA_DEFAULT_LIMIT)
+                if (
+                    not isinstance(delta_limit, int)
+                    or isinstance(delta_limit, bool)
+                    or not 1 <= delta_limit <= TURN_DELTA_MAX_LIMIT
+                ):
+                    return error_response(
+                        "invalid_params",
+                        "limit must be an integer in the supported range",
+                        details={
+                            "field": "limit", "minimum": 1,
+                            "maximum": TURN_DELTA_MAX_LIMIT,
+                        },
+                        request_id=request_id,
+                    )
+                delta_watermark = params.get("watermark")
+                delta_cursor = params.get("cursor")
+                for token_name, token in (
+                    ("watermark", delta_watermark), ("cursor", delta_cursor)
+                ):
+                    if token is not None and (not isinstance(token, str) or not token):
+                        return error_response(
+                            "invalid_params",
+                            f"{token_name} must be a non-empty string or null",
+                            details={"field": token_name},
+                            request_id=request_id,
+                        )
+                if delta_watermark is not None and delta_cursor is not None:
+                    return error_response(
+                        "invalid_params",
+                        "watermark and cursor cannot be combined",
+                        details={"fields": ["watermark", "cursor"]},
+                        request_id=request_id,
+                    )
+                if self._get_turn_delta is None:
+                    delta_result = {
+                        "schema_version": 1,
+                        "projection_schema_version": 2,
+                        "ok": False,
+                        "status": "store_unavailable",
+                    }
+                else:
+                    delta_result = dict(self._get_turn_delta(
+                        watermark=delta_watermark,
+                        cursor=delta_cursor,
+                        limit=delta_limit,
+                    ))
+                response = success_response(delta_result, request_id=request_id)
+                _restore_turn_delta_text(response, delta_result)
                 return response
             if method == "turn.content.get":
                 allowed_content_params = {
@@ -644,6 +711,32 @@ def _restore_content_page_text(
         result["text"] = text
 
 
+def _restore_turn_delta_text(
+    response: dict[str, Any],
+    original_result: Mapping[str, Any],
+) -> None:
+    """Restore trusted list-v2 inline fields/previews inside delta upserts."""
+    result = response.get("result")
+    original_changes = original_result.get("changes")
+    if not isinstance(result, dict) or not isinstance(original_changes, list):
+        return
+    target_changes = result.get("changes")
+    if not isinstance(target_changes, list):
+        return
+    for original, target in zip(original_changes, target_changes, strict=False):
+        if not isinstance(original, Mapping) or not isinstance(target, dict):
+            continue
+        original_turn = original.get("turn")
+        target_turn = target.get("turn")
+        if not isinstance(original_turn, Mapping) or not isinstance(target_turn, dict):
+            continue
+        wrapper = {"result": {"turns": [target_turn]}}
+        _restore_turn_list_text(
+            wrapper,
+            {"schema_version": 2, "turns": [original_turn]},
+        )
+
+
 def _restore_plan_token(
     response: dict[str, Any],
     original_result: Mapping[str, Any],
@@ -708,6 +801,7 @@ def _serialized_response(response: Mapping[str, Any]) -> bytes:
     original_result = response.get("result")
     if isinstance(original_result, Mapping):
         _restore_turn_list_text(sanitized, original_result)
+        _restore_turn_delta_text(sanitized, original_result)
         _restore_content_page_text(sanitized, original_result)
         _restore_plan_token(sanitized, original_result)
         try:
