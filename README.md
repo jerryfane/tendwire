@@ -545,6 +545,7 @@ variables:
 | `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
 | `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
+| `turn_claim_hard_ttl_seconds` | `TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS` | `86400` | positive integer; unobserved command claims become terminal after this interval |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set

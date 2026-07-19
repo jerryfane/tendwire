@@ -39,6 +39,7 @@ from ..store.sqlite import (
     apply_turn_refresh,
     list_worker_bindings,
     prune_backend_pending,
+    sweep_turn_claims,
 )
 
 
@@ -4394,6 +4395,17 @@ class TurnIngestionScheduler:
                 },
                 cancelled=self._cancel_event.is_set,
                 observed_at=self._utc_clock(),
+            )
+        except Exception:
+            pass
+
+        try:
+            sweep_turn_claims(
+                self.config.db_path,
+                self.config.host_id,
+                grace_seconds=2.0 * self.refresh_interval_seconds,
+                hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
+                now=self._utc_clock(),
             )
         except Exception:
             pass

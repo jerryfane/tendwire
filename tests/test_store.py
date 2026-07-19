@@ -4953,6 +4953,66 @@ def test_command_pending_turn_terminal_effect_is_atomic_with_acceptance(
     assert turns[0]["user_text"] == "Continue safely."
 
 
+def test_command_pending_turn_effect_is_atomic_with_send_start(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "pending-turn-send-start-effect.db"
+    init_store(db_path)
+    reservation = _reserve_test_request(db_path, request_id="turn-send-start")
+    invalid_effect = command_pending_turn_terminal_effect(
+        host_id="host-a",
+        worker={"id": "worker-public", "name": "Worker"},
+        request_id="turn-send-start",
+        instruction_text="",
+    )
+    with pytest.raises(
+        store_sqlite.StoreSchemaError,
+        match="command_pending_turn_terminal_effect_failed",
+    ):
+        mark_command_send_started(
+            db_path,
+            host_id="host-a",
+            request_id="turn-send-start",
+            canonical_fingerprint="send_instruction:turn-send-start",
+            owner_token=reservation["owner_token"],
+            binding_fingerprint="private-binding",
+            send_started_effect=invalid_effect,
+            now="2026-01-01T00:00:01+00:00",
+        )
+    assert get_command_request(
+        db_path,
+        "host-a",
+        "turn-send-start",
+    )["state"] == "reserved"
+    assert turns_payload_from_store(db_path, "host-a")["turns"] == []
+
+    valid_effect = command_pending_turn_terminal_effect(
+        host_id="host-a",
+        worker={"id": "worker-public", "name": "Worker"},
+        request_id="turn-send-start",
+        instruction_text="Continue safely.",
+    )
+    started = mark_command_send_started(
+        db_path,
+        host_id="host-a",
+        request_id="turn-send-start",
+        canonical_fingerprint="send_instruction:turn-send-start",
+        owner_token=reservation["owner_token"],
+        binding_fingerprint="private-binding",
+        send_started_effect=valid_effect,
+        now="2026-01-01T00:00:01+00:00",
+    )
+    assert started["status"] == "send_started"
+    assert started["effect_result"]["origin_command_id"] == "turn-send-start"
+    turns = turns_payload_from_store(
+        db_path,
+        "host-a",
+        claim_hard_ttl_seconds=1_000_000_000,
+    )["turns"]
+    assert len(turns) == 1
+    assert turns[0]["id"] == started["effect_result"]["id"]
+
+
 def test_backend_pending_choice_terminal_effect_is_atomic_with_acceptance(
     tmp_path: Path,
 ) -> None:
@@ -6384,6 +6444,321 @@ def test_twenty_offline_source_finals_are_retained_as_unique_ready_anchors(
     assert "source_turn_id" not in encoded_anchors
 
 
+def test_turn_claim_sweeper_expires_never_observed_claim(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-claim-expiry.db"
+    host_id = "turn-claim-expiry-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("c" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="never-observed-request",
+        instruction_text="never observed",
+        observed_at="2026-07-19T00:00:00+00:00",
+    )
+    assert claim is not None
+
+    assert store_sqlite.sweep_turn_claims(
+        db_path,
+        host_id,
+        grace_seconds=1,
+        hard_ttl_seconds=60,
+        now="2026-07-19T00:02:00+00:00",
+    ) == 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        raw = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, claim["id"]),
+            ).fetchone()[0]
+        )
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    assert raw["complete"] is True
+    assert raw["has_open_turn"] is False
+    assert raw["status"] == "closed"
+    assert raw["superseded_at"] == "2026-07-19T00:02:00+00:00"
+    assert raw["superseded_by_turn_id"] is None
+    assert claim["id"] not in {
+        turn["id"]
+        for turn in turns_payload_from_store(db_path, host_id)["turns"]
+    }
+    assert foreign_keys == []
+
+
+def test_turn_claim_sweeper_resolves_only_one_identical_claim_per_done_turn(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-claim-identical.db"
+    host_id = "turn-claim-identical-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "identical-observed-source",
+            "user_text": "same prompt",
+            "assistant_final_text": "one answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2099-07-19T00:00:00+00:00",
+    ) == 1
+    observed = next(
+        turn
+        for turn in turns_payload_from_store(db_path, host_id)["turns"]
+        if turn.get("source_turn_id")
+    )
+    first = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="identical-first",
+        instruction_text="same prompt",
+        observed_at="2099-07-19T00:00:01+00:00",
+    )
+    second = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="identical-second",
+        instruction_text="same prompt",
+        observed_at="2099-07-19T00:00:02+00:00",
+    )
+    assert first is not None and second is not None
+
+    assert store_sqlite.sweep_turn_claims(
+        db_path,
+        host_id,
+        grace_seconds=1,
+        now="2099-07-19T00:01:00+00:00",
+    ) == 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        stored = {
+            turn_id: json.loads(payload_json)
+            for turn_id, payload_json in conn.execute(
+                """
+                SELECT turn_id, payload_json
+                FROM turns
+                WHERE host_id = ? AND turn_id IN (?, ?)
+                """,
+                (host_id, first["id"], second["id"]),
+            ).fetchall()
+        }
+    assert stored[first["id"]]["superseded_by_turn_id"] == observed["id"]
+    assert stored[second["id"]].get("superseded_at") is None
+    assert stored[second["id"]]["has_open_turn"] is True
+
+
+def test_text_drift_tombstone_preserves_cursor_and_since_continuity(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-claim-cursor.db"
+    host_id = "turn-claim-cursor-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("e" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    baseline = turns_payload_from_store(db_path, host_id, schema_version=2)
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="drift-request",
+        instruction_text="final normalized prompt",
+        observed_at="2099-07-19T00:00:00+00:00",
+    )
+    assert claim is not None
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "drift-source",
+            "user_text": "draft prompt",
+            "complete": False,
+            "has_open_turn": True,
+        },
+        observed_at="2099-07-19T00:00:01+00:00",
+    ) == 1
+    first_page = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        limit=1,
+    )
+    source_id = first_page["turns"][0]["id"]
+    assert source_id != claim["id"]
+    assert first_page["has_more"] is True
+    assert first_page["next_cursor"] is not None
+
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "drift-source",
+            "user_text": "final normalized prompt",
+            "assistant_final_text": "done",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2099-07-19T00:00:02+00:00",
+    ) == 1
+
+    continuation = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        limit=1,
+        cursor=first_page["next_cursor"],
+    )
+    assert continuation.get("status") != "cursor_expired"
+    assert claim["id"] not in {turn["id"] for turn in continuation["turns"]}
+    since_poll = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        since=baseline["since"],
+    )
+    assert {turn["id"] for turn in since_poll["turns"]} == {source_id}
+    with sqlite3.connect(str(db_path)) as conn:
+        physical = conn.execute(
+            "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+            (host_id, claim["id"]),
+        ).fetchone()
+    assert physical is not None
+    claim_payload = json.loads(physical[0])
+    assert claim_payload["superseded_by_turn_id"] == source_id
+    assert claim_payload["superseded_at"] == "2099-07-19T00:00:02+00:00"
+
+
+def test_v14_migration_tombstones_production_shape_duplicate_claim(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-claim-v14.db"
+    host_id = "turn-claim-v14-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("d" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "migration-observed-source",
+            "user_text": "same migration prompt",
+            "assistant_final_text": "migration answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-19T00:00:00+00:00",
+    ) == 1
+    observed = next(
+        turn
+        for turn in turns_payload_from_store(db_path, host_id, schema_version=2)["turns"]
+        if turn.get("assistant_final_text") == "migration answer"
+    )
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="migration-command-request",
+        instruction_text="temporary different prompt",
+        observed_at="2026-07-19T00:00:01+00:00",
+    )
+    assert claim is not None
+    assert claim["id"] != observed["id"]
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE turn_content_revisions
+            SET user_text = 'same migration prompt'
+            WHERE host_id = ? AND turn_id = ? AND is_current = 1
+            """,
+            (host_id, claim["id"]),
+        )
+        generation_before = conn.execute(
+            "SELECT traversal_generation FROM turn_list_hosts WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+        conn.execute("PRAGMA user_version = 14")
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        claim_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, claim["id"]),
+            ).fetchone()[0]
+        )
+        generation_after = conn.execute(
+            "SELECT traversal_generation FROM turn_list_hosts WHERE host_id = ?",
+            (host_id,),
+        ).fetchone()[0]
+        physical_rows = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ? AND turn_id IN (?, ?)",
+            (host_id, observed["id"], claim["id"]),
+        ).fetchone()[0]
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    public = turns_payload_from_store(db_path, host_id, schema_version=2)["turns"]
+    assert claim_payload["superseded_by_turn_id"] == observed["id"]
+    assert claim_payload["complete"] is True
+    assert generation_after == generation_before + 1
+    assert physical_rows == 2
+    assert public[0]["id"] == observed["id"]
+    assert claim["id"] not in {turn["id"] for turn in public}
+    assert foreign_keys == []
+
+
 def _reset_store_to_v5_with_legacy_turn(
     db_path: Path,
     *,
@@ -6785,7 +7160,7 @@ def test_v6_to_v7_repairs_mixed_turns_with_absent_content_descriptors(
         )
         for row in first_rows
     )
-    assert len(first_v2["turns"]) >= 3
+    assert len(first_v2["turns"]) >= 2
     for turn in first_v2["turns"]:
         assert turn["content"]["schema_version"] == 1
         if turn["id"] not in missing_turn_ids:
@@ -10221,7 +10596,7 @@ def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
     init_store(db_path)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 14
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 15
         assert conn.execute(
             """
             SELECT turn_id, list_sequence
@@ -13289,7 +13664,12 @@ def test_same_source_completion_is_observation_monotonic_and_never_reopens(
         },
         observed_at="2030-01-01T00:00:01+00:00",
     ) == 1
-    payload = turns_payload_from_store(db_path, host_id, schema_version=2)
+    payload = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        claim_hard_ttl_seconds=1_000_000_000,
+    )
     source_turn = next(turn for turn in payload["turns"] if turn.get("source_turn_id"))
     assert source_turn["assistant_final_text"] == "revised final"
     assert source_turn["assistant_stream_text"] is None
@@ -14272,8 +14652,9 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
         source_turn_id=raw_matching_source,
         meta=worker.meta,
     )
-    assert exact_source["id"] == source_with_origin.id == source_without_origin.id
-    assert exact_source["id"] != command["id"]
+    assert exact_source["id"] == command["id"]
+    assert exact_source["id"] != source_with_origin.id
+    assert source_with_origin.id == source_without_origin.id
     assert exact_source["origin_command_id"] == "request-exact"
     assert exact_source["source_turn_id"] == source_with_origin.source_turn_id
     assert raw_matching_source not in json.dumps(payload, sort_keys=True)
@@ -14301,18 +14682,27 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
         },
         observed_at="2026-07-13T02:00:04+00:00",
     ) == 1
-    refreshed = turns_payload_from_store(db_path, host_id, schema_version=2)
+    refreshed = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        claim_hard_ttl_seconds=1_000_000_000,
+    )
     unmatched_source = next(
         turn for turn in refreshed["turns"]
         if turn.get("assistant_final_text") == "independent final"
     )
     assert unmatched_source.get("origin_command_id") is None
     assert unmatched_source["id"] != stale_command["id"]
-    assert any(
-        turn.get("id") == stale_command["id"]
-        and turn.get("origin_command_id") == "request-stale"
-        for turn in refreshed["turns"]
-    )
+    assert stale_command["id"] not in {turn["id"] for turn in refreshed["turns"]}
+    with sqlite3.connect(str(db_path)) as conn:
+        stale_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, stale_command["id"]),
+            ).fetchone()[0]
+        )
+    assert stale_payload["superseded_by_turn_id"] == unmatched_source["id"]
     encoded = json.dumps(refreshed, sort_keys=True)
     assert raw_matching_source not in encoded
     assert raw_unmatched_source not in encoded

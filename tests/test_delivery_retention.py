@@ -84,6 +84,8 @@ def _source_turns(db_path: Path, snapshot: Any, *, host_id: str = HOST_ID) -> li
         snapshot=snapshot,
         schema_version=2,
         limit=250,
+        turn_refresh_interval_seconds=1_000_000_000,
+        claim_hard_ttl_seconds=1_000_000_000,
     )
     return [
         turn
@@ -791,6 +793,8 @@ def test_completed_command_receipt_does_not_release_command_linked_pending_turn(
         snapshot=snapshot,
         schema_version=2,
         limit=250,
+        turn_refresh_interval_seconds=1_000_000_000,
+        claim_hard_ttl_seconds=1_000_000_000,
     )["turns"]
     protected = [
         turn

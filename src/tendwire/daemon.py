@@ -1021,6 +1021,8 @@ class TendwireDaemon:
             limit=limit,
             cursor=cursor,
             since=since,
+            turn_refresh_interval_seconds=self.config.turn_refresh_interval_seconds,
+            claim_hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
         )
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:

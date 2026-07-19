@@ -21,6 +21,7 @@ DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
 DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_TURN_REFRESH_WORKERS = 4
+DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
@@ -59,6 +60,7 @@ class Config:
     max_workers: int = DEFAULT_MAX_WORKERS
     turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
     turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
+    turn_claim_hard_ttl_seconds: int = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
@@ -145,6 +147,15 @@ class Config:
         )
         if self.turn_refresh_workers > self.max_workers:
             raise ValueError("turn_refresh_workers must be <= max_workers")
+        object.__setattr__(
+            self,
+            "turn_claim_hard_ttl_seconds",
+            _bounded_positive_int(
+                self.turn_claim_hard_ttl_seconds,
+                "turn_claim_hard_ttl_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
+            ),
+        )
         object.__setattr__(
             self,
             "pending_stale_grace_seconds",
@@ -353,6 +364,7 @@ def load_config(
     max_workers: int | str | None = None,
     turn_refresh_interval_seconds: float | str | None = None,
     turn_refresh_workers: int | str | None = None,
+    turn_claim_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
@@ -463,6 +475,11 @@ def load_config(
             turn_refresh_workers,
             "TENDWIRE_TURN_REFRESH_WORKERS",
             DEFAULT_TURN_REFRESH_WORKERS,
+        ),
+        turn_claim_hard_ttl_seconds=_resolve_value(
+            turn_claim_hard_ttl_seconds,
+            "TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS",
+            DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
         ),
         pending_stale_grace_seconds=_resolve_value(
             pending_stale_grace_seconds,

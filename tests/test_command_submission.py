@@ -478,12 +478,14 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
 
     assert first.status == STATUS_ACCEPTED
     assert first.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert str(first.result["turn_id"]).startswith("turn-")
     assert first.result == {
         "target": {"worker_id": "w-1"},
         "delivery_state": "submitted",
         "transport_state": "submitted",
         "target_state_at_send": "active",
         "observed_turn_state": "pending_observation",
+        "turn_id": first.result["turn_id"],
     }
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
@@ -580,11 +582,249 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         _assert_no_private_json(surface)
 
 
+def test_submit_command_writes_turn_claim_before_pane_send(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + ("a" * 64),
+            "stable_key_version": 1,
+        },
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    claim_ids: list[str] = []
+
+    class InspectingClient(_FakeSocketClient):
+        def request(self, method, params, *, timeout=None):
+            if method == "pane.send_input":
+                with sqlite3.connect(str(config.db_path)) as conn:
+                    claim_ids.extend(
+                        str(row[0])
+                        for row in conn.execute(
+                            """
+                            SELECT turn_id FROM turns
+                            WHERE host_id = ?
+                              AND json_extract(payload_json, '$.origin_command_id') = ?
+                            """,
+                            (config.host_id, "write-early-request"),
+                        ).fetchall()
+                    )
+            return super().request(method, params, timeout=timeout)
+
+    accepted = submit_command(
+        config,
+        _request(request_id="write-early-request"),
+        socket_client_factory=lambda _config: InspectingClient(calls),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert claim_ids == [accepted.result["turn_id"]]
+
+
+def test_submit_command_removes_claim_when_pane_input_never_starts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    class ClearFailsClient(_FakeSocketClient):
+        def request(self, method, params, *, timeout=None):
+            if method == "pane.send_keys":
+                calls.append({"method": method, "params": dict(params)})
+                raise HerdrSocketDisconnectedError("clear failed before input")
+            return super().request(method, params, timeout=timeout)
+
+    envelope = submit_command(
+        config,
+        _request(request_id="clear-failure-request"),
+        socket_client_factory=lambda _config: ClearFailsClient(calls),
+    )
+
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert not any(call["method"] == "pane.send_input" for call in calls)
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "clear-failure-request",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "uncertain"
+    with sqlite3.connect(str(config.db_path)) as conn:
+        claims = conn.execute(
+            """
+            SELECT turn_id
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.origin_command_id') = ?
+            """,
+            (config.host_id, "clear-failure-request"),
+        ).fetchall()
+    assert claims == []
+
+
+def test_observation_first_submission_adopts_source_row_in_place(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + ("b" * 64),
+            "stable_key_version": 1,
+        },
+    )
+    _seed(config, [worker], [_binding(worker)])
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "observation-first-source",
+            "user_text": "hello",
+            "assistant_final_text": "already observed",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2099-07-19T10:00:00+00:00",
+    ) == 1
+    observed = next(
+        turn
+        for turn in turns_payload_from_store(
+            config.db_path,
+            config.host_id,
+            schema_version=2,
+        )["turns"]
+        if turn.get("assistant_final_text") == "already observed"
+    )
+
+    calls: list[dict[str, Any]] = []
+    accepted = submit_command(
+        config,
+        _request(request_id="observation-first-request"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.result["turn_id"] == observed["id"]
+    assert accepted.result["observed_turn_state"] == "complete"
+    assert calls == _expected_submit_calls()
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "observation-first-source",
+            "user_text": "hello",
+            "assistant_final_text": "tier one refresh",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2099-07-19T10:00:02+00:00",
+    ) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        matching = conn.execute(
+            """
+            SELECT turns.turn_id, turns.list_sequence
+            FROM turns
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = ? AND revisions.user_text = 'hello'
+            """,
+            (config.host_id,),
+        ).fetchall()
+    assert len(matching) == 1
+    assert matching[0][0] == observed["id"]
+    refreshed = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )["turns"]
+    assert len([turn for turn in refreshed if turn.get("source_turn_id")]) == 1
+    assert next(
+        turn for turn in refreshed if turn.get("source_turn_id")
+    )["assistant_final_text"] == "tier one refresh"
+
+
+def test_submission_first_envelope_reflects_observation_during_send(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + ("c" * 64),
+            "stable_key_version": 1,
+        },
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    class ObservingClient(_FakeSocketClient):
+        def request(self, method, params, *, timeout=None):
+            result = super().request(method, params, timeout=timeout)
+            if method == "pane.send_input":
+                assert merge_turn_content(
+                    config.db_path,
+                    config.host_id,
+                    worker.id,
+                    {
+                        "source_turn_id": "submission-first-source",
+                        "user_text": "hello",
+                        "assistant_final_text": "observed during send",
+                        "complete": True,
+                        "has_open_turn": False,
+                    },
+                    observed_at="2099-07-19T10:00:00+00:00",
+                ) == 1
+            return result
+
+    accepted = submit_command(
+        config,
+        _request(request_id="submission-first-request"),
+        socket_client_factory=lambda _config: ObservingClient(calls),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.result["observed_turn_state"] == "complete"
+    turns = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )["turns"]
+    matching = [turn for turn in turns if turn.get("user_text") == "hello"]
+    assert len(matching) == 1
+    assert matching[0]["id"] == accepted.result["turn_id"]
+    assert matching[0]["assistant_final_text"] == "observed during send"
+
+
 def test_submit_command_sends_identical_100_character_instructions_with_distinct_ids(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
-    worker = Worker(id="w-1", name="Alpha", status="active")
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + ("d" * 64),
+            "stable_key_version": 1,
+        },
+    )
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
     text = "x" * 100
@@ -602,6 +842,7 @@ def test_submit_command_sends_identical_100_character_instructions_with_distinct
 
     assert first.status == STATUS_ACCEPTED
     assert second.status == STATUS_ACCEPTED
+    assert first.result["turn_id"] != second.result["turn_id"]
     expected_send = [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
@@ -617,12 +858,64 @@ def test_submit_command_sends_identical_100_character_instructions_with_distinct
     assert second_receipt is not None
     assert second_receipt["state"] == "accepted"
     with sqlite3.connect(str(config.db_path)) as conn:
+        turn_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM turns
+            WHERE host_id = ?
+              AND json_extract(payload_json, '$.source') = 'command'
+              AND json_extract(payload_json, '$.has_open_turn') = 1
+            """,
+            (config.host_id,),
+        ).fetchone()[0]
         events = [
             row[0]
             for row in conn.execute(
                 "SELECT event_type FROM events WHERE aggregate_type = 'command_request' ORDER BY id"
             ).fetchall()
         ]
+    assert turn_count == 2
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "ambiguous-identical-source",
+            "user_text": text,
+            "assistant_final_text": "independent observation",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2099-07-19T10:00:00+00:00",
+    ) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        stored = [
+            (str(turn_id), json.loads(payload_json))
+            for turn_id, payload_json in conn.execute(
+                "SELECT turn_id, payload_json FROM turns WHERE host_id = ?",
+                (config.host_id,),
+            ).fetchall()
+        ]
+    relevant = [
+        (turn_id, payload)
+        for turn_id, payload in stored
+        if payload.get("origin_command_id")
+        or payload.get("source_turn_id")
+    ]
+    assert len(relevant) == 3
+    assert {first.result["turn_id"], second.result["turn_id"]}.issubset(
+        {turn_id for turn_id, _payload in relevant}
+    )
+    observed = [
+        (turn_id, payload)
+        for turn_id, payload in relevant
+        if payload.get("source_turn_id")
+    ]
+    assert len(observed) == 1
+    assert observed[0][0] not in {
+        first.result["turn_id"],
+        second.result["turn_id"],
+    }
     assert events == [
         "command.request.reserved",
         "command.request.send_started",
@@ -807,12 +1100,14 @@ def test_submit_command_reports_submitted_transport_and_worker_state(tmp_path: P
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
 
     assert envelope.status == STATUS_ACCEPTED
+    assert str(envelope.result["turn_id"]).startswith("turn-")
     assert envelope.result == {
         "target": {"worker_id": "w-1"},
         "delivery_state": "submitted",
         "transport_state": "submitted",
         "target_state_at_send": "active",
         "observed_turn_state": "pending_observation",
+        "turn_id": envelope.result["turn_id"],
     }
 
 
@@ -825,12 +1120,14 @@ def test_submit_command_marks_idle_worker_delivery_as_submitted(tmp_path: Path) 
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
 
     assert envelope.status == STATUS_ACCEPTED
+    assert str(envelope.result["turn_id"]).startswith("turn-")
     assert envelope.result == {
         "target": {"worker_id": "w-1"},
         "delivery_state": "submitted",
         "transport_state": "submitted",
         "target_state_at_send": "idle",
         "observed_turn_state": "pending_observation",
+        "turn_id": envelope.result["turn_id"],
     }
 
 
@@ -3325,7 +3622,7 @@ def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
         for turn in completed_payload["turns"]
         if turn.get("assistant_final_text") == "durable owner answer"
     )
-    assert completed_source["id"] != command_before["id"]
+    assert completed_source["id"] == command_before["id"]
     assert completed_source["origin_command_id"] == request_id
     assert completed_source["source_turn_id"].startswith("turnsrc-")
     assert completed_source["source_turn_id"] != raw_source
