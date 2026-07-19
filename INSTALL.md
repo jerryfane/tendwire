@@ -95,8 +95,8 @@ Every cache hit validates the current sessions-root device/inode; a found result
 also validates the rollout inode. A root identity change immediately clears
 that root's cached path results and complete index.
 
-The complete Codex index is capped at 100,000 visited entries, 32,768 session
-identities, and 8 MiB; its path-result LRU is capped at 256 entries and 256 KiB.
+The complete Codex index is capped at 100,000 visited entries, 100,000 session
+identities, and 16 MiB; its path-result LRU is capped at 256 entries and 256 KiB.
 Negative results expire after 2 seconds. A lookup rebuilds the complete index
 once its snapshot is 60 seconds old. Consequently, a newly created duplicate
 may remain undiscovered for up to one 60-second snapshot interval before the

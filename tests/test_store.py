@@ -6572,8 +6572,11 @@ def test_turn_claim_sweeper_resolves_only_one_identical_claim_per_done_turn(
     assert stored[second["id"]]["has_open_turn"] is True
 
 
-@pytest.mark.parametrize(("claim_count", "done_count"), [(1, 2), (2, 1)])
-def test_turn_claim_sweeper_fifo_requires_unambiguous_claim_and_done_sets(
+@pytest.mark.parametrize(
+    ("claim_count", "done_count"),
+    [(1, 1), (1, 2), (2, 1)],
+)
+def test_turn_claim_sweeper_never_infers_match_from_cardinality(
     tmp_path: Path,
     claim_count: int,
     done_count: int,

@@ -212,7 +212,7 @@ def test_duplicate_exact_identity_is_ambiguous_independent_of_mtime(
     assert herdr_turns._find_codex_session_file(SESSION_A) is None
 
 
-def test_complete_20k_index_build_is_bounded_and_deterministic(monkeypatch) -> None:
+def test_complete_34k_index_build_is_bounded_and_deterministic(monkeypatch) -> None:
     root = Path("/virtual/sessions")
 
     class Entry:
@@ -233,7 +233,7 @@ def test_complete_20k_index_build_is_bounded_and_deterministic(monkeypatch) -> N
     month = Entry(f"{year.path}/07", "07", "dir")
     day = Entry(f"{month.path}/03", "03", "dir")
     files = []
-    for ordinal in range(1, 20_001):
+    for ordinal in range(1, 34_001):
         session_id = str(UUID(int=ordinal))
         name = f"rollout-2026-07-03T00-00-00-{session_id}.jsonl"
         files.append(Entry(f"{day.path}/{name}", name, "file"))
@@ -248,10 +248,10 @@ def test_complete_20k_index_build_is_bounded_and_deterministic(monkeypatch) -> N
 
     generation = herdr_turns._build_codex_index(root)
     assert generation.overflowed is False
-    assert len(generation.entries) == 20_000
+    assert len(generation.entries) == 34_000
     assert generation.entries[str(UUID(int=1))][0].endswith("000000000001.jsonl")
-    assert generation.entries[str(UUID(int=20_000))][0].endswith("000000004e20.jsonl")
-    assert generation.visited == 20_003
+    assert generation.entries[str(UUID(int=34_000))][0].endswith("0000000084d0.jsonl")
+    assert generation.visited == 34_003
     assert generation.retained_bytes <= herdr_turns._CODEX_INDEX_MAX_BYTES
 
 
