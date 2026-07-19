@@ -69,6 +69,7 @@ _HERDR_BACKEND = "herdr"
 _DEFAULT_FETCH_HERDR_STATE = fetch_herdr_state
 _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS = 2.0
 _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS = 10.0
+_DAEMON_CONNECTOR_CLIENT_TIMEOUT_SECONDS = 10.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS = 2.0
 _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS = 0.5
 
@@ -89,6 +90,8 @@ def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
         )
     if method in {"turn.list", "turn.content.get"}:
         return _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS
+    if method.startswith("connector."):
+        return _DAEMON_CONNECTOR_CLIENT_TIMEOUT_SECONDS
     return _DAEMON_FAST_CLIENT_TIMEOUT_SECONDS
 
 
@@ -1467,10 +1470,36 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         }
         print(public_json_dumps(payload, indent=2))
         return 2
-    daemon_result = _try_daemon_result(config, method, params)
-    if daemon_result is not None:
-        print(_connector_payload_json(daemon_result, indent=2))
-        return 0 if daemon_result.get("ok") is not False else 1
+    daemon_attempt = _try_daemon_attempt(config, method, params)
+    if daemon_attempt.result is not None:
+        print(_connector_payload_json(daemon_attempt.result, indent=2))
+        return 0 if daemon_attempt.result.get("ok") is not False else 1
+    if daemon_attempt.response_error is not None:
+        print(_connector_payload_json(daemon_attempt.response_error, indent=2))
+        return 1
+    if daemon_attempt.request_started is not False:
+        status = (
+            "daemon_timeout"
+            if daemon_attempt.error_kind == "timeout"
+            else "daemon_protocol_error"
+        )
+        payload = {
+            "schema_version": 1,
+            "ok": False,
+            "status": status,
+            "host_id": config.host_id,
+            "name": params.get("name", ""),
+            "error": {
+                "code": status,
+                "message": (
+                    "Tendwire daemon request timed out"
+                    if status == "daemon_timeout"
+                    else "Tendwire daemon returned an invalid response"
+                ),
+            },
+        }
+        print(_connector_payload_json(payload, indent=2))
+        return 1
     if config.db_path is None:
         payload = {
             "schema_version": 1,

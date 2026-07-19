@@ -2624,6 +2624,7 @@ def _final_ready_payload_conn(
     turn_id: str,
     content_revision_value: str,
     allow_unroutable: bool = False,
+    working_predecessor_turn_id: str | None = None,
 ) -> dict[str, Any] | None:
     row = conn.execute(
         """
@@ -2712,6 +2713,11 @@ def _final_ready_payload_conn(
     if routable:
         payload["stable_key"] = str(stable_key)
         payload["stable_key_version"] = 1
+        predecessor = str(
+            working_predecessor_turn_id or ""
+        ).strip()
+        if predecessor and predecessor != str(turn_id):
+            payload["working_predecessor_turn_id"] = predecessor
     return payload
 
 
@@ -3143,6 +3149,7 @@ def _ensure_final_ready_anchor_conn(
     turn_id: str,
     content_revision_value: str,
     now: str,
+    working_predecessor_turn_id: str | None = None,
 ) -> int | None:
     payload = _final_ready_payload_conn(
         conn,
@@ -3150,6 +3157,7 @@ def _ensure_final_ready_anchor_conn(
         turn_id=str(turn_id),
         content_revision_value=str(content_revision_value),
         allow_unroutable=True,
+        working_predecessor_turn_id=working_predecessor_turn_id,
     )
     if payload is None:
         return None
@@ -5762,6 +5770,20 @@ def poll_connector_outbox(
                                 AND earlier_final.delivery_kind = 'final_ready'
                                 AND earlier_final.ordering_key = outbox.ordering_key
                                 AND earlier_final.id < outbox.id
+                                AND json_extract(
+                                    earlier_final.payload_json,
+                                    '$.stable_key'
+                                ) = json_extract(
+                                    outbox.payload_json,
+                                    '$.stable_key'
+                                )
+                                AND json_extract(
+                                    earlier_final.payload_json,
+                                    '$.stable_key_version'
+                                ) = json_extract(
+                                    outbox.payload_json,
+                                    '$.stable_key_version'
+                                )
                                 AND earlier_final.status NOT IN (
                                     'delivered',
                                     'superseded',
@@ -19928,6 +19950,7 @@ def _merge_owned_turn_content_conn(
                 turn_id=selected_turn_id,
                 content_revision_value=str(current_revision[0]),
                 now=str(observed_at),
+                working_predecessor_turn_id=command_predecessor_turn_id,
             )
             if current_revision is not None
             else None
@@ -20261,6 +20284,7 @@ def _merge_turn_content_conn(
                 turn_id=selected_turn_id,
                 content_revision_value=str(current_revision[0]),
                 now=str(observed_at),
+                working_predecessor_turn_id=command_predecessor_turn_id,
             )
             if current_revision is not None
             else None

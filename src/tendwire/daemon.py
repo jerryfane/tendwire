@@ -544,16 +544,6 @@ class TendwireDaemon:
 
             scheduler = self.hooks.turn_scheduler_factory(self.config)
             self._turn_scheduler = scheduler
-            backend = self._event_backend
-            callback_setter = (
-                getattr(backend, "set_turn_refresh_callback", None)
-                if backend is not None
-                else None
-            )
-            if callable(callback_setter):
-                callback_setter(scheduler.request_refresh)
-            scheduler.start()
-            scheduler.request_refresh()
 
             api = TendwireDaemonAPI(
                 get_snapshot=self.get_snapshot,
@@ -574,7 +564,22 @@ class TendwireDaemon:
                 periodic_callback=self._connector_periodic_tick,
             )
             self._server = server
+            # Bind before ingestion starts. Managed store connections and the
+            # socket publisher lock the same parent directory, so allowing an
+            # initial refresh first can make the daemon deadlock with itself.
+            # Requests are not served until start() returns successfully.
             server.start()
+
+            backend = self._event_backend
+            callback_setter = (
+                getattr(backend, "set_turn_refresh_callback", None)
+                if backend is not None
+                else None
+            )
+            if callable(callback_setter):
+                callback_setter(scheduler.request_refresh)
+            scheduler.start()
+            scheduler.request_refresh()
         except Exception:
             self.stop_event.set()
             backend = self._event_backend

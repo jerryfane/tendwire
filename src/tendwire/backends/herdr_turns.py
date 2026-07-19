@@ -388,7 +388,10 @@ def _extract_turn_payload(value: Any) -> Mapping[str, Any] | None:
     return value
 
 
-PENDING_DECISION_MAX_OPTIONS = 11
+# Every driven ordinal must stay a single keystroke (digits select/toggle
+# absolutely in the pane, live-verified on Claude Code 2.1.211), so 9 is the
+# hard bound; larger decisions fail closed to the read-only interaction.
+PENDING_DECISION_MAX_OPTIONS = 9
 _PENDING_TEXT_MAX = 2000
 _SINGLE_WRITE_IN_OPTION_IDS = frozenset(
     {"custom", "other", "writein", "write_in", "write-in"}
@@ -422,7 +425,10 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
             options = []
         if not isinstance(options, list):
             return PendingObservation("read_succeeded_invalid_prompt")
-        if len(options) > PENDING_DECISION_MAX_OPTIONS:
+        # A single-choice Claude prompt may have one trailing write-in row in
+        # addition to the digit-addressable options. Validate the effective
+        # selectable rows after the decision kind and write-in shape are known.
+        if len(options) > PENDING_DECISION_MAX_OPTIONS + 1:
             return PendingObservation("read_succeeded_unsupported_decision")
         choices: list[PendingObservedChoice] = []
         for ordinal, option in enumerate(options, 1):
@@ -528,6 +534,8 @@ def _pending_observation_from_turn(turn: Mapping[str, Any]) -> PendingObservatio
         decision_options = tuple(decision_option_labels)
         if not decision_options:
             return PendingObservation("read_succeeded_invalid_prompt")
+        if len(decision_options) > PENDING_DECISION_MAX_OPTIONS:
+            return PendingObservation("read_succeeded_unsupported_decision")
         return PendingObservation(
             "open_prompt",
             question=question,
@@ -1733,14 +1741,17 @@ def _apply_codex_event(
         state_value.final_text = None
     if event.kind == "user":
         if _is_internal_user_text(event.text):
-            state_value.internal_turn = True
-            state_value.last_content_turn_id = turn_id
-            state_value.stream_items.clear()
-            state_value.user_text = None
-            state_value.final_text = None
+            # Codex may emit environment or command context before the real
+            # user message under the same turn ID. Suppress that context
+            # without allowing later internal metadata to erase a user turn
+            # that has already become public.
+            if state_value.user_text is None:
+                state_value.internal_turn = True
+                state_value.last_content_turn_id = turn_id
+                state_value.stream_items.clear()
+                state_value.final_text = None
             return
-        if state_value.internal_turn:
-            return
+        state_value.internal_turn = False
         state_value.user_text = event.text
         state_value.last_content_turn_id = turn_id
         state_value.turn_open = not state_value.final_seen
