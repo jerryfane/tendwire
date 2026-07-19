@@ -1252,7 +1252,8 @@ effect.
 `connector.poll` atomically leases due `connector_outbox` rows for one `name`
 and returns opaque per-attempt refs. A live lease prevents duplicate polling.
 Expired leases are reclaimed before polling and before ref-mutating operations;
-the daemon also runs this reclaim pass on its periodic tick, and
+the daemon first performs a read-only due check on its periodic tick and takes
+the reclaim write transaction only when work is actually expired.
 `connector.reclaim` can be called directly. `connector.renew` extends a live
 lease without creating a delivery attempt. `connector.release` records the live
 attempt as released and makes the row immediately pollable again. `connector.ack`
@@ -1273,13 +1274,21 @@ public status `attempts_exhausted` without exposing private outbox or delivery
 state.
 
 Final-root FIFO is partitioned by the turn's immutable stable worker key, with
-the persisted worker ID as the enqueue-time fallback. A blocked worker therefore
+the persisted worker ID as the enqueue-time fallback. Legacy backfill prefers
+the enqueue-era stable key carried in the outbox payload; rows that predate that
+metadata still fall back to the turn's current persisted worker ID. If neither
+identity can be resolved, each row receives its own `orphan:<id>` partition so
+unrelated degraded rows cannot block one another. A blocked worker therefore
 cannot starve another worker, while roots and plan parts for the same worker stay
 strictly ordered. `dead_letter`, `superseded`, and `delivered` roots are terminal
 for this gate. A committed source in `awaiting_ack` no longer blocks by itself;
-its plan jobs carry the ordering obligation. Commit stamps an ACK deadline, and
-an expired incomplete plan is failed and its source requeued. Missing or
-unrecoverable plan state terminates the source instead of leaving it pending.
+its plan jobs carry the ordering obligation, including source-less recovery
+plans. Commit stamps an ACK deadline, each acknowledged plan job extends it,
+and a valid part lease prevents deadline reclaim from interrupting in-flight
+delivery. ACK-deadline recovery does not consume the connector failure-attempt
+budget. An expired incomplete plan is otherwise failed and its source requeued.
+Missing or unrecoverable plan state terminates the source instead of leaving it
+pending.
 
 ### Delivery-aware final roots and acknowledged history
 

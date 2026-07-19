@@ -1241,7 +1241,16 @@ def _benchmark(args: argparse.Namespace) -> dict[str, Any]:
             )
         ) - baseline_threads
         source_calls_final = len(adapter_records)
-        forbidden_values.extend(str(process_id) for process_id in process_ids)
+        forbidden_values.extend(
+            marker
+            for process_id in process_ids
+            for marker in (
+                f'"process_id":{process_id}',
+                f'"process_id":"{process_id}"',
+                f'"pid":{process_id}',
+                f'"pid":"{process_id}"',
+            )
+        )
         overlap_ns = _first_call_overlap_ns(adapter_records, args.blocked_workers)
         response_bytes_max = max(
             metric["response_bytes_max"] for metric in latency.values()

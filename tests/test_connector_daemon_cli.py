@@ -17,6 +17,7 @@ from tendwire.config import Config
 from tendwire.core.models import Snapshot
 from tendwire.daemon import TendwireDaemon
 from tendwire.daemon_api import TendwireDaemonAPI
+from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import init_store
 
 
@@ -192,6 +193,26 @@ def test_daemon_periodic_tick_reclaims_without_a_followup_poll(tmp_path: Path) -
         ).fetchone()[0]
     assert outbox_status == "queued"
     assert delivery_status == "expired"
+
+
+def test_daemon_periodic_tick_skips_write_reclaim_when_nothing_is_due(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "daemon-no-reclaim-due.db"
+    _enqueue(db_path, host_id="daemon-host", key="not-leased")
+    daemon = TendwireDaemon(Config(host_id="daemon-host", db_path=db_path))
+
+    def reject_write(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("write reclaim should not run without due work")
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "reclaim_expired_connector_leases",
+        reject_write,
+    )
+
+    daemon._connector_periodic_tick()
 
 
 def test_cli_connector_poll_and_ack_print_json_only(tmp_path: Path, capsys) -> None:

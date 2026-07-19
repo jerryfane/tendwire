@@ -112,7 +112,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 16
+STORE_SCHEMA_VERSION = 17
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
@@ -169,19 +169,6 @@ def _configured_turn_claim_hard_ttl_seconds() -> int:
         raise StoreSchemaError("turn_claim_hard_ttl_invalid") from exc
     if configured <= 0:
         raise StoreSchemaError("turn_claim_hard_ttl_invalid")
-    return configured
-
-
-def _configured_connector_ack_ttl_seconds() -> int:
-    raw = os.environ.get("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS")
-    if raw is None:
-        return CONNECTOR_ACK_TTL_SECONDS
-    try:
-        configured = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise StoreSchemaError("connector_ack_ttl_invalid") from exc
-    if configured <= 0:
-        raise StoreSchemaError("connector_ack_ttl_invalid")
     return configured
 
 
@@ -2138,6 +2125,12 @@ def _connector_reclaim_expired_awaiting_ack_conn(
         }
         if recoverable:
             plan_id = int(plan[0])
+            if _connector_plan_has_live_job_lease_conn(
+                conn,
+                plan_id=plan_id,
+                now_dt=now_dt,
+            ):
+                continue
             conn.execute(
                 "UPDATE turn_presentation_plans SET state = 'failed' WHERE id = ?",
                 (plan_id,),
@@ -2241,6 +2234,37 @@ def _connector_reclaim_expired_awaiting_ack_conn(
     return reclaimed
 
 
+def _connector_plan_has_live_job_lease_conn(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+    now_dt: datetime,
+) -> bool:
+    live_job_leases = conn.execute(
+        """
+        SELECT deliveries.private_state_json
+        FROM turn_presentation_jobs AS jobs
+        JOIN connector_outbox AS outbox
+          ON outbox.id = jobs.outbox_id
+        JOIN connector_deliveries AS deliveries
+          ON deliveries.outbox_id = outbox.id
+        WHERE jobs.plan_id = ?
+          AND outbox.status = 'leased'
+          AND deliveries.status = 'leased'
+        """,
+        (int(plan_id),),
+    ).fetchall()
+    return any(
+        (
+            lease_expires_at := str(
+                _json_object(row[0]).get("lease_expires_at") or ""
+            )
+        )
+        and _connector_datetime(lease_expires_at) > now_dt
+        for row in live_job_leases
+    )
+
+
 def _connector_exhaust_retryable_conn(
     conn: sqlite3.Connection,
     *,
@@ -2255,7 +2279,22 @@ def _connector_exhaust_retryable_conn(
         "status IN ('queued', 'deferred', 'retry')",
         """
         (
-            SELECT COALESCE(MAX(d.attempt), 0)
+            SELECT
+                COALESCE(MAX(d.attempt), 0)
+                - COALESCE(
+                    SUM(
+                        CASE
+                            WHEN d.status = 'failed'
+                             AND COALESCE(
+                                 json_extract(d.response_json, '$.status'),
+                                 ''
+                             ) = 'ack_deadline_expired'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )
             FROM connector_deliveries d
             WHERE d.outbox_id = connector_outbox.id
         ) >= ?
@@ -2296,6 +2335,93 @@ def _connector_exhaust_retryable_conn(
         now=str(now),
     )
     return int(cursor.rowcount or 0)
+
+
+def connector_reclaim_due(
+    db_path: Path,
+    host_id: str,
+    name: str | None = None,
+    *,
+    now: str | None = None,
+) -> bool:
+    """Return whether connector work is due for reclaim without taking a write lock."""
+    if not _sqlite_store_exists(db_path):
+        return False
+    current_time = _connector_now(now)
+    now_dt = _connector_datetime(current_time)
+    delivery_clauses = ["host_id = ?", "status = 'leased'"]
+    outbox_clauses = ["host_id = ?", "status = 'awaiting_ack'"]
+    params: list[Any] = [str(host_id)]
+    if name is not None:
+        delivery_clauses.append("connector = ?")
+        outbox_clauses.append("connector = ?")
+        params.append(str(name))
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        lease_rows = conn.execute(
+            f"""
+            SELECT private_state_json
+            FROM connector_deliveries
+            WHERE {' AND '.join(delivery_clauses)}
+            """,
+            params,
+        ).fetchall()
+        for (private_state_json,) in lease_rows:
+            expires_at = str(
+                _json_object(private_state_json).get("lease_expires_at") or ""
+            )
+            if expires_at and _connector_datetime(expires_at) <= now_dt:
+                return True
+        awaiting_rows = conn.execute(
+            f"""
+            SELECT
+                outbox.id,
+                outbox.private_state_json,
+                (
+                    SELECT deliveries.private_state_json
+                    FROM connector_deliveries AS deliveries
+                    WHERE deliveries.outbox_id = outbox.id
+                      AND deliveries.status = 'awaiting_ack'
+                    ORDER BY deliveries.id DESC
+                    LIMIT 1
+                )
+            FROM connector_outbox AS outbox
+            WHERE {' AND '.join(outbox_clauses)}
+            """,
+            params,
+        ).fetchall()
+        for outbox_id, outbox_private, delivery_private in awaiting_rows:
+            deadline = str(
+                _json_object(outbox_private).get("ack_deadline_at") or ""
+            )
+            if not deadline:
+                deadline = str(
+                    _json_object(delivery_private).get("ack_deadline_at") or ""
+                )
+            if not deadline or _connector_datetime(deadline) > now_dt:
+                continue
+            plan = conn.execute(
+                """
+                SELECT id, state
+                FROM turn_presentation_plans
+                WHERE source_outbox_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(outbox_id),),
+            ).fetchone()
+            if (
+                plan is not None
+                and str(plan[1]) in {"active", "waiting_predecessor", "failed"}
+                and _connector_plan_has_live_job_lease_conn(
+                    conn,
+                    plan_id=int(plan[0]),
+                    now_dt=now_dt,
+                )
+            ):
+                continue
+            return True
+    return False
 
 
 def reclaim_expired_connector_leases(
@@ -2447,7 +2573,7 @@ def _turn_ordering_key_conn(
         (str(host_id), str(turn_id)),
     ).fetchone()
     if row is None:
-        return ""
+        return f"orphan:{turn_id}"
     payload = _json_object(row[1])
     meta = _json_object(payload.get("meta"))
     stable_key = meta.get("stable_key")
@@ -2457,7 +2583,7 @@ def _turn_ordering_key_conn(
         and meta.get("stable_key_version") == 1
     ):
         return str(stable_key)
-    return str(row[0] or "")
+    return str(row[0] or f"orphan:{turn_id}")
 
 
 def _final_content_field_descriptor(
@@ -4282,6 +4408,7 @@ def _update_presentation_plan_after_outbox_conn(
     outbox_id: int,
     outbox_status: str,
     now: str,
+    ack_ttl_seconds: int | None = None,
 ) -> None:
     plan = conn.execute(
         """
@@ -4323,7 +4450,67 @@ def _update_presentation_plan_after_outbox_conn(
                 """,
                 (plan_id,),
             ).fetchone()
-            if int(remaining[0] or 0) == 0:
+            remaining_count = int(remaining[0] or 0)
+            source_outbox_id = (
+                int(plan[4]) if plan[4] is not None else None
+            )
+            if (
+                remaining_count > 0
+                and source_outbox_id is not None
+                and ack_ttl_seconds is not None
+            ):
+                deadline = _connector_add_seconds(
+                    str(now),
+                    max(1, int(ack_ttl_seconds)),
+                )
+                source_row = conn.execute(
+                    """
+                    SELECT private_state_json
+                    FROM connector_outbox
+                    WHERE id = ? AND status = 'awaiting_ack'
+                    """,
+                    (source_outbox_id,),
+                ).fetchone()
+                if source_row is not None:
+                    source_state = _json_object(source_row[0])
+                    source_state["ack_deadline_at"] = deadline
+                    conn.execute(
+                        """
+                        UPDATE connector_outbox
+                        SET private_state_json = ?, updated_at = ?
+                        WHERE id = ? AND status = 'awaiting_ack'
+                        """,
+                        (
+                            _canonical_json(source_state),
+                            str(now),
+                            source_outbox_id,
+                        ),
+                    )
+                    delivery_row = conn.execute(
+                        """
+                        SELECT id, private_state_json
+                        FROM connector_deliveries
+                        WHERE outbox_id = ? AND status = 'awaiting_ack'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (source_outbox_id,),
+                    ).fetchone()
+                    if delivery_row is not None:
+                        delivery_state = _json_object(delivery_row[1])
+                        delivery_state["ack_deadline_at"] = deadline
+                        conn.execute(
+                            """
+                            UPDATE connector_deliveries
+                            SET private_state_json = ?
+                            WHERE id = ? AND status = 'awaiting_ack'
+                            """,
+                            (
+                                _canonical_json(delivery_state),
+                                int(delivery_row[0]),
+                            ),
+                        )
+            if remaining_count == 0:
                 conn.execute(
                     """
                     UPDATE turn_presentation_plans
@@ -4331,9 +4518,6 @@ def _update_presentation_plan_after_outbox_conn(
                     WHERE id = ? AND state = 'active'
                     """,
                     (str(now), plan_id),
-                )
-                source_outbox_id = (
-                    int(plan[4]) if plan[4] is not None else None
                 )
                 if source_outbox_id is not None:
                     conn.execute(
@@ -5605,7 +5789,7 @@ def poll_connector_outbox(
                           AND NOT EXISTS (
                               SELECT 1
                               FROM turn_presentation_plans AS earlier_plan
-                              JOIN connector_outbox AS earlier_source
+                              LEFT JOIN connector_outbox AS earlier_source
                                 ON earlier_source.id = earlier_plan.source_outbox_id
                               WHERE earlier_plan.host_id = outbox.host_id
                                 AND earlier_plan.name = outbox.connector
@@ -5613,8 +5797,30 @@ def poll_connector_outbox(
                                     'active',
                                     'waiting_predecessor'
                                 )
-                                AND earlier_source.ordering_key = outbox.ordering_key
-                                AND earlier_source.id < outbox.id
+                                AND (
+                                    (
+                                        earlier_source.ordering_key
+                                            = outbox.ordering_key
+                                        AND earlier_source.id < outbox.id
+                                    )
+                                    OR (
+                                        earlier_plan.source_outbox_id IS NULL
+                                        AND EXISTS (
+                                            SELECT 1
+                                            FROM turn_presentation_jobs
+                                                AS ordering_job
+                                            JOIN connector_outbox
+                                                AS ordering_outbox
+                                              ON ordering_outbox.id
+                                                = ordering_job.outbox_id
+                                            WHERE ordering_job.plan_id
+                                                = earlier_plan.id
+                                              AND ordering_outbox.ordering_key
+                                                = outbox.ordering_key
+                                              AND ordering_outbox.id < outbox.id
+                                        )
+                                    )
+                                )
                                 AND EXISTS (
                                     SELECT 1
                                     FROM turn_presentation_jobs AS earlier_job
@@ -6070,6 +6276,7 @@ def _connector_update_ref(
     available_at: str | None = None,
     delay_seconds: int | None = None,
     max_attempts: int | None = None,
+    ack_ttl_seconds: int | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
     if not _sqlite_store_exists(db_path):
@@ -6204,6 +6411,7 @@ def _connector_update_ref(
                     outbox_id=outbox_id,
                     outbox_status=_CONNECTOR_TERMINAL_OUTBOX_STATUS,
                     now=current_time,
+                    ack_ttl_seconds=ack_ttl_seconds,
                 )
                 conn.commit()
                 return _connector_response(
@@ -6224,7 +6432,40 @@ def _connector_update_ref(
             else:
                 available_at = _connector_iso(available_at)
             attempt_limit = max(1, int(max_attempts)) if max_attempts is not None else None
-            exhausted = action == "fail" and attempt_limit is not None and attempt >= attempt_limit
+            attempts_used = int(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(MAX(attempt), 0)
+                        - COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN status = 'failed'
+                                     AND COALESCE(
+                                         json_extract(
+                                             response_json,
+                                             '$.status'
+                                         ),
+                                         ''
+                                     ) = 'ack_deadline_expired'
+                                    THEN 1
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                    FROM connector_deliveries
+                    WHERE outbox_id = ?
+                    """,
+                    (outbox_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            exhausted = (
+                action == "fail"
+                and attempt_limit is not None
+                and attempts_used >= attempt_limit
+            )
             result_status = "attempts_exhausted" if exhausted else ("retry_scheduled" if action == "fail" else "deferred")
             delivery_status = "failed" if action == "fail" else "deferred"
             outbox_status = (
@@ -6298,6 +6539,7 @@ def ack_connector_delivery(
     name: str,
     ref: str,
     response: Mapping[str, Any] | None = None,
+    ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Acknowledge a live connector lease and make the outbox item terminal."""
@@ -6308,6 +6550,7 @@ def ack_connector_delivery(
         name=name,
         ref=ref,
         response=response,
+        ack_ttl_seconds=max(1, int(ack_ttl_seconds)),
         now=now,
     )
 
@@ -11487,10 +11730,26 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
 
 def _legacy_outbox_ordering_key(
     *,
+    outbox_id: int,
     outbox_payload: Mapping[str, Any],
     worker_id: Any,
     turn_payload: Mapping[str, Any],
 ) -> str:
+    nested_turn = outbox_payload.get("turn")
+    route = dict(nested_turn) if isinstance(nested_turn, Mapping) else outbox_payload
+    route_meta = _json_object(route.get("meta"))
+    route_stable_key = route.get("stable_key") or route_meta.get("stable_key")
+    route_stable_key_version = (
+        route.get("stable_key_version")
+        if route.get("stable_key") is not None
+        else route_meta.get("stable_key_version")
+    )
+    if (
+        _valid_final_stable_key(route_stable_key)
+        and type(route_stable_key_version) is int
+        and route_stable_key_version == 1
+    ):
+        return str(route_stable_key)
     meta = _json_object(turn_payload.get("meta"))
     stable_key = meta.get("stable_key")
     if (
@@ -11499,19 +11758,14 @@ def _legacy_outbox_ordering_key(
         and meta.get("stable_key_version") == 1
     ):
         return str(stable_key)
-    nested_turn = outbox_payload.get("turn")
-    route = dict(nested_turn) if isinstance(nested_turn, Mapping) else outbox_payload
-    route_stable_key = route.get("stable_key")
-    if (
-        _valid_final_stable_key(route_stable_key)
-        and type(route.get("stable_key_version")) is int
-        and route.get("stable_key_version") == 1
-    ):
-        return str(route_stable_key)
-    return str(worker_id or route.get("worker_id") or "")
+    return str(worker_id or route.get("worker_id") or f"orphan:{outbox_id}")
 
 
-def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
+def _migrate_v15_to_v16_conn(
+    conn: sqlite3.Connection,
+    *,
+    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
+) -> None:
     """Partition final FIFO order and bound legacy awaiting-ack plans."""
     columns = _table_columns(conn, "connector_outbox")
     if not columns:
@@ -11529,9 +11783,7 @@ def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
             LEFT JOIN turns
               ON turns.host_id = outbox.host_id
              AND turns.turn_id = outbox.turn_id
-            WHERE outbox.turn_id IS NOT NULL
-              AND outbox.turn_id != ''
-              AND outbox.ordering_key = ''
+            WHERE outbox.ordering_key = ''
             ORDER BY outbox.id
             """
         ).fetchall()
@@ -11542,7 +11794,7 @@ def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
                 """
                 SELECT id, payload_json
                 FROM connector_outbox
-                WHERE turn_id IS NOT NULL AND turn_id != '' AND ordering_key = ''
+                WHERE ordering_key = ''
                 ORDER BY id
                 """
             ).fetchall()
@@ -11552,6 +11804,7 @@ def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
             "UPDATE connector_outbox SET ordering_key = ? WHERE id = ?",
             (
                 _legacy_outbox_ordering_key(
+                    outbox_id=int(outbox_id),
                     outbox_payload=_json_object(outbox_payload),
                     worker_id=worker_id,
                     turn_payload=_json_object(turn_payload),
@@ -11561,7 +11814,7 @@ def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
         )
     deadline = _connector_add_seconds(
         utc_timestamp(),
-        _configured_connector_ack_ttl_seconds(),
+        max(1, int(connector_ack_ttl_seconds)),
     )
     awaiting_rows = conn.execute(
         "SELECT id, private_state_json FROM connector_outbox WHERE status = 'awaiting_ack'"
@@ -11595,6 +11848,48 @@ def _migrate_v15_to_v16_conn(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_CONNECTOR_ORDERING_INDEX)
 
 
+def _migrate_v16_to_v17_conn(conn: sqlite3.Connection) -> None:
+    """Give unresolved legacy outbox rows independent FIFO partitions."""
+    if _table_columns(conn, "turns"):
+        rows = conn.execute(
+            """
+            SELECT outbox.id, outbox.payload_json,
+                   turns.worker_id, turns.payload_json
+            FROM connector_outbox AS outbox
+            LEFT JOIN turns
+              ON turns.host_id = outbox.host_id
+             AND turns.turn_id = outbox.turn_id
+            WHERE outbox.ordering_key = ''
+            ORDER BY outbox.id
+            """
+        ).fetchall()
+    else:
+        rows = [
+            (row[0], row[1], None, None)
+            for row in conn.execute(
+                """
+                SELECT id, payload_json
+                FROM connector_outbox
+                WHERE ordering_key = ''
+                ORDER BY id
+                """
+            ).fetchall()
+        ]
+    for outbox_id, outbox_payload, worker_id, turn_payload in rows:
+        conn.execute(
+            "UPDATE connector_outbox SET ordering_key = ? WHERE id = ?",
+            (
+                _legacy_outbox_ordering_key(
+                    outbox_id=int(outbox_id),
+                    outbox_payload=_json_object(outbox_payload),
+                    worker_id=worker_id,
+                    turn_payload=_json_object(turn_payload),
+                ),
+                int(outbox_id),
+            ),
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -11612,6 +11907,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(13, 14, _migrate_v13_to_v14_conn),
     Migration(14, 15, _migrate_v14_to_v15_conn),
     Migration(15, 16, _migrate_v15_to_v16_conn),
+    Migration(16, 17, _migrate_v16_to_v17_conn),
 )
 
 
@@ -11708,6 +12004,7 @@ def _run_migrations(
     conn: sqlite3.Connection,
     *,
     target_version: int = STORE_SCHEMA_VERSION,
+    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
 ) -> None:
     """Run exact ordered transitions with one transaction per version."""
     if conn.in_transaction:
@@ -11720,7 +12017,15 @@ def _run_migrations(
             raise RuntimeError("invalid migration registry dispatch")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            migration.apply(conn)
+            if migration.apply is _migrate_v15_to_v16_conn:
+                _migrate_v15_to_v16_conn(
+                    conn,
+                    connector_ack_ttl_seconds=max(
+                        1, int(connector_ack_ttl_seconds)
+                    ),
+                )
+            else:
+                migration.apply(conn)
             conn.execute(f"PRAGMA user_version = {migration.to_version}")
             conn.commit()
         except Exception:
@@ -11731,7 +12036,11 @@ def _run_migrations(
             raise StoreSchemaError("schema_version_not_advanced")
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def ensure_schema(
+    conn: sqlite3.Connection,
+    *,
+    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
+) -> None:
     """Gate the current schema cheaply, or initialize/migrate older stores."""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version == STORE_SCHEMA_VERSION:
@@ -11757,16 +12066,30 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             if version == 0 and not _database_has_application_objects(conn):
                 _create_current_schema_conn(conn)
                 return
-            _run_migrations(conn)
+            _run_migrations(
+                conn,
+                connector_ack_ttl_seconds=max(
+                    1, int(connector_ack_ttl_seconds)
+                ),
+            )
 
 
 _ensure_schema = ensure_schema
 
 
-def init_store(db_path: Path) -> None:
+def init_store(
+    db_path: Path,
+    *,
+    connector_ack_ttl_seconds: int = CONNECTOR_ACK_TTL_SECONDS,
+) -> None:
     """Initialize or migrate the sqlite store to the current schema."""
     with _connect(db_path, prepare=True) as conn:
-        ensure_schema(conn)
+        ensure_schema(
+            conn,
+            connector_ack_ttl_seconds=max(
+                1, int(connector_ack_ttl_seconds)
+            ),
+        )
 
 
 def _normalized_command_request_policy(

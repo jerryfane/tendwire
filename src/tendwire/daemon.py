@@ -431,10 +431,19 @@ def default_socket_path(config: Config) -> Path:
     return Path(config.data_dir) / "tendwire.sock"
 
 
-def _default_init_store(db_path: Path) -> None:
+def _default_init_store(
+    db_path: Path,
+    *,
+    connector_ack_ttl_seconds: int | None = None,
+) -> None:
     from .store.sqlite import init_store
 
-    init_store(db_path)
+    kwargs = (
+        {"connector_ack_ttl_seconds": connector_ack_ttl_seconds}
+        if connector_ack_ttl_seconds is not None
+        else {}
+    )
+    init_store(db_path, **kwargs)
 
 
 def _default_observe_initial_snapshot(config: Config) -> Snapshot:
@@ -517,7 +526,15 @@ class TendwireDaemon:
                     self.config.installation_key_sentinel_path,
                 ),
             )
-            self.hooks.init_store(Path(self.config.db_path))
+            if self.hooks.init_store is _default_init_store:
+                _default_init_store(
+                    Path(self.config.db_path),
+                    connector_ack_ttl_seconds=(
+                        self.config.connector_ack_ttl_seconds
+                    ),
+                )
+            else:
+                self.hooks.init_store(Path(self.config.db_path))
             self._connector_periodic_tick()
             if self.config.herdr_backend == "socket":
                 self._snapshot = self._start_socket_event_backend()
@@ -1083,9 +1100,18 @@ class TendwireDaemon:
         """Eagerly reclaim expired connector work without waiting for a poll."""
         if self.config.db_path is None:
             return
-        from .store.sqlite import reclaim_expired_connector_leases
+        from .store.sqlite import (
+            connector_reclaim_due,
+            reclaim_expired_connector_leases,
+        )
 
         try:
+            if not connector_reclaim_due(
+                Path(self.config.db_path),
+                self.config.host_id,
+                None,
+            ):
+                return
             reclaim_expired_connector_leases(
                 Path(self.config.db_path),
                 self.config.host_id,

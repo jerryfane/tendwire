@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 from typing import Any
@@ -18,6 +18,7 @@ from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     ack_connector_delivery,
+    connector_reclaim_due,
     defer_connector_delivery,
     fail_connector_delivery,
     init_store,
@@ -244,6 +245,36 @@ def test_renew_extends_live_lease_and_release_requeues_immediately(tmp_path: Pat
     assert released["status"] == "released"
     assert second["key"] == "renew-release"
     assert second["attempt"] == 2
+
+
+@pytest.mark.parametrize("action", ["renew", "release"])
+def test_renew_and_release_reject_stale_live_refs(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    db_path = tmp_path / f"stale-{action}.db"
+    _enqueue(db_path, key=f"stale-{action}")
+    api = ConnectorOutboxAPI(db_path, "host-a")
+    item = api.poll({"name": "attention"})["items"][0]
+    with sqlite3.connect(str(db_path)) as conn:
+        row_id, private_state_json = conn.execute(
+            "SELECT id, private_state_json FROM connector_outbox"
+        ).fetchone()
+        private_state = json.loads(private_state_json)
+        private_state["current_delivery_id"] = -1
+        conn.execute(
+            "UPDATE connector_outbox SET private_state_json = ? WHERE id = ?",
+            (json.dumps(private_state), row_id),
+        )
+
+    params = {"name": "attention", "ref": item["ref"]}
+    if action == "renew":
+        params["lease_seconds"] = 120
+    result = getattr(api, action)(params)
+
+    assert result["ok"] is False
+    assert result["status"] == "stale_ref"
+    _assert_no_forbidden(result)
 
 
 @pytest.mark.parametrize("terminal_status", ["dead_letter", "awaiting_ack"])
@@ -1067,6 +1098,49 @@ def _stage_final_plan(
     return _commit_plan(api, token)
 
 
+def _stage_source_bound_plan(
+    api: ConnectorOutboxAPI,
+    *,
+    turn_id: str,
+    revision: str,
+    ranges: list[tuple[int, int]],
+    version: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source = api.poll({"name": "turn-final"})["items"][0]
+    begun = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": turn_id,
+            "content_revision": revision,
+            "presentation_version": version,
+            "part_count": len(ranges),
+            "source_ref": source["ref"],
+        }
+    )
+    assert begun["ok"] is True
+    for ordinal, (start, end) in enumerate(ranges):
+        assert _put_final_part(
+            api,
+            plan_token=begun["plan_token"],
+            ordinal=ordinal,
+            start=start,
+            end=end,
+        )["ok"] is True
+    committed = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "commit",
+            "name": "turn-final",
+            "plan_token": begun["plan_token"],
+            "source_ref": source["ref"],
+        }
+    )
+    assert committed["ok"] is True
+    return source, committed
+
+
 def _drain_turn_final(api: ConnectorOutboxAPI) -> list[str]:
     keys: list[str] = []
     while True:
@@ -1193,7 +1267,7 @@ def test_v6_to_current_plan_migration_is_bounded_atomic_and_preserves_jobs(
             ).fetchall()
         }
         foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == store_sqlite.STORE_SCHEMA_VERSION == 16
+    assert version == store_sqlite.STORE_SCHEMA_VERSION == 17
     assert plan_row == (plan["plan_token"], 1, None, "active")
     assert job_count == 2
     assert outbox_count == 3
@@ -2298,6 +2372,357 @@ def test_final_parts_preserve_enqueued_worker_fallback_after_adoption(
     assert keys == [("worker-before-adoption",), ("worker-before-adoption",)]
 
 
+def test_unresolvable_final_rows_receive_independent_ordering_partitions(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "orphan-ordering-partitions.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        first_key = store_sqlite._turn_ordering_key_conn(
+            conn,
+            host_id="host-a",
+            turn_id="turn-deleted-a",
+        )
+        second_key = store_sqlite._turn_ordering_key_conn(
+            conn,
+            host_id="host-a",
+            turn_id="turn-deleted-b",
+        )
+    _enqueue_final_root(
+        db_path,
+        key_suffix="deleted-a",
+        ordering_key=first_key,
+    )
+    _enqueue_final_root(
+        db_path,
+        key_suffix="deleted-b",
+        ordering_key=second_key,
+    )
+
+    items = ConnectorOutboxAPI(db_path, "host-a").poll(
+        {"name": "turn-final", "limit": 10}
+    )["items"]
+
+    assert first_key == "orphan:turn-deleted-a"
+    assert second_key == "orphan:turn-deleted-b"
+    assert len(items) == 2
+
+
+def test_source_less_recovery_plan_blocks_later_same_worker_final(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "source-less-recovery-plan-ordering.db"
+    stable_key = "wsk1_" + ("e" * 64)
+    first_turn, first_revision = _canonical_turn(
+        db_path,
+        worker_id="worker-shared",
+        source_turn_id="source-first",
+        stable_key=stable_key,
+        final_text="abcdefgh",
+    )
+    api = ConnectorOutboxAPI(db_path, "host-a", max_attempts=1)
+    failed_plan = _stage_final_plan(
+        api,
+        turn_id=first_turn,
+        revision=first_revision,
+        ranges=[(0, 4), (4, 8)],
+    )
+    failed_job = api.poll({"name": "turn-final"})["items"][0]
+    assert api.fail(
+        {
+            "name": "turn-final",
+            "ref": failed_job["ref"],
+            "delay_seconds": 0,
+        }
+    )["status"] == "attempts_exhausted"
+    recovery_plan = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "recover",
+            "name": "turn-final",
+            "failed_plan_token": failed_plan["plan_token"],
+            "request_id": "source-less-ordering-recovery-1",
+        }
+    )
+    assert recovery_plan["status"] == "recovered"
+    second_turn, second_revision = _canonical_turn(
+        db_path,
+        worker_id="worker-shared",
+        source_turn_id="source-second",
+        stable_key=stable_key,
+        final_text="ijklmnop",
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        later_source_id = store_sqlite._ensure_final_ready_anchor_conn(
+            conn,
+            host_id="host-a",
+            turn_id=second_turn,
+            content_revision_value=second_revision,
+            now="2026-01-01T00:01:00+00:00",
+        )
+    assert later_source_id is not None
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT source_outbox_id, recovers_plan_token
+            FROM turn_presentation_plans
+            WHERE plan_token = ?
+            """,
+            (recovery_plan["plan_token"],),
+        ).fetchone() == (None, failed_plan["plan_token"])
+
+    items = api.poll({"name": "turn-final", "limit": 10})["items"]
+
+    assert len(items) == 1
+    assert items[0]["payload"]["plan_token"] == recovery_plan["plan_token"]
+
+
+def test_part_ack_progress_extends_source_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "ack-progress-deadline.db"
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current[0].isoformat(),
+    )
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        source_id = store_sqlite._ensure_final_ready_anchor_conn(
+            conn,
+            host_id="host-a",
+            turn_id=turn_id,
+            content_revision_value=revision,
+            now=current[0].isoformat(),
+        )
+    assert source_id is not None
+    api = ConnectorOutboxAPI(db_path, "host-a", ack_ttl_seconds=30)
+    _source, plan = _stage_source_bound_plan(
+        api,
+        turn_id=turn_id,
+        revision=revision,
+        ranges=[(0, 4), (4, 8)],
+        version="turn-present-progress-v1",
+    )
+    first_part = api.poll({"name": "turn-final"})["items"][0]
+    current[0] += timedelta(seconds=20)
+
+    acknowledged = api.ack(
+        {"name": "turn-final", "ref": first_part["ref"]}
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        source_private = json.loads(
+            conn.execute(
+                "SELECT private_state_json FROM connector_outbox WHERE id = ?",
+                (source_id,),
+            ).fetchone()[0]
+        )
+    current[0] += timedelta(seconds=11)
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        "host-a",
+        "turn-final",
+        now=current[0].isoformat(),
+    )
+
+    assert acknowledged["status"] == "acknowledged"
+    assert datetime.fromisoformat(source_private["ack_deadline_at"]) == (
+        datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=50)
+    )
+    assert reclaimed["reclaimed"] == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state FROM turn_presentation_plans WHERE plan_token = ?",
+            (plan["plan_token"],),
+        ).fetchone() == ("active",)
+
+
+def test_ack_deadline_reclaim_preserves_validly_leased_part(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "ack-deadline-live-part.db"
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current[0].isoformat(),
+    )
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        source_id = store_sqlite._ensure_final_ready_anchor_conn(
+            conn,
+            host_id="host-a",
+            turn_id=turn_id,
+            content_revision_value=revision,
+            now=current[0].isoformat(),
+        )
+    assert source_id is not None
+    api = ConnectorOutboxAPI(db_path, "host-a", ack_ttl_seconds=30)
+    _source, plan = _stage_source_bound_plan(
+        api,
+        turn_id=turn_id,
+        revision=revision,
+        ranges=[(0, 4), (4, 8)],
+        version="turn-present-live-lease-v1",
+    )
+    leased_part = api.poll(
+        {"name": "turn-final", "lease_seconds": 60}
+    )["items"][0]
+    current[0] += timedelta(seconds=31)
+
+    assert connector_reclaim_due(
+        db_path,
+        "host-a",
+        "turn-final",
+        now=current[0].isoformat(),
+    ) is False
+    reclaimed = reclaim_expired_connector_leases(
+        db_path,
+        "host-a",
+        "turn-final",
+        now=current[0].isoformat(),
+    )
+    acknowledged = api.ack(
+        {"name": "turn-final", "ref": leased_part["ref"]}
+    )
+
+    assert reclaimed["reclaimed"] == 0
+    assert acknowledged["status"] == "acknowledged"
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state FROM turn_presentation_plans WHERE plan_token = ?",
+            (plan["plan_token"],),
+        ).fetchone() == ("active",)
+        assert conn.execute(
+            "SELECT status FROM connector_outbox WHERE id = ?",
+            (source_id,),
+        ).fetchone() == ("awaiting_ack",)
+
+
+def test_repeated_ack_deadline_reclaims_do_not_exhaust_healthy_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "repeated-ack-deadline-reclaim.db"
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current[0].isoformat(),
+    )
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        source_id = store_sqlite._ensure_final_ready_anchor_conn(
+            conn,
+            host_id="host-a",
+            turn_id=turn_id,
+            content_revision_value=revision,
+            now=current[0].isoformat(),
+        )
+    assert source_id is not None
+    api = ConnectorOutboxAPI(
+        db_path,
+        "host-a",
+        ack_ttl_seconds=30,
+        max_attempts=3,
+    )
+
+    for cycle in range(3):
+        source, _plan = _stage_source_bound_plan(
+            api,
+            turn_id=turn_id,
+            revision=revision,
+            ranges=[(0, 8)],
+            version=f"turn-present-slow-ack-v{cycle + 1}",
+        )
+        assert source["attempt"] == cycle + 1
+        current[0] += timedelta(seconds=31)
+        reclaimed = reclaim_expired_connector_leases(
+            db_path,
+            "host-a",
+            "turn-final",
+            now=current[0].isoformat(),
+        )
+        assert reclaimed["reclaimed"] == 1
+
+    fourth = api.poll({"name": "turn-final"})["items"][0]
+
+    assert fourth["attempt"] == 4
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT status FROM connector_outbox WHERE id = ?",
+            (source_id,),
+        ).fetchone() == ("leased",)
+
+
+def test_ack_deadline_reclaims_do_not_inflate_later_failure_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "ack-deadline-failure-budget.db"
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(
+        store_sqlite,
+        "utc_timestamp",
+        lambda: current[0].isoformat(),
+    )
+    turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
+    with sqlite3.connect(str(db_path)) as conn:
+        assert store_sqlite._ensure_final_ready_anchor_conn(
+            conn,
+            host_id="host-a",
+            turn_id=turn_id,
+            content_revision_value=revision,
+            now=current[0].isoformat(),
+        ) is not None
+    api = ConnectorOutboxAPI(
+        db_path,
+        "host-a",
+        ack_ttl_seconds=30,
+        max_attempts=2,
+    )
+
+    _stage_source_bound_plan(
+        api,
+        turn_id=turn_id,
+        revision=revision,
+        ranges=[(0, 8)],
+        version="turn-present-timeout-before-failure-v1",
+    )
+    current[0] += timedelta(seconds=31)
+    assert reclaim_expired_connector_leases(
+        db_path,
+        "host-a",
+        "turn-final",
+        now=current[0].isoformat(),
+    )["reclaimed"] == 1
+
+    first_real_attempt = api.poll({"name": "turn-final"})["items"][0]
+    first_failure = api.fail(
+        {
+            "name": "turn-final",
+            "ref": first_real_attempt["ref"],
+            "delay_seconds": 0,
+        }
+    )
+    second_real_attempt = api.poll({"name": "turn-final"})["items"][0]
+    second_failure = api.fail(
+        {
+            "name": "turn-final",
+            "ref": second_real_attempt["ref"],
+            "delay_seconds": 0,
+        }
+    )
+
+    assert first_real_attempt["attempt"] == 2
+    assert first_failure["status"] == "retry_scheduled"
+    assert second_real_attempt["attempt"] == 3
+    assert second_failure["status"] == "attempts_exhausted"
+
+
 def test_awaiting_ack_deadline_fails_plan_and_requeues_source(tmp_path: Path) -> None:
     db_path = tmp_path / "awaiting-ack-reclaim.db"
     turn_id, revision = _canonical_turn(db_path, final_text="abcdefgh")
@@ -2485,6 +2910,7 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
 ) -> None:
     db_path = tmp_path / "connector-v16-migration.db"
     stable_key = "wsk1_" + ("c" * 64)
+    enqueue_stable_key = "wsk1_" + ("d" * 64)
     tombstoned_turn, _ = _canonical_turn(
         db_path,
         worker_id="worker-tombstoned",
@@ -2499,6 +2925,15 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
         stable_key="invalid",
         final_text="done",
     )
+    deleted_turns = [
+        _canonical_turn(
+            db_path,
+            worker_id=f"worker-deleted-{suffix}",
+            source_turn_id=f"source-deleted-{suffix}",
+            final_text="done",
+        )[0]
+        for suffix in ("a", "b")
+    ]
     with sqlite3.connect(str(db_path)) as conn:
         assert store_sqlite._tombstone_turn_conn(
             conn,
@@ -2512,19 +2947,28 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
             (fallback_turn, "dead_letter"),
             (fallback_turn, "superseded"),
         ):
+            payload = (
+                {
+                    "stable_key": enqueue_stable_key,
+                    "stable_key_version": 1,
+                }
+                if status == "dead_letter"
+                else {}
+            )
             cursor = conn.execute(
                 """
                 INSERT INTO connector_outbox (
                     host_id, connector, delivery_key, delivery_kind, turn_id,
                     ordering_key, status, payload_json, private_state_json,
                     created_at, updated_at
-                ) VALUES (?, 'turn-final', ?, 'final_ready', ?, '', ?, '{}', '{}', ?, ?)
+                ) VALUES (?, 'turn-final', ?, 'final_ready', ?, '', ?, ?, '{}', ?, ?)
                 """,
                 (
                     "host-a",
                     f"migration-{turn_id}-{status}",
                     turn_id,
                     status,
+                    json.dumps(payload),
                     "2026-01-01T00:00:00+00:00",
                     "2026-01-01T00:00:00+00:00",
                 ),
@@ -2540,17 +2984,47 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
                     """,
                     (cursor.lastrowid, "2026-01-01T00:00:00+00:00"),
                 )
+        for deleted_turn in deleted_turns:
+            conn.execute(
+                "DELETE FROM turn_content_revisions WHERE host_id = ? AND turn_id = ?",
+                ("host-a", deleted_turn),
+            )
+            conn.execute(
+                "DELETE FROM turns WHERE host_id = ? AND turn_id = ?",
+                ("host-a", deleted_turn),
+            )
+        orphan_ids: list[int] = []
+        for suffix, deleted_turn in zip(("a", "b"), deleted_turns, strict=True):
+            cursor = conn.execute(
+                """
+                INSERT INTO connector_outbox (
+                    host_id, connector, delivery_key, delivery_kind, turn_id,
+                    ordering_key, status, payload_json, private_state_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'host-a', 'turn-final', ?, 'final_ready', ?, '',
+                    'dead_letter', '{}', '{}', ?, ?
+                )
+                """,
+                (
+                    f"migration-deleted-{suffix}",
+                    deleted_turn,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            orphan_ids.append(int(cursor.lastrowid))
         conn.execute("DROP INDEX IF EXISTS idx_connector_outbox_final_ordering")
         conn.execute("ALTER TABLE connector_outbox DROP COLUMN ordering_key")
         conn.execute("PRAGMA user_version = 15")
     migration_now = "2026-01-03T00:00:00+00:00"
-    monkeypatch.setenv("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS", "123")
+    monkeypatch.setenv("TENDWIRE_CONNECTOR_ACK_TTL_SECONDS", "999")
     monkeypatch.setattr(store_sqlite, "utc_timestamp", lambda: migration_now)
-    init_store(db_path)
+    init_store(db_path, connector_ack_ttl_seconds=123)
     with sqlite3.connect(str(db_path)) as conn:
         rows = conn.execute(
             """
-            SELECT turn_id, status, ordering_key, private_state_json
+            SELECT delivery_key, turn_id, status, ordering_key, private_state_json
             FROM connector_outbox
             WHERE delivery_key LIKE 'migration-%'
             ORDER BY id
@@ -2559,12 +3033,31 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
         delivery_private = conn.execute(
             "SELECT private_state_json FROM connector_deliveries WHERE status = 'awaiting_ack'"
         ).fetchone()[0]
-    assert rows[0][0:3] == (tombstoned_turn, "awaiting_ack", stable_key)
-    ack_deadline = json.loads(rows[0][3])["ack_deadline_at"]
+    by_key = {row[0]: row[1:] for row in rows}
+    tombstoned_key = f"migration-{tombstoned_turn}-awaiting_ack"
+    dead_letter_key = f"migration-{fallback_turn}-dead_letter"
+    superseded_key = f"migration-{fallback_turn}-superseded"
+    assert by_key[tombstoned_key][0:3] == (
+        tombstoned_turn,
+        "awaiting_ack",
+        stable_key,
+    )
+    ack_deadline = json.loads(by_key[tombstoned_key][3])["ack_deadline_at"]
     assert (
         datetime.fromisoformat(ack_deadline)
         - datetime.fromisoformat(migration_now)
     ).total_seconds() == 123
-    assert rows[1][0:3] == (fallback_turn, "dead_letter", "worker-fallback")
-    assert rows[2][0:3] == (fallback_turn, "superseded", "worker-fallback")
+    assert by_key[dead_letter_key][0:3] == (
+        fallback_turn,
+        "dead_letter",
+        enqueue_stable_key,
+    )
+    assert by_key[superseded_key][0:3] == (
+        fallback_turn,
+        "superseded",
+        "worker-fallback",
+    )
+    assert by_key["migration-deleted-a"][2] == f"orphan:{orphan_ids[0]}"
+    assert by_key["migration-deleted-b"][2] == f"orphan:{orphan_ids[1]}"
+    assert by_key["migration-deleted-a"][2] != by_key["migration-deleted-b"][2]
     assert json.loads(delivery_private)["ack_deadline_at"] == ack_deadline
