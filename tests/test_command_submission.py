@@ -684,6 +684,7 @@ def test_observation_first_submission_adopts_source_row_in_place(
         },
     )
     _seed(config, [worker], [_binding(worker)])
+    observed_at = store_sqlite.utc_timestamp()
     assert merge_turn_content(
         config.db_path,
         config.host_id,
@@ -695,7 +696,7 @@ def test_observation_first_submission_adopts_source_row_in_place(
             "complete": True,
             "has_open_turn": False,
         },
-        observed_at="2099-07-19T10:00:00+00:00",
+        observed_at=observed_at,
     ) == 1
     observed = next(
         turn
@@ -706,6 +707,11 @@ def test_observation_first_submission_adopts_source_row_in_place(
         )["turns"]
         if turn.get("assistant_final_text") == "already observed"
     )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        observed_list_sequence = conn.execute(
+            "SELECT list_sequence FROM turns WHERE host_id = ? AND turn_id = ?",
+            (config.host_id, observed["id"]),
+        ).fetchone()[0]
 
     calls: list[dict[str, Any]] = []
     accepted = submit_command(
@@ -729,7 +735,7 @@ def test_observation_first_submission_adopts_source_row_in_place(
             "complete": True,
             "has_open_turn": False,
         },
-        observed_at="2099-07-19T10:00:02+00:00",
+        observed_at=store_sqlite.utc_timestamp(),
     ) == 1
     with sqlite3.connect(str(config.db_path)) as conn:
         matching = conn.execute(
@@ -746,6 +752,7 @@ def test_observation_first_submission_adopts_source_row_in_place(
         ).fetchall()
     assert len(matching) == 1
     assert matching[0][0] == observed["id"]
+    assert matching[0][1] == observed_list_sequence
     refreshed = turns_payload_from_store(
         config.db_path,
         config.host_id,
@@ -810,6 +817,71 @@ def test_submission_first_envelope_reflects_observation_during_send(
     assert len(matching) == 1
     assert matching[0]["id"] == accepted.result["turn_id"]
     assert matching[0]["assistant_final_text"] == "observed during send"
+
+
+def test_legacy_submission_envelope_follows_tombstoned_claim_successor(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    class LegacyObservingClient(_FakeSocketClient):
+        def request(self, method, params, *, timeout=None):
+            result = super().request(method, params, timeout=timeout)
+            if method == "pane.send_input":
+                assert merge_turn_content(
+                    config.db_path,
+                    config.host_id,
+                    worker.id,
+                    {
+                        "source_turn_id": "legacy-envelope-source",
+                        "user_text": "hello",
+                        "assistant_final_text": "legacy observed during send",
+                        "complete": True,
+                        "has_open_turn": False,
+                    },
+                    observed_at=store_sqlite.utc_timestamp(),
+                ) == 1
+            return result
+
+    accepted = submit_command(
+        config,
+        _request(request_id="legacy-envelope-request"),
+        socket_client_factory=lambda _config: LegacyObservingClient(calls),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.result["observed_turn_state"] == "complete"
+    turns = turns_payload_from_store(
+        config.db_path,
+        config.host_id,
+        schema_version=2,
+    )["turns"]
+    successor = next(
+        turn
+        for turn in turns
+        if turn.get("assistant_final_text") == "legacy observed during send"
+    )
+    assert accepted.result["turn_id"] == successor["id"]
+    with sqlite3.connect(str(config.db_path)) as conn:
+        tombstones = [
+            json.loads(row[0])
+            for row in conn.execute(
+                """
+                SELECT payload_json
+                FROM turns
+                WHERE host_id = ?
+                  AND json_extract(payload_json, '$.origin_command_id') = ?
+                  AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') != ''
+                """,
+                (config.host_id, "legacy-envelope-request"),
+            ).fetchall()
+        ]
+    assert len(tombstones) == 1
+    assert tombstones[0]["superseded_by_turn_id"] == successor["id"]
 
 
 def test_submit_command_sends_identical_100_character_instructions_with_distinct_ids(

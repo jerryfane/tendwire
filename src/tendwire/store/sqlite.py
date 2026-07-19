@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -25,7 +26,10 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, quote, urlsplit
 
-from ..config import DEFAULT_PENDING_STALE_GRACE_SECONDS
+from ..config import (
+    DEFAULT_PENDING_STALE_GRACE_SECONDS,
+    DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
+)
 from ..local_state import (
     EntryIdentity,
     EntryType,
@@ -108,7 +112,9 @@ from ..core.turns import (
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
 STORE_SCHEMA_VERSION = 15
-TURN_CLAIM_HARD_TTL_SECONDS = 86_400
+TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
+TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
+TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -138,6 +144,9 @@ BACKEND_PENDING_CLAIM_LEASE_SECONDS = 30.0
 ATTENTION_MISSING_REQUIRED = 2
 ATTENTION_MISSING_GRACE_SECONDS = 120
 _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
+_LOGGER = logging.getLogger(__name__)
+_TURN_CLAIM_SWEEP_LAST_AT: dict[tuple[str, str], float] = {}
+_TURN_CLAIM_SWEEP_LOCK = threading.Lock()
 
 
 class StoreSchemaError(RuntimeError):
@@ -146,6 +155,19 @@ class StoreSchemaError(RuntimeError):
     def __init__(self, status: str) -> None:
         self.status = str(status)
         super().__init__(self.status)
+
+
+def _configured_turn_claim_hard_ttl_seconds() -> int:
+    raw = os.environ.get("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS")
+    if raw is None:
+        return TURN_CLAIM_HARD_TTL_SECONDS
+    try:
+        configured = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise StoreSchemaError("turn_claim_hard_ttl_invalid") from exc
+    if configured <= 0:
+        raise StoreSchemaError("turn_claim_hard_ttl_invalid")
+    return configured
 
 
 @dataclass(frozen=True)
@@ -10876,6 +10898,7 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         row
         for row in decoded
         if str(row[3].get("source_turn_id") or "").strip()
+        and not _turn_is_tombstoned(row[3])
         and (
             row[3].get("complete") is True
             or row[4] is not None
@@ -10883,6 +10906,12 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         )
     ]
     affected_hosts: set[str] = set()
+    used_done = {
+        str(row[3].get("superseded_by_turn_id") or "")
+        for row in decoded
+        if _turn_is_tombstoned(row[3])
+        and str(row[3].get("superseded_by_turn_id") or "").strip()
+    }
     for claim in claims:
         claim_view = _turn_with_current_content(claim[3], claim[4])
         matches = [
@@ -10890,12 +10919,27 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
             for observed in done
             if observed[0] == claim[0]
             and observed[2] == claim[2]
+            and observed[1] not in used_done
             and _turn_content_matches_origin(
                 _turn_with_current_content(observed[3], observed[4]),
                 claim_view,
             )
         ]
-        if len(matches) == 1 and _tombstone_turn_conn(
+        if len(matches) != 1:
+            continue
+        matching_claims = [
+            candidate
+            for candidate in claims
+            if candidate[0] == claim[0]
+            and candidate[2] == claim[2]
+            and _turn_content_matches_origin(
+                _turn_with_current_content(matches[0][3], matches[0][4]),
+                _turn_with_current_content(candidate[3], candidate[4]),
+            )
+        ]
+        if len(matching_claims) != 1:
+            continue
+        if _tombstone_turn_conn(
             conn,
             claim[0],
             claim[1],
@@ -10903,7 +10947,9 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
             superseded_at=now,
         ):
             affected_hosts.add(claim[0])
+            used_done.add(matches[0][1])
 
+    configured_hard_ttl = _configured_turn_claim_hard_ttl_seconds()
     for claim in claims:
         stored = conn.execute(
             "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
@@ -10912,7 +10958,7 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         if stored is None or _turn_is_tombstoned(_json_object(stored[0])):
             continue
         claim_dt = _turn_row_time(claim[3], claim[5])
-        if claim_dt is None or (now_dt - claim_dt).total_seconds() < TURN_CLAIM_HARD_TTL_SECONDS:
+        if claim_dt is None or (now_dt - claim_dt).total_seconds() < configured_hard_ttl:
             continue
         if _tombstone_turn_conn(
             conn,
@@ -15557,7 +15603,8 @@ def _snapshot_owned_turn_candidate(
         source_rows = [
             row
             for row in rows
-            if str(row[1].get("source_turn_id") or "").strip()
+            if not _turn_is_tombstoned(row[1])
+            and str(row[1].get("source_turn_id") or "").strip()
             and str(row[1].get("origin_command_id") or "").strip()
             == origin_command_id
         ]
@@ -15568,7 +15615,8 @@ def _snapshot_owned_turn_candidate(
         command_rows = [
             row
             for row in rows
-            if not str(row[1].get("source_turn_id") or "").strip()
+            if not _turn_is_tombstoned(row[1])
+            and not str(row[1].get("source_turn_id") or "").strip()
             and str(row[1].get("origin_command_id") or "").strip()
             == origin_command_id
         ]
@@ -17801,7 +17849,11 @@ def _current_turn_content_rows_conn(
         """,
         (str(host_id), str(worker_id)),
     ).fetchall()
-    return _decode_turn_content_rows(rows)
+    return [
+        row
+        for row in _decode_turn_content_rows(rows)
+        if not _turn_is_tombstoned(row[1])
+    ]
 
 
 def _current_owned_turn_content_rows_conn(
@@ -17834,7 +17886,8 @@ def _current_owned_turn_content_rows_conn(
     return [
         row
         for row in _decode_turn_content_rows(rows)
-        if _turn_continuity_identity(row[1]) == owner_identity
+        if not _turn_is_tombstoned(row[1])
+        and _turn_continuity_identity(row[1]) == owner_identity
     ]
 
 
@@ -17898,6 +17951,57 @@ def _tombstone_turn_conn(
     return True
 
 
+def _superseding_turn_content_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: str,
+) -> dict[str, Any] | None:
+    """Follow a tombstone chain to the current list-visible successor."""
+    current_turn_id = str(turn_id)
+    seen: set[str] = set()
+    first = True
+    while current_turn_id and current_turn_id not in seen:
+        seen.add(current_turn_id)
+        row = conn.execute(
+            """
+            SELECT turns.payload_json,
+                   revisions.user_text,
+                   revisions.assistant_final_text,
+                   revisions.user_state,
+                   revisions.final_state
+            FROM turns
+            LEFT JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = ? AND turns.turn_id = ?
+            """,
+            (str(host_id), current_turn_id),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _json_object(row[0])
+        if not _turn_is_tombstoned(payload):
+            if first:
+                return None
+            current = (
+                {
+                    "user_text": row[1],
+                    "assistant_final_text": row[2],
+                    "user_state": str(row[3]),
+                    "final_state": str(row[4]),
+                }
+                if row[3] is not None
+                else None
+            )
+            return _turn_with_current_content(payload, current)
+        first = False
+        current_turn_id = str(
+            payload.get("superseded_by_turn_id") or ""
+        ).strip()
+    return None
+
+
 def _tombstone_matching_command_sibling_conn(
     conn: sqlite3.Connection,
     host_id: str,
@@ -17954,6 +18058,35 @@ def _turn_row_time(payload: Mapping[str, Any], observed_at: str) -> datetime | N
         if timestamp is not None:
             return datetime.fromisoformat(timestamp)
     return None
+
+
+def _turn_is_open_or_incomplete(
+    payload: Mapping[str, Any],
+    current: Mapping[str, Any] | None,
+) -> bool:
+    return bool(
+        payload.get("has_open_turn") is True
+        or payload.get("complete") is not True
+        or current is not None
+        and str(current.get("final_state") or "") != "complete"
+    )
+
+
+def _turn_observed_near_submission(
+    observed_at: str,
+    send_started_at: str,
+) -> bool:
+    observed = _strict_utc_timestamp(observed_at)
+    started = _strict_utc_timestamp(send_started_at)
+    if observed is None or started is None:
+        return False
+    delta = abs(
+        (
+            datetime.fromisoformat(started)
+            - datetime.fromisoformat(observed)
+        ).total_seconds()
+    )
+    return delta <= TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS
 
 
 def _sweep_turn_claims_conn(
@@ -18081,7 +18214,7 @@ def _sweep_turn_claims_conn(
             (row for row in unresolved if row[1] == worker_id),
             key=lambda row: (_turn_row_time(row[2], row[4]) or current_dt, row[0]),
         )
-        if not worker_claims:
+        if len(worker_claims) != 1:
             continue
         claim = worker_claims[0]
         claim_dt = _turn_row_time(claim[2], claim[4])
@@ -18093,11 +18226,12 @@ def _sweep_turn_claims_conn(
                 for row in done
                 if row[1] == worker_id
                 and row[0] not in used_done
+                and not str(row[2].get("origin_command_id") or "").strip()
                 and (_turn_row_time(row[2], row[4]) or current_dt) > claim_dt
             ),
             key=lambda row: (_turn_row_time(row[2], row[4]) or current_dt, row[0]),
         )
-        if newer_done and _tombstone_turn_conn(
+        if len(newer_done) == 1 and _tombstone_turn_conn(
             conn,
             str(host_id),
             claim[0],
@@ -18159,6 +18293,36 @@ def sweep_turn_claims(
         except Exception:
             conn.rollback()
             raise
+
+
+def _reserve_lazy_turn_claim_sweep(
+    db_path: Path | str,
+    host_id: str,
+    *,
+    current_clock: float,
+    refresh_interval_seconds: float,
+) -> tuple[tuple[str, str], bool]:
+    key = (str(Path(db_path).absolute()), str(host_id))
+    with _TURN_CLAIM_SWEEP_LOCK:
+        last = _TURN_CLAIM_SWEEP_LAST_AT.get(key)
+        if (
+            last is not None
+            and current_clock >= last
+            and current_clock - last < refresh_interval_seconds
+        ):
+            return key, False
+        _TURN_CLAIM_SWEEP_LAST_AT[key] = current_clock
+    return key, True
+
+
+def _release_failed_lazy_turn_claim_sweep(
+    key: tuple[str, str],
+    *,
+    current_clock: float,
+) -> None:
+    with _TURN_CLAIM_SWEEP_LOCK:
+        if _TURN_CLAIM_SWEEP_LAST_AT.get(key) == current_clock:
+            _TURN_CLAIM_SWEEP_LAST_AT.pop(key, None)
 
 
 def _source_turn_matches(payload: Mapping[str, Any], incoming_source_turn: str) -> bool:
@@ -18351,7 +18515,8 @@ def _owned_command_candidates(
         payload = row[1]
         row_origin = str(payload.get("origin_command_id") or "").strip()
         if (
-            str(payload.get("source_turn_id") or "").strip()
+            _turn_is_tombstoned(payload)
+            or str(payload.get("source_turn_id") or "").strip()
             or not row_origin
             or expected_origin and row_origin != expected_origin
             or not _turn_content_matches_origin(
@@ -18372,7 +18537,8 @@ def _owned_placeholder_candidates(
     return [
         row
         for row in rows
-        if not str(row[1].get("source_turn_id") or "").strip()
+        if not _turn_is_tombstoned(row[1])
+        and not str(row[1].get("source_turn_id") or "").strip()
         and not str(row[1].get("origin_command_id") or "").strip()
     ]
 
@@ -18539,6 +18705,20 @@ def _merge_owned_turn_content_conn(
                     command_predecessor_turn_id = predecessor_id
     else:
         command_rows = _owned_command_candidates(rows, automation_probe)
+        if len(command_rows) > 1:
+            _LOGGER.warning(
+                "turn_ingestion_ambiguity_fallthrough",
+                extra={
+                    "tendwire_diagnostic": {
+                        "code": "turn_ingestion_ambiguity_fallthrough",
+                        "host_id": str(host_id),
+                        "worker_id": str(
+                            current_projection.get("worker_id") or ""
+                        ),
+                        "candidate_count": len(command_rows),
+                    }
+                },
+            )
         if len(command_rows) == 1:
             base_row = command_rows[0]
         else:
@@ -19491,6 +19671,15 @@ def _upsert_command_pending_turn_impl(
             _ensure_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
         try:
+            superseding_turn = _superseding_turn_content_conn(
+                conn,
+                str(host_id),
+                turn_id,
+            )
+            if superseding_turn is not None:
+                if owns_transaction:
+                    conn.commit()
+                return sanitize_public_mapping(superseding_turn)
             owner_identity = _turn_continuity_identity(item)
             if owner_identity is not None:
                 owned_rows = _current_owned_turn_content_rows_conn(
@@ -19554,6 +19743,13 @@ def _upsert_command_pending_turn_impl(
                         row[1].get("origin_command_id") or ""
                     ).strip()
                     and not _turn_is_tombstoned(row[1])
+                    and (
+                        _turn_is_open_or_incomplete(row[1], row[2])
+                        or _turn_observed_near_submission(
+                            row[3],
+                            current_time,
+                        )
+                    )
                     and _turn_content_matches_origin(
                         _turn_with_current_content(row[1], row[2]),
                         {"user_text": clean_text},
@@ -19909,17 +20105,36 @@ def turns_payload_from_store(
             "ok": False,
             "status": "store_unavailable",
         }
-    try:
-        sweep_turn_claims(
-            db_path,
-            str(host_id),
-            grace_seconds=2.0 * float(turn_refresh_interval_seconds),
-            hard_ttl_seconds=float(claim_hard_ttl_seconds),
-        )
-    except Exception:
-        # Listing remains available if opportunistic maintenance is contended.
-        pass
     current_clock = time.time() if now is None else float(now)
+    refresh_interval = float(turn_refresh_interval_seconds)
+    sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
+        db_path,
+        str(host_id),
+        current_clock=current_clock,
+        refresh_interval_seconds=refresh_interval,
+    )
+    if sweep_due:
+        try:
+            sweep_turn_claims(
+                db_path,
+                str(host_id),
+                grace_seconds=max(
+                    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
+                    10.0 * refresh_interval,
+                ),
+                hard_ttl_seconds=float(claim_hard_ttl_seconds),
+                now=datetime.fromtimestamp(
+                    current_clock,
+                    tz=timezone.utc,
+                ).isoformat(),
+            )
+        except Exception:
+            _release_failed_lazy_turn_claim_sweep(
+                sweep_key,
+                current_clock=current_clock,
+            )
+            # Listing remains available if opportunistic maintenance is contended.
+            pass
     try:
         decoded_cursor = (
             decode_turn_list_cursor(

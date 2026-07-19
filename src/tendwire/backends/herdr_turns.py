@@ -36,6 +36,7 @@ from ..core.turns import (
     redact_private_prompt_text,
 )
 from ..store.sqlite import (
+    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
     apply_turn_refresh,
     list_worker_bindings,
     prune_backend_pending,
@@ -4403,7 +4404,10 @@ class TurnIngestionScheduler:
             sweep_turn_claims(
                 self.config.db_path,
                 self.config.host_id,
-                grace_seconds=2.0 * self.refresh_interval_seconds,
+                grace_seconds=max(
+                    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
+                    10.0 * self.refresh_interval_seconds,
+                ),
                 hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
                 now=self._utc_clock(),
             )

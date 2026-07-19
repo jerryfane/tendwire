@@ -419,7 +419,7 @@ def test_scheduler_scan_sweeps_turn_claims_with_configured_ttls(
     assert len(calls) == 1
     args, kwargs = calls[0]
     assert args == (config.db_path, config.host_id)
-    assert kwargs["grace_seconds"] == 15.0
+    assert kwargs["grace_seconds"] == 75.0
     assert kwargs["hard_ttl_seconds"] == config.turn_claim_hard_ttl_seconds
     assert isinstance(kwargs["now"], str)
 
