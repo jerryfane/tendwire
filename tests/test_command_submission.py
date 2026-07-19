@@ -3735,10 +3735,10 @@ def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
             """,
             (config.host_id,),
         ).fetchone()
-    assert (
-        final_root["working_predecessor_turn_id"]
-        == command_before["id"]
-    )
+    # Adopt-in-place preserves the command row's turn id, so the final's own
+    # turn IS the working predecessor; the payload pointer is correctly
+    # omitted (it is only stamped when the ids differ).
+    assert "working_predecessor_turn_id" not in final_root
 
     source_wins = upsert_command_pending_turn(
         config.db_path,
