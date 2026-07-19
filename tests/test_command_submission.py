@@ -3332,6 +3332,19 @@ def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
     assert completed_source["complete"] is True
     assert completed_source["has_open_turn"] is False
     with sqlite3.connect(str(config.db_path)) as conn:
+        final_root = json.loads(
+            conn.execute(
+                """
+                SELECT payload_json
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND connector = 'turn-final'
+                  AND delivery_kind = 'final_ready'
+                  AND turn_id = ?
+                """,
+                (config.host_id, completed_source["id"]),
+            ).fetchone()[0]
+        )
         source_before_retry = conn.execute(
             """
             SELECT turns.turn_id, turns.list_sequence, turns.payload_json,
@@ -3353,6 +3366,10 @@ def test_stable_owner_pending_command_survives_worker_churn_and_source_wins(
             """,
             (config.host_id,),
         ).fetchone()
+    assert (
+        final_root["working_predecessor_turn_id"]
+        == command_before["id"]
+    )
 
     source_wins = upsert_command_pending_turn(
         config.db_path,
