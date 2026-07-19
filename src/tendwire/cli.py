@@ -91,7 +91,7 @@ def _daemon_client_timeout_seconds(config: Config, method: str) -> float:
             _DAEMON_COMMAND_CLIENT_TIMEOUT_FLOOR_SECONDS,
             float(config.herdr_timeout_seconds) + _DAEMON_COMMAND_CLIENT_TIMEOUT_GRACE_SECONDS,
         )
-    if method in {"turn.list", "turn.content.get"}:
+    if method in {"turn.list", "turn.content.get", "turn.delta"}:
         return _DAEMON_CONTENT_CLIENT_TIMEOUT_SECONDS
     if method.startswith("connector."):
         return _DAEMON_CONNECTOR_CLIENT_TIMEOUT_SECONDS
