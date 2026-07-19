@@ -551,6 +551,7 @@ class TendwireDaemon:
                 submit_command=self.submit_command,
                 get_attention=self.get_attention,
                 get_turns=self.get_turns,
+                get_turn_delta=self.get_turn_delta,
                 get_turn_content=self.get_turn_content,
                 get_pending=self.get_pending,
                 connector_call=self.connector_call,
@@ -674,6 +675,7 @@ class TendwireDaemon:
             return
         from .store.sqlite import (
             SnapshotRetentionPolicy,
+            compact_turn_change_journal,
             maybe_run_automatic_store_maintenance,
         )
 
@@ -703,11 +705,24 @@ class TendwireDaemon:
                 ),
                 cadence_seconds=self.config.store_maintenance_cadence_seconds,
             )
+            turn_change_result: Mapping[str, Any] = {"ok": True}
+            if bool(result.get("due")):
+                turn_change_result = compact_turn_change_journal(
+                    Path(self.config.db_path),
+                    self.config.host_id,
+                    retention_days=self.config.turn_change_retention_days,
+                    retention_count=self.config.turn_change_retention_count,
+                    batch_size=self.config.turn_change_compaction_batch_size,
+                )
             snapshot_result = result.get("snapshot")
             snapshot_counts = snapshot_result if isinstance(snapshot_result, Mapping) else {}
             maintenance_status = {
-                "ok": bool(result.get("ok")),
-                "status": str(result.get("status") or "unknown"),
+                "ok": bool(result.get("ok")) and bool(turn_change_result.get("ok")),
+                "status": (
+                    str(result.get("status") or "unknown")
+                    if bool(turn_change_result.get("ok"))
+                    else "failed"
+                ),
                 "due": bool(result.get("due")),
                 "examined": int(snapshot_counts.get("examined") or 0),
                 "deleted": int(snapshot_counts.get("deleted") or 0),
@@ -1075,6 +1090,32 @@ class TendwireDaemon:
             field=params.get("field"),
             cursor=params.get("cursor"),
             schema_version=params.get("schema_version", 1),
+        )
+
+    def get_turn_delta(
+        self,
+        *,
+        watermark: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Mapping[str, Any]:
+        """Read one cache-only delta page; this surface has no delivery authority."""
+        if self.config.db_path is None:
+            return {
+                "schema_version": 1,
+                "projection_schema_version": 2,
+                "host_id": self.config.host_id,
+                "ok": False,
+                "status": "store_unavailable",
+            }
+        from .store.sqlite import turn_delta_payload_from_store
+
+        return turn_delta_payload_from_store(
+            Path(self.config.db_path),
+            self.config.host_id,
+            watermark=watermark,
+            cursor=cursor,
+            limit=limit,
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
