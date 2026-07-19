@@ -53,6 +53,14 @@ TURN_CONTENT_PAGE_MAX_UTF8_BYTES = 48 * 1024
 TURN_LIST_DEFAULT_LIMIT = 100
 TURN_LIST_MAX_LIMIT = 250
 TURN_LIST_CURSOR_TTL_SECONDS = 900
+TURN_DELTA_SCHEMA_VERSION = 1
+TURN_DELTA_PROJECTION_SCHEMA_VERSION = TURN_LIST_SCHEMA_VERSION
+TURN_DELTA_DEFAULT_LIMIT = 100
+TURN_DELTA_MAX_LIMIT = 500
+TURN_DELTA_CURSOR_TTL_SECONDS = 300
+TURN_DELTA_MAX_BATCH_SEQUENCES = 10_000
+TURN_DELTA_BOOTSTRAP_MAX_ROWS = 100_000
+TURN_DELTA_BOOTSTRAP_MAX_PAGES = 2_000
 
 TURN_CONTENT_FIELDS = ("user_text", "assistant_final_text")
 TURN_CONTENT_AVAILABILITIES = frozenset({"absent", "complete", "known_incomplete"})
@@ -546,6 +554,35 @@ class TurnSincePosition:
     store_epoch: str
 
 
+@dataclass(frozen=True)
+class TurnDeltaWatermarkPosition:
+    """Validated durable mutation checkpoint for one host projection."""
+
+    schema_version: int
+    projection_schema_version: int
+    sequence: int
+    store_epoch: str
+
+
+@dataclass(frozen=True)
+class TurnDeltaCursorPosition:
+    """Validated continuation coordinates for one frozen delta batch."""
+
+    schema_version: int
+    projection_schema_version: int
+    mode: Literal["bootstrap", "changes"]
+    limit: int
+    accepted_sequence: int
+    batch_high: int
+    insertion_high: int
+    page_number: int
+    position_sequence: int
+    position_worker_id: str
+    position_turn_id: str
+    store_epoch: str
+    expires_at: int
+
+
 def _decode_turn_list_token(token: str, prefix: str, status: str) -> dict[str, Any]:
     if not isinstance(token, str) or not token.startswith(prefix):
         raise ValueError(status)
@@ -845,6 +882,290 @@ def decode_turn_since_token(
     if not hmac.compare_digest(str(body["h"]), expected):
         raise ValueError(status)
     return TurnSincePosition(schema, high, epoch)
+
+
+def _turn_delta_host_digest(host_id: str) -> str:
+    host = str(host_id)
+    if not host or len(host) > 512:
+        raise ValueError("invalid_watermark")
+    return _domain_digest("tendwire.turn-delta-host.v1", {"host_id": host})
+
+
+def turn_delta_watermark(
+    host_id: str,
+    *,
+    sequence: int,
+    store_epoch: str,
+    schema_version: int = TURN_DELTA_SCHEMA_VERSION,
+    projection_schema_version: int = TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+) -> str:
+    """Encode a host/schema/store-bound durable mutation checkpoint."""
+    status = "invalid_watermark"
+    schema = _turn_list_nonnegative_integer(schema_version, status)
+    projection = _turn_list_nonnegative_integer(projection_schema_version, status)
+    accepted = _turn_list_nonnegative_integer(sequence, status)
+    epoch = str(store_epoch)
+    if (
+        schema != TURN_DELTA_SCHEMA_VERSION
+        or projection != TURN_DELTA_PROJECTION_SCHEMA_VERSION
+        or not epoch
+        or len(epoch) > 512
+    ):
+        raise ValueError(status)
+    host_digest = _turn_delta_host_digest(host_id)
+    material = {
+        "host_digest": host_digest,
+        "projection_schema_version": projection,
+        "schema_version": schema,
+        "sequence": accepted,
+        "store_epoch": epoch,
+        "token_version": 1,
+    }
+    body = stable_json_dumps(
+        {
+            "h": _domain_digest("tendwire.turn-delta-watermark-integrity.v1", material),
+            "p": projection,
+            "q": epoch,
+            "s": accepted,
+            "v": 1,
+            "x": schema,
+            "z": host_digest,
+        }
+    ).encode("utf-8")
+    return f"twdelta1.{_base64url(body)}"
+
+
+def decode_turn_delta_watermark(
+    token: str,
+    *,
+    host_id: str,
+    schema_version: int = TURN_DELTA_SCHEMA_VERSION,
+    projection_schema_version: int = TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+) -> TurnDeltaWatermarkPosition:
+    """Validate a watermark with distinct host and schema mismatch outcomes."""
+    status = "invalid_watermark"
+    body = _decode_turn_list_token(token, "twdelta1.", status)
+    if set(body) != {"h", "p", "q", "s", "v", "x", "z"} or body.get("v") != 1:
+        raise ValueError(status)
+    if any(not isinstance(body.get(key), str) or not body.get(key) for key in ("h", "q", "z")):
+        raise ValueError(status)
+    try:
+        schema = _turn_list_nonnegative_integer(body.get("x"), status)
+        projection = _turn_list_nonnegative_integer(body.get("p"), status)
+        accepted = _turn_list_nonnegative_integer(body.get("s"), status)
+    except ValueError:
+        raise ValueError(status) from None
+    epoch = str(body["q"])
+    host_digest = str(body["z"])
+    if len(epoch) > 512 or len(host_digest) > 512:
+        raise ValueError(status)
+    expected_integrity = _domain_digest(
+        "tendwire.turn-delta-watermark-integrity.v1",
+        {
+            "host_digest": host_digest,
+            "projection_schema_version": projection,
+            "schema_version": schema,
+            "sequence": accepted,
+            "store_epoch": epoch,
+            "token_version": 1,
+        },
+    )
+    if not hmac.compare_digest(str(body["h"]), expected_integrity):
+        raise ValueError(status)
+    if not hmac.compare_digest(host_digest, _turn_delta_host_digest(host_id)):
+        raise ValueError("cross_host_watermark")
+    if schema != schema_version or projection != projection_schema_version:
+        raise ValueError("incompatible_schema")
+    return TurnDeltaWatermarkPosition(schema, projection, accepted, epoch)
+
+
+def turn_delta_cursor(
+    host_id: str,
+    *,
+    mode: Literal["bootstrap", "changes"],
+    limit: int,
+    accepted_sequence: int,
+    batch_high: int,
+    insertion_high: int,
+    page_number: int,
+    position_sequence: int,
+    position_worker_id: str,
+    position_turn_id: str,
+    store_epoch: str,
+    expires_at: int,
+    schema_version: int = TURN_DELTA_SCHEMA_VERSION,
+    projection_schema_version: int = TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+) -> str:
+    """Encode a short-lived cursor bound to one frozen bootstrap/change batch."""
+    status = "invalid_cursor"
+    if mode not in {"bootstrap", "changes"}:
+        raise ValueError(status)
+    values = {
+        "schema": schema_version,
+        "projection": projection_schema_version,
+        "limit": limit,
+        "accepted": accepted_sequence,
+        "batch_high": batch_high,
+        "insertion_high": insertion_high,
+        "page_number": page_number,
+        "position": position_sequence,
+        "expiry": expires_at,
+    }
+    try:
+        parsed = {key: _turn_list_nonnegative_integer(value, status) for key, value in values.items()}
+    except ValueError:
+        raise ValueError(status) from None
+    worker = str(position_worker_id)
+    turn = str(position_turn_id)
+    epoch = str(store_epoch)
+    if (
+        parsed["schema"] != TURN_DELTA_SCHEMA_VERSION
+        or parsed["projection"] != TURN_DELTA_PROJECTION_SCHEMA_VERSION
+        or not 1 <= parsed["limit"] <= TURN_DELTA_MAX_LIMIT
+        or parsed["accepted"] > parsed["batch_high"]
+        or parsed["page_number"] < 1
+        or not epoch
+        or not turn
+        or mode == "bootstrap" and not worker
+        or mode == "changes" and parsed["position"] <= parsed["accepted"]
+        or max(map(len, (worker, turn, epoch))) > 512
+    ):
+        raise ValueError(status)
+    host_digest = _turn_delta_host_digest(host_id)
+    material = {
+        "accepted_sequence": parsed["accepted"],
+        "batch_high": parsed["batch_high"],
+        "expires_at": parsed["expiry"],
+        "host_digest": host_digest,
+        "insertion_high": parsed["insertion_high"],
+        "limit": parsed["limit"],
+        "mode": mode,
+        "position_sequence": parsed["position"],
+        "page_number": parsed["page_number"],
+        "position_turn_id": turn,
+        "position_worker_id": worker,
+        "projection_schema_version": parsed["projection"],
+        "schema_version": parsed["schema"],
+        "store_epoch": epoch,
+        "token_version": 1,
+    }
+    body = stable_json_dumps(
+        {
+            "a": parsed["accepted"],
+            "b": parsed["batch_high"],
+            "e": parsed["expiry"],
+            "h": _domain_digest("tendwire.turn-delta-cursor-integrity.v1", material),
+            "i": parsed["insertion_high"],
+            "l": parsed["limit"],
+            "m": mode,
+            "n": parsed["page_number"],
+            "p": [worker, parsed["position"], turn],
+            "q": epoch,
+            "r": parsed["projection"],
+            "v": 1,
+            "x": parsed["schema"],
+            "z": host_digest,
+        }
+    ).encode("utf-8")
+    return f"twdeltac1.{_base64url(body)}"
+
+
+def decode_turn_delta_cursor(
+    cursor: str,
+    *,
+    host_id: str,
+    limit: int,
+    now: float | int | None = None,
+    schema_version: int = TURN_DELTA_SCHEMA_VERSION,
+    projection_schema_version: int = TURN_DELTA_PROJECTION_SCHEMA_VERSION,
+) -> TurnDeltaCursorPosition:
+    """Strictly validate a delta cursor and the complete page request binding."""
+    status = "invalid_cursor"
+    body = _decode_turn_list_token(cursor, "twdeltac1.", status)
+    if set(body) != {"a", "b", "e", "h", "i", "l", "m", "n", "p", "q", "r", "v", "x", "z"} or body.get("v") != 1:
+        raise ValueError(status)
+    position = body.get("p")
+    if (
+        not isinstance(position, list)
+        or len(position) != 3
+        or not isinstance(position[0], str)
+        or not isinstance(position[2], str)
+        or not position[2]
+        or body.get("m") not in {"bootstrap", "changes"}
+        or any(not isinstance(body.get(key), str) or not body.get(key) for key in ("h", "q", "z"))
+    ):
+        raise ValueError(status)
+    try:
+        accepted = _turn_list_nonnegative_integer(body.get("a"), status)
+        batch_high = _turn_list_nonnegative_integer(body.get("b"), status)
+        expiry = _turn_list_nonnegative_integer(body.get("e"), status)
+        insertion_high = _turn_list_nonnegative_integer(body.get("i"), status)
+        page_limit = _turn_list_nonnegative_integer(body.get("l"), status)
+        page_number = _turn_list_nonnegative_integer(body.get("n"), status)
+        position_sequence = _turn_list_nonnegative_integer(position[1], status)
+        projection = _turn_list_nonnegative_integer(body.get("r"), status)
+        schema = _turn_list_nonnegative_integer(body.get("x"), status)
+    except ValueError:
+        raise ValueError(status) from None
+    mode = str(body["m"])
+    worker = str(position[0])
+    turn = str(position[2])
+    epoch = str(body["q"])
+    host_digest = str(body["z"])
+    material = {
+        "accepted_sequence": accepted,
+        "batch_high": batch_high,
+        "expires_at": expiry,
+        "host_digest": host_digest,
+        "insertion_high": insertion_high,
+        "limit": page_limit,
+        "mode": mode,
+        "page_number": page_number,
+        "position_sequence": position_sequence,
+        "position_turn_id": turn,
+        "position_worker_id": worker,
+        "projection_schema_version": projection,
+        "schema_version": schema,
+        "store_epoch": epoch,
+        "token_version": 1,
+    }
+    if not hmac.compare_digest(
+        str(body["h"]),
+        _domain_digest("tendwire.turn-delta-cursor-integrity.v1", material),
+    ):
+        raise ValueError(status)
+    if (
+        not hmac.compare_digest(host_digest, _turn_delta_host_digest(host_id))
+        or schema != schema_version
+        or projection != projection_schema_version
+        or page_limit != limit
+        or not 1 <= page_limit <= TURN_DELTA_MAX_LIMIT
+        or accepted > batch_high
+        or page_number < 1
+        or not epoch
+        or mode == "bootstrap" and not worker
+        or mode == "changes" and position_sequence <= accepted
+        or max(map(len, (worker, turn, epoch, host_digest))) > 512
+    ):
+        raise ValueError(status)
+    current = time.time() if now is None else float(now)
+    if not current < expiry:
+        raise ValueError("expired_cursor")
+    return TurnDeltaCursorPosition(
+        schema,
+        projection,
+        mode,
+        page_limit,
+        accepted,
+        batch_high,
+        insertion_high,
+        page_number,
+        position_sequence,
+        worker,
+        turn,
+        epoch,
+        expiry,
+    )
 
 
 def _utf8_code_point_width(character: str) -> int:
