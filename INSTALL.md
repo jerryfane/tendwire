@@ -45,6 +45,7 @@ Environment=TENDWIRE_HERDR_BACKEND=socket
 Environment=TENDWIRE_DB_PATH=%h/.local/share/tendwire/tendwire.db
 Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
 Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
+Environment=TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS=86400
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
 Restart=always
 RestartSec=5s
@@ -71,6 +72,8 @@ reconciles. `TENDWIRE_TURN_REFRESH_WORKERS` defaults to `4`, must be from 1
 through 32, and cannot exceed `TENDWIRE_MAX_WORKERS`. Every adapter uses
 `TENDWIRE_HERDR_TIMEOUT_SECONDS`; the queue is fixed at 64. One private target
 is serialized with itself while distinct targets can use the worker pool.
+Unobserved command-turn claims become terminal tombstones after
+`TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS` (default `86400`).
 
 OMP JSONL cache/IPC state is coordinate-only: parse/EOF and replay offsets,
 observed file identity/size/timestamps, an open-turn flag, and validated project

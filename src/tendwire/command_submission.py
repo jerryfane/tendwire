@@ -58,6 +58,7 @@ from .store.sqlite import (
     claim_backend_pending_choice,
     claim_backend_pending_decision,
     command_pending_turn_terminal_effect,
+    delete_command_pending_turn_claim_effect,
     command_reservation_is_live,
     envelope_to_receipt_json,
     finish_command_request,
@@ -69,6 +70,7 @@ from .store.sqlite import (
     reserve_terminal_command_replay,
     start_backend_pending_choice_send,
     start_backend_pending_decision_send,
+    upsert_command_pending_turn,
 )
 
 
@@ -349,19 +351,26 @@ def _submit_private_pane_input(client: Any, pane_id: str, instruction_text: str,
     # A single ctrl+u is not reliable across all foreground TUIs. Clear stale
     # input first, then submit text and Enter in one Herdr operation so the
     # foreground application cannot observe a staged prompt between requests.
-    for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
-        _socket_request(
-            client,
-            "pane.send_keys",
-            {"pane_id": pane_id, "keys": list(keys)},
-            timeout=timeout,
-        )
+    try:
+        for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
+            _socket_request(
+                client,
+                "pane.send_keys",
+                {"pane_id": pane_id, "keys": list(keys)},
+                timeout=timeout,
+            )
+    except Exception as exc:
+        raise _PaneInputNotStartedError from exc
     _socket_request(
         client,
         "pane.send_input",
         {"pane_id": pane_id, "text": instruction_text, "keys": ["Enter"]},
         timeout=timeout,
     )
+
+
+class _PaneInputNotStartedError(RuntimeError):
+    """The instruction input operation was never attempted."""
 
 
 def _target_state_at_send(worker: Worker) -> str:
@@ -1253,10 +1262,22 @@ def _mark_request_send_started(
     reservation: ReservedCommandMutation,
     *,
     binding_fingerprint: str,
-) -> CommandEnvelope | None:
+    worker: Worker | None = None,
+    instruction_text: str | None = None,
+) -> CommandEnvelope | Mapping[str, Any] | None:
     if config.db_path is None:
         return _backend_uncertain(request, "command receipt store is unavailable")
     try:
+        send_started_effect = (
+            command_pending_turn_terminal_effect(
+                host_id=config.host_id,
+                worker=worker,
+                request_id=request.request_id or "",
+                instruction_text=instruction_text,
+            )
+            if worker is not None and instruction_text is not None
+            else None
+        )
         started = mark_command_send_started(
             config.db_path,
             host_id=config.host_id,
@@ -1264,6 +1285,7 @@ def _mark_request_send_started(
             canonical_fingerprint=reservation.canonical.fingerprint,
             owner_token=reservation.owner_token,
             binding_fingerprint=binding_fingerprint,
+            send_started_effect=send_started_effect,
             event_payload=_transition_payload(
                 request,
                 worker_id=reservation.canonical.public_worker_id,
@@ -1283,7 +1305,12 @@ def _mark_request_send_started(
         and started["receipt"].get("state") == "send_started"
         and _receipt_is_canonical(request, reservation.canonical, started["receipt"])
     ):
-        return None
+        if send_started_effect is None:
+            return None
+        effect_result = started.get("effect_result")
+        if isinstance(effect_result, Mapping):
+            return effect_result
+        return _recover_request(config, request, reservation.canonical)
     if isinstance(started, Mapping) and isinstance(started.get("receipt"), Mapping):
         embedded = _envelope_from_receipt(
             request,
@@ -1304,7 +1331,13 @@ def _mark_request_send_started(
 def _accepted_send_envelope(
     request: CommandRequest,
     worker: Worker,
+    turn: Mapping[str, Any],
 ) -> CommandEnvelope:
+    observed_turn_state = "pending_observation"
+    if str(turn.get("source_turn_id") or "").strip():
+        observed_turn_state = (
+            "complete" if turn.get("complete") is True else "observed"
+        )
     return CommandEnvelope.from_result(
         request,
         ok=True,
@@ -1315,7 +1348,8 @@ def _accepted_send_envelope(
             "delivery_state": "submitted",
             "transport_state": "submitted",
             "target_state_at_send": _target_state_at_send(worker),
-            "observed_turn_state": "pending_observation",
+            "turn_id": str(turn.get("id") or ""),
+            "observed_turn_state": observed_turn_state,
         },
     )
 
@@ -1329,14 +1363,23 @@ def _submit_instruction(
 ) -> CommandEnvelope:
     assert config.db_path is not None
     try:
-        send_start_error = _mark_request_send_started(
+        send_started = _mark_request_send_started(
             config,
             request,
             reservation,
             binding_fingerprint=prepared.binding_fingerprint,
+            worker=worker,
+            instruction_text=_instruction_text(request),
         )
-        if send_start_error is not None:
-            return send_start_error
+        if isinstance(send_started, CommandEnvelope):
+            return send_started
+        if not isinstance(send_started, Mapping):
+            return _recover_request(
+                config,
+                request,
+                reservation.canonical,
+            )
+        pending_turn = send_started
 
         try:
             _submit_private_pane_input(
@@ -1344,6 +1387,23 @@ def _submit_instruction(
                 prepared.pane_id,
                 _instruction_text(request),
                 timeout=config.herdr_timeout_seconds,
+            )
+        except _PaneInputNotStartedError:
+            envelope = _backend_uncertain(
+                request,
+                "Herdr socket pane input did not start after send start",
+            )
+            return _finish_request(
+                config,
+                request,
+                reservation,
+                envelope,
+                expected_state="send_started",
+                terminal_state="uncertain",
+                terminal_effect=delete_command_pending_turn_claim_effect(
+                    host_id=config.host_id,
+                    request_id=request.request_id or "",
+                ),
             )
         except Exception:  # noqa: BLE001
             envelope = _backend_uncertain(
@@ -1358,23 +1418,27 @@ def _submit_instruction(
                 expected_state="send_started",
                 terminal_state="uncertain",
             )
+
+        # The ingestion scheduler can adopt the write-early claim while the
+        # pane call is in flight. Re-read through the idempotent upsert so the
+        # accepted envelope reports the canonical row's observed state rather
+        # than the pre-send snapshot of that row.
+        try:
+            refreshed_turn = upsert_command_pending_turn(
+                config.db_path,
+                config.host_id,
+                worker,
+                request_id=request.request_id or "",
+                instruction_text=_instruction_text(request),
+            )
+        except Exception:  # noqa: BLE001
+            refreshed_turn = None
+        if isinstance(refreshed_turn, Mapping):
+            pending_turn = refreshed_turn
     finally:
         _close_socket_client(prepared.client)
 
-    accepted = _accepted_send_envelope(request, worker)
-    try:
-        effect = command_pending_turn_terminal_effect(
-            host_id=config.host_id,
-            worker=worker,
-            request_id=request.request_id or "",
-            instruction_text=_instruction_text(request),
-        )
-    except Exception:
-        return _recover_request(
-            config,
-            request,
-            reservation.canonical,
-        )
+    accepted = _accepted_send_envelope(request, worker, pending_turn)
     return _finish_request(
         config,
         request,
@@ -1382,7 +1446,6 @@ def _submit_instruction(
         accepted,
         expected_state="send_started",
         terminal_state="accepted",
-        terminal_effect=effect,
     )
 
 

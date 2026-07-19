@@ -1784,6 +1784,8 @@ class Turn:
     completed_at: str | None = None
     origin_command_id: str | None = None
     source_turn_id: str | None = None
+    superseded_by_turn_id: str | None = None
+    superseded_at: str | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     id: str = ""
     fingerprint: str = ""
@@ -1808,6 +1810,10 @@ class Turn:
         completed_at = _optional_timestamp(self.completed_at)
         origin_command_id = _optional_public_text(self.origin_command_id)
         raw_source_turn_id = _optional_public_text(self.source_turn_id)
+        superseded_by_turn_id = _optional_public_text(
+            self.superseded_by_turn_id
+        )
+        superseded_at = _optional_timestamp(self.superseded_at)
         meta = _clean_meta(self.meta)
         source_id_candidates = turn_source_id_candidates(
             raw_source_turn_id,
@@ -1891,6 +1897,12 @@ class Turn:
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "origin_command_id", origin_command_id)
         object.__setattr__(self, "source_turn_id", source_turn_id)
+        object.__setattr__(
+            self,
+            "superseded_by_turn_id",
+            superseded_by_turn_id,
+        )
+        object.__setattr__(self, "superseded_at", superseded_at)
         object.__setattr__(self, "fingerprint", fingerprint)
         object.__setattr__(self, "meta", meta)
 
@@ -1921,6 +1933,8 @@ class Turn:
             "source": self.source,
             "origin_command_id": self.origin_command_id,
             "source_turn_id": self.source_turn_id,
+            "superseded_by_turn_id": self.superseded_by_turn_id,
+            "superseded_at": self.superseded_at,
             "fingerprint": self.fingerprint,
             "meta": _clean_meta(self.meta),
         }
@@ -1955,6 +1969,8 @@ class Turn:
             source=clean.get("source", "snapshot"),
             origin_command_id=clean.get("origin_command_id"),
             source_turn_id=clean.get("source_turn_id"),
+            superseded_by_turn_id=clean.get("superseded_by_turn_id"),
+            superseded_at=clean.get("superseded_at"),
             fingerprint=_string_value(clean.get("fingerprint")),
             meta=clean.get("meta", {}),
         )

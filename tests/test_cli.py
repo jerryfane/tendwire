@@ -480,6 +480,8 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
                 "limit": 7,
                 "cursor": None,
                 "since": None,
+                "turn_refresh_interval_seconds": 2.0,
+                "claim_hard_ttl_seconds": 86400,
             },
         )
     ]
@@ -555,6 +557,8 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
             "limit": 9,
             "cursor": position_value if position_flag == "--cursor" else None,
             "since": position_value if position_flag == "--since" else None,
+            "turn_refresh_interval_seconds": 2.0,
+            "claim_hard_ttl_seconds": 86400,
         }
     ]
 
