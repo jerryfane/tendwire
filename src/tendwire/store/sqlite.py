@@ -19135,11 +19135,9 @@ def _sweep_turn_claims_conn(
         if _turn_is_tombstoned(row[2])
     }
     changed = 0
-    unresolved: list[tuple[str, str, dict[str, Any], dict[str, Any] | None, str]] = []
     for claim in claims:
         claim_dt = _turn_row_time(claim[2], claim[4])
         if claim_dt is None or (current_dt - claim_dt).total_seconds() < grace_seconds:
-            unresolved.append(claim)
             continue
         claim_view = _turn_with_current_content(claim[2], claim[3])
         matches = [
@@ -19162,40 +19160,6 @@ def _sweep_turn_claims_conn(
             ):
                 changed += 1
                 used_done.add(matches[0][0])
-            continue
-        unresolved.append(claim)
-
-    for worker_id in sorted({row[1] for row in unresolved}):
-        worker_claims = sorted(
-            (row for row in unresolved if row[1] == worker_id),
-            key=lambda row: (_turn_row_time(row[2], row[4]) or current_dt, row[0]),
-        )
-        if len(worker_claims) != 1:
-            continue
-        claim = worker_claims[0]
-        claim_dt = _turn_row_time(claim[2], claim[4])
-        if claim_dt is None or (current_dt - claim_dt).total_seconds() < grace_seconds:
-            continue
-        newer_done = sorted(
-            (
-                row
-                for row in done
-                if row[1] == worker_id
-                and row[0] not in used_done
-                and not str(row[2].get("origin_command_id") or "").strip()
-                and (_turn_row_time(row[2], row[4]) or current_dt) > claim_dt
-            ),
-            key=lambda row: (_turn_row_time(row[2], row[4]) or current_dt, row[0]),
-        )
-        if len(newer_done) == 1 and _tombstone_turn_conn(
-            conn,
-            str(host_id),
-            claim[0],
-            superseded_by_turn_id=newer_done[0][0],
-            superseded_at=current_timestamp,
-        ):
-            changed += 1
-            used_done.add(newer_done[0][0])
 
     for claim in claims:
         row = conn.execute(
