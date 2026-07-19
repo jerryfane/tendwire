@@ -14,8 +14,10 @@ import pytest
 
 from tendwire.cli import main
 from tendwire.config import Config, load_config
+from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core import turns as turns_core
 from tendwire.core.models import stable_json_dumps
+from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import decode_turn_delta_watermark
 from tendwire.daemon_api import (
     DaemonAPIClient,
@@ -253,12 +255,28 @@ def _nearest_rank_p95(samples: list[float]) -> float:
 
 def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """10k bootstrap is stable/bounded; unchanged polls traverse no list/content."""
     db_path = tmp_path / "ten-thousand.db"
     _seed_pre_v18_store(db_path, 10_000)
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM turn_change_journal").fetchone() == (0,)
+
+    reader_calls = {"list": 0, "content": 0}
+    real_list_reader = store_sqlite.turns_payload_from_store
+    real_content_reader = store_sqlite.get_turn_content
+
+    def list_reader_spy(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        reader_calls["list"] += 1
+        return real_list_reader(*args, **kwargs)
+
+    def content_reader_spy(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        reader_calls["content"] += 1
+        return real_content_reader(*args, **kwargs)
+
+    monkeypatch.setattr(store_sqlite, "turns_payload_from_store", list_reader_spy)
+    monkeypatch.setattr(store_sqlite, "get_turn_content", content_reader_spy)
 
     cursor: str | None = None
     seen: set[str] = set()
@@ -277,7 +295,6 @@ def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
         pages += 1
         assert page["mode"] == "bootstrap"
         assert len(_serialized_response(success_response(page))) < MAX_RESPONSE_BYTES
-        assert counters.list_pages_read == counters.content_pages_read == 0
         seen.update(str(change["turn_id"]) for change in page["changes"])
         active_workers.update(
             str(change["turn"]["worker_id"])
@@ -308,8 +325,36 @@ def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
         assert unchanged["has_more"] is False
         assert counters.journal_rows_scanned == 0
         assert counters.projection_rows_read == 0
-        assert counters.list_pages_read == counters.content_pages_read == 0
         checkpoint = str(unchanged["checkpoint"])
+    assert reader_calls == {"list": 0, "content": 0}
+
+
+def test_bootstrap_size_gate_is_independent_of_client_limit_two(tmp_path: Path) -> None:
+    db_path = tmp_path / "limit-two-bootstrap.db"
+    _seed_pre_v18_store(db_path, 5_000)
+
+    first = turn_delta_payload_from_store(
+        db_path,
+        HOST,
+        limit=2,
+        bootstrap_max_pages=10,
+    )
+    assert first.get("ok") is not False
+    assert first["mode"] == "bootstrap"
+    assert first["has_more"] is True
+    assert len(first["changes"]) == 2
+
+    second = turn_delta_payload_from_store(
+        db_path,
+        HOST,
+        cursor=first["next_cursor"],
+        limit=2,
+        bootstrap_max_pages=10,
+    )
+    assert second.get("ok") is not False
+    assert second["mode"] == "bootstrap"
+    assert second["has_more"] is True
+    assert len(second["changes"]) == 2
 
 
 def test_goal13_acceptance_4_working_mutation_is_one_upsert_and_revision_only_changes(
@@ -403,6 +448,80 @@ def test_current_revision_insert_alone_emits_one_upsert(tmp_path: Path) -> None:
     )
 
 
+def test_public_turn_reclassified_as_internal_emits_remove(tmp_path: Path) -> None:
+    db_path = tmp_path / "hidden-reclassification.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_turn(conn, "public-then-hidden", 1, summary="visible work")
+        conn.commit()
+    checkpoint = _bootstrap_checkpoint(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+            (HOST, "public-then-hidden"),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row[0]))
+        payload["assistant_stream_text"] = stable_json_dumps(
+            {"gitmoot_result": {"decision": "approved"}}
+        )
+        conn.execute(
+            "UPDATE turns SET payload_json = ? WHERE host_id = ? AND turn_id = ?",
+            (stable_json_dumps(payload), HOST, "public-then-hidden"),
+        )
+        conn.commit()
+
+    delta = turn_delta_payload_from_store(db_path, HOST, watermark=checkpoint)
+    assert [(item["op"], item["turn_id"]) for item in delta["changes"]] == [
+        ("remove", "public-then-hidden")
+    ]
+
+
+def test_single_oversized_change_degrades_and_advances_checkpoint(tmp_path: Path) -> None:
+    db_path = tmp_path / "oversized-single-change.db"
+    init_store(db_path)
+    checkpoint = _bootstrap_checkpoint(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_turn(
+            conn,
+            "oversized",
+            1,
+            summary="large public descriptor",
+            extra={"meta": {"items": ["x" * 12_000 for _ in range(100)]}},
+        )
+        store_sqlite._insert_turn_content_revision_conn(
+            conn,
+            host_id=HOST,
+            turn_id="oversized",
+            user_text="prompt",
+            assistant_final_text="answer",
+            user_state="complete",
+            final_state="complete",
+            created_at=TS,
+            is_current=True,
+        )
+        conn.commit()
+
+    page = turn_delta_payload_from_store(
+        db_path,
+        HOST,
+        watermark=checkpoint,
+        limit=1,
+    )
+    encoded = _serialized_response(success_response(page))
+    assert len(encoded) < MAX_RESPONSE_BYTES
+    assert page["has_more"] is False
+    assert page["checkpoint"] is not None
+    assert [(item["op"], item["turn_id"]) for item in page["changes"]] == [
+        ("upsert", "oversized")
+    ]
+    projected = page["changes"][0]["turn"]
+    assert "meta" not in projected
+    assert projected["content"]["fields"]["user_text"]["inline"] is False
+    assert projected["content"]["fields"]["user_text"]["first_cursor"]
+
+
 def test_goal13_acceptance_6_tombstone_once_and_physical_delete_not_repeated(
     tmp_path: Path,
 ) -> None:
@@ -457,19 +576,27 @@ def test_goal13_acceptance_7_concurrent_changes_are_frozen_then_safely_repeated(
     assert first["has_more"] is True
     first_id = str(first["changes"][0]["turn_id"])
 
+    inserted = threading.Event()
+    continue_writer = threading.Event()
+
     def race_writer() -> None:
         with sqlite3.connect(str(db_path)) as conn:
             _insert_turn(conn, "d", 4)
             conn.commit()
+        inserted.set()
+        assert continue_writer.wait(timeout=5)
         _mutate_turn(db_path, first_id, summary="mutated after its frozen page")
 
     writer = threading.Thread(target=race_writer)
     writer.start()
-    writer.join(timeout=5)
-    assert not writer.is_alive()
+    assert inserted.wait(timeout=5)
 
     frozen_ids = [first_id]
     cursor = str(first["next_cursor"])
+    page = turn_delta_payload_from_store(db_path, HOST, cursor=cursor, limit=1)
+    frozen_ids.extend(str(change["turn_id"]) for change in page["changes"])
+    continue_writer.set()
+    cursor = str(page["next_cursor"])
     while True:
         page = turn_delta_payload_from_store(db_path, HOST, cursor=cursor, limit=1)
         frozen_ids.extend(str(change["turn_id"]) for change in page["changes"])
@@ -477,6 +604,8 @@ def test_goal13_acceptance_7_concurrent_changes_are_frozen_then_safely_repeated(
             frozen_checkpoint = str(page["checkpoint"])
             break
         cursor = str(page["next_cursor"])
+    writer.join(timeout=5)
+    assert not writer.is_alive()
     assert set(frozen_ids) == {"a", "b", "c"}
     assert len(frozen_ids) == 3
 
@@ -488,6 +617,29 @@ def test_goal13_acceptance_7_concurrent_changes_are_frozen_then_safely_repeated(
     )
     assert {change["turn_id"] for change in next_batch["changes"]} == {"d", first_id}
     assert len(next_batch["changes"]) == 2
+
+
+def test_journal_rows_scanned_counts_raw_rows_before_collapse(tmp_path: Path) -> None:
+    db_path = tmp_path / "raw-journal-count.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_turn(conn, "collapsed", 1)
+        conn.commit()
+    checkpoint = _bootstrap_checkpoint(db_path)
+    for index in range(3):
+        _mutate_turn(db_path, "collapsed", summary=f"revision {index}")
+
+    counters = TurnDeltaWorkCounters()
+    page = turn_delta_payload_from_store(
+        db_path,
+        HOST,
+        watermark=checkpoint,
+        work_counters=counters,
+    )
+    assert len(page["changes"]) == 1
+    assert page["aggregate"]["projection_rows_read"] == 1
+    assert page["aggregate"]["journal_rows_scanned"] == 3
+    assert counters.journal_rows_scanned == 3
 
 
 def test_lost_final_page_response_is_safely_repeatable_without_delivery_authority(
@@ -663,6 +815,184 @@ def test_goal13_capture_is_trigger_backed_immutable_and_public_minimal(tmp_path:
     assert bootstrap["changes"][0]["turn"]["summary"] == "public summary"
 
 
+def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:
+    db_path = tmp_path / "real-writer-capture.db"
+    snapshot = project_from_raw(
+        Config(host_id=HOST, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-0",
+                "name": "Journal Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("a" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    store_sqlite.save_snapshot(db_path, snapshot)
+
+    def journal_high() -> int:
+        with sqlite3.connect(str(db_path)) as conn:
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM turn_change_journal"
+                ).fetchone()[0]
+            )
+
+    def journal_since(sequence: int) -> list[tuple[str, str]]:
+        with sqlite3.connect(str(db_path)) as conn:
+            return [
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    """
+                    SELECT turn_id, op FROM turn_change_journal
+                    WHERE seq > ? ORDER BY seq
+                    """,
+                    (sequence,),
+                ).fetchall()
+            ]
+
+    before = journal_high()
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        HOST,
+        snapshot.workers[0],
+        request_id="journal-command",
+        instruction_text="capture this pending command",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    assert claim is not None
+    assert (claim["id"], "upsert") in journal_since(before)
+
+    before = journal_high()
+    assert store_sqlite.merge_turn_content(
+        db_path,
+        HOST,
+        "worker-0",
+        {
+            "assistant_stream_text": "working through the request",
+            "complete": False,
+            "has_open_turn": True,
+        },
+        observed_at="2026-01-01T00:01:00+00:00",
+    ) == 1
+    assert any(op == "upsert" for _turn_id, op in journal_since(before))
+
+    before = journal_high()
+    applied = store_sqlite.apply_turn_refresh(
+        db_path,
+        HOST,
+        "worker-0",
+        {
+            "source_turn_id": "journal-final-source",
+            "assistant_final_text": "captured final",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-01-01T00:02:00+00:00",
+    )
+    assert applied.updated == 1
+    applied_rows = journal_since(before)
+    assert applied_rows and all(op == "upsert" for _turn_id, op in applied_rows)
+    final_turn_id = applied_rows[0][0]
+
+    old_claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        HOST,
+        snapshot.workers[0],
+        request_id="journal-expired-command",
+        instruction_text="expire this pending command",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    assert old_claim is not None
+    before = journal_high()
+    assert store_sqlite.sweep_turn_claims(
+        db_path,
+        HOST,
+        grace_seconds=1,
+        hard_ttl_seconds=60,
+        now="2026-01-01T00:10:00+00:00",
+    ) >= 1
+    assert (old_claim["id"], "remove") in journal_since(before)
+
+    api = ConnectorOutboxAPI(db_path, HOST)
+    source_poll = api.poll(
+        {"name": "turn-final", "limit": 100, "lease_seconds": 60}
+    )
+    assert source_poll["ok"] is True
+    source = next(
+        item
+        for item in source_poll["items"]
+        if item["payload"]["turn_id"] == final_turn_id
+    )
+    source_payload = source["payload"]
+    final_length = int(
+        source_payload["content"]["fields"]["assistant_final_text"]["char_length"]
+    )
+    begun = api.prepare(
+        {
+            "schema_version": 1,
+            "action": "begin",
+            "name": "turn-final",
+            "turn_id": final_turn_id,
+            "content_revision": source_payload["content_revision"],
+            "presentation_version": "journal-capture",
+            "part_count": 1,
+            "source_ref": source["ref"],
+        }
+    )
+    assert begun["ok"] is True
+    plan_token = begun["plan_token"]
+    assert api.prepare(
+        {
+            "schema_version": 1,
+            "action": "part",
+            "name": "turn-final",
+            "plan_token": plan_token,
+            "ordinal": 0,
+            "spans": [
+                {
+                    "field": "assistant_final_text",
+                    "start_char": 0,
+                    "end_char": final_length,
+                }
+            ],
+        }
+    )["ok"] is True
+    assert api.prepare(
+        {
+            "schema_version": 1,
+            "action": "commit",
+            "name": "turn-final",
+            "plan_token": plan_token,
+            "source_ref": source["ref"],
+        }
+    )["ok"] is True
+    part = api.poll({"name": "turn-final", "limit": 100})["items"][0]
+    assert api.ack(
+        {
+            "name": "turn-final",
+            "ref": part["ref"],
+            "response": {"accepted": True},
+        }
+    )["status"] == "acknowledged"
+
+    before = journal_high()
+    cleanup = store_sqlite.cleanup_acknowledged_final_retention(
+        db_path,
+        HOST,
+        acknowledged_final_retention_days=1,
+        acknowledged_final_retention_count=1,
+        batch_size=100,
+        now="2099-01-01T00:00:00+00:00",
+    )
+    assert cleanup["deleted"] == 1
+    assert (final_turn_id, "remove") in journal_since(before)
+
+
 def test_turn_delta_rpc_advertises_feature_and_cannot_invoke_delivery(tmp_path: Path) -> None:
     db_path = tmp_path / "authority.db"
     init_store(db_path)
@@ -804,8 +1134,15 @@ def test_goal13_acceptance_10_unix_socket_noop_and_one_update_p95_under_350ms(
     thread.start()
     client = DaemonAPIClient(socket_path, timeout_seconds=2)
     try:
+        for _ in range(5):
+            response = client.request(
+                "turn.delta", {"watermark": checkpoint, "limit": 10}
+            )
+            assert response["result"]["changes"] == []
+            checkpoint = str(response["result"]["checkpoint"])
+
         noop_ms: list[float] = []
-        for _ in range(21):
+        for _ in range(51):
             started = time.perf_counter()
             response = client.request(
                 "turn.delta", {"watermark": checkpoint, "limit": 10}
@@ -815,7 +1152,7 @@ def test_goal13_acceptance_10_unix_socket_noop_and_one_update_p95_under_350ms(
             checkpoint = str(response["result"]["checkpoint"])
 
         update_ms: list[float] = []
-        for index in range(21):
+        for index in range(51):
             _mutate_turn(db_path, "live", summary=f"working update {index}")
             started = time.perf_counter()
             response = client.request(

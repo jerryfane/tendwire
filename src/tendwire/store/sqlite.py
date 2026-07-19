@@ -372,8 +372,6 @@ class TurnDeltaWorkCounters:
     journal_rows_scanned: int = 0
     projection_queries: int = 0
     projection_rows_read: int = 0
-    list_pages_read: int = 0
-    content_pages_read: int = 0
     max_response_utf8_bytes: int = 0
 
     def to_dict(self) -> dict[str, int]:
@@ -382,8 +380,6 @@ class TurnDeltaWorkCounters:
             "journal_rows_scanned": self.journal_rows_scanned,
             "projection_queries": self.projection_queries,
             "projection_rows_read": self.projection_rows_read,
-            "list_pages_read": self.list_pages_read,
-            "content_pages_read": self.content_pages_read,
             "max_response_utf8_bytes": self.max_response_utf8_bytes,
         }
 
@@ -21464,6 +21460,60 @@ def _turn_delta_remove(
     return change
 
 
+def _turn_delta_descriptor_only(projected: Mapping[str, Any]) -> dict[str, Any]:
+    """Bound one turn change while preserving its content-page descriptor."""
+    descriptor_keys = (
+        "schema_version",
+        "id",
+        "host_id",
+        "worker_id",
+        "worker_fingerprint",
+        "space_id",
+        "status",
+        "kind",
+        "complete",
+        "has_open_turn",
+        "started_at",
+        "updated_at",
+        "completed_at",
+        "source",
+        "origin_command_id",
+        "source_turn_id",
+        "superseded_by_turn_id",
+        "superseded_at",
+        "fingerprint",
+    )
+    bounded = {key: projected[key] for key in descriptor_keys if key in projected}
+    raw_content = projected.get("content")
+    if isinstance(raw_content, Mapping):
+        content = dict(raw_content)
+        revision = str(content.get("content_revision") or "")
+        raw_fields = content.get("fields")
+        if revision and isinstance(raw_fields, Mapping):
+            fields: dict[str, Any] = {}
+            for field in ("user_text", "assistant_final_text"):
+                raw_field = raw_fields.get(field)
+                if not isinstance(raw_field, Mapping):
+                    continue
+                field_descriptor = dict(raw_field)
+                field_descriptor["inline"] = False
+                if (
+                    field_descriptor.get("availability") == "complete"
+                    and int(field_descriptor.get("page_count") or 0) > 0
+                ):
+                    field_descriptor["first_cursor"] = content_cursor(
+                        revision,
+                        field,
+                        0,
+                        start_char=0,
+                        start_byte=0,
+                    )
+                fields[field] = field_descriptor
+            content["fields"] = fields
+        bounded["content"] = content
+    return bounded
+
+
 def _turn_delta_payload_from_store(
     db_path: Path | str,
     host_id: str,
@@ -21552,9 +21602,6 @@ def _turn_delta_payload_from_store(
                 insertion_high = decoded_cursor.insertion_high
                 expires_at = decoded_cursor.expires_at
                 page_number = decoded_cursor.page_number + 1
-                if mode == "bootstrap" and page_number > max(1, int(bootstrap_max_pages)):
-                    conn.rollback()
-                    return {**error_base, "status": "bootstrap_too_large"}
             elif decoded_watermark is not None:
                 mode = "changes"
                 if (
@@ -21589,7 +21636,7 @@ def _turn_delta_payload_from_store(
                 ).fetchone()[0] or 0)
                 if (
                     bootstrap_count > max(1, int(bootstrap_max_rows))
-                    or math.ceil(bootstrap_count / limit)
+                    or math.ceil(bootstrap_count / TURN_DELTA_MAX_LIMIT)
                     > max(1, int(bootstrap_max_pages))
                 ):
                     conn.rollback()
@@ -21646,19 +21693,22 @@ def _turn_delta_payload_from_store(
                 params.update({"accepted": accepted, "batch_high": batch_high})
                 rows = conn.execute(f"""
                     WITH collapsed AS (
-                        SELECT turn_id, MAX(seq) AS seq
+                        SELECT turn_id, MAX(seq) AS seq,
+                               SUM(COUNT(*)) OVER () AS raw_count
                         FROM turn_change_journal
                         WHERE host_id = :host_id
                           AND seq > :accepted AND seq <= :batch_high
                         GROUP BY turn_id
                     ), positioned AS (
-                        SELECT collapsed.turn_id, collapsed.seq FROM collapsed
+                        SELECT collapsed.turn_id, collapsed.seq, collapsed.raw_count
+                        FROM collapsed
                         {continuation}
                         ORDER BY collapsed.seq, collapsed.turn_id
                         LIMIT :limit
                     )
                     SELECT {_TURN_DELTA_PROJECTION_SELECT},
-                           positioned.seq, positioned.turn_id, journal.changed_at
+                           positioned.seq, positioned.turn_id, journal.changed_at,
+                           positioned.raw_count
                     FROM positioned
                     JOIN turn_change_journal AS journal
                       ON journal.host_id = :host_id
@@ -21676,7 +21726,9 @@ def _turn_delta_payload_from_store(
             if work_counters is not None:
                 if mode == "changes":
                     work_counters.journal_queries += 1
-                    work_counters.journal_rows_scanned += len(rows)
+                    work_counters.journal_rows_scanned += (
+                        int(rows[0][21]) if rows else 0
+                    )
                 work_counters.projection_queries += 1
                 work_counters.projection_rows_read += len(rows)
             conn.commit()
@@ -21701,7 +21753,9 @@ def _turn_delta_payload_from_store(
             changed_at = str(row[20] or utc_timestamp())
         projected, raw_payload = _turn_delta_projection(tuple(row[:18]))
         tombstoned = bool(str(raw_payload.get("superseded_at") or "").strip())
-        if mode == "changes" and (row[2] is None or tombstoned):
+        if mode == "changes" and (
+            row[2] is None or tombstoned or projected is None
+        ):
             change = _turn_delta_remove(turn_id, changed_at=changed_at, payload=raw_payload)
         elif projected is None:
             last_scanned = (worker, sequence, turn_id)
@@ -21712,6 +21766,9 @@ def _turn_delta_payload_from_store(
                 "changed_at": changed_at, "turn": projected,
             }
         item_bytes = len(_canonical_json(change).encode("utf-8")) + 1
+        if item_bytes > 850_000 and change["op"] == "upsert":
+            change["turn"] = _turn_delta_descriptor_only(change["turn"])
+            item_bytes = len(_canonical_json(change).encode("utf-8")) + 1
         if changes and accumulated_bytes + item_bytes > 850_000:
             has_more = True
             break
@@ -21748,7 +21805,9 @@ def _turn_delta_payload_from_store(
         "next_cursor": next_cursor,
         "checkpoint": checkpoint,
         "aggregate": {
-            "journal_rows_scanned": len(rows) if mode == "changes" else 0,
+            "journal_rows_scanned": (
+                int(rows[0][21]) if mode == "changes" and rows else 0
+            ),
             "projection_rows_read": len(rows),
             "changes_returned": len(changes),
             "duration_ms": duration_ms,
