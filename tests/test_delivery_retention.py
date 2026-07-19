@@ -321,7 +321,11 @@ def _aggressive_cleanup(db_path: Path, *, batch_size: int = 100) -> dict[str, An
     )
 
 
-def test_dead_letter_final_blocks_only_its_stable_owner(tmp_path: Path) -> None:
+def test_dead_letter_final_blocks_no_later_finals(tmp_path: Path) -> None:
+    # dead_letter is terminal for FIFO ordering: it must not block ANY later
+    # final — not other owners (the original intent of this test) and not its
+    # own owner either (a poisoned reply must never wedge its worker; recovery
+    # goes through retry_final_ready_delivery/supersede instead).
     db_path = tmp_path / "dead-letter-owner-isolation.db"
     second_worker_id = "worker-2"
     second_stable_key = "wsk1_" + ("b" * 64)
@@ -394,8 +398,9 @@ def test_dead_letter_final_blocks_only_its_stable_owner(tmp_path: Path) -> None:
         {"name": FINAL_NAME, "limit": 100, "lease_seconds": 60}
     )
     assert unrelated["ok"] is True
-    assert len(unrelated["items"]) == 1
-    assert unrelated["items"][0]["payload"]["stable_key"] == second_stable_key
+    assert len(unrelated["items"]) == 2
+    polled_keys = {item["payload"]["stable_key"] for item in unrelated["items"]}
+    assert polled_keys == {STABLE_KEY, second_stable_key}
 
     with sqlite3.connect(str(db_path)) as conn:
         first_owner_states = conn.execute(
@@ -409,7 +414,7 @@ def test_dead_letter_final_blocks_only_its_stable_owner(tmp_path: Path) -> None:
             """,
             (FINAL_NAME, STABLE_KEY),
         ).fetchall()
-    assert first_owner_states == [("dead_letter",), ("queued",)]
+    assert first_owner_states == [("dead_letter",), ("leased",)]
 
 
 def test_acknowledged_prefix_is_cleaned_but_failed_suffix_and_exact_final_survive(

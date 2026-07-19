@@ -5770,20 +5770,6 @@ def poll_connector_outbox(
                                 AND earlier_final.delivery_kind = 'final_ready'
                                 AND earlier_final.ordering_key = outbox.ordering_key
                                 AND earlier_final.id < outbox.id
-                                AND json_extract(
-                                    earlier_final.payload_json,
-                                    '$.stable_key'
-                                ) = json_extract(
-                                    outbox.payload_json,
-                                    '$.stable_key'
-                                )
-                                AND json_extract(
-                                    earlier_final.payload_json,
-                                    '$.stable_key_version'
-                                ) = json_extract(
-                                    outbox.payload_json,
-                                    '$.stable_key_version'
-                                )
                                 AND earlier_final.status NOT IN (
                                     'delivered',
                                     'superseded',
