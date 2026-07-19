@@ -12,7 +12,7 @@ import sqlite3
 import stat
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -6572,6 +6572,237 @@ def test_turn_claim_sweeper_resolves_only_one_identical_claim_per_done_turn(
     assert stored[second["id"]]["has_open_turn"] is True
 
 
+@pytest.mark.parametrize(("claim_count", "done_count"), [(1, 2), (2, 1)])
+def test_turn_claim_sweeper_fifo_requires_unambiguous_claim_and_done_sets(
+    tmp_path: Path,
+    claim_count: int,
+    done_count: int,
+) -> None:
+    db_path = tmp_path / f"turn-fifo-{claim_count}-{done_count}.db"
+    host_id = "turn-fifo-unambiguous-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("7" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    claims = [
+        store_sqlite.upsert_command_pending_turn(
+            db_path,
+            host_id,
+            snapshot.workers[0],
+            request_id=f"fifo-claim-{index}",
+            instruction_text=f"claim prompt {index}",
+            observed_at=f"2026-07-19T00:00:0{index}+00:00",
+        )
+        for index in range(claim_count)
+    ]
+    assert all(claim is not None for claim in claims)
+    for index in range(done_count):
+        assert merge_turn_content(
+            db_path,
+            host_id,
+            "worker-1",
+            {
+                "source_turn_id": f"fifo-done-{index}",
+                "user_text": f"unrelated done {index}",
+                "assistant_final_text": f"answer {index}",
+                "complete": True,
+                "has_open_turn": False,
+            },
+            observed_at=f"2026-07-19T00:01:0{index}+00:00",
+        ) == 1
+
+    assert store_sqlite.sweep_turn_claims(
+        db_path,
+        host_id,
+        grace_seconds=1,
+        hard_ttl_seconds=1_000_000,
+        now="2026-07-19T00:02:00+00:00",
+    ) == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        stored = [
+            json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                    (host_id, claim["id"]),
+                ).fetchone()[0]
+            )
+            for claim in claims
+            if claim is not None
+        ]
+    assert all(payload.get("superseded_at") is None for payload in stored)
+
+
+def test_turn_list_lazy_sweep_uses_the_callers_now(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-list-caller-now.db"
+    host_id = "turn-list-caller-now-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="caller-now-claim",
+        instruction_text="caller clock",
+        observed_at="2000-01-01T00:00:00+00:00",
+    )
+    assert claim is not None
+
+    before_ttl = turns_payload_from_store(
+        db_path,
+        host_id,
+        now=datetime.fromisoformat("2000-01-01T00:00:30+00:00").timestamp(),
+        claim_hard_ttl_seconds=60,
+    )
+    assert claim["id"] in {turn["id"] for turn in before_ttl["turns"]}
+    after_ttl = turns_payload_from_store(
+        db_path,
+        host_id,
+        now=datetime.fromisoformat("2000-01-01T00:02:00+00:00").timestamp(),
+        claim_hard_ttl_seconds=60,
+    )
+    assert claim["id"] not in {turn["id"] for turn in after_ttl["turns"]}
+
+
+def test_late_real_completion_never_adopts_tombstoned_claim(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-late-real-completion.db"
+    host_id = "turn-late-real-completion-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("8" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="late-real-claim",
+        instruction_text="late real prompt",
+        observed_at="2026-07-19T00:00:00+00:00",
+    )
+    assert claim is not None
+    assert store_sqlite.sweep_turn_claims(
+        db_path,
+        host_id,
+        grace_seconds=1,
+        hard_ttl_seconds=60,
+        now="2026-07-19T00:02:00+00:00",
+    ) == 1
+
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "late-real-source",
+            "user_text": "late real prompt",
+            "assistant_final_text": "late real answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-19T00:02:01+00:00",
+    ) == 1
+    listed = turns_payload_from_store(
+        db_path,
+        host_id,
+        now=datetime.fromisoformat("2026-07-19T00:02:02+00:00").timestamp(),
+    )["turns"]
+    real = next(turn for turn in listed if turn.get("assistant_final_text") == "late real answer")
+    assert real["id"] != claim["id"]
+    with sqlite3.connect(str(db_path)) as conn:
+        claim_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, claim["id"]),
+            ).fetchone()[0]
+        )
+    assert claim_payload.get("source_turn_id") is None
+    assert claim_payload["superseded_at"] == "2026-07-19T00:02:00+00:00"
+
+
+def test_submission_adoption_rejects_old_completed_matching_text(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-old-observation-adoption.db"
+    host_id = "turn-old-observation-adoption-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("9" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "old-yes-source",
+            "user_text": "yes",
+            "assistant_final_text": "old answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-19T00:00:00+00:00",
+    ) == 1
+    old = next(
+        turn
+        for turn in turns_payload_from_store(
+            db_path,
+            host_id,
+            now=datetime.fromisoformat("2026-07-19T00:00:01+00:00").timestamp(),
+        )["turns"]
+        if turn.get("assistant_final_text") == "old answer"
+    )
+
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="new-yes-request",
+        instruction_text="yes",
+        observed_at="2026-07-19T00:05:00+00:00",
+    )
+    assert claim is not None
+    assert claim["id"] != old["id"]
+    assert claim["complete"] is False
+    assert claim.get("assistant_final_text") in {None, ""}
+    assert old.get("origin_command_id") is None
+
+
 def test_text_drift_tombstone_preserves_cursor_and_since_continuity(
     tmp_path: Path,
 ) -> None:
@@ -6757,6 +6988,370 @@ def test_v14_migration_tombstones_production_shape_duplicate_claim(
     assert public[0]["id"] == observed["id"]
     assert claim["id"] not in {turn["id"] for turn in public}
     assert foreign_keys == []
+
+
+def test_v14_migration_skips_ambiguous_claim_pair(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "turn-v14-ambiguous-pair.db"
+    host_id = "turn-v14-ambiguous-pair-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("a" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "ambiguous-migration-source",
+            "user_text": "ambiguous migration prompt",
+            "assistant_final_text": "one observed answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-19T00:00:00+00:00",
+    ) == 1
+    claims = [
+        store_sqlite.upsert_command_pending_turn(
+            db_path,
+            host_id,
+            snapshot.workers[0],
+            request_id=f"ambiguous-migration-{index}",
+            instruction_text=f"temporary migration prompt {index}",
+            observed_at=f"2026-07-19T00:02:0{index}+00:00",
+        )
+        for index in range(2)
+    ]
+    assert all(claim is not None for claim in claims)
+    with sqlite3.connect(str(db_path)) as conn:
+        for claim in claims:
+            assert claim is not None
+            conn.execute(
+                """
+                UPDATE turn_content_revisions
+                SET user_text = 'ambiguous migration prompt'
+                WHERE host_id = ? AND turn_id = ? AND is_current = 1
+                """,
+                (host_id, claim["id"]),
+            )
+        conn.execute("PRAGMA user_version = 14")
+    monkeypatch.setenv("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS", "999999999")
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        payloads = [
+            json.loads(
+                conn.execute(
+                    "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                    (host_id, claim["id"]),
+                ).fetchone()[0]
+            )
+            for claim in claims
+            if claim is not None
+        ]
+    assert len(payloads) == 2
+    assert all(payload.get("superseded_at") is None for payload in payloads)
+
+
+def test_v14_migration_does_not_reuse_already_claimed_done_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "turn-v14-used-done.db"
+    host_id = "turn-v14-used-done-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("b" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    assert merge_turn_content(
+        db_path,
+        host_id,
+        "worker-1",
+        {
+            "source_turn_id": "used-done-source",
+            "user_text": "used done prompt",
+            "assistant_final_text": "used done answer",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at="2026-07-19T00:00:00+00:00",
+    ) == 1
+    done = next(
+        turn
+        for turn in turns_payload_from_store(
+            db_path,
+            host_id,
+            now=datetime.fromisoformat("2026-07-19T00:00:01+00:00").timestamp(),
+        )["turns"]
+        if turn.get("assistant_final_text") == "used done answer"
+    )
+    claims = [
+        store_sqlite.upsert_command_pending_turn(
+            db_path,
+            host_id,
+            snapshot.workers[0],
+            request_id=f"used-done-claim-{index}",
+            instruction_text=f"temporary used prompt {index}",
+            observed_at=f"2026-07-19T00:02:0{index}+00:00",
+        )
+        for index in range(2)
+    ]
+    assert all(claim is not None for claim in claims)
+    with sqlite3.connect(str(db_path)) as conn:
+        for claim in claims:
+            assert claim is not None
+            conn.execute(
+                """
+                UPDATE turn_content_revisions
+                SET user_text = 'used done prompt'
+                WHERE host_id = ? AND turn_id = ? AND is_current = 1
+                """,
+                (host_id, claim["id"]),
+            )
+        assert store_sqlite._tombstone_turn_conn(
+            conn,
+            host_id,
+            claims[0]["id"],
+            superseded_by_turn_id=done["id"],
+            superseded_at="2026-07-19T00:03:00+00:00",
+        )
+        conn.execute("PRAGMA user_version = 14")
+    monkeypatch.setenv("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS", "999999999")
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        second_payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, claims[1]["id"]),
+            ).fetchone()[0]
+        )
+    assert second_payload.get("superseded_at") is None
+    assert second_payload["has_open_turn"] is True
+
+
+def test_v14_migration_uses_configured_claim_hard_ttl(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "turn-v14-configured-ttl.db"
+    host_id = "turn-v14-configured-ttl-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    claim = store_sqlite.upsert_command_pending_turn(
+        db_path,
+        host_id,
+        snapshot.workers[0],
+        request_id="configured-ttl-claim",
+        instruction_text="expire from configured ttl",
+        observed_at=(datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat(),
+    )
+    assert claim is not None
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 14")
+    monkeypatch.setenv("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS", "60")
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
+                (host_id, claim["id"]),
+            ).fetchone()[0]
+        )
+    assert payload.get("superseded_at") is not None
+    assert payload.get("superseded_by_turn_id") is None
+
+
+def test_turn_cursor_continues_across_interior_tombstone(tmp_path: Path) -> None:
+    db_path = tmp_path / "turn-interior-tombstone-cursor.db"
+    host_id = "turn-interior-tombstone-cursor-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[{"id": "worker-1", "name": "Worker", "status": "active"}],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    for index in range(3):
+        assert merge_turn_content(
+            db_path,
+            host_id,
+            "worker-1",
+            {
+                "source_turn_id": f"cursor-source-{index}",
+                "user_text": f"cursor prompt {index}",
+                "assistant_final_text": f"cursor answer {index}",
+                "complete": True,
+                "has_open_turn": False,
+            },
+            observed_at=f"2026-07-19T00:0{index}:00+00:00",
+        ) == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        visible = conn.execute(
+            """
+            SELECT turn_id
+            FROM turns
+            WHERE host_id = ?
+              AND COALESCE(json_extract(payload_json, '$.source_turn_id'), '') != ''
+            ORDER BY worker_id ASC, list_sequence DESC, turn_id ASC
+            """,
+            (host_id,),
+        ).fetchall()
+    ordered_ids = [str(row[0]) for row in visible]
+    assert len(ordered_ids) == 3
+    first = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        limit=1,
+        now=datetime.fromisoformat("2026-07-19T00:03:00+00:00").timestamp(),
+    )
+    assert first["turns"][0]["id"] == ordered_ids[0]
+    assert first["next_cursor"] is not None
+    with sqlite3.connect(str(db_path)) as conn:
+        assert store_sqlite._tombstone_turn_conn(
+            conn,
+            host_id,
+            ordered_ids[1],
+            superseded_by_turn_id=ordered_ids[0],
+            superseded_at="2026-07-19T00:03:01+00:00",
+        )
+
+    continuation = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        limit=1,
+        cursor=first["next_cursor"],
+        now=datetime.fromisoformat("2026-07-19T00:03:02+00:00").timestamp(),
+    )
+    assert continuation.get("status") != "cursor_expired"
+    assert [turn["id"] for turn in continuation["turns"]] == [ordered_ids[2]]
+
+
+def test_turn_list_lazy_sweep_is_rate_limited(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "turn-list-sweep-rate-limit.db"
+    host_id = "turn-list-sweep-rate-limit-host"
+    init_store(db_path)
+    calls: list[tuple[float | None, str | None]] = []
+
+    def capture_sweep(*_args, grace_seconds=None, now=None, **_kwargs):
+        calls.append((grace_seconds, now))
+        return 0
+
+    monkeypatch.setattr(store_sqlite, "sweep_turn_claims", capture_sweep)
+    for current in (1_000.0, 1_001.0, 1_002.0):
+        turns_payload_from_store(
+            db_path,
+            host_id,
+            now=current,
+            turn_refresh_interval_seconds=2.0,
+        )
+    assert calls == [
+        (
+            60.0,
+            datetime.fromtimestamp(1_000.0, tz=timezone.utc).isoformat(),
+        ),
+        (
+            60.0,
+            datetime.fromtimestamp(1_002.0, tz=timezone.utc).isoformat(),
+        ),
+    ]
+
+
+def test_ingestion_ambiguity_fallthrough_emits_structured_diagnostic(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    db_path = tmp_path / "turn-ingestion-ambiguity-diagnostic.db"
+    host_id = "turn-ingestion-ambiguity-diagnostic-host"
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": "worker-1",
+                "name": "Worker",
+                "status": "active",
+                "meta": {
+                    "stable_key": "wsk1_" + ("c" * 64),
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    save_snapshot(db_path, snapshot)
+    for index in range(2):
+        assert store_sqlite.upsert_command_pending_turn(
+            db_path,
+            host_id,
+            snapshot.workers[0],
+            request_id=f"diagnostic-claim-{index}",
+            instruction_text="same ambiguous prompt",
+            observed_at=f"2026-07-19T00:00:0{index}+00:00",
+        ) is not None
+
+    with caplog.at_level("WARNING", logger="tendwire.store.sqlite"):
+        assert merge_turn_content(
+            db_path,
+            host_id,
+            "worker-1",
+            {
+                "source_turn_id": "diagnostic-source",
+                "user_text": "same ambiguous prompt",
+                "assistant_final_text": "independent answer",
+                "complete": True,
+                "has_open_turn": False,
+            },
+            observed_at="2026-07-19T00:01:00+00:00",
+        ) == 1
+
+    diagnostics = [
+        getattr(record, "tendwire_diagnostic", None)
+        for record in caplog.records
+        if record.getMessage() == "turn_ingestion_ambiguity_fallthrough"
+    ]
+    assert diagnostics == [
+        {
+            "code": "turn_ingestion_ambiguity_fallthrough",
+            "host_id": host_id,
+            "worker_id": "worker-1",
+            "candidate_count": 2,
+        }
+    ]
 
 
 def _reset_store_to_v5_with_legacy_turn(
@@ -14579,7 +15174,7 @@ def test_stable_owner_snapshot_ambiguity_rolls_back_without_allocating_sequence(
     assert foreign_keys == []
 
 
-def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
+def test_stable_owner_exact_content_adoption_does_not_misattribute_unmatched_turn(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "stable-owner-command-provenance.db"
@@ -14624,7 +15219,12 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
         },
         observed_at="2026-07-13T02:00:02+00:00",
     ) == 1
-    payload = turns_payload_from_store(db_path, host_id, schema_version=2)
+    payload = turns_payload_from_store(
+        db_path,
+        host_id,
+        schema_version=2,
+        now=datetime.fromisoformat("2026-07-13T02:00:02+00:00").timestamp(),
+    )
     exact_source = next(
         turn for turn in payload["turns"]
         if turn.get("assistant_final_text") == "exact final"
@@ -14687,6 +15287,7 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
         host_id,
         schema_version=2,
         claim_hard_ttl_seconds=1_000_000_000,
+        now=datetime.fromisoformat("2026-07-13T02:00:05+00:00").timestamp(),
     )
     unmatched_source = next(
         turn for turn in refreshed["turns"]
@@ -14694,7 +15295,7 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
     )
     assert unmatched_source.get("origin_command_id") is None
     assert unmatched_source["id"] != stale_command["id"]
-    assert stale_command["id"] not in {turn["id"] for turn in refreshed["turns"]}
+    assert stale_command["id"] in {turn["id"] for turn in refreshed["turns"]}
     with sqlite3.connect(str(db_path)) as conn:
         stale_payload = json.loads(
             conn.execute(
@@ -14702,7 +15303,8 @@ def test_stable_owner_source_turn_inherits_only_exact_matching_command_origin(
                 (host_id, stale_command["id"]),
             ).fetchone()[0]
         )
-    assert stale_payload["superseded_by_turn_id"] == unmatched_source["id"]
+    assert stale_payload.get("superseded_at") is None
+    assert stale_payload.get("superseded_by_turn_id") is None
     encoded = json.dumps(refreshed, sort_keys=True)
     assert raw_matching_source not in encoded
     assert raw_unmatched_source not in encoded
