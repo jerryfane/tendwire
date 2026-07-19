@@ -3326,7 +3326,7 @@ def test_unix_socket_server_close_preserves_substituted_socket(tmp_path: Path) -
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_publishes_socket_after_store_observation_and_scheduler_readiness(
+def test_daemon_binds_socket_after_store_observation_before_scheduler_io(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "ordered-cli.sock"
@@ -3347,13 +3347,27 @@ def test_daemon_publishes_socket_after_store_observation_and_scheduler_readiness
         return snapshot
 
     class RecordingScheduler:
+        parent_fd: int | None = None
+
         def start(self) -> None:
-            record_unpublished("scheduler_start")
+            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
+            import fcntl
+
+            self.parent_fd = os.open(
+                tmp_path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            fcntl.flock(self.parent_fd, fcntl.LOCK_SH)
+            calls.append("scheduler_start")
 
         def request_refresh(self) -> None:
-            record_unpublished("scheduler_request")
+            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
+            calls.append("scheduler_request")
 
         def stop(self, *, flush_timeout_seconds: float | None = None) -> None:
+            if self.parent_fd is not None:
+                os.close(self.parent_fd)
+                self.parent_fd = None
             calls.append(f"scheduler_stop:{flush_timeout_seconds}")
 
     def scheduler_factory(_config: Config) -> RecordingScheduler:
@@ -3394,7 +3408,7 @@ def test_daemon_publishes_socket_after_store_observation_and_scheduler_readiness
 
 
 @_UNIX_SOCKET_TEST
-def test_daemon_event_callback_is_attached_after_reconcile_before_socket_publish(
+def test_daemon_event_callback_is_attached_after_reconcile_before_ingestion(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "ordered-events.sock"
@@ -3420,6 +3434,8 @@ def test_daemon_event_callback_is_attached_after_reconcile_before_socket_publish
             save_snapshot(db_path, _public_snapshot())
 
         def set_turn_refresh_callback(self, callback: Any | None) -> None:
+            if callback is not None:
+                assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
             self.callback = callback
             calls.append("callback_attached" if callback is not None else "callback_detached")
 
@@ -3434,7 +3450,8 @@ def test_daemon_event_callback_is_attached_after_reconcile_before_socket_publish
 
     class RecordingScheduler:
         def start(self) -> None:
-            record_unpublished("scheduler_start")
+            assert stat.S_ISSOCK(os.lstat(socket_path).st_mode)
+            calls.append("scheduler_start")
 
         def request_refresh(self) -> None:
             calls.append("scheduler_request")
