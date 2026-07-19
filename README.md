@@ -534,6 +534,8 @@ variables:
 | `max_workers` | `TENDWIRE_MAX_WORKERS` | `512` | integer >= 1 |
 | `max_outbox_attempts` | `TENDWIRE_MAX_OUTBOX_ATTEMPTS` | `10` | integer >= 1 |
 | `connector_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS` | `60` | integer >= 1 |
+| `connector_max_claim_ttl_seconds` | `TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS` | `300` | integer >= 1; caps `turn-final` poll and renew requests |
+| `connector_ack_ttl_seconds` | `TENDWIRE_CONNECTOR_ACK_TTL_SECONDS` | `300` | integer >= 1; grace period for committed plans awaiting ACK completion |
 | `command_retry_horizon_seconds` | `TENDWIRE_COMMAND_RETRY_HORIZON_SECONDS` | `604800` | positive integer no greater than 604800 |
 | `command_receipt_retention_seconds` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_SECONDS` | `2592000` | integer at least 691200 and strictly greater than the retry horizon |
 | `command_receipt_retention_count` | `TENDWIRE_COMMAND_RECEIPT_RETENTION_COUNT` | `4096` | positive integer; newest bounded inactive receipts per host |
@@ -1135,15 +1137,17 @@ See `INSTALL.md` for the required maintenance and rollback order.
 
 Tendwire exposes a Tendwire-only connector delivery boundary above the SQLite
 store. The public daemon methods are `connector.prepare`, `connector.poll`,
-`connector.ack`, `connector.fail`, `connector.defer`, `connector.inspect`,
-`connector.retry`, and the operational helper `connector.reclaim`. Matching
-JSON-only CLI hooks include:
+`connector.ack`, `connector.fail`, `connector.defer`, `connector.renew`,
+`connector.release`, `connector.inspect`, `connector.retry`, and the operational
+helper `connector.reclaim`. Matching JSON-only CLI hooks include:
 
 ```bash
 tendwire connector poll --name attention --limit 10 --lease-seconds 60 --db-path /path/to/tendwire.db
 tendwire connector ack --name attention --ref '<opaque-ref>' --response-json '{"delivered":true}' --db-path /path/to/tendwire.db
 tendwire connector fail --name attention --ref '<opaque-ref>' --reason temporary --delay-seconds 60 --db-path /path/to/tendwire.db
 tendwire connector defer --name attention --ref '<opaque-ref>' --reason scheduled --available-at 2026-01-01T00:10:00+00:00 --db-path /path/to/tendwire.db
+tendwire connector renew --name turn-final --ref '<opaque-ref>' --lease-seconds 120 --db-path /path/to/tendwire.db
+tendwire connector release --name turn-final --ref '<opaque-ref>' --db-path /path/to/tendwire.db
 tendwire connector inspect --name turn-final --status dead_letter --limit 100 --db-path /path/to/tendwire.db
 tendwire connector retry --name turn-final --final-identity 'twfinal1.<opaque>' --db-path /path/to/tendwire.db
 ```
@@ -1248,19 +1252,34 @@ effect.
 `connector.poll` atomically leases due `connector_outbox` rows for one `name`
 and returns opaque per-attempt refs. A live lease prevents duplicate polling.
 Expired leases are reclaimed before polling and before ref-mutating operations;
-`connector.reclaim` can also be called directly. `connector.ack` validates the
-host, name, attempt, lease, and ref before marking the delivery and outbox item
-delivered. `connector.fail` records sanitized failure data and schedules retry
-availability. `connector.defer` records sanitized defer data and schedules future
-availability without treating the item as delivered. Stale, expired,
-wrong-host, wrong-name, and superseded refs fail closed with neutral errors.
+the daemon also runs this reclaim pass on its periodic tick, and
+`connector.reclaim` can be called directly. `connector.renew` extends a live
+lease without creating a delivery attempt. `connector.release` records the live
+attempt as released and makes the row immediately pollable again. `connector.ack`
+validates the host, name, attempt, lease, and ref before marking the delivery and
+outbox item delivered. `connector.fail` records sanitized failure data and
+schedules retry availability. `connector.defer` records sanitized defer data and
+schedules future availability without treating the item as delivered. Stale,
+expired, wrong-host, wrong-name, and superseded refs fail closed with neutral
+errors.
 When callers omit `lease_seconds`, the daemon and CLI use
 `connector_claim_ttl_seconds` from config, defaulting to 60 seconds; an explicit
-public `lease_seconds` value still wins. `max_outbox_attempts` prevents
+public `lease_seconds` value still wins. `turn-final` poll and renew requests are
+capped by `connector_max_claim_ttl_seconds`, defaulting to 300 seconds.
+`max_outbox_attempts` prevents
 unbounded retry loops. Once a failed job reaches the configured cap, Tendwire
 moves the outbox item to a neutral terminal `dead_letter` state and returns the
 public status `attempts_exhausted` without exposing private outbox or delivery
 state.
+
+Final-root FIFO is partitioned by the turn's immutable stable worker key, with
+the persisted worker ID as the enqueue-time fallback. A blocked worker therefore
+cannot starve another worker, while roots and plan parts for the same worker stay
+strictly ordered. `dead_letter`, `superseded`, and `delivered` roots are terminal
+for this gate. A committed source in `awaiting_ack` no longer blocks by itself;
+its plan jobs carry the ordering obligation. Commit stamps an ACK deadline, and
+an expired incomplete plan is failed and its source requeued. Missing or
+unrecoverable plan state terminates the source instead of leaving it pending.
 
 ### Delivery-aware final roots and acknowledged history
 

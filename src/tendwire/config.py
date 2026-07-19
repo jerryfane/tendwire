@@ -25,6 +25,8 @@ DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
+DEFAULT_CONNECTOR_MAX_CLAIM_TTL_SECONDS = 300
+DEFAULT_CONNECTOR_ACK_TTL_SECONDS = 300
 DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 DEFAULT_COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -64,6 +66,8 @@ class Config:
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
+    connector_max_claim_ttl_seconds: int = DEFAULT_CONNECTOR_MAX_CLAIM_TTL_SECONDS
+    connector_ack_ttl_seconds: int = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
     acknowledged_final_retention_days: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_DAYS
     acknowledged_final_retention_count: int = DEFAULT_ACKNOWLEDGED_FINAL_RETENTION_COUNT
     command_retry_horizon_seconds: int = DEFAULT_COMMAND_RETRY_HORIZON_SECONDS
@@ -175,6 +179,24 @@ class Config:
             _positive_int(
                 self.connector_claim_ttl_seconds,
                 "connector_claim_ttl_seconds",
+                minimum=1,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "connector_max_claim_ttl_seconds",
+            _positive_int(
+                self.connector_max_claim_ttl_seconds,
+                "connector_max_claim_ttl_seconds",
+                minimum=1,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "connector_ack_ttl_seconds",
+            _positive_int(
+                self.connector_ack_ttl_seconds,
+                "connector_ack_ttl_seconds",
                 minimum=1,
             ),
         )
@@ -368,6 +390,8 @@ def load_config(
     pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
+    connector_max_claim_ttl_seconds: int | str | None = None,
+    connector_ack_ttl_seconds: int | str | None = None,
     acknowledged_final_retention_days: int | str | None = None,
     acknowledged_final_retention_count: int | str | None = None,
     command_retry_horizon_seconds: int | str | None = None,
@@ -495,6 +519,16 @@ def load_config(
             connector_claim_ttl_seconds,
             "TENDWIRE_CONNECTOR_CLAIM_TTL_SECONDS",
             DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS,
+        ),
+        connector_max_claim_ttl_seconds=_resolve_value(
+            connector_max_claim_ttl_seconds,
+            "TENDWIRE_CONNECTOR_MAX_CLAIM_TTL_SECONDS",
+            DEFAULT_CONNECTOR_MAX_CLAIM_TTL_SECONDS,
+        ),
+        connector_ack_ttl_seconds=_resolve_value(
+            connector_ack_ttl_seconds,
+            "TENDWIRE_CONNECTOR_ACK_TTL_SECONDS",
+            DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
         ),
         acknowledged_final_retention_days=_resolve_value(
             acknowledged_final_retention_days,

@@ -518,6 +518,7 @@ class TendwireDaemon:
                 ),
             )
             self.hooks.init_store(Path(self.config.db_path))
+            self._connector_periodic_tick()
             if self.config.herdr_backend == "socket":
                 self._snapshot = self._start_socket_event_backend()
             else:
@@ -553,6 +554,7 @@ class TendwireDaemon:
                 stop_event=self.stop_event,
                 socket_group=self.config.socket_group,
                 prepare_parent=self._prepare_socket_parent,
+                periodic_callback=self._connector_periodic_tick,
             )
             self._server = server
             server.start()
@@ -949,6 +951,10 @@ class TendwireDaemon:
                 "max_workers": self.config.max_workers,
                 "max_outbox_attempts": self.config.max_outbox_attempts,
                 "outbox_claim_ttl_seconds": self.config.connector_claim_ttl_seconds,
+                "outbox_max_claim_ttl_seconds": (
+                    self.config.connector_max_claim_ttl_seconds
+                ),
+                "outbox_ack_ttl_seconds": self.config.connector_ack_ttl_seconds,
                 "acknowledged_final_retention_days": (
                     self.config.acknowledged_final_retention_days
                 ),
@@ -1068,8 +1074,27 @@ class TendwireDaemon:
             Path(self.config.db_path),
             self.config.host_id,
             default_lease_seconds=self.config.connector_claim_ttl_seconds,
+            max_lease_seconds=self.config.connector_max_claim_ttl_seconds,
+            ack_ttl_seconds=self.config.connector_ack_ttl_seconds,
             max_attempts=self.config.max_outbox_attempts,
         ).dispatch(method, params)
+
+    def _connector_periodic_tick(self) -> None:
+        """Eagerly reclaim expired connector work without waiting for a poll."""
+        if self.config.db_path is None:
+            return
+        from .store.sqlite import reclaim_expired_connector_leases
+
+        try:
+            reclaim_expired_connector_leases(
+                Path(self.config.db_path),
+                self.config.host_id,
+                None,
+            )
+        except Exception:
+            # Startup and periodic maintenance remain best-effort; store health
+            # is reported through the normal daemon health surface.
+            return
 
     def submit_command(self, params: Mapping[str, Any]) -> CommandEnvelope | Mapping[str, Any]:
         # Preserve the submitted keys exactly so the existing command parser can

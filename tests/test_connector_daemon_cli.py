@@ -119,6 +119,81 @@ def test_daemon_api_routes_connector_methods_safely(tmp_path: Path) -> None:
     _assert_json_only_and_safe(ack)
 
 
+def test_daemon_api_routes_renew_and_release(tmp_path: Path) -> None:
+    db_path = tmp_path / "daemon-renew-release.db"
+    _enqueue(db_path, host_id="daemon-host", key="renew-release")
+    daemon = TendwireDaemon(Config(host_id="daemon-host", db_path=db_path))
+    api = TendwireDaemonAPI(
+        get_snapshot=lambda: Snapshot(host_id="daemon-host"),
+        get_health=lambda: {"schema_version": 1, "status": "ok", "host_id": "daemon-host"},
+        submit_command=daemon.submit_command,
+        connector_call=daemon.connector_call,
+    )
+    first = api.dispatch(
+        {"method": "connector.poll", "params": {"name": "attention"}}
+    )["result"]["items"][0]
+    renewed = api.dispatch(
+        {
+            "method": "connector.renew",
+            "params": {
+                "name": "attention",
+                "ref": first["ref"],
+                "lease_seconds": 120,
+            },
+        }
+    )
+    released = api.dispatch(
+        {
+            "method": "connector.release",
+            "params": {"name": "attention", "ref": first["ref"]},
+        }
+    )
+    second = api.dispatch(
+        {"method": "connector.poll", "params": {"name": "attention"}}
+    )["result"]["items"][0]
+
+    assert renewed["result"]["status"] == "renewed"
+    assert released["result"]["status"] == "released"
+    assert second["attempt"] == 2
+    _assert_json_only_and_safe(renewed)
+    _assert_json_only_and_safe(released)
+
+
+def test_daemon_periodic_tick_reclaims_without_a_followup_poll(tmp_path: Path) -> None:
+    db_path = tmp_path / "daemon-periodic-reclaim.db"
+    _enqueue(db_path, host_id="daemon-host", key="expired")
+    daemon = TendwireDaemon(Config(host_id="daemon-host", db_path=db_path))
+    item = daemon.connector_call(
+        "connector.poll",
+        {"name": "attention", "lease_seconds": 60},
+    )["items"][0]
+    assert item["attempt"] == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        for table in ("connector_outbox", "connector_deliveries"):
+            rows = conn.execute(
+                f"SELECT id, private_state_json FROM {table}"
+            ).fetchall()
+            for row_id, private_state_json in rows:
+                private = json.loads(private_state_json)
+                private["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+                conn.execute(
+                    f"UPDATE {table} SET private_state_json = ? WHERE id = ?",
+                    (json.dumps(private), row_id),
+                )
+
+    daemon._connector_periodic_tick()
+
+    with sqlite3.connect(str(db_path)) as conn:
+        outbox_status = conn.execute(
+            "SELECT status FROM connector_outbox"
+        ).fetchone()[0]
+        delivery_status = conn.execute(
+            "SELECT status FROM connector_deliveries"
+        ).fetchone()[0]
+    assert outbox_status == "queued"
+    assert delivery_status == "expired"
+
+
 def test_cli_connector_poll_and_ack_print_json_only(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "cli-connector.db"
     _enqueue(db_path)
@@ -167,6 +242,72 @@ def test_cli_connector_poll_and_ack_print_json_only(tmp_path: Path, capsys) -> N
     assert ack_payload["status"] == "acknowledged"
     _assert_json_only_and_safe(poll_payload)
     _assert_json_only_and_safe(ack_payload)
+
+
+def test_cli_connector_renew_and_release_forward_live_ref_options(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    db_path = tmp_path / "cli-renew-release.db"
+    _enqueue(db_path, key="cli-renew-release")
+    poll_code = main(
+        [
+            "--host-id",
+            "host-a",
+            "connector",
+            "poll",
+            "--name",
+            "attention",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    poll_payload = json.loads(capsys.readouterr().out)
+    ref = poll_payload["items"][0]["ref"]
+
+    renew_code = main(
+        [
+            "--host-id",
+            "host-a",
+            "connector",
+            "renew",
+            "--name",
+            "attention",
+            "--ref",
+            ref,
+            "--lease-seconds",
+            "120",
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    renew_capture = capsys.readouterr()
+    renew_payload = json.loads(renew_capture.out)
+    release_code = main(
+        [
+            "--host-id",
+            "host-a",
+            "connector",
+            "release",
+            "--name",
+            "attention",
+            "--ref",
+            ref,
+            "--db-path",
+            str(db_path),
+        ]
+    )
+    release_capture = capsys.readouterr()
+    release_payload = json.loads(release_capture.out)
+
+    assert poll_code == renew_code == release_code == 0
+    assert renew_capture.err == release_capture.err == ""
+    assert renew_payload["status"] == "renewed"
+    assert renew_payload["leased_until"]
+    assert release_payload["status"] == "released"
+    assert release_payload["available_at"]
+    _assert_json_only_and_safe(renew_payload)
+    _assert_json_only_and_safe(release_payload)
 
 
 def test_cli_connector_prepare_reads_bounded_action_from_stdin(

@@ -494,15 +494,18 @@ def _add_connector_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     reclaim_parser = actions.add_parser("reclaim", help="Expire stale connector leases.")
     add_common(reclaim_parser)
 
-    for action in ("ack", "fail", "defer"):
+    for action in ("ack", "fail", "defer", "renew", "release"):
         action_parser = actions.add_parser(action, help=f"Apply connector.{action} to a live ref.")
         add_common(action_parser)
         action_parser.add_argument("--ref", required=True)
-        action_parser.add_argument("--response-json", dest="response_json", default=None)
+        if action in {"ack", "fail", "defer"}:
+            action_parser.add_argument("--response-json", dest="response_json", default=None)
         if action in {"fail", "defer"}:
             action_parser.add_argument("--reason", default="")
             action_parser.add_argument("--available-at", dest="available_at", default=None)
             action_parser.add_argument("--delay-seconds", dest="delay_seconds", type=int, default=None)
+        if action == "renew":
+            action_parser.add_argument("--lease-seconds", dest="lease_seconds", type=int, default=None)
 
 
 def _load_worker_bindings(config: Config) -> list[WorkerBinding]:
@@ -1424,9 +1427,9 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         params["limit"] = args.limit
         if args.lease_seconds is not None:
             params["lease_seconds"] = args.lease_seconds
-    if args.connector_action in {"ack", "fail", "defer"}:
+    if args.connector_action in {"ack", "fail", "defer", "renew", "release"}:
         params["ref"] = args.ref
-        if args.response_json:
+        if getattr(args, "response_json", None):
             try:
                 parsed = json.loads(args.response_json)
             except json.JSONDecodeError:
@@ -1439,6 +1442,8 @@ def _connector_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
                 params["available_at"] = args.available_at
             if args.delay_seconds is not None:
                 params["delay_seconds"] = args.delay_seconds
+        if args.connector_action == "renew" and args.lease_seconds is not None:
+            params["lease_seconds"] = args.lease_seconds
     return params
 
 
@@ -1485,6 +1490,8 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
         config.db_path,
         config.host_id,
         default_lease_seconds=config.connector_claim_ttl_seconds,
+        max_lease_seconds=config.connector_max_claim_ttl_seconds,
+        ack_ttl_seconds=config.connector_ack_ttl_seconds,
         max_attempts=config.max_outbox_attempts,
     ).dispatch(method, params)
     print(_connector_payload_json(payload, indent=2))
