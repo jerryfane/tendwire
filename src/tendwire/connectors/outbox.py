@@ -490,6 +490,7 @@ class ConnectorOutboxAPI:
             name=name,
             ref=live_ref,
             response=_clean_mapping(data.get("response")),
+            ack_ttl_seconds=self.ack_ttl_seconds,
         )
 
     def fail(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:

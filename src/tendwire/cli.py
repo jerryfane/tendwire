@@ -1105,7 +1105,10 @@ def cmd_turn_content_get(config: Config, args: argparse.Namespace) -> int:
     else:
         from .store.sqlite import get_turn_content, init_store
 
-        init_store(config.db_path)
+        init_store(
+            config.db_path,
+            connector_ack_ttl_seconds=config.connector_ack_ttl_seconds,
+        )
         payload = get_turn_content(
             config.db_path,
             config.host_id,
@@ -1485,7 +1488,10 @@ def cmd_connector(config: Config, args: argparse.Namespace) -> int:
     from .connectors import ConnectorOutboxAPI
     from .store.sqlite import init_store
 
-    init_store(config.db_path)
+    init_store(
+        config.db_path,
+        connector_ack_ttl_seconds=config.connector_ack_ttl_seconds,
+    )
     payload = ConnectorOutboxAPI(
         config.db_path,
         config.host_id,
