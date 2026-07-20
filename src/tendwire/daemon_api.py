@@ -927,6 +927,41 @@ def _cleanup_stale_socket(parent_fd: int, leaf: str, address: str) -> None:
             pass
 
 
+def ensure_daemon_socket_not_active(
+    socket_path: str | os.PathLike[str],
+    *,
+    socket_group: str | None = None,
+) -> None:
+    """Fail before startup work when a live process already owns the socket.
+
+    This probe is read-only. Missing endpoints and owned socket files whose
+    listener has gone away are left for the server's locked stale-socket
+    cleanup. A connected peer is active even when it is older, non-Tendwire,
+    slow, or returns an unrecognized protocol response.
+    """
+    client = DaemonAPIClient(
+        socket_path,
+        socket_group=socket_group,
+        timeout_seconds=0.2,
+    )
+    try:
+        client.request("ping")
+    except DaemonUnavailable as exc:
+        if exc.code is LocalStateErrorCode.MISSING_ENTRY:
+            return
+        if exc.code is None and not exc.request_started and not exc.timed_out:
+            # Connection refused: the securely pinned socket entry is stale.
+            return
+        if exc.request_started or exc.timed_out:
+            raise DaemonUnavailable("daemon socket is already active") from None
+        raise
+    except DaemonProtocolError as exc:
+        if exc.request_started:
+            raise DaemonUnavailable("daemon socket is already active") from None
+        raise
+    raise DaemonUnavailable("daemon socket is already active")
+
+
 class _DaemonRequestExecutor:
     """Fixed daemon-worker executor that cannot block interpreter shutdown."""
 

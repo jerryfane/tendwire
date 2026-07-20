@@ -7,9 +7,11 @@ import gc
 import io
 import json
 import os
+import signal
 import socket
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -49,7 +51,7 @@ from tendwire.core.turns import (
     pending_payload_from_snapshot,
     recompute_pending_content_fingerprint,
 )
-from tendwire.daemon import DaemonHooks, TendwireDaemon
+from tendwire.daemon import DaemonHooks, TendwireDaemon, run_daemon
 from tendwire.daemon_api import (
     DaemonAPIClient,
     DaemonUnavailable,
@@ -2084,6 +2086,70 @@ _UNIX_SOCKET_TEST = pytest.mark.skipif(
 )
 
 
+def test_sigterm_handler_only_requests_stop_before_ordered_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire import daemon as daemon_module
+
+    calls: list[str] = []
+    installed: dict[int, Any] = {}
+
+    class FakeDaemon:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            calls.append("start")
+
+        def serve_forever(self) -> None:
+            calls.append("serve")
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+        def request_stop(self) -> None:
+            calls.append("request_stop")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    previous = object()
+    monkeypatch.setattr(daemon_module, "TendwireDaemon", FakeDaemon)
+    monkeypatch.setattr(signal, "getsignal", lambda _signum: previous)
+
+    def capture_signal(signum: int, handler: Any) -> Any:
+        if handler is not previous:
+            installed[signum] = handler
+        return previous
+
+    monkeypatch.setattr(signal, "signal", capture_signal)
+
+    assert run_daemon(Config(data_dir=tmp_path, db_path=tmp_path / "daemon.db")) == 0
+    assert calls == [
+        "start",
+        "serve",
+        "request_stop",
+        "request_stop",
+        "stop",
+    ]
+
+
+@_UNIX_SOCKET_TEST
+def test_service_group_sigterm_exits_closes_socket_and_reaps_child() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["bash", str(root / "scripts/tendwired_lifecycle_smoke.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PYTHON": sys.executable},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "tendwired lifecycle smoke: ok\n"
+
+
 def _socket_mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
@@ -3138,6 +3204,55 @@ def test_unix_socket_server_rejects_and_preserves_active_listener(tmp_path: Path
         server.close()
         active_listener.close()
         socket_path.unlink(missing_ok=True)
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path) -> None:
+    socket_path = tmp_path / "fail-fast-active.sock"
+    active = UnixSocketJSONServer(
+        socket_path,
+        lambda _request: {"ok": True, "result": {"pong": True}},
+    )
+    active_thread = threading.Thread(target=active.serve_forever)
+    active_thread.start()
+    deadline = time.monotonic() + 2
+    while not active.listening and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    calls: list[str] = []
+
+    def forbidden_store(_path: Path) -> None:
+        calls.append("init_store")
+
+    def forbidden_observe(_config: Config) -> Snapshot:
+        calls.append("observe")
+        raise AssertionError("live-socket guard must precede backend work")
+
+    daemon = TendwireDaemon(
+        Config(
+            host_id="fail-fast-host",
+            data_dir=tmp_path,
+            db_path=tmp_path / "fail-fast.db",
+            socket_path=socket_path,
+        ),
+        hooks=DaemonHooks(
+            init_store=forbidden_store,
+            observe_initial_snapshot=forbidden_observe,
+        ),
+    )
+    try:
+        with pytest.raises(DaemonUnavailable, match="already active"):
+            daemon.start()
+
+        assert calls == []
+        _assert_unix_socket_connects(socket_path)
+    finally:
+        daemon.stop()
+        active.close()
+        active_thread.join(timeout=2)
+        socket_path.unlink(missing_ok=True)
+
+    assert not active_thread.is_alive()
 
 
 @_UNIX_SOCKET_TEST

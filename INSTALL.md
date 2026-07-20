@@ -47,6 +47,10 @@ Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
 Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
 Environment=TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS=86400
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+FinalKillSignal=SIGKILL
 Restart=always
 RestartSec=5s
 
@@ -54,13 +58,24 @@ RestartSec=5s
 WantedBy=default.target
 ```
 
-Install it as `~/.config/systemd/user/tendwired.service`, then run:
+The same unit is shipped as `tendwired.service.example`. Install it as
+`~/.config/systemd/user/tendwired.service`, then run:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now tendwired.service
 systemctl --user is-active tendwired.service
 ```
+
+`KillMode=control-group` is intentional: the daemon's Herdr adapter and
+isolated turn readers are supervised children in the same service cgroup.
+`SIGTERM` starts Tendwire's bounded shutdown, closes the listening socket, and
+cancels active ingestion; systemd sends `SIGKILL` to any exceptional survivor
+after the 20-second stop deadline. Tendwire does not fork, daemonize, create a
+new session, or transfer the listening socket, so `MainPID` is always the
+socket-holding daemon process. If another live process already holds the
+configured socket, startup fails with a non-zero status instead of replacing
+the endpoint or running a second daemon.
 
 ## Background Turn Ingestion Operations
 

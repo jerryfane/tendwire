@@ -14,7 +14,11 @@ from typing import Any
 from .config import Config
 from .core.commands import CommandEnvelope
 from .core.models import Snapshot, sanitize_public_mapping, utc_timestamp
-from .daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
+from .daemon_api import (
+    TendwireDaemonAPI,
+    UnixSocketJSONServer,
+    ensure_daemon_socket_not_active,
+)
 from .local_state import repair_config_state
 
 
@@ -526,6 +530,10 @@ class TendwireDaemon:
                     self.config.installation_key_sentinel_path,
                 ),
             )
+            ensure_daemon_socket_not_active(
+                self.socket_path,
+                socket_group=self.config.socket_group,
+            )
             if self.hooks.init_store is _default_init_store:
                 _default_init_store(
                     Path(self.config.db_path),
@@ -625,6 +633,18 @@ class TendwireDaemon:
         if server is None:
             raise RuntimeError("daemon server did not start")
         server.serve_forever()
+
+    def request_stop(self) -> None:
+        """Request shutdown without performing teardown in signal context.
+
+        Python signal handlers run on the main thread between bytecode
+        instructions.  They must not enter the daemon's lifecycle locks or
+        wait for worker threads: a second signal, or a signal delivered while
+        cleanup already owns one of those locks, could otherwise deadlock the
+        process.  The socket loop observes this event within its bounded
+        accept timeout and performs normal teardown outside the handler.
+        """
+        self.stop_event.set()
 
     def stop(self) -> None:
         with self._stop_lock:
@@ -1192,7 +1212,7 @@ def run_daemon(
     previous_handlers: dict[int, Any] = {}
 
     def _handle_stop(_signum: int, _frame: Any) -> None:
-        daemon.stop()
+        daemon.request_stop()
 
     if install_signal_handlers:
         for signum in (signal.SIGINT, signal.SIGTERM):

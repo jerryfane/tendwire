@@ -1754,8 +1754,17 @@ def cmd_store(config: Config, args: argparse.Namespace) -> int:
 def cmd_daemon(config: Config) -> int:
     """Run the long-lived local daemon."""
     from .daemon import run_daemon
+    from .daemon_api import DaemonUnavailable
+    from ._version import __version__
 
-    return run_daemon(config)
+    try:
+        return run_daemon(config)
+    except DaemonUnavailable as exc:
+        print(
+            f"tendwire daemon {__version__}: startup failed: {exc}",
+            file=sys.stderr,
+        )
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:
