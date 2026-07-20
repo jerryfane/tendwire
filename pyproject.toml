@@ -51,6 +51,7 @@ include = [
     "/herdr-plugin.toml",
     "/pyproject.toml",
     "/RELEASE.md",
+    "/tendwired.service.example",
     "/scripts",
     "/docs/evidence",
 ]

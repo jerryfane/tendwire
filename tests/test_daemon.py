@@ -7,9 +7,11 @@ import gc
 import io
 import json
 import os
+import signal
 import socket
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -19,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from tendwire import __version__
 from tendwire.backends.herdr_turns import TurnIngestionScheduler, TurnRefreshResult
 from tendwire.cli import main
 from tendwire.config import Config
@@ -49,13 +52,14 @@ from tendwire.core.turns import (
     pending_payload_from_snapshot,
     recompute_pending_content_fingerprint,
 )
-from tendwire.daemon import DaemonHooks, TendwireDaemon
+from tendwire.daemon import DaemonHooks, TendwireDaemon, run_daemon
 from tendwire.daemon_api import (
     DaemonAPIClient,
     DaemonUnavailable,
     DaemonProtocolError,
     TendwireDaemonAPI,
     UnixSocketJSONServer,
+    ensure_daemon_socket_not_active,
     MAX_RESPONSE_BYTES,
 )
 from tendwire.local_state import LocalStateError, LocalStateErrorCode, LocalStateKind
@@ -105,8 +109,14 @@ def _assert_no_public_json_forbidden(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             normalized = str(key).lower().replace("-", "_")
+            daemon_pid = (
+                path == "$.result"
+                and normalized == "pid"
+                and value.get("version") == __version__
+            )
             assert (
-                normalized not in _PUBLIC_JSON_FORBIDDEN_KEYS
+                daemon_pid
+                or normalized not in _PUBLIC_JSON_FORBIDDEN_KEYS
                 and normalized.replace("_", "") not in _PUBLIC_JSON_FORBIDDEN_COMPACT
             ), f"forbidden field {path}.{key}"
             _assert_no_public_json_forbidden(item, f"{path}.{key}")
@@ -196,6 +206,9 @@ def test_daemon_api_required_methods_are_public_safe() -> None:
     for method in ("ping", "health.get", "snapshot.get", "attention.list", "turn.list", "pending.list"):
         response = api.dispatch({"method": method})
         assert response["ok"] is True
+        if method in {"ping", "health.get"}:
+            assert response["result"]["version"] == __version__
+            assert response["result"]["pid"] == os.getpid()
         encoded = json.dumps(response)
         assert "sentinel-private" not in encoded
         _assert_no_public_json_forbidden(response)
@@ -2084,6 +2097,70 @@ _UNIX_SOCKET_TEST = pytest.mark.skipif(
 )
 
 
+def test_sigterm_handler_only_requests_stop_before_ordered_teardown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire import daemon as daemon_module
+
+    calls: list[str] = []
+    installed: dict[int, Any] = {}
+
+    class FakeDaemon:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            calls.append("start")
+
+        def serve_forever(self) -> None:
+            calls.append("serve")
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+        def request_stop(self) -> None:
+            calls.append("request_stop")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    previous = object()
+    monkeypatch.setattr(daemon_module, "TendwireDaemon", FakeDaemon)
+    monkeypatch.setattr(signal, "getsignal", lambda _signum: previous)
+
+    def capture_signal(signum: int, handler: Any) -> Any:
+        if handler is not previous:
+            installed[signum] = handler
+        return previous
+
+    monkeypatch.setattr(signal, "signal", capture_signal)
+
+    assert run_daemon(Config(data_dir=tmp_path, db_path=tmp_path / "daemon.db")) == 0
+    assert calls == [
+        "start",
+        "serve",
+        "request_stop",
+        "request_stop",
+        "stop",
+    ]
+
+
+@_UNIX_SOCKET_TEST
+def test_service_group_sigterm_exits_closes_socket_and_reaps_child() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["bash", str(root / "scripts/tendwired_lifecycle_smoke.sh")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PYTHON": sys.executable},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "tendwired lifecycle smoke: ok\n"
+
+
 def _socket_mode(path: Path) -> int:
     return stat.S_IMODE(os.lstat(path).st_mode)
 
@@ -3140,6 +3217,145 @@ def test_unix_socket_server_rejects_and_preserves_active_listener(tmp_path: Path
         socket_path.unlink(missing_ok=True)
 
 
+def test_peer_validation_failure_is_typed_and_fails_startup_guard_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tendwire.daemon_api as daemon_api_module
+
+    class BrokenPeerSocket:
+        def getsockopt(self, *_args: Any) -> bytes:
+            raise OSError("peer credentials unavailable")
+
+    with pytest.raises(DaemonUnavailable) as validation:
+        daemon_api_module._validate_connected_peer(BrokenPeerSocket(), os.geteuid())
+    assert validation.value.code is LocalStateErrorCode.PEER_VALIDATION_FAILED
+
+    def fail_peer_validation(
+        _client: DaemonAPIClient,
+        _method: str,
+        _params: Any = None,
+    ) -> dict[str, Any]:
+        raise DaemonUnavailable(
+            "daemon peer validation failed",
+            code=LocalStateErrorCode.PEER_VALIDATION_FAILED,
+        )
+
+    monkeypatch.setattr(DaemonAPIClient, "request", fail_peer_validation)
+    with pytest.raises(DaemonUnavailable) as guarded:
+        ensure_daemon_socket_not_active(tmp_path / "peer-validation.sock")
+
+    assert guarded.value.code is LocalStateErrorCode.PEER_VALIDATION_FAILED
+    assert "holder version is unknown" in str(guarded.value)
+    assert f"refusing to start tendwire {__version__}" in str(guarded.value)
+
+
+@_UNIX_SOCKET_TEST
+def test_daemon_active_socket_fails_before_store_or_backend_work(tmp_path: Path) -> None:
+    socket_path = tmp_path / "fail-fast-active.sock"
+    active = UnixSocketJSONServer(
+        socket_path,
+        lambda _request: {
+            "ok": True,
+            "result": {
+                "pong": True,
+                "version": __version__,
+                "pid": os.getpid(),
+            },
+        },
+    )
+    active_thread = threading.Thread(target=active.serve_forever)
+    active_thread.start()
+    deadline = time.monotonic() + 2
+    while not active.listening and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    calls: list[str] = []
+
+    def forbidden_store(_path: Path) -> None:
+        calls.append("init_store")
+
+    def forbidden_observe(_config: Config) -> Snapshot:
+        calls.append("observe")
+        raise AssertionError("live-socket guard must precede backend work")
+
+    daemon = TendwireDaemon(
+        Config(
+            host_id="fail-fast-host",
+            data_dir=tmp_path,
+            db_path=tmp_path / "fail-fast.db",
+            socket_path=socket_path,
+        ),
+        hooks=DaemonHooks(
+            init_store=forbidden_store,
+            observe_initial_snapshot=forbidden_observe,
+        ),
+    )
+    try:
+        with pytest.raises(DaemonUnavailable) as caught:
+            daemon.start()
+
+        assert str(caught.value) == (
+            "daemon socket is already active: "
+            f"holder is tendwire {__version__} (PID {os.getpid()}); "
+            f"refusing to start tendwire {__version__}"
+        )
+        assert calls == []
+        _assert_unix_socket_connects(socket_path)
+    finally:
+        daemon.stop()
+        active.close()
+        active_thread.join(timeout=2)
+        socket_path.unlink(missing_ok=True)
+
+    assert not active_thread.is_alive()
+
+
+@_UNIX_SOCKET_TEST
+def test_blocked_periodic_callback_does_not_block_stop(tmp_path: Path) -> None:
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    stop_event = threading.Event()
+
+    def blocked_periodic_callback() -> None:
+        callback_started.set()
+        release_callback.wait(timeout=2)
+
+    server = UnixSocketJSONServer(
+        tmp_path / "blocked-periodic.sock",
+        lambda _request: {"ok": True},
+        stop_event=stop_event,
+        accept_timeout_seconds=0.01,
+        periodic_callback=blocked_periodic_callback,
+        periodic_interval_seconds=0.01,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        assert callback_started.wait(timeout=1)
+        started = time.monotonic()
+        stop_event.set()
+        thread.join(timeout=0.5)
+        assert not thread.is_alive()
+        assert time.monotonic() - started < 0.5
+    finally:
+        stop_event.set()
+        release_callback.set()
+        server.close()
+        thread.join(timeout=2)
+
+    deadline = time.monotonic() + 1
+    while (
+        any(item.name.startswith("tendwire-daemon-periodic") for item in threading.enumerate())
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+    assert not any(
+        item.name.startswith("tendwire-daemon-periodic")
+        for item in threading.enumerate()
+    )
+
+
 @_UNIX_SOCKET_TEST
 @pytest.mark.parametrize("entry_kind", ["regular-file", "symlink"])
 def test_unix_socket_server_rejects_wrong_type_without_mutating_entry_or_target(
@@ -3734,9 +3950,13 @@ def test_daemon_starts_observes_persists_serves_and_removes_socket(tmp_path: Pat
 
         assert ping["ok"] is True
         assert ping["result"]["pong"] is True
+        assert ping["result"]["version"] == __version__
+        assert ping["result"]["pid"] == os.getpid()
         assert snapshot_response["result"]["host_id"] == "daemon-host"
         assert snapshot_response["result"]["workers"][0]["id"] == "worker-1"
         assert health_response["result"]["store"]["status"] == "healthy"
+        assert health_response["result"]["version"] == __version__
+        assert health_response["result"]["pid"] == os.getpid()
     finally:
         daemon.stop()
         thread.join(timeout=2)

@@ -221,6 +221,33 @@ def test_cli_socket_group_option_is_daemon_only_and_normalized(monkeypatch) -> N
     assert captured[0].socket_group == "daemon-clients"
 
 
+def test_cli_daemon_startup_conflict_is_clear_and_nonzero(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tendwire.daemon_api import DaemonUnavailable
+
+    def active_socket(_config: Config) -> int:
+        raise DaemonUnavailable(
+            "daemon socket is already active: holder is tendwire 0.1.0rc4 "
+            "(PID 4242); refusing to start tendwire 0.1.0rc5"
+        )
+
+    monkeypatch.setattr("tendwire.daemon.run_daemon", active_socket)
+
+    code = main(["daemon", "--db-path", str(tmp_path / "daemon.db")])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err == (
+        "tendwire daemon 0.1.0rc5: startup failed: "
+        "daemon socket is already active: holder is tendwire 0.1.0rc4 "
+        "(PID 4242); refusing to start tendwire 0.1.0rc5\n"
+    )
+
+
 def test_cli_turns_json_without_cached_store_is_publicly_unavailable(capsys) -> None:
     code = main(
         [

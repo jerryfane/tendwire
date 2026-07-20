@@ -42,6 +42,7 @@ REQUIRED_SDIST = {
     "README.md",
     "RELEASE.md",
     "SECURITY.md",
+    "tendwired.service.example",
     "pyproject.toml",
     "scripts/herdr_smoke.py",
     "scripts/release_artifacts.py",
