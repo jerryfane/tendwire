@@ -7985,6 +7985,41 @@ def _append_event_conn(
     return int(cursor.lastrowid)
 
 
+def _repair_missing_final_ready_anchors_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    now: str,
+) -> None:
+    """Repair missing final anchors without decoding retained turn payloads."""
+    rows = conn.execute(
+        """
+        SELECT revisions.turn_id, revisions.content_revision
+        FROM turn_content_revisions AS revisions
+        WHERE revisions.host_id = ?
+          AND revisions.is_current = 1
+          AND revisions.final_state = 'complete'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM connector_outbox AS outbox
+              WHERE outbox.host_id = revisions.host_id
+                AND outbox.turn_id = revisions.turn_id
+                AND outbox.content_revision = revisions.content_revision
+                AND outbox.delivery_kind = 'final_ready'
+          )
+        """,
+        (str(host_id),),
+    ).fetchall()
+    for turn_id, content_revision_value in rows:
+        _ensure_final_ready_anchor_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=str(turn_id),
+            content_revision_value=str(content_revision_value),
+            now=str(now),
+        )
+
+
 def append_event(
     db_path: Path,
     host_id: str,
@@ -8928,8 +8963,9 @@ def _refresh_snapshot_projections_conn(
     payload_data: Mapping[str, Any],
     *,
     content_fingerprint: str,
+    turn_items: Iterable[Mapping[str, Any]] | None = None,
+    pending_items: Iterable[Mapping[str, Any]] | None = None,
 ) -> None:
-    payload_data = sanitize_public_mapping(payload_data)
     host_id = str(snapshot.host_id)
     observed_at = str(snapshot.updated_at)
 
@@ -9022,19 +9058,36 @@ def _refresh_snapshot_projections_conn(
 
 
     turn_ids: set[str] = set()
-    for turn in turns_from_snapshot(snapshot):
-        item = sanitize_public_mapping(turn.to_dict())
+    prepared_turn_items = (
+        [dict(item) for item in turn_items]
+        if turn_items is not None
+        else [turn.to_dict() for turn in turns_from_snapshot(snapshot)]
+    )
+    for item in prepared_turn_items:
         turn_id = str(item.get("id") or "unknown")
         owner_identity = _turn_continuity_identity(item)
         if owner_identity is not None:
-            owned_rows = _current_owned_turn_content_rows_conn(
+            owned_ref = _snapshot_owned_turn_candidate_ref_conn(
                 conn,
                 host_id,
                 owner_identity,
-            )
-            owned_candidate = _snapshot_owned_turn_candidate(
-                owned_rows,
                 item,
+            )
+            if (
+                owned_ref is not None
+                and owned_ref[1] == str(item.get("worker_fingerprint") or "")
+                and owned_ref[2] == str(item.get("updated_at") or "")
+            ):
+                turn_ids.add(owned_ref[0])
+                continue
+            owned_candidate = (
+                _current_turn_content_row_by_id_conn(
+                    conn,
+                    host_id,
+                    owned_ref[0],
+                )
+                if owned_ref is not None
+                else None
             )
             if owned_candidate is not None:
                 (
@@ -9095,12 +9148,20 @@ def _refresh_snapshot_projections_conn(
                 )
         existing_turn = conn.execute(
             """
-            SELECT payload_json
+            SELECT payload_json, worker_fingerprint, updated_at
             FROM turns
             WHERE host_id = ? AND turn_id = ?
             """,
             (host_id, turn_id),
         ).fetchone()
+        if (
+            existing_turn is not None
+            and str(existing_turn[1] or "")
+            == str(item.get("worker_fingerprint") or "")
+            and str(existing_turn[2] or "") == str(item.get("updated_at") or "")
+        ):
+            turn_ids.add(turn_id)
+            continue
         if existing_turn is not None:
             existing_payload = _json_object(existing_turn[0])
             for provenance_key in ("origin_command_id", "source_turn_id"):
@@ -9181,8 +9242,12 @@ def _refresh_snapshot_projections_conn(
     _prune_turn_projection(conn, host_id, turn_ids)
 
     pending_ids: set[str] = set()
-    for pending in pending_from_snapshot(snapshot):
-        item = sanitize_public_mapping(pending.to_dict())
+    prepared_pending_items = (
+        [dict(item) for item in pending_items]
+        if pending_items is not None
+        else [pending.to_dict() for pending in pending_from_snapshot(snapshot)]
+    )
+    for item in prepared_pending_items:
         pending_id = str(item.get("id") or "unknown")
         pending_ids.add(pending_id)
         conn.execute(
@@ -19091,9 +19156,12 @@ def _decode_turn_content_rows(
             loaded = json.loads(str(payload_json or "{}"))
         except (TypeError, json.JSONDecodeError):
             loaded = {}
+        sanitized_payload = sanitize_public_value(
+            loaded if isinstance(loaded, Mapping) else {}
+        )
         payload = (
-            sanitize_public_mapping(loaded)
-            if isinstance(loaded, Mapping)
+            dict(sanitized_payload)
+            if isinstance(sanitized_payload, Mapping)
             else {}
         )
         current = (
@@ -19111,6 +19179,37 @@ def _decode_turn_content_rows(
             (turn_id, payload, current, str(stored_observed_at or ""))
         )
     return decoded
+
+
+def _current_turn_content_row_by_id_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any] | None, str] | None:
+    row = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            turns.payload_json,
+            revisions.content_revision,
+            revisions.user_text,
+            revisions.assistant_final_text,
+            revisions.user_state,
+            revisions.final_state,
+            turns.observed_at
+        FROM turns
+        LEFT JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        WHERE turns.host_id = ? AND turns.turn_id = ?
+        """,
+        (str(host_id), str(turn_id)),
+    ).fetchone()
+    if row is None:
+        return None
+    decoded = _decode_turn_content_rows((row,))
+    return decoded[0] if decoded else None
 
 
 def _current_turn_content_rows_conn(
@@ -19150,6 +19249,9 @@ def _current_owned_turn_content_rows_conn(
     host_id: str,
     owner_identity: tuple[str, str, int],
 ) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
+    owner_kind, owner_key, owner_version = owner_identity
+    if owner_kind != "stable_key" or owner_version != 1:
+        return []
     rows = conn.execute(
         """
         SELECT
@@ -19167,8 +19269,19 @@ def _current_owned_turn_content_rows_conn(
          AND revisions.turn_id = turns.turn_id
          AND revisions.is_current = 1
         WHERE turns.host_id = ?
+          AND json_valid(turns.payload_json)
+          AND json_type(turns.payload_json, '$.meta.stable_key') = 'text'
+          AND json_extract(turns.payload_json, '$.meta.stable_key') = ?
+          AND json_type(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = 'integer'
+          AND json_extract(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = ?
         """,
-        (str(host_id),),
+        (str(host_id), str(owner_key), int(owner_version)),
     ).fetchall()
     # SQL JSON affinity must not decide owner authority: Python's strict
     # validator rejects booleans, malformed keys, and unsupported versions.
@@ -19178,6 +19291,76 @@ def _current_owned_turn_content_rows_conn(
         if not _turn_is_tombstoned(row[1])
         and _turn_continuity_identity(row[1]) == owner_identity
     ]
+
+
+def _snapshot_owned_turn_candidate_ref_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    owner_identity: tuple[str, str, int],
+    projection: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    """Resolve an owned snapshot row without decoding or sanitizing its payload."""
+    owner_kind, owner_key, owner_version = owner_identity
+    if owner_kind != "stable_key" or owner_version != 1:
+        return None
+    rows = conn.execute(
+        """
+        SELECT
+            turn_id,
+            worker_fingerprint,
+            updated_at,
+            json_extract(payload_json, '$.source_turn_id'),
+            json_extract(payload_json, '$.origin_command_id')
+        FROM turns
+        WHERE host_id = ?
+          AND json_valid(payload_json)
+          AND json_type(payload_json, '$.meta.stable_key') = 'text'
+          AND json_extract(payload_json, '$.meta.stable_key') = ?
+          AND json_type(payload_json, '$.meta.stable_key_version') = 'integer'
+          AND json_extract(payload_json, '$.meta.stable_key_version') = ?
+          AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
+        """,
+        (str(host_id), str(owner_key), int(owner_version)),
+    ).fetchall()
+    candidates = [
+        (
+            str(turn_id),
+            str(worker_fingerprint or ""),
+            str(updated_at or ""),
+            str(source_turn_id or "").strip(),
+            str(origin_command_id or "").strip(),
+        )
+        for (
+            turn_id,
+            worker_fingerprint,
+            updated_at,
+            source_turn_id,
+            origin_command_id,
+        ) in rows
+    ]
+    expected_origin = str(projection.get("origin_command_id") or "").strip()
+    if expected_origin:
+        source_rows = [
+            row for row in candidates if row[3] and row[4] == expected_origin
+        ]
+        if len(source_rows) > 1:
+            raise StoreSchemaError("turn_owner_source_ambiguous")
+        if source_rows:
+            return source_rows[0][0], source_rows[0][1], source_rows[0][2]
+        command_rows = [
+            row for row in candidates if not row[3] and row[4] == expected_origin
+        ]
+        if len(command_rows) > 1:
+            raise StoreSchemaError("turn_owner_command_ambiguous")
+        if command_rows:
+            return command_rows[0][0], command_rows[0][1], command_rows[0][2]
+        return None
+    placeholder_rows = [row for row in candidates if not row[3] and not row[4]]
+    if len(placeholder_rows) > 1:
+        raise StoreSchemaError("turn_owner_placeholder_ambiguous")
+    if not placeholder_rows:
+        return None
+    return placeholder_rows[0][0], placeholder_rows[0][1], placeholder_rows[0][2]
 
 
 def _turn_with_current_content(
@@ -22958,6 +23141,55 @@ def _expire_stale_worker_bindings_conn(
     return int(cursor.rowcount or 0)
 
 
+def _snapshot_projection_freshness(
+    payload_data: Mapping[str, Any],
+) -> tuple[tuple[str, str, str], ...]:
+    """Return timestamp fields that projections persist outside snapshots."""
+    freshness: list[tuple[str, str, str]] = []
+    for collection, timestamp_key in (
+        ("spaces", "updated_at"),
+        ("workers", "last_seen_at"),
+        ("attention", "updated_at"),
+    ):
+        values = payload_data.get(collection, [])
+        if not isinstance(values, list | tuple):
+            continue
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            freshness.append(
+                (
+                    collection,
+                    str(item.get("id") or ""),
+                    str(item.get(timestamp_key) or ""),
+                )
+            )
+    return tuple(sorted(freshness))
+
+
+def _snapshot_projection_refresh_required(
+    latest: sqlite3.Row | tuple[Any, ...] | None,
+    content_fingerprint: str,
+    payload_data: Mapping[str, Any],
+) -> bool:
+    if latest is None or str(latest[1]) != str(content_fingerprint):
+        return True
+    retained_payload = _json_object(latest[3])
+    if _snapshot_projection_freshness(retained_payload) != (
+        _snapshot_projection_freshness(payload_data)
+    ):
+        return True
+    retained_created_at = str(latest[2])
+    retained_at = _strict_utc_timestamp(retained_created_at)
+    return retained_at is None or (
+        retained_at == _LEGACY_SNAPSHOT_CREATED_AT_QUARANTINE
+        and not _legacy_snapshot_created_at_is_authoritative(
+            retained_created_at,
+            latest[3],
+        )
+    )
+
+
 def save_snapshot(
     db_path: Path,
     snapshot: Snapshot,
@@ -23000,8 +23232,41 @@ def save_snapshot(
     payload = _canonical_json(data)
     with _connect(db_path, prepare=True, isolation_level=None) as conn:
         _ensure_schema(conn)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+        prepared_turn_items: tuple[dict[str, Any], ...] | None = None
+        prepared_pending_items: tuple[dict[str, Any], ...] | None = None
+        while True:
+            preflight_latest = conn.execute(
+                """
+                SELECT id, content_fingerprint, created_at, payload
+                FROM snapshots
+                WHERE host_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(public_snapshot.host_id),),
+            ).fetchone()
+            preflight_projection_refresh_required = (
+                _snapshot_projection_refresh_required(
+                    preflight_latest,
+                    fingerprint,
+                    data,
+                )
+            )
+            if (
+                preflight_projection_refresh_required
+                and prepared_turn_items is None
+            ):
+                # Turn model construction and pending serialization can recurse
+                # through the public sanitizer. Keep that CPU work outside the
+                # SQLite writer transaction.
+                prepared_turn_items = tuple(
+                    turn.to_dict() for turn in turns_from_snapshot(public_snapshot)
+                )
+                prepared_pending_items = tuple(
+                    pending.to_dict()
+                    for pending in pending_from_snapshot(public_snapshot)
+                )
+            conn.execute("BEGIN IMMEDIATE")
             latest = conn.execute(
                 """
                 SELECT id, content_fingerprint, created_at, payload
@@ -23012,6 +23277,26 @@ def save_snapshot(
                 """,
                 (str(public_snapshot.host_id),),
             ).fetchone()
+            projection_refresh_required = _snapshot_projection_refresh_required(
+                latest,
+                fingerprint,
+                data,
+            )
+            if projection_refresh_required and prepared_turn_items is None:
+                # Another writer changed the retained snapshot between the
+                # read-only preflight and BEGIN IMMEDIATE. Retry after preparing
+                # the now-required projection inputs without holding the lock.
+                conn.rollback()
+                prepared_turn_items = tuple(
+                    turn.to_dict() for turn in turns_from_snapshot(public_snapshot)
+                )
+                prepared_pending_items = tuple(
+                    pending.to_dict()
+                    for pending in pending_from_snapshot(public_snapshot)
+                )
+                continue
+            break
+        try:
             retained_created_at = str(latest[2]) if latest is not None else ""
             retained_at = (
                 _strict_utc_timestamp(retained_created_at)
@@ -23080,13 +23365,22 @@ def save_snapshot(
                     content_fingerprint=fingerprint,
                     private_snapshot_data=private_snapshot_data,
                 )
-            if refresh_current:
+            if refresh_current and projection_refresh_required:
                 _refresh_snapshot_projections_conn(
                     conn,
                     public_snapshot,
                     data,
                     content_fingerprint=fingerprint,
+                    turn_items=prepared_turn_items,
+                    pending_items=prepared_pending_items,
                 )
+            elif refresh_current:
+                _repair_missing_final_ready_anchors_conn(
+                    conn,
+                    host_id=str(public_snapshot.host_id),
+                    now=created_at,
+                )
+            if refresh_current:
                 if binding_list is not None:
                     _upsert_worker_bindings_conn(conn, binding_list)
                     if binding_observation_authoritative and (

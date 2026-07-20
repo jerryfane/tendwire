@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -315,6 +318,14 @@ _TEXT_FORBIDDEN_FIELD_NAMES = frozenset(
     name for name in FORBIDDEN_FIELD_NAMES if name not in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
 )
 _CAMEL_CASE_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_PUBLIC_PHRASE_MAX_COMPACT_CHARS = max(
+    len(value.replace("_", ""))
+    for value in (
+        FORBIDDEN_FIELD_NAMES
+        | _PUBLIC_TEXT_ALLOWED_FIELD_WORDS
+        | _PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT
+    )
+)
 _BACKEND_MESSAGE_LABEL_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9_-]*\s+[A-Za-z][A-Za-z0-9_-]*|[A-Za-z][A-Za-z0-9_.-]*"
 )
@@ -466,6 +477,8 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
     "_fingerprints",
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
+_PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
+_PUBLIC_SANITIZER_CONFIG_VERSION = 1
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
     {
         "assistant_final_text",
@@ -508,9 +521,40 @@ def _is_forbidden_backend_message_label(value: str) -> bool:
 
 
 def _is_forbidden_public_text_phrase(value: str) -> bool:
-    separated = _CAMEL_CASE_BOUNDARY_RE.sub("_", value)
-    normalized = "_".join(part for part in re.split(r"[\s_.-]+", separated.lower()) if part)
-    compact = normalized.replace("_", "")
+    # This helper sits in a token-window scan and sees arbitrary model output.
+    # Normalize in one bounded pass so a hash/base64-dense token cannot cause
+    # repeated full-size regex substitutions and temporary strings.
+    normalized_chars: list[str] = []
+    compact_chars: list[str] = []
+    previous = ""
+    separated = True
+    for char in value:
+        camel_boundary = previous in "abcdefghijklmnopqrstuvwxyz0123456789" and char in (
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        )
+        is_separator = camel_boundary or char in "_.-" or char.isspace()
+        if is_separator:
+            if normalized_chars and not separated:
+                normalized_chars.append("_")
+            separated = True
+            if camel_boundary:
+                lowered = char.lower()
+                compact_chars.append(lowered)
+                normalized_chars.append(lowered)
+                separated = False
+            previous = char
+            continue
+        lowered = char.lower()
+        compact_chars.append(lowered)
+        if len(compact_chars) > _PUBLIC_PHRASE_MAX_COMPACT_CHARS:
+            return False
+        normalized_chars.append(lowered)
+        separated = False
+        previous = char
+    if normalized_chars and normalized_chars[-1] == "_":
+        normalized_chars.pop()
+    normalized = "".join(normalized_chars)
+    compact = "".join(compact_chars)
     if normalized in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS or compact in _PUBLIC_TEXT_ALLOWED_FIELD_WORDS_COMPACT:
         return False
     return normalized in FORBIDDEN_FIELD_NAMES or compact in _FORBIDDEN_FIELD_COMPACT
@@ -799,6 +843,49 @@ def _redact_and_truncate_public_text(text: str, max_chars: int | None) -> str:
     return redacted[:prefix_limit].rstrip() + marker
 
 
+def _public_sanitize_cache_size() -> int:
+    raw = os.environ.get(
+        "TENDWIRE_SANITIZE_CACHE_SIZE",
+        str(_PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE),
+    )
+    try:
+        return max(0, min(65536, int(raw)))
+    except ValueError:
+        return _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE
+
+
+_PUBLIC_SANITIZE_CACHE_SIZE = _public_sanitize_cache_size()
+_PUBLIC_SANITIZE_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+_PUBLIC_SANITIZE_CACHE_LOCK = threading.RLock()
+
+
+def _public_sanitize_cache_key(
+    value: str,
+    *,
+    max_chars: int | None,
+    collapse_whitespace: bool,
+    strip_outer: bool,
+) -> tuple[Any, ...]:
+    digest = hashlib.blake2b(
+        value.encode("utf-8", errors="surrogatepass"),
+        digest_size=16,
+    ).digest()
+    return (
+        _PUBLIC_SANITIZER_CONFIG_VERSION,
+        max_chars,
+        collapse_whitespace,
+        strip_outer,
+        len(value),
+        digest,
+    )
+
+
+def _clear_public_sanitize_cache() -> None:
+    """Clear the process-local text sanitizer cache (primarily for tests)."""
+    with _PUBLIC_SANITIZE_CACHE_LOCK:
+        _PUBLIC_SANITIZE_CACHE.clear()
+
+
 def sanitize_public_text(
     value: Any,
     *,
@@ -819,6 +906,19 @@ def sanitize_public_text(
     """
     if not isinstance(value, str):
         return ""
+    cache_key: tuple[Any, ...] | None = None
+    if _PUBLIC_SANITIZE_CACHE_SIZE:
+        cache_key = _public_sanitize_cache_key(
+            value,
+            max_chars=max_chars,
+            collapse_whitespace=collapse_whitespace,
+            strip_outer=strip_outer,
+        )
+        with _PUBLIC_SANITIZE_CACHE_LOCK:
+            cached = _PUBLIC_SANITIZE_CACHE.get(cache_key)
+            if cached is not None:
+                _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
+                return cached
     text = unicodedata.normalize("NFKC", value).replace("\x00", "")
     text = _PUBLIC_ZERO_WIDTH_RE.sub("", text)
     text = _redact_and_truncate_public_text(text, max_chars)
@@ -826,6 +926,12 @@ def sanitize_public_text(
         text = " ".join(text.split())
     elif strip_outer:
         text = text.strip()
+    if cache_key is not None:
+        with _PUBLIC_SANITIZE_CACHE_LOCK:
+            _PUBLIC_SANITIZE_CACHE[cache_key] = text
+            _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
+            while len(_PUBLIC_SANITIZE_CACHE) > _PUBLIC_SANITIZE_CACHE_SIZE:
+                _PUBLIC_SANITIZE_CACHE.popitem(last=False)
     return text
 
 
