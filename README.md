@@ -1405,6 +1405,9 @@ change is required.
   least one non-empty explicit selector.
 - `instruction` — optional; for `send_instruction` contains `text` only.
 - `params` — optional opaque parameters.
+- `response_schema_version` — optional response negotiation. Omit it (or use
+  `2`) for the unchanged schema-v2 envelope. A client may explicitly use `3`
+  to receive the accepted instruction submission handle described below.
 
 Requests containing connector or low-level terminal fields are rejected before
 any backend call. Rejected fields include `telegram`, `chat_id`, `topic_id`,
@@ -1438,6 +1441,24 @@ The envelope contains exactly those fields. The local daemon's outer RPC frame
 remains schema v1; for `command.submit`, its `result` is this exact schema-v2
 command envelope. The CLI unwraps that result and prints the schema-v2 command
 envelope itself.
+
+For a non-dry-run `send_instruction`, a client can opt into schema v3 by
+setting request `response_schema_version: 3`. Only an accepted response is
+projected as v3; its existing `result.turn_id` remains unchanged and
+`result.submission_id` is added as an opaque deterministic `twsub1.*` handle.
+The default and all current Herdres requests remain byte-for-byte schema v2.
+The durable receipt also remains schema v2, so response negotiation does not
+change idempotency evidence.
+
+Each instruction that reaches `send_started` is dual-written atomically to the
+shadow `turn_submissions` ledger while the legacy pending turn is still created
+exactly as before. The ledger stores a whitespace-normalized instruction digest,
+never another raw instruction copy, and advances to `submitted` or `uncertain`
+with the terminal receipt transaction. Unlinked rows expire after
+`TENDWIRE_SUBMISSION_HARD_TTL_SECONDS` (default `86400`); candidate linkage uses
+the symmetric observation window configured by
+`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). Stage 2 does not read
+this ledger to make turn, command, observation, or delivery decisions.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

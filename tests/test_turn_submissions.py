@@ -7,11 +7,18 @@ from pathlib import Path
 
 import pytest
 
+from tendwire.core.commands import (
+    instruction_fingerprint,
+    normalize_instruction_text,
+    turn_submission_id,
+)
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     TURN_SUBMISSION_STATE_TRANSITIONS,
+    cancel_turn_submission,
     init_store,
     is_valid_turn_submission_state_transition,
+    sweep_expired_turn_submissions,
 )
 
 
@@ -193,3 +200,132 @@ def test_turn_submission_state_transition_table() -> None:
     assert not is_valid_turn_submission_state_transition("unknown", "submitted")
     assert not is_valid_turn_submission_state_transition("submitted", "unknown")
     assert not is_valid_turn_submission_state_transition(None, "submitted")
+
+
+def test_instruction_fingerprint_is_normalized_deterministic_and_opaque() -> None:
+    variants = (
+        "  deploy   the build\nthen verify  ",
+        "deploy the build\nthen   verify",
+        "deploy\tthe build\nthen verify",
+    )
+
+    assert {normalize_instruction_text(value) for value in variants} == {
+        "deploy the build\nthen verify"
+    }
+    fingerprints = {instruction_fingerprint(value) for value in variants}
+    assert len(fingerprints) == 1
+    fingerprint = fingerprints.pop()
+    assert fingerprint.startswith("twins1.")
+    assert "deploy" not in fingerprint
+    assert instruction_fingerprint("deploy the other build") != fingerprint
+
+    first = turn_submission_id("host-a", "request-1")
+    assert first == turn_submission_id("host-a", "request-1")
+    assert first.startswith("twsub1.")
+    assert turn_submission_id("host-b", "request-1") != first
+    assert turn_submission_id("host-a", "request-2") != first
+
+
+def _insert_submission(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    state: str,
+    hard_expires_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO turn_submissions (
+            host_id, submission_id, request_id, owner_key,
+            owner_key_version, instruction_fingerprint, state,
+            linked_turn_id, link_not_before, link_expires_at,
+            hard_expires_at, linked_at, terminal_at, submitted_at,
+            send_started_at, updated_at
+        ) VALUES (
+            'host-a', ?, ?, 'owner-a', 1, ?, ?, NULL,
+            '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:02:00+00:00', ?, NULL, NULL,
+            '2026-01-01T00:01:00+00:00',
+            '2026-01-01T00:00:00+00:00',
+            '2026-01-01T00:01:00+00:00'
+        )
+        """,
+        (
+            turn_submission_id("host-a", request_id),
+            request_id,
+            instruction_fingerprint("hello"),
+            state,
+            hard_expires_at,
+        ),
+    )
+
+
+def test_submission_expiry_sweeper_expires_only_old_unlinked_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "expiry.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_submission(
+            conn,
+            request_id="old",
+            state="submitted",
+            hard_expires_at="2026-01-02T00:00:00+00:00",
+        )
+        _insert_submission(
+            conn,
+            request_id="future",
+            state="uncertain",
+            hard_expires_at="2026-03-01T00:00:00+00:00",
+        )
+
+    assert sweep_expired_turn_submissions(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T00:00:00+00:00",
+    ) == 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT request_id, state, terminal_at
+            FROM turn_submissions ORDER BY request_id
+            """
+        ).fetchall()
+    assert rows == [
+        ("future", "uncertain", None),
+        ("old", "expired", "2026-02-01T00:00:00+00:00"),
+    ]
+
+
+def test_submission_cancellation_is_terminal_and_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "cancel.db"
+    init_store(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        _insert_submission(
+            conn,
+            request_id="cancel-me",
+            state="send_started",
+            hard_expires_at="2026-03-01T00:00:00+00:00",
+        )
+
+    assert cancel_turn_submission(
+        db_path,
+        host_id="host-a",
+        request_id="cancel-me",
+        now="2026-02-01T00:00:00+00:00",
+    )
+    assert not cancel_turn_submission(
+        db_path,
+        host_id="host-a",
+        request_id="cancel-me",
+        now="2026-02-01T00:00:01+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT state, terminal_at FROM turn_submissions
+            WHERE host_id = 'host-a' AND request_id = 'cancel-me'
+            """
+        ).fetchone() == ("cancelled", "2026-02-01T00:00:00+00:00")
