@@ -544,6 +544,11 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         command_row = conn.execute(
             "SELECT request_json, result_json FROM commands WHERE request_id = 'req-1'"
         ).fetchone()
+        ledger_counts = (
+            conn.execute("SELECT COUNT(*) FROM turn_submissions").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM turn_supersessions").fetchone()[0],
+        )
+    assert ledger_counts == (0, 0)
     assert [row[0] for row in event_rows] == [
         "snapshot.saved",
         "command.request.reserved",

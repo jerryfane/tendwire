@@ -11194,7 +11194,7 @@ def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
     init_store(db_path)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 18
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 19
         assert conn.execute(
             """
             SELECT turn_id, list_sequence

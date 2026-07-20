@@ -13,6 +13,7 @@ from tendwire.config import (
     DEFAULT_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
     DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
+    DEFAULT_TURN_MODEL,
     MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
     DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
@@ -23,6 +24,22 @@ from tendwire.config import (
     Config,
     load_config,
 )
+
+
+def test_turn_model_defaults_to_legacy_and_accepts_env_override(monkeypatch) -> None:
+    monkeypatch.delenv("TENDWIRE_TURN_MODEL", raising=False)
+    assert DEFAULT_TURN_MODEL == "legacy"
+    assert load_config().turn_model == "legacy"
+
+    monkeypatch.setenv("TENDWIRE_TURN_MODEL", "shadow")
+    assert load_config().turn_model == "shadow"
+    assert load_config(turn_model="dual").turn_model == "dual"
+
+
+@pytest.mark.parametrize("value", ["", "future", "legacy,dual"])
+def test_turn_model_rejects_unknown_values(value: str) -> None:
+    with pytest.raises(ValueError, match="turn_model must be one of"):
+        Config(turn_model=value)
 
 
 def test_pr16_runtime_knobs_have_documented_defaults(monkeypatch) -> None:

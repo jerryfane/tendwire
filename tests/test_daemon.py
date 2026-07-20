@@ -1420,6 +1420,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
         command_retry_horizon_seconds=120,
         command_receipt_retention_seconds=691_200,
         command_receipt_retention_count=77,
+        turn_model="shadow",
     )
     snapshot = project_from_raw(
         config,
@@ -1489,6 +1490,7 @@ def test_daemon_health_exposes_public_operational_status_without_private_values(
     encoded = json.dumps(health)
 
     assert health["status"] == "ok"
+    assert health["turn_model"] == "shadow"
     assert health["daemon"]["started_at"]
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["store"]["outbox"]["pending"] == 1
