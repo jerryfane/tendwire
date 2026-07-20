@@ -231,6 +231,26 @@ def test_public_text_sanitize_cache_hits_and_separates_configurations(monkeypatc
     assert calls == 2
 
 
+def test_public_text_sanitize_cache_is_byte_bounded_and_skips_oversized_values(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(models, "_PUBLIC_SANITIZE_CACHE_MAX_BYTES", 4096)
+    models._clear_public_sanitize_cache()
+
+    for index in range(20):
+        models.sanitize_public_text(f"{index}:" + ("x" * 500))
+
+    assert models._PUBLIC_SANITIZE_CACHE_BYTES <= 4096
+    assert sum(weight for _text, weight in models._PUBLIC_SANITIZE_CACHE.values()) == (
+        models._PUBLIC_SANITIZE_CACHE_BYTES
+    )
+
+    before = dict(models._PUBLIC_SANITIZE_CACHE)
+    oversized = "y" * 4096
+    assert models.sanitize_canonical_turn_text(oversized) == oversized
+    assert dict(models._PUBLIC_SANITIZE_CACHE) == before
+
+
 def test_forbidden_phrase_scan_is_bounded_for_token_dense_text() -> None:
     def elapsed(size: int) -> float:
         value = ("a1b2c3d4_" * ((size + 8) // 9))[:size]

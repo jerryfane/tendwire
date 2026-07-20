@@ -478,6 +478,7 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
 _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
+_PUBLIC_SANITIZE_CACHE_MAX_BYTES = 8 * 1024 * 1024
 _PUBLIC_SANITIZER_CONFIG_VERSION = 1
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
     {
@@ -855,7 +856,10 @@ def _public_sanitize_cache_size() -> int:
 
 
 _PUBLIC_SANITIZE_CACHE_SIZE = _public_sanitize_cache_size()
-_PUBLIC_SANITIZE_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+_PUBLIC_SANITIZE_CACHE: OrderedDict[
+    tuple[Any, ...], tuple[str, int]
+] = OrderedDict()
+_PUBLIC_SANITIZE_CACHE_BYTES = 0
 _PUBLIC_SANITIZE_CACHE_LOCK = threading.RLock()
 
 
@@ -882,8 +886,18 @@ def _public_sanitize_cache_key(
 
 def _clear_public_sanitize_cache() -> None:
     """Clear the process-local text sanitizer cache (primarily for tests)."""
+    global _PUBLIC_SANITIZE_CACHE_BYTES
     with _PUBLIC_SANITIZE_CACHE_LOCK:
         _PUBLIC_SANITIZE_CACHE.clear()
+        _PUBLIC_SANITIZE_CACHE_BYTES = 0
+
+
+def _public_sanitize_cache_weight(value: str) -> int:
+    """Conservatively bound retained Python string storage plus cache overhead."""
+    return max(
+        len(value.encode("utf-8", errors="surrogatepass")),
+        len(value) * 4,
+    ) + 256
 
 
 def sanitize_public_text(
@@ -918,7 +932,7 @@ def sanitize_public_text(
             cached = _PUBLIC_SANITIZE_CACHE.get(cache_key)
             if cached is not None:
                 _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
-                return cached
+                return cached[0]
     text = unicodedata.normalize("NFKC", value).replace("\x00", "")
     text = _PUBLIC_ZERO_WIDTH_RE.sub("", text)
     text = _redact_and_truncate_public_text(text, max_chars)
@@ -927,11 +941,24 @@ def sanitize_public_text(
     elif strip_outer:
         text = text.strip()
     if cache_key is not None:
+        cache_weight = _public_sanitize_cache_weight(text)
+        global _PUBLIC_SANITIZE_CACHE_BYTES
         with _PUBLIC_SANITIZE_CACHE_LOCK:
-            _PUBLIC_SANITIZE_CACHE[cache_key] = text
-            _PUBLIC_SANITIZE_CACHE.move_to_end(cache_key)
-            while len(_PUBLIC_SANITIZE_CACHE) > _PUBLIC_SANITIZE_CACHE_SIZE:
-                _PUBLIC_SANITIZE_CACHE.popitem(last=False)
+            previous = _PUBLIC_SANITIZE_CACHE.pop(cache_key, None)
+            if previous is not None:
+                _PUBLIC_SANITIZE_CACHE_BYTES -= previous[1]
+            if cache_weight <= _PUBLIC_SANITIZE_CACHE_MAX_BYTES:
+                _PUBLIC_SANITIZE_CACHE[cache_key] = (text, cache_weight)
+                _PUBLIC_SANITIZE_CACHE_BYTES += cache_weight
+                while (
+                    len(_PUBLIC_SANITIZE_CACHE) > _PUBLIC_SANITIZE_CACHE_SIZE
+                    or _PUBLIC_SANITIZE_CACHE_BYTES
+                    > _PUBLIC_SANITIZE_CACHE_MAX_BYTES
+                ):
+                    _key, (_value, evicted_weight) = (
+                        _PUBLIC_SANITIZE_CACHE.popitem(last=False)
+                    )
+                    _PUBLIC_SANITIZE_CACHE_BYTES -= evicted_weight
     return text
 
 

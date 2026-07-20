@@ -258,6 +258,7 @@ def test_goal13_acceptance_1_to_3_ten_thousand_bootstrap_and_unchanged_polls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """10k bootstrap is stable/bounded; unchanged polls traverse no list/content."""
+    assert turns_core.TURN_DELTA_CURSOR_TTL_SECONDS == 3600
     db_path = tmp_path / "ten-thousand.db"
     _seed_pre_v18_store(db_path, 10_000)
     with sqlite3.connect(str(db_path)) as conn:
@@ -729,7 +730,7 @@ def test_goal13_acceptance_9_token_outcomes_compaction_and_store_epoch_rebuild(
         HOST,
         cursor=page["next_cursor"],
         limit=1,
-        now=1_800_000_301,
+        now=1_800_003_601,
     )["status"] == "expired_cursor"
     assert turn_delta_payload_from_store(
         db_path, HOST, cursor="twdeltac1.bad", limit=1
