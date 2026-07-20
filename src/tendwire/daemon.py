@@ -956,6 +956,7 @@ class TendwireDaemon:
                 else "degraded"
             ),
             "host_id": self.config.host_id,
+            "turn_model": self.config.turn_model,
             "daemon": {
                 "status": "healthy",
                 "started_at": self.started_at,

@@ -124,7 +124,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 18
+STORE_SCHEMA_VERSION = 19
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
@@ -149,6 +149,15 @@ _COMMAND_REQUEST_STATES = frozenset(
 )
 _COMMAND_REQUEST_ACTIVE_STATES = frozenset({"reserved", "send_started"})
 _COMMAND_REQUEST_TERMINAL_STATES = frozenset({"accepted", "rejected", "uncertain"})
+TURN_SUBMISSION_STATE_TRANSITIONS = {
+    "send_started": frozenset({"submitted", "uncertain", "expired", "cancelled"}),
+    "submitted": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
+    "uncertain": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
+    "linked": frozenset(),
+    "ambiguous": frozenset(),
+    "expired": frozenset(),
+    "cancelled": frozenset(),
+}
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
 _MAX_RETENTION_DAYS = 365_000
 _MAX_TIMEDELTA_SECONDS = _MAX_RETENTION_DAYS * 24 * 60 * 60
@@ -172,6 +181,19 @@ class StoreSchemaError(RuntimeError):
     def __init__(self, status: str) -> None:
         self.status = str(status)
         super().__init__(self.status)
+
+
+def is_valid_turn_submission_state_transition(
+    current_state: object,
+    next_state: object,
+) -> bool:
+    """Return whether a turn-submission state change is allowed."""
+    if not isinstance(current_state, str) or not isinstance(next_state, str):
+        return False
+    return next_state in TURN_SUBMISSION_STATE_TRANSITIONS.get(
+        current_state,
+        frozenset(),
+    )
 
 
 def _configured_turn_claim_hard_ttl_seconds() -> int:
@@ -647,6 +669,65 @@ CREATE TABLE IF NOT EXISTS turns (
     PRIMARY KEY (host_id, turn_id)
 );
 """
+
+CREATE_TURN_SUBMISSIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_submissions (
+    host_id TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    owner_key TEXT NOT NULL,
+    owner_key_version INTEGER NOT NULL,
+    instruction_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'send_started', 'submitted', 'uncertain', 'linked',
+            'ambiguous', 'expired', 'cancelled'
+        )
+    ),
+    linked_turn_id TEXT,
+    link_not_before TEXT NOT NULL,
+    link_expires_at TEXT NOT NULL,
+    hard_expires_at TEXT NOT NULL,
+    linked_at TEXT,
+    terminal_at TEXT,
+    submitted_at TEXT,
+    send_started_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, submission_id),
+    UNIQUE (host_id, request_id)
+);
+"""
+
+CREATE_TURN_SUBMISSION_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_submissions_link_candidates "
+        "ON turn_submissions("
+        "host_id, owner_key, instruction_fingerprint, state)"
+    ),
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_turn_submissions_linked_turn "
+        "ON turn_submissions(host_id, linked_turn_id) "
+        "WHERE linked_turn_id IS NOT NULL"
+    ),
+)
+
+CREATE_TURN_SUPERSESSIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS turn_supersessions (
+    host_id TEXT NOT NULL,
+    superseded_turn_id TEXT NOT NULL,
+    canonical_turn_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, superseded_turn_id)
+);
+"""
+
+CREATE_TURN_SUPERSESSION_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_turn_supersessions_canonical "
+        "ON turn_supersessions(host_id, canonical_turn_id)"
+    ),
+)
 
 CREATE_TURN_LIST_STATE_TABLE = """
 CREATE TABLE IF NOT EXISTS turn_list_state (
@@ -12183,6 +12264,16 @@ def _migrate_v17_to_v18_conn(conn: sqlite3.Connection) -> None:
     _create_available_turn_change_triggers_conn(conn)
 
 
+def _migrate_v18_to_v19_conn(conn: sqlite3.Connection) -> None:
+    """Install empty Phase 2 submission and supersession ledgers."""
+    conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
+    conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
+    for statement in CREATE_TURN_SUBMISSION_INDEXES:
+        conn.execute(statement)
+    for statement in CREATE_TURN_SUPERSESSION_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -12202,6 +12293,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(15, 16, _migrate_v15_to_v16_conn),
     Migration(16, 17, _migrate_v16_to_v17_conn),
     Migration(17, 18, _migrate_v17_to_v18_conn),
+    Migration(18, 19, _migrate_v18_to_v19_conn),
 )
 
 
@@ -12251,6 +12343,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_CHANGE_JOURNAL_TABLE)
         conn.execute(CREATE_TURN_CHANGE_FLOOR_TABLE)
         conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
+        conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
+        conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
         for statement in CREATE_WORKER_BINDING_INDEXES:
@@ -12265,6 +12359,10 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_CHANGE_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_CHANGE_TRIGGERS:
+            conn.execute(statement)
+        for statement in CREATE_TURN_SUBMISSION_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_TURN_SUPERSESSION_INDEXES:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)

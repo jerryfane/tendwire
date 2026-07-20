@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
+TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
+DEFAULT_TURN_MODEL = "legacy"
 DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
@@ -58,6 +60,7 @@ class Config:
     socket_path: Path | None = None
     herdr_timeout_seconds: float = 5.0
     herdr_backend: str = "cli"
+    turn_model: str = DEFAULT_TURN_MODEL
     event_debounce_seconds: float = DEFAULT_EVENT_DEBOUNCE_SECONDS
     reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
     event_retention_days: int = DEFAULT_EVENT_RETENTION_DAYS
@@ -109,6 +112,11 @@ class Config:
             allowed = ", ".join(sorted(HERDR_BACKENDS))
             raise ValueError(f"herdr_backend must be one of: {allowed}")
         object.__setattr__(self, "herdr_backend", backend)
+        turn_model = str(self.turn_model or "").strip().lower()
+        if turn_model not in TURN_MODELS:
+            allowed = ", ".join(sorted(TURN_MODELS))
+            raise ValueError(f"turn_model must be one of: {allowed}")
+        object.__setattr__(self, "turn_model", turn_model)
         object.__setattr__(
             self,
             "event_debounce_seconds",
@@ -412,6 +420,7 @@ def load_config(
     socket_group: str | None = None,
     herdr_timeout_seconds: float | str | None = None,
     herdr_backend: str | None = None,
+    turn_model: str | None = None,
     event_debounce_seconds: float | str | None = None,
     reconcile_interval_seconds: float | str | None = None,
     event_retention_days: int | str | None = None,
@@ -501,6 +510,11 @@ def load_config(
         socket_path=resolved_socket_path,
         herdr_timeout_seconds=resolved_herdr_timeout_seconds,
         herdr_backend=resolved_herdr_backend,
+        turn_model=_resolve_value(
+            turn_model,
+            "TENDWIRE_TURN_MODEL",
+            DEFAULT_TURN_MODEL,
+        ),
         event_debounce_seconds=_resolve_value(
             event_debounce_seconds,
             "TENDWIRE_EVENT_DEBOUNCE_SECONDS",
