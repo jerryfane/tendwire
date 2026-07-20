@@ -1562,7 +1562,7 @@ def test_cli_connector_post_send_failure_never_mutates_store_fallback(
             timeout_seconds: float,
             **_kwargs: Any,
         ) -> None:
-            assert timeout_seconds == 10.0
+            assert timeout_seconds == 30.0
 
         def request(
             self,
