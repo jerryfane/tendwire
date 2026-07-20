@@ -4977,6 +4977,8 @@ def test_command_pending_turn_effect_is_atomic_with_send_start(
             owner_token=reservation["owner_token"],
             binding_fingerprint="private-binding",
             send_started_effect=invalid_effect,
+            submission_worker={"id": "worker-public", "name": "Worker"},
+            instruction_text="Continue safely.",
             now="2026-01-01T00:00:01+00:00",
         )
     assert get_command_request(
@@ -4985,6 +4987,10 @@ def test_command_pending_turn_effect_is_atomic_with_send_start(
         "turn-send-start",
     )["state"] == "reserved"
     assert turns_payload_from_store(db_path, "host-a")["turns"] == []
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM turn_submissions"
+        ).fetchone() == (0,)
 
     valid_effect = command_pending_turn_terminal_effect(
         host_id="host-a",
@@ -5000,6 +5006,8 @@ def test_command_pending_turn_effect_is_atomic_with_send_start(
         owner_token=reservation["owner_token"],
         binding_fingerprint="private-binding",
         send_started_effect=valid_effect,
+        submission_worker={"id": "worker-public", "name": "Worker"},
+        instruction_text="Continue safely.",
         now="2026-01-01T00:00:01+00:00",
     )
     assert started["status"] == "send_started"
@@ -5011,6 +5019,13 @@ def test_command_pending_turn_effect_is_atomic_with_send_start(
     )["turns"]
     assert len(turns) == 1
     assert turns[0]["id"] == started["effect_result"]["id"]
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT state, owner_key, owner_key_version
+            FROM turn_submissions
+            """
+        ).fetchone() == ("send_started", "legacy-worker:worker-public", 0)
 
 
 def test_backend_pending_choice_terminal_effect_is_atomic_with_acceptance(
