@@ -29,6 +29,8 @@ from urllib.parse import parse_qsl, quote, urlsplit
 from ..config import (
     DEFAULT_CONNECTOR_ACK_TTL_SECONDS,
     DEFAULT_PENDING_STALE_GRACE_SECONDS,
+    DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
+    DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
 )
 from ..local_state import (
@@ -59,7 +61,14 @@ from ..local_state import (
     verify_created_private_sqlite_replacement_at,
     verify_entry_identity,
 )
-from ..core.commands import CommandEnvelope, is_selector_proof, validate_instruction_text
+from ..core.commands import (
+    CommandEnvelope,
+    instruction_fingerprint,
+    is_selector_proof,
+    normalize_instruction_text,
+    turn_submission_id,
+    validate_instruction_text,
+)
 from ..core.models import (
     FINGERPRINT_HEX_CHARS,
     SCHEMA_VERSION,
@@ -132,6 +141,8 @@ TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
 TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
+SUBMISSION_LINK_WINDOW_SECONDS = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
+SUBMISSION_HARD_TTL_SECONDS = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -16973,7 +16984,7 @@ _TURN_IDENTITY_SEED_FIELDS = (
 
 
 def _turn_merge_match_text(value: Any) -> str:
-    return "\n".join(" ".join(line.split()) for line in str(value or "").splitlines()).strip()
+    return normalize_instruction_text(value)
 
 
 def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) -> tuple[int, str, str]:
@@ -17023,6 +17034,200 @@ def _turn_continuity_identity(payload: Mapping[str, Any]) -> tuple[str, str, int
         ):
             return ("stable_key", str(stable_key), 1)
     return None
+
+
+def _turn_submission_owner_identity(worker: Any) -> tuple[str, int]:
+    """Extract the Phase-1 continuity owner, with a legacy worker fallback."""
+    meta = getattr(worker, "meta", None)
+    if meta is None and isinstance(worker, Mapping):
+        meta = worker.get("meta")
+    identity = _turn_continuity_identity(
+        {"meta": meta if isinstance(meta, Mapping) else {}}
+    )
+    if identity is not None:
+        _kind, owner_key, owner_key_version = identity
+        return owner_key, owner_key_version
+
+    # Old snapshots and direct API callers can predate stable worker keys. The
+    # shadow ledger must never change their submission behavior, so isolate
+    # those rows by the existing public worker ID until Stage 4 migration.
+    worker_id = str(getattr(worker, "id", "") or "").strip()
+    if not worker_id and isinstance(worker, Mapping):
+        worker_id = str(worker.get("id") or worker.get("worker_id") or "").strip()
+    if not worker_id:
+        raise StoreSchemaError("turn_submission_owner_missing")
+    return f"legacy-worker:{worker_id}", 0
+
+
+def _turn_submission_policy(
+    link_window_seconds: Any,
+    hard_ttl_seconds: Any,
+) -> tuple[int, int]:
+    values = (link_window_seconds, hard_ttl_seconds)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in values
+    ):
+        raise ValueError("turn submission windows must be positive integers")
+    link_window = int(link_window_seconds)
+    hard_ttl = int(hard_ttl_seconds)
+    if hard_ttl < link_window:
+        raise ValueError("turn submission hard TTL must cover the link window")
+    return link_window, hard_ttl
+
+
+def _insert_turn_submission_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    request_id: str,
+    worker: Any,
+    instruction_text: str,
+    current: str,
+    link_window_seconds: int,
+    hard_ttl_seconds: int,
+) -> str:
+    """Insert the send-started shadow ledger row in the caller transaction."""
+    link_window, hard_ttl = _turn_submission_policy(
+        link_window_seconds,
+        hard_ttl_seconds,
+    )
+    owner_key, owner_key_version = _turn_submission_owner_identity(worker)
+    submission_id = turn_submission_id(host_id, request_id)
+    current_time = datetime.fromisoformat(current)
+    link_not_before = (current_time - timedelta(seconds=link_window)).isoformat(
+        timespec="seconds"
+    )
+    link_expires_at = (current_time + timedelta(seconds=link_window)).isoformat(
+        timespec="seconds"
+    )
+    hard_expires_at = (current_time + timedelta(seconds=hard_ttl)).isoformat(
+        timespec="seconds"
+    )
+    conn.execute(
+        """
+        INSERT INTO turn_submissions (
+            host_id, submission_id, request_id, owner_key,
+            owner_key_version, instruction_fingerprint, state,
+            linked_turn_id, link_not_before, link_expires_at,
+            hard_expires_at, linked_at, terminal_at, submitted_at,
+            send_started_at, updated_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, 'send_started', NULL, ?, ?, ?,
+            NULL, NULL, NULL, ?, ?
+        )
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            str(host_id),
+            submission_id,
+            str(request_id),
+            owner_key,
+            owner_key_version,
+            instruction_fingerprint(instruction_text),
+            link_not_before,
+            link_expires_at,
+            hard_expires_at,
+            current,
+            current,
+        ),
+    )
+    return submission_id
+
+
+def _turn_submission_transition_sources(next_state: str) -> tuple[str, ...]:
+    """Return states that may advance to ``next_state`` under the contract."""
+    return tuple(
+        current_state
+        for current_state in TURN_SUBMISSION_STATE_TRANSITIONS
+        if is_valid_turn_submission_state_transition(current_state, next_state)
+    )
+
+
+def _terminalize_turn_submission_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    request_id: str,
+    terminal_state: str,
+    current: str,
+) -> bool:
+    """Advance an existing shadow row with its command receipt transaction."""
+    next_state = {
+        "accepted": "submitted",
+        "uncertain": "uncertain",
+    }.get(str(terminal_state))
+    if next_state is None:
+        return False
+    row = conn.execute(
+        """
+        SELECT state
+        FROM turn_submissions
+        WHERE host_id = ? AND request_id = ?
+        """,
+        (str(host_id), str(request_id)),
+    ).fetchone()
+    if row is None:
+        # Answer commands and receipts created before Stage 2 have no ledger row.
+        return False
+    current_state = str(row[0])
+    if not is_valid_turn_submission_state_transition(current_state, next_state):
+        # Expiry/cancellation/linkage may have won before a late receipt write.
+        return False
+    updated = conn.execute(
+        """
+        UPDATE turn_submissions
+        SET state = ?,
+            terminal_at = ?,
+            submitted_at = CASE WHEN ? = 'submitted' THEN ? ELSE submitted_at END,
+            updated_at = ?
+        WHERE host_id = ? AND request_id = ? AND state = ?
+        """,
+        (
+            next_state,
+            current,
+            next_state,
+            current,
+            current,
+            str(host_id),
+            str(request_id),
+            current_state,
+        ),
+    )
+    if int(updated.rowcount or 0) != 1:
+        raise StoreSchemaError("turn_submission_terminal_transition_failed")
+    return True
+
+
+def _expire_turn_submissions_conn(
+    conn: sqlite3.Connection,
+    *,
+    current: str,
+    host_id: str | None = None,
+) -> int:
+    source_states = _turn_submission_transition_sources("expired")
+    if not source_states:
+        return 0
+    state_params = {
+        f"transition_state_{index}": state
+        for index, state in enumerate(source_states)
+    }
+    state_placeholders = ", ".join(
+        f":{name}" for name in state_params
+    )
+    scope_sql = "" if host_id is None else "AND host_id = :host_id"
+    updated = conn.execute(
+        f"""
+        UPDATE turn_submissions
+        SET state = 'expired', terminal_at = :current, updated_at = :current
+        WHERE linked_turn_id IS NULL
+          AND state IN ({state_placeholders})
+          AND julianday(hard_expires_at) <= julianday(:current)
+          {scope_sql}
+        """,
+        {"current": current, "host_id": host_id} | state_params,
+    )
+    return int(updated.rowcount or 0)
 
 
 def _turn_uses_current_canonical_identity(
@@ -21139,7 +21344,10 @@ def _upsert_command_pending_turn_impl(
 ) -> dict[str, Any] | None:
     """Upsert a public pending turn for an accepted command submission."""
     clean_request_id = str(request_id or "").strip()
-    clean_text = str(instruction_text or "").strip()
+    # Instruction validation rejects the empty string but deliberately permits
+    # whitespace-only text. Keep that raw text here: trimming it to empty would
+    # make the transactional legacy pending-turn effect abort a valid send.
+    clean_text = str(instruction_text or "")
     if not clean_request_id or not clean_text:
         return None
     current_time = observed_at or utc_timestamp()
@@ -24416,6 +24624,82 @@ def reserve_terminal_command_replay(
         conn.close()
 
 
+def sweep_expired_turn_submissions(
+    db_path: Path,
+    *,
+    host_id: str | None = None,
+    now: str | None = None,
+) -> int:
+    """Expire unlinked shadow submissions past their precomputed hard TTL.
+
+    This Stage-2 store hook is intentionally caller-driven until a later
+    lifecycle stage wires submission maintenance into the daemon scheduler.
+    """
+    if not _sqlite_store_exists(db_path):
+        return 0
+    current = _command_request_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            expired = _expire_turn_submissions_conn(
+                conn,
+                current=current,
+                host_id=None if host_id is None else str(host_id),
+            )
+            conn.commit()
+            return expired
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def cancel_turn_submission(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    now: str | None = None,
+) -> bool:
+    """Apply the shadow-ledger side of an authoritative request cancellation.
+
+    This Stage-2 store hook is intentionally caller-driven until a later stage
+    introduces an authoritative production cancellation workflow.
+    """
+    if not _sqlite_store_exists(db_path):
+        return False
+    current = _command_request_now(now)
+    source_states = _turn_submission_transition_sources("cancelled")
+    if not source_states:
+        return False
+    state_placeholders = ", ".join("?" for _ in source_states)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = conn.execute(
+                f"""
+                UPDATE turn_submissions
+                SET state = 'cancelled', terminal_at = ?, updated_at = ?
+                WHERE host_id = ? AND request_id = ?
+                  AND linked_turn_id IS NULL
+                  AND state IN ({state_placeholders})
+                """,
+                (
+                    current,
+                    current,
+                    str(host_id),
+                    str(request_id),
+                    *source_states,
+                ),
+            )
+            conn.commit()
+            return int(updated.rowcount or 0) == 1
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def mark_command_send_started(
     db_path: Path,
     *,
@@ -24426,11 +24710,19 @@ def mark_command_send_started(
     binding_fingerprint: str,
     event_payload: Mapping[str, Any] | None = None,
     send_started_effect: Callable[[sqlite3.Connection], Any] | None = None,
+    submission_worker: Any | None = None,
+    instruction_text: str | None = None,
+    submission_link_window_seconds: int = SUBMISSION_LINK_WINDOW_SECONDS,
+    submission_hard_ttl_seconds: int = SUBMISSION_HARD_TTL_SECONDS,
     now: str | None = None,
 ) -> dict[str, Any]:
     """CAS the exact reserved owner to send_started before external mutation."""
     if not str(binding_fingerprint).strip():
         raise ValueError("binding_fingerprint must be non-empty")
+    if (submission_worker is None) is not (instruction_text is None):
+        raise ValueError(
+            "submission_worker and instruction_text must be provided together"
+        )
     current = _command_request_now(now)
     owner_hash = _owner_token_hash(owner_token)
     conn = _connect(db_path, isolation_level=None, prepare=True)
@@ -24478,6 +24770,20 @@ def mark_command_send_started(
             row = _command_request_row(conn, host_id, request_id)
             conn.commit()
             return _command_request_response("not_owner", row)
+        submission_id = (
+            _insert_turn_submission_conn(
+                conn,
+                host_id=str(host_id),
+                request_id=str(request_id),
+                worker=submission_worker,
+                instruction_text=str(instruction_text),
+                current=current,
+                link_window_seconds=submission_link_window_seconds,
+                hard_ttl_seconds=submission_hard_ttl_seconds,
+            )
+            if submission_worker is not None and instruction_text is not None
+            else None
+        )
         effect_result = (
             send_started_effect(conn)
             if send_started_effect is not None
@@ -24499,6 +24805,8 @@ def mark_command_send_started(
         )
         if send_started_effect is not None:
             response["effect_result"] = effect_result
+        if submission_id is not None:
+            response["submission_id"] = submission_id
         return response
     except Exception:
         if conn.in_transaction:
@@ -24600,6 +24908,13 @@ def finish_command_request(
             return _command_request_response("not_owner", row)
         if terminal_effect is not None:
             terminal_effect(conn)
+        _terminalize_turn_submission_conn(
+            conn,
+            host_id=str(host_id),
+            request_id=str(request_id),
+            terminal_state=terminal,
+            current=current,
+        )
         row = _command_request_row(conn, host_id, request_id)
         if row is None:
             raise RuntimeError("command request terminal row disappeared")
@@ -24731,6 +25046,12 @@ def cleanup_command_request_retention(
     try:
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
+        if not dry_run:
+            _expire_turn_submissions_conn(
+                conn,
+                current=current,
+                host_id=None if host_id is None else str(host_id),
+            )
         stale_rows = conn.execute(
             f"""
             SELECT id
@@ -24782,6 +25103,13 @@ def cleanup_command_request_retention(
                     (receipt_id,),
                 ).fetchone()
                 if row is not None:
+                    _terminalize_turn_submission_conn(
+                        conn,
+                        host_id=str(row[1]),
+                        request_id=str(row[2]),
+                        terminal_state="uncertain",
+                        current=current,
+                    )
                     _project_command_request_conn(conn, row)
                     _command_transition_event_conn(
                         conn,
@@ -24861,6 +25189,11 @@ def cleanup_command_request_retention(
             )
         if not dry_run:
             for receipt_id, receipt_host_id, receipt_request_id in deletion_rows:
+                conn.execute(
+                    "DELETE FROM turn_submissions "
+                    "WHERE host_id = ? AND request_id = ?",
+                    (str(receipt_host_id), str(receipt_request_id)),
+                )
                 conn.execute(
                     "DELETE FROM commands WHERE host_id = ? AND request_id = ?",
                     (str(receipt_host_id), str(receipt_request_id)),

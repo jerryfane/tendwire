@@ -24,6 +24,8 @@ DEFAULT_MAX_WORKERS = 512
 DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_TURN_REFRESH_WORKERS = 4
 DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
+DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS = 60
+DEFAULT_SUBMISSION_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
 DEFAULT_MAX_OUTBOX_ATTEMPTS = 10
 DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS = 60
@@ -69,6 +71,8 @@ class Config:
     turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
     turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
     turn_claim_hard_ttl_seconds: int = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
+    submission_link_window_seconds: int = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
+    submission_hard_ttl_seconds: int = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
     max_outbox_attempts: int = DEFAULT_MAX_OUTBOX_ATTEMPTS
     connector_claim_ttl_seconds: int = DEFAULT_CONNECTOR_CLAIM_TTL_SECONDS
@@ -174,6 +178,28 @@ class Config:
                 maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
             ),
         )
+        object.__setattr__(
+            self,
+            "submission_link_window_seconds",
+            _bounded_positive_int(
+                self.submission_link_window_seconds,
+                "submission_link_window_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "submission_hard_ttl_seconds",
+            _bounded_positive_int(
+                self.submission_hard_ttl_seconds,
+                "submission_hard_ttl_seconds",
+                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
+            ),
+        )
+        if self.submission_hard_ttl_seconds < self.submission_link_window_seconds:
+            raise ValueError(
+                "submission_hard_ttl_seconds must be >= submission_link_window_seconds"
+            )
         object.__setattr__(
             self,
             "pending_stale_grace_seconds",
@@ -429,6 +455,8 @@ def load_config(
     turn_refresh_interval_seconds: float | str | None = None,
     turn_refresh_workers: int | str | None = None,
     turn_claim_hard_ttl_seconds: int | str | None = None,
+    submission_link_window_seconds: int | str | None = None,
+    submission_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
     max_outbox_attempts: int | str | None = None,
     connector_claim_ttl_seconds: int | str | None = None,
@@ -554,6 +582,16 @@ def load_config(
             turn_claim_hard_ttl_seconds,
             "TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS",
             DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
+        ),
+        submission_link_window_seconds=_resolve_value(
+            submission_link_window_seconds,
+            "TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS",
+            DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
+        ),
+        submission_hard_ttl_seconds=_resolve_value(
+            submission_hard_ttl_seconds,
+            "TENDWIRE_SUBMISSION_HARD_TTL_SECONDS",
+            DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
         ),
         pending_stale_grace_seconds=_resolve_value(
             pending_stale_grace_seconds,

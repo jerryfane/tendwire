@@ -12,6 +12,7 @@ from .config import Config
 from .core.actions import CommandContext, execute_command
 from .core.commands import (
     COMMAND_ENVELOPE_SCHEMA_VERSION,
+    COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
     DISPOSITION_IN_PROGRESS,
     DISPOSITION_NO_RECEIPT,
     DISPOSITION_TERMINAL_ACCEPTED,
@@ -43,6 +44,7 @@ from .core.commands import (
     build_selector_proof,
     error_value,
     is_selector_proof,
+    turn_submission_id,
     parse_command_request,
     resolve_target,
     validate_request,
@@ -1100,7 +1102,11 @@ def _recover_request(
         )
     except Exception:
         receipt = None
-    return _envelope_from_receipt(request, canonical, receipt)
+    return _negotiated_submission_envelope(
+        config,
+        request,
+        _envelope_from_receipt(request, canonical, receipt),
+    )
 
 
 def _terminal_envelope(
@@ -1286,6 +1292,12 @@ def _mark_request_send_started(
             owner_token=reservation.owner_token,
             binding_fingerprint=binding_fingerprint,
             send_started_effect=send_started_effect,
+            submission_worker=worker,
+            instruction_text=instruction_text,
+            submission_link_window_seconds=(
+                config.submission_link_window_seconds
+            ),
+            submission_hard_ttl_seconds=config.submission_hard_ttl_seconds,
             event_payload=_transition_payload(
                 request,
                 worker_id=reservation.canonical.public_worker_id,
@@ -2149,10 +2161,14 @@ def replay_command_receipt(
         canonical = build_canonical_mutation(request, public_worker_id=proven)
     except (TypeError, ValueError):
         return _receipt_malformed(request)
-    return _envelope_from_receipt(request, canonical, receipt)
+    return _negotiated_submission_envelope(
+        config,
+        request,
+        _envelope_from_receipt(request, canonical, receipt),
+    )
 
 
-def submit_command(
+def _submit_command_v2(
     config: Config,
     params: Mapping[str, Any] | str,
     *,
@@ -2367,3 +2383,58 @@ def submit_command(
         reservation,
         client_or_error,
     )
+
+
+def _negotiated_submission_envelope(
+    config: Config,
+    request: CommandRequest,
+    envelope: CommandEnvelope,
+) -> CommandEnvelope:
+    """Project an accepted send into v3 only for an explicit client opt-in."""
+    if (
+        request.response_schema_version != COMMAND_ENVELOPE_V3_SCHEMA_VERSION
+        or request.action != "send_instruction"
+        or envelope.action != "send_instruction"
+        or envelope.disposition != DISPOSITION_TERMINAL_ACCEPTED
+        or envelope.status != STATUS_ACCEPTED
+        or not isinstance(envelope.result, Mapping)
+        or not isinstance(envelope.result.get("turn_id"), str)
+        or not envelope.result.get("turn_id")
+    ):
+        return envelope
+    result = dict(envelope.result)
+    result["submission_id"] = turn_submission_id(
+        config.host_id,
+        request.request_id or "",
+    )
+    return CommandEnvelope(
+        ok=envelope.ok,
+        status=envelope.status,
+        action=envelope.action,
+        disposition=envelope.disposition,
+        request_id=envelope.request_id,
+        dry_run=envelope.dry_run,
+        result=result,
+        error=envelope.error,
+        warnings=list(envelope.warnings),
+        schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
+    )
+
+
+def submit_command(
+    config: Config,
+    params: Mapping[str, Any] | str,
+    *,
+    socket_client_factory: SocketClientFactory | None = None,
+) -> CommandEnvelope:
+    """Submit one command and apply optional response-envelope negotiation."""
+    envelope = _submit_command_v2(
+        config,
+        params,
+        socket_client_factory=socket_client_factory,
+    )
+    payload = params if isinstance(params, str) else _raw_payload_from_mapping(params)
+    request, parse_error = parse_command_request(payload)
+    if parse_error is not None or request is None:
+        return envelope
+    return _negotiated_submission_envelope(config, request, envelope)

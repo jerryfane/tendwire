@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from threading import Event
 
 import json
@@ -41,6 +42,8 @@ from tendwire.core.commands import (
     CommandEnvelope,
     CommandRequest,
     build_canonical_mutation,
+    instruction_fingerprint,
+    turn_submission_id,
 )
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.turns import PendingObservation, PendingObservedChoice
@@ -115,11 +118,12 @@ def _request(
     worker_id: str = "w-1",
     text: str = "hello",
     worker_fingerprint: str | None = None,
+    response_schema_version: int | None = None,
 ) -> dict[str, Any]:
     target: dict[str, Any] = {"worker_id": worker_id}
     if worker_fingerprint is not None:
         target["worker_fingerprint"] = worker_fingerprint
-    return {
+    payload = {
         "schema_version": 1,
         "action": "send_instruction",
         "request_id": request_id,
@@ -127,6 +131,9 @@ def _request(
         "target": target,
         "instruction": {"text": text},
     }
+    if response_schema_version is not None:
+        payload["response_schema_version"] = response_schema_version
+    return payload
 
 
 def _healthy_backend() -> BackendHealth:
@@ -458,13 +465,31 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert receipt["uncertain"] is True
     with sqlite3.connect(str(config.db_path)) as conn:
         events = [row[0] for row in conn.execute("SELECT event_type FROM events ORDER BY id").fetchall()]
+        ledger = conn.execute(
+            """
+            SELECT state, terminal_at, submitted_at
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, f"uncertain-{type(exc).__name__}"),
+        ).fetchone()
+    assert ledger is not None
+    assert ledger[0] == "uncertain"
+    assert ledger[1] is not None
+    assert ledger[2] is None
     assert "command.request.send_started" in events
     assert "command.request.uncertain" in events
 
 
 def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    worker = Worker(id="w-1", name="Alpha", status="active")
+    stable_key = "wsk1_" + ("9" * 64)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
 
@@ -544,11 +569,39 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         command_row = conn.execute(
             "SELECT request_json, result_json FROM commands WHERE request_id = 'req-1'"
         ).fetchone()
-        ledger_counts = (
-            conn.execute("SELECT COUNT(*) FROM turn_submissions").fetchone()[0],
-            conn.execute("SELECT COUNT(*) FROM turn_supersessions").fetchone()[0],
-        )
-    assert ledger_counts == (0, 0)
+        submission_rows = conn.execute(
+            """
+            SELECT submission_id, request_id, owner_key, owner_key_version,
+                   instruction_fingerprint, state, linked_turn_id,
+                   link_not_before, link_expires_at, hard_expires_at,
+                   terminal_at, submitted_at, send_started_at, updated_at
+            FROM turn_submissions
+            """
+        ).fetchall()
+        supersession_count = conn.execute(
+            "SELECT COUNT(*) FROM turn_supersessions"
+        ).fetchone()[0]
+    assert len(submission_rows) == 1
+    submission = submission_rows[0]
+    assert submission[:7] == (
+        turn_submission_id("cmd-host", "req-1"),
+        "req-1",
+        stable_key,
+        1,
+        instruction_fingerprint("hello"),
+        "submitted",
+        None,
+    )
+    link_not_before = datetime.fromisoformat(submission[7])
+    link_expires_at = datetime.fromisoformat(submission[8])
+    hard_expires_at = datetime.fromisoformat(submission[9])
+    send_started_at = datetime.fromisoformat(submission[12])
+    assert (send_started_at - link_not_before).total_seconds() == 60
+    assert (link_expires_at - send_started_at).total_seconds() == 60
+    assert (hard_expires_at - send_started_at).total_seconds() == 86_400
+    assert submission[10] == submission[11] == submission[13]
+    assert datetime.fromisoformat(submission[11]) >= send_started_at
+    assert supersession_count == 0
     assert [row[0] for row in event_rows] == [
         "snapshot.saved",
         "command.request.reserved",
@@ -587,6 +640,221 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         _assert_no_private_json(surface)
 
 
+def test_whitespace_only_instruction_completes_legacy_send(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    instruction_text = " \n\t "
+
+    envelope = submit_command(
+        config,
+        _request(request_id="whitespace-send", text=instruction_text),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert envelope.schema_version == 2
+    assert "submission_id" not in envelope.result
+    assert calls[-1] == {
+        "method": "pane.send_input",
+        "params": {
+            "pane_id": "pane-secret",
+            "text": instruction_text,
+            "keys": ["Enter"],
+        },
+    }
+    assert config.db_path is not None
+    receipt = get_command_request(
+        config.db_path,
+        config.host_id,
+        "whitespace-send",
+    )
+    assert receipt is not None
+    assert receipt["state"] == "accepted"
+    with sqlite3.connect(str(config.db_path)) as conn:
+        submission = conn.execute(
+            """
+            SELECT state, instruction_fingerprint
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, "whitespace-send"),
+        ).fetchone()
+    assert submission == ("submitted", instruction_fingerprint(instruction_text))
+
+
+def test_request_id_can_be_resubmitted_after_receipt_retention_purge(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(request_id="purged-request"),
+        socket_client_factory=_factory(calls),
+    )
+    survivor = submit_command(
+        config,
+        _request(request_id="retention-survivor"),
+        socket_client_factory=_factory(calls),
+    )
+    assert first.status == survivor.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+
+    cleanup = cleanup_command_request_retention(
+        config.db_path,
+        retry_horizon_seconds=604_800,
+        retention_seconds=691_200,
+        retention_count=1,
+        host_id=config.host_id,
+        now="2099-01-01T00:00:00+00:00",
+    )
+    assert cleanup["deleted"] == 1
+    assert get_command_request(
+        config.db_path,
+        config.host_id,
+        "purged-request",
+    ) is None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, "purged-request"),
+        ).fetchone() == (0,)
+
+    resubmitted = submit_command(
+        config,
+        _request(request_id="purged-request"),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert resubmitted.status == STATUS_ACCEPTED
+    assert resubmitted.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert [call["method"] for call in calls].count("pane.send_input") == 3
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT state FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, "purged-request"),
+        ).fetchone() == ("submitted",)
+
+
+def test_submission_envelope_v3_requires_explicit_negotiation(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    default = submit_command(
+        config,
+        _request(request_id="default-v2"),
+        socket_client_factory=_factory(calls),
+    )
+    opted_in = submit_command(
+        config,
+        _request(request_id="opted-v3", response_schema_version=3),
+        socket_client_factory=_factory(calls),
+    )
+    replayed = submit_command(
+        config,
+        _request(request_id="opted-v3", response_schema_version=3),
+        socket_client_factory=_factory(calls),
+    )
+
+    assert default.schema_version == 2
+    assert "submission_id" not in default.result
+    assert set(default.to_dict()) == {
+        "schema_version", "action", "request_id", "ok", "dry_run",
+        "status", "disposition", "result", "error", "warnings",
+    }
+    assert opted_in.schema_version == 3
+    assert opted_in.result["submission_id"] == turn_submission_id(
+        config.host_id,
+        "opted-v3",
+    )
+    assert opted_in.result["turn_id"]
+    assert replayed.to_dict() == opted_in.to_dict()
+    assert [call["method"] for call in calls].count("pane.send_input") == 2
+
+    assert config.db_path is not None
+    receipt = get_command_request(config.db_path, config.host_id, "opted-v3")
+    assert receipt is not None
+    stored = json.loads(receipt["result_json"])
+    assert stored["schema_version"] == 2
+    assert "submission_id" not in stored["result"]
+
+
+def test_submission_fingerprint_is_owner_isolated(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    first_key = "wsk1_" + ("1" * 64)
+    second_key = "wsk1_" + ("2" * 64)
+    first_worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={"stable_key": first_key, "stable_key_version": 1},
+    )
+    second_worker = Worker(
+        id="w-2",
+        name="Beta",
+        status="active",
+        meta={"stable_key": second_key, "stable_key_version": 1},
+    )
+    _seed(
+        config,
+        [first_worker, second_worker],
+        [
+            _binding(
+                first_worker,
+                value="agent-1",
+                private_fingerprint="private-1",
+                turn_target_value="pane-1",
+            ),
+            _binding(
+                second_worker,
+                value="agent-2",
+                private_fingerprint="private-2",
+                turn_target_value="pane-2",
+            ),
+        ],
+    )
+    calls: list[dict[str, Any]] = []
+
+    first = submit_command(
+        config,
+        _request(request_id="owner-1", worker_id="w-1", text="hello   world"),
+        socket_client_factory=_factory(calls, pane_id="pane-1"),
+    )
+    second = submit_command(
+        config,
+        _request(request_id="owner-2", worker_id="w-2", text=" hello world "),
+        socket_client_factory=_factory(calls, pane_id="pane-2"),
+    )
+
+    assert first.status == second.status == STATUS_ACCEPTED
+    assert config.db_path is not None
+    with sqlite3.connect(str(config.db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT owner_key, owner_key_version, instruction_fingerprint
+            FROM turn_submissions ORDER BY request_id
+            """
+        ).fetchall()
+    assert rows == [
+        (first_key, 1, instruction_fingerprint("hello world")),
+        (second_key, 1, instruction_fingerprint("hello world")),
+    ]
+
+
 def test_submit_command_writes_turn_claim_before_pane_send(tmp_path: Path) -> None:
     config = _config(tmp_path)
     assert config.db_path is not None
@@ -602,6 +870,7 @@ def test_submit_command_writes_turn_claim_before_pane_send(tmp_path: Path) -> No
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
     claim_ids: list[str] = []
+    ledger_states: list[tuple[str, str]] = []
 
     class InspectingClient(_FakeSocketClient):
         def request(self, method, params, *, timeout=None):
@@ -618,6 +887,16 @@ def test_submit_command_writes_turn_claim_before_pane_send(tmp_path: Path) -> No
                             (config.host_id, "write-early-request"),
                         ).fetchall()
                     )
+                    ledger_states.extend(
+                        (str(row[0]), str(row[1]))
+                        for row in conn.execute(
+                            """
+                            SELECT submission_id, state FROM turn_submissions
+                            WHERE host_id = ? AND request_id = ?
+                            """,
+                            (config.host_id, "write-early-request"),
+                        ).fetchall()
+                    )
             return super().request(method, params, timeout=timeout)
 
     accepted = submit_command(
@@ -628,6 +907,20 @@ def test_submit_command_writes_turn_claim_before_pane_send(tmp_path: Path) -> No
 
     assert accepted.status == STATUS_ACCEPTED
     assert claim_ids == [accepted.result["turn_id"]]
+    assert ledger_states == [
+        (
+            turn_submission_id(config.host_id, "write-early-request"),
+            "send_started",
+        )
+    ]
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT state FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, "write-early-request"),
+        ).fetchone() == ("submitted",)
 
 
 def test_submit_command_removes_claim_when_pane_input_never_starts(
