@@ -40,6 +40,7 @@ class LocalStateErrorCode(str, Enum):
     INSECURE_MODE = "insecure_mode"
     INVALID_SOCKET_GROUP = "invalid_socket_group"
     INSECURE_SOCKET_PARENT = "insecure_socket_parent"
+    PEER_VALIDATION_FAILED = "peer_validation_failed"
     OPERATION_FAILED = "operation_failed"
 
 

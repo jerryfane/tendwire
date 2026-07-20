@@ -13,11 +13,12 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, wait
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ._version import __version__
 from .core.attention import attention_payload_from_snapshot
 from .core.commands import CommandEnvelope, error_value
 from .core.models import (
@@ -255,6 +256,20 @@ def success_response(result: Mapping[str, Any] | None = None, *, request_id: Any
     return sanitize_public_mapping(response)
 
 
+def _daemon_identity_response(
+    result: Mapping[str, Any],
+    *,
+    request_id: Any = None,
+) -> dict[str, Any]:
+    """Add the local daemon identity after generic public-field sanitation."""
+    response = success_response(result, request_id=request_id)
+    public_result = response.get("result")
+    if isinstance(public_result, dict):
+        public_result["version"] = __version__
+        public_result["pid"] = os.getpid()
+    return response
+
+
 def error_response(
     code: str,
     message: str,
@@ -371,12 +386,15 @@ class TendwireDaemonAPI:
 
         try:
             if method == "ping":
-                return success_response(
+                return _daemon_identity_response(
                     {"pong": True, "methods": sorted(REQUIRED_METHODS)},
                     request_id=request_id,
                 )
             if method == "health.get":
-                return success_response(self._get_health(), request_id=request_id)
+                return _daemon_identity_response(
+                    self._get_health(),
+                    request_id=request_id,
+                )
             if method == "snapshot.get":
                 return success_response(_snapshot_dict(self._get_snapshot()), request_id=request_id)
             if method == "attention.list":
@@ -800,6 +818,17 @@ def _serialized_response(response: Mapping[str, Any]) -> bytes:
     sanitized = sanitize_public_mapping(response)
     original_result = response.get("result")
     if isinstance(original_result, Mapping):
+        # PID is normally excluded from public projections. The local daemon
+        # identity is the one narrow exception: it lets startup diagnostics
+        # identify the exact socket holder without exposing backend process
+        # details. Require the current version/PID pair before restoring it.
+        if (
+            original_result.get("version") == __version__
+            and original_result.get("pid") == os.getpid()
+            and isinstance(sanitized.get("result"), dict)
+        ):
+            sanitized["result"]["version"] = __version__
+            sanitized["result"]["pid"] = os.getpid()
         _restore_turn_list_text(sanitized, original_result)
         _restore_turn_delta_text(sanitized, original_result)
         _restore_content_page_text(sanitized, original_result)
@@ -925,6 +954,65 @@ def _cleanup_stale_socket(parent_fd: int, leaf: str, address: str) -> None:
             os.close(pin_fd)
         except OSError:
             pass
+
+
+def ensure_daemon_socket_not_active(
+    socket_path: str | os.PathLike[str],
+    *,
+    socket_group: str | None = None,
+) -> None:
+    """Fail before startup work when a live process already owns the socket.
+
+    This probe is read-only. Missing endpoints and owned socket files whose
+    listener has gone away are left for the server's locked stale-socket
+    cleanup. A connected peer is active even when it is older, non-Tendwire,
+    slow, or returns an unrecognized protocol response.
+    """
+    client = DaemonAPIClient(
+        socket_path,
+        socket_group=socket_group,
+        timeout_seconds=0.2,
+    )
+    try:
+        response = client.request("ping")
+    except DaemonUnavailable as exc:
+        if exc.code is LocalStateErrorCode.MISSING_ENTRY:
+            return
+        if exc.code is None and not exc.request_started and not exc.timed_out:
+            # Connection refused: the securely pinned socket entry is stale.
+            return
+        if exc.code is LocalStateErrorCode.PEER_VALIDATION_FAILED:
+            raise DaemonUnavailable(
+                _active_daemon_conflict_message(),
+                code=exc.code,
+            ) from None
+        if exc.request_started or exc.timed_out:
+            raise DaemonUnavailable(_active_daemon_conflict_message()) from None
+        raise
+    except DaemonProtocolError as exc:
+        if exc.request_started:
+            raise DaemonUnavailable(_active_daemon_conflict_message()) from None
+        raise
+    raise DaemonUnavailable(_active_daemon_conflict_message(response))
+
+
+def _active_daemon_conflict_message(
+    response: Mapping[str, Any] | None = None,
+) -> str:
+    result = response.get("result") if isinstance(response, Mapping) else None
+    holder_version = result.get("version") if isinstance(result, Mapping) else None
+    holder_pid = result.get("pid") if isinstance(result, Mapping) else None
+    holder = (
+        f"holder is tendwire {holder_version}"
+        if isinstance(holder_version, str) and holder_version
+        else "holder version is unknown"
+    )
+    if isinstance(holder_pid, int) and not isinstance(holder_pid, bool) and holder_pid > 0:
+        holder += f" (PID {holder_pid})"
+    return (
+        f"daemon socket is already active: {holder}; "
+        f"refusing to start tendwire {__version__}"
+    )
 
 
 class _DaemonRequestExecutor:
@@ -1082,6 +1170,8 @@ class UnixSocketJSONServer:
         self._tracking_lock = threading.RLock()
         self._admission = threading.BoundedSemaphore(max_in_flight_requests)
         self._executor: _DaemonRequestExecutor | None = None
+        self._periodic_executor: _DaemonRequestExecutor | None = None
+        self._periodic_future: Future[Any] | None = None
         self._closed = False
         self._accepting = False
         self._connections: set[socket.socket] = set()
@@ -1174,7 +1264,20 @@ class UnixSocketJSONServer:
                         queue_capacity=self.max_in_flight_requests,
                         thread_name_prefix="tendwire-daemon-api",
                     )
+                    periodic_executor = (
+                        _DaemonRequestExecutor(
+                            max_workers=1,
+                            queue_capacity=1,
+                            thread_name_prefix="tendwire-daemon-periodic",
+                        )
+                        if self.periodic_callback is not None
+                        else None
+                    )
                 except Exception:
+                    if "periodic_executor" in locals() and periodic_executor is not None:
+                        periodic_executor.shutdown(cancel_futures=True)
+                    if "executor" in locals():
+                        executor.shutdown(cancel_futures=True)
                     self._rollback_bound_socket(
                         listener,
                         parent_fd,
@@ -1189,6 +1292,7 @@ class UnixSocketJSONServer:
             self._parent_fd = parent_fd
             self._leaf = leaf
             self._executor = executor
+            self._periodic_executor = periodic_executor
             with self._tracking_lock:
                 self._accepting = True
             listener = None
@@ -1266,12 +1370,19 @@ class UnixSocketJSONServer:
 
     def _run_periodic_callback_if_due(self) -> None:
         callback = self.periodic_callback
+        future = self._periodic_future
+        if future is not None:
+            if not future.done():
+                return
+            self._periodic_future = None
         if callback is None or time.monotonic() < self._next_periodic_at:
             return
         self._next_periodic_at = time.monotonic() + self.periodic_interval_seconds
         try:
-            callback()
-        except Exception:
+            executor = self._periodic_executor
+            if executor is not None:
+                self._periodic_future = executor.submit(callback)
+        except (RuntimeError, Full):
             # Periodic maintenance is best-effort and must not stop the API loop.
             return
 
@@ -1410,6 +1521,10 @@ class UnixSocketJSONServer:
             self._closed = True
             executor = self._executor
             self._executor = None
+            periodic_executor = self._periodic_executor
+            periodic_future = self._periodic_future
+            self._periodic_executor = None
+            self._periodic_future = None
             futures = tuple(self._futures) if executor is not None else ()
         listener = self._listener
         self._listener = None
@@ -1435,6 +1550,10 @@ class UnixSocketJSONServer:
                 except OSError:
                     pass
             executor.shutdown(cancel_futures=True)
+        if periodic_future is not None:
+            periodic_future.cancel()
+        if periodic_executor is not None:
+            periodic_executor.shutdown(cancel_futures=True)
 
         identity = self._identity
         pin_fd = self._pin_fd
@@ -1577,7 +1696,10 @@ def _validate_connected_peer(conn: socket.socket, expected_uid: int) -> None:
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, credentials.size)
         _pid, peer_uid, _gid = credentials.unpack(raw)
     except (OSError, struct.error):
-        raise DaemonUnavailable("daemon peer validation failed") from None
+        raise DaemonUnavailable(
+            "daemon peer validation failed",
+            code=LocalStateErrorCode.PEER_VALIDATION_FAILED,
+        ) from None
     if peer_uid != expected_uid:
         raise DaemonUnavailable(
             "daemon peer ownership is invalid",

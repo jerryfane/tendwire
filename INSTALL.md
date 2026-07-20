@@ -47,6 +47,10 @@ Environment=TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS=2.0
 Environment=TENDWIRE_TURN_REFRESH_WORKERS=4
 Environment=TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS=86400
 ExecStart=%h/.local/bin/tendwire daemon --db-path %h/.local/share/tendwire/tendwire.db
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+FinalKillSignal=SIGKILL
 Restart=always
 RestartSec=5s
 
@@ -54,13 +58,34 @@ RestartSec=5s
 WantedBy=default.target
 ```
 
-Install it as `~/.config/systemd/user/tendwired.service`, then run:
+The same unit is shipped as `tendwired.service.example`. Install it as
+`~/.config/systemd/user/tendwired.service`, then run:
 
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now tendwired.service
 systemctl --user is-active tendwired.service
 ```
+
+Template ownership is split for Herdres-managed source installs: Herdres's
+`systemd/user/tendwired.service.example` and `install-user.sh` generate the
+production unit with its `PYTHONPATH`, adapter environment, and drop-ins; they
+do not consume Tendwire's shipped example. Keep the four shutdown-hardening
+directives synchronized in that Herdres-owned template and verify the generated
+unit after either repository changes.
+
+`KillMode=control-group` is intentional: the daemon's Herdr adapter and
+isolated turn readers are supervised children in the same service cgroup.
+`SIGTERM` starts Tendwire's bounded shutdown, closes the listening socket, and
+cancels active ingestion; systemd sends `SIGKILL` to any exceptional survivor
+after the 20-second stop deadline. Tendwire is designed not to fork, daemonize,
+create a new session, or transfer the listening socket, so `MainPID` should be
+the socket-holding daemon process. The observed stale-holder incident involved
+an unhardened production unit and the former synchronous signal-teardown hazard;
+the available evidence did not establish a specific process-escape mechanism.
+If another live process already holds the
+configured socket, startup fails with a non-zero status instead of replacing
+the endpoint or running a second daemon.
 
 ## Background Turn Ingestion Operations
 

@@ -54,7 +54,12 @@ def test_secret_scanner_detects_runtime_assembled_provider_shapes() -> None:
 def test_sdist_declares_release_and_script_assets() -> None:
     data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     includes = set(data["tool"]["hatch"]["build"]["targets"]["sdist"]["include"])
-    assert {"/RELEASE.md", "/scripts", "/docs/evidence"} <= includes
+    assert {
+        "/RELEASE.md",
+        "/scripts",
+        "/docs/evidence",
+        "/tendwired.service.example",
+    } <= includes
     assert release_artifacts.REQUIRED_SDIST <= {
         ".env.example",
         "INSTALL.md",
@@ -62,10 +67,34 @@ def test_sdist_declares_release_and_script_assets() -> None:
         "README.md",
         "RELEASE.md",
         "SECURITY.md",
+        "tendwired.service.example",
         "pyproject.toml",
         "scripts/herdr_smoke.py",
         "scripts/release_artifacts.py",
     }
+
+
+def test_shipped_systemd_unit_owns_the_entire_process_tree() -> None:
+    unit = (ROOT / "tendwired.service.example").read_text(encoding="utf-8")
+    assert "Type=simple\n" in unit
+    assert "KillMode=control-group\n" in unit
+    assert "KillSignal=SIGTERM\n" in unit
+    assert "TimeoutStopSec=20s\n" in unit
+    assert "FinalKillSignal=SIGKILL\n" in unit
+    assert "ExecStart=%h/.local/bin/tendwire daemon " in unit
+
+
+def test_install_documents_herdres_template_ownership_and_observed_diagnosis() -> None:
+    install = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
+    assert "Template ownership is split for Herdres-managed source installs" in install
+    assert "`systemd/user/tendwired.service.example`" in install
+    assert "`install-user.sh`" in install
+    assert "generate the\nproduction unit" in install
+    assert "do not consume Tendwire's shipped example" in install
+    assert (
+        "available evidence did not establish a specific process-escape mechanism"
+        in install
+    )
 
 
 def test_clean_install_doctor_accepts_only_documented_health_states() -> None:
