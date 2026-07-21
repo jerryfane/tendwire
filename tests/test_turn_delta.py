@@ -858,10 +858,20 @@ def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
     current = datetime.fromisoformat(TS).timestamp() + 3
 
     before = stable_json_dumps(
-        turn_delta_payload_from_store(db_path, HOST, now=current)
+        turn_delta_payload_from_store(
+            db_path,
+            HOST,
+            now=current,
+            turn_model="observed",
+        )
     ).encode("utf-8")
     during = stable_json_dumps(
-        turn_delta_payload_from_store(db_path, HOST, now=current)
+        turn_delta_payload_from_store(
+            db_path,
+            HOST,
+            now=current,
+            turn_model="observed",
+        )
     ).encode("utf-8")
 
     assert during == before
