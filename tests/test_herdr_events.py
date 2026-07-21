@@ -2034,6 +2034,7 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
         db_path: Path,
         snapshot: Any,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext | None = None,
         worker_bindings: Any = None,
         binding_backend: str | None = None,
@@ -2053,6 +2054,7 @@ def test_snapshot_observation_context_matches_each_herdr_persistence_barrier(
         return original_save_snapshot(
             db_path,
             snapshot,
+            turn_model=turn_model,
             observation=observation,
             worker_bindings=worker_bindings,
             binding_backend=binding_backend,
@@ -2290,6 +2292,7 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         db_path: Path,
         snapshot: Any,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext | None = None,
         worker_bindings: Any = None,
         binding_backend: str | None = None,
@@ -2300,6 +2303,7 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         return save_snapshot(
             db_path,
             snapshot,
+            turn_model=turn_model,
             observation=observation,
             worker_bindings=worker_bindings,
             binding_backend=binding_backend,

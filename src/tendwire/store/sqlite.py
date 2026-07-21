@@ -33,6 +33,7 @@ from ..config import (
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
     DEFAULT_TURN_MODEL,
+    DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
     TURN_MODELS,
 )
 from ..local_state import (
@@ -187,7 +188,7 @@ ATTENTION_MISSING_REQUIRED = 2
 ATTENTION_MISSING_GRACE_SECONDS = 120
 _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _LOGGER = logging.getLogger(__name__)
-_TURN_CLAIM_SWEEP_LAST_AT: dict[tuple[str, str], float] = {}
+_TURN_CLAIM_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
 _TURN_CLAIM_SWEEP_LOCK = threading.Lock()
 
 
@@ -2894,7 +2895,17 @@ def _final_ready_payload_conn(
     content_revision_value: str,
     allow_unroutable: bool = False,
     working_predecessor_turn_id: str | None = None,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any] | None:
+    if str(turn_model or "").strip().lower() == "observed":
+        canonical_turn_id = _resolve_canonical_turn_id_conn(
+            conn,
+            str(host_id),
+            turn_id,
+        )
+        if canonical_turn_id is None:
+            return None
+        turn_id = canonical_turn_id
     row = conn.execute(
         """
         SELECT
@@ -3840,6 +3851,7 @@ def prepare_connector_plan_begin(
     presentation_version: str,
     part_count: int,
     source_ref: str | None = None,
+    turn_model: str = DEFAULT_TURN_MODEL,
     now: str | None = None,
 ) -> dict[str, Any]:
     """Idempotently begin one bounded range-only presentation plan."""
@@ -3870,6 +3882,20 @@ def prepare_connector_plan_begin(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if str(turn_model or "").strip().lower() == "observed":
+                canonical_turn_id = _resolve_canonical_turn_id_conn(
+                    conn,
+                    str(host_id),
+                    turn_id,
+                )
+                if canonical_turn_id is None:
+                    conn.rollback()
+                    return _presentation_error(
+                        "content_revision_not_found",
+                        host_id=host_id,
+                        name=name,
+                    )
+                turn_id = canonical_turn_id
             _, revision_error = _current_presentation_revision_conn(
                 conn,
                 host_id=str(host_id),
@@ -12493,6 +12519,38 @@ def _linked_canonical_turn_id_conn(
     return None
 
 
+def _resolve_canonical_turn_id_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    turn_id: Any,
+) -> str | None:
+    """Resolve a public legacy turn alias without guessing through bad rows."""
+    current = str(turn_id or "").strip()
+    if not current:
+        return None
+    if not {
+        "host_id",
+        "superseded_turn_id",
+        "canonical_turn_id",
+    } <= _table_columns(conn, "turn_supersessions"):
+        return current
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        row = conn.execute(
+            """
+            SELECT canonical_turn_id
+            FROM turn_supersessions
+            WHERE host_id = ? AND superseded_turn_id = ?
+            """,
+            (str(host_id), current),
+        ).fetchone()
+        if row is None:
+            return current
+        current = str(row[0] or "").strip()
+    return None
+
+
 def _backfill_turn_supersessions_conn(conn: sqlite3.Connection) -> None:
     """Alias only legacy command turns with deterministic Phase 1 linkage."""
     if not {"host_id", "turn_id", "payload_json", "observed_at", "list_sequence"} <= (
@@ -15474,6 +15532,14 @@ def maybe_run_automatic_store_maintenance(
                     "command_requests": empty_command_requests,
                     "batch_size": policy.batch_size,
                 }))
+            _settle_due_submission_links_conn(
+                conn,
+                now=current_at,
+            )
+            _expire_turn_submissions_conn(
+                conn,
+                current=current_at,
+            )
             candidates, _ = _snapshot_retention_candidates_conn(
                 conn,
                 cutoff_at=cutoff_at,
@@ -17740,6 +17806,39 @@ def settle_submission_links_conn(
             ),
         )
         changed += int(updated.rowcount or 0)
+    return changed
+
+
+def _settle_due_submission_links_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str | None = None,
+    now: str | None = None,
+) -> int:
+    """Settle every due open owner/fingerprint component in one transaction."""
+    current, _current_dt = _pending_observed_time(now)
+    scope_sql = "" if host_id is None else "AND host_id = :host_id"
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT host_id, owner_key, instruction_fingerprint
+        FROM turn_submissions
+        WHERE linked_turn_id IS NULL
+          AND state IN ('send_started', 'submitted', 'uncertain')
+          AND julianday(link_not_before) <= julianday(:current)
+          {scope_sql}
+        ORDER BY host_id, owner_key, instruction_fingerprint
+        """,
+        {"current": current, "host_id": host_id},
+    ).fetchall()
+    changed = 0
+    for candidate_host, owner_key, fingerprint in rows:
+        changed += settle_submission_links_conn(
+            conn,
+            str(candidate_host),
+            str(owner_key),
+            str(fingerprint),
+            now=current,
+        )
     return changed
 
 
@@ -20551,10 +20650,11 @@ def _reserve_lazy_turn_claim_sweep(
     db_path: Path | str,
     host_id: str,
     *,
+    purpose: str,
     current_clock: float,
     refresh_interval_seconds: float,
-) -> tuple[tuple[str, str], bool]:
-    key = (str(Path(db_path).absolute()), str(host_id))
+) -> tuple[tuple[str, str, str], bool]:
+    key = (str(Path(db_path).absolute()), str(host_id), str(purpose))
     with _TURN_CLAIM_SWEEP_LOCK:
         last = _TURN_CLAIM_SWEEP_LAST_AT.get(key)
         if (
@@ -20568,7 +20668,7 @@ def _reserve_lazy_turn_claim_sweep(
 
 
 def _release_failed_lazy_turn_claim_sweep(
-    key: tuple[str, str],
+    key: tuple[str, str, str],
     *,
     current_clock: float,
 ) -> None:
@@ -20857,6 +20957,180 @@ def _insert_owned_turn_conn(
         ),
     )
     return turn_id
+
+
+def _merge_observed_turn_content_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    current_worker_payload: Mapping[str, Any],
+    current_projection: Mapping[str, Any],
+    clean_content: Mapping[str, Any],
+    *,
+    incoming_user: str | None,
+    incoming_final: str | None,
+    observed_at: str,
+    snapshot_content_fingerprint: str,
+) -> _TurnContentMergeResult:
+    """Apply the observation-authoritative path without command adoption."""
+    incoming_source_turn = str(
+        clean_content.get("source_turn_id") or ""
+    ).strip()
+    if not incoming_source_turn:
+        return _TurnContentMergeResult(0)
+
+    seed = dict(current_projection)
+    seed.pop("origin_command_id", None)
+    if str(seed.get("source") or "") == "command":
+        seed["source"] = "snapshot"
+    seed.update(
+        _retain_authoritative_completion(
+            clean_content,
+            None,
+            {},
+            incoming_final=incoming_final,
+            observed_at=observed_at,
+        )
+    )
+    seed["source_turn_id"] = incoming_source_turn
+    item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
+    item.pop("origin_command_id", None)
+    turn_id = str(item.get("id") or "")
+    if not turn_id:
+        raise StoreSchemaError("turn_observed_identity_missing")
+
+    current_row = _current_turn_content_row_by_id_conn(
+        conn,
+        str(host_id),
+        turn_id,
+    )
+    changed = False
+    if current_row is None:
+        _insert_owned_turn_conn(
+            conn,
+            host_id=str(host_id),
+            item=item,
+            snapshot_content_fingerprint=snapshot_content_fingerprint,
+            observed_at=observed_at,
+        )
+        _replace_current_turn_content_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            current=None,
+            incoming_user=incoming_user,
+            incoming_final=incoming_final,
+            current_time=observed_at,
+        )
+        _ensure_absent_turn_content_revision_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            observed_at=observed_at,
+        )
+        changed = True
+    else:
+        (
+            _persisted_turn_id,
+            stored_payload,
+            current_content,
+            stored_observed_at,
+        ) = current_row
+        if (
+            _turn_is_tombstoned(stored_payload)
+            or not _owned_source_turn_matches(
+                stored_payload,
+                incoming_source_turn,
+            )
+            and not _source_turn_matches(
+                stored_payload,
+                incoming_source_turn,
+            )
+        ):
+            raise StoreSchemaError("turn_observed_identity_conflict")
+        payload = dict(stored_payload)
+        for key in (
+            "worker_id",
+            "worker_fingerprint",
+            "space_id",
+            "status",
+            "kind",
+            "title",
+            "summary",
+            "updated_at",
+            "meta",
+        ):
+            if key in item:
+                payload[key] = item.get(key)
+        payload.pop("origin_command_id", None)
+        observation_is_newer = _turn_observation_is_newer(
+            observed_at,
+            stored_observed_at,
+        )
+        if observation_is_newer:
+            payload.update(
+                _retain_authoritative_completion(
+                    clean_content,
+                    current_content,
+                    payload,
+                    incoming_final=incoming_final,
+                    observed_at=observed_at,
+                )
+            )
+        metadata_changed, _persisted_item = _update_persisted_turn_row(
+            conn,
+            str(host_id),
+            turn_id,
+            payload,
+            stored_payload,
+            observed_at,
+            snapshot_content_fingerprint=snapshot_content_fingerprint,
+        )
+        if observation_is_newer:
+            revision_changed = _replace_current_turn_content_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=turn_id,
+                current=current_content,
+                incoming_user=incoming_user,
+                incoming_final=incoming_final,
+                current_time=observed_at,
+            )
+            revision_repaired = _ensure_absent_turn_content_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=turn_id,
+                observed_at=observed_at,
+            )
+        else:
+            revision_changed = False
+            revision_repaired = False
+        changed = metadata_changed or revision_changed or revision_repaired
+
+    owner_key, owner_key_version = _turn_submission_owner_identity(
+        current_worker_payload
+    )
+    submission_link = (
+        (owner_key, instruction_fingerprint(incoming_user))
+        if owner_key_version == 1
+        else None
+    )
+    current_revision = conn.execute(
+        """
+        SELECT content_revision
+        FROM turn_content_revisions
+        WHERE host_id = ? AND turn_id = ? AND is_current = 1
+        """,
+        (str(host_id), turn_id),
+    ).fetchone()
+    if current_revision is not None:
+        _ensure_final_ready_anchor_conn(
+            conn,
+            host_id=str(host_id),
+            turn_id=turn_id,
+            content_revision_value=str(current_revision[0]),
+            now=str(observed_at),
+        )
+    return _TurnContentMergeResult(int(changed), submission_link)
 
 
 def _merge_owned_turn_content_conn(
@@ -21311,17 +21585,29 @@ def _merge_turn_content_conn(
         return _TurnContentMergeResult(0)
     current_worker_payload = _json_object(current_worker_row[0])
     current_snapshot_fingerprint = str(current_worker_row[1] or "")
+    current_projection = _current_worker_turn_projection(
+        str(host_id),
+        str(worker_id),
+        current_worker_payload,
+    )
+    if turn_model == "observed":
+        return _merge_observed_turn_content_conn(
+            conn,
+            str(host_id),
+            current_worker_payload,
+            current_projection,
+            clean_content,
+            incoming_user=incoming_user,
+            incoming_final=incoming_final,
+            observed_at=observed_at,
+            snapshot_content_fingerprint=current_snapshot_fingerprint,
+        )
     current_identity = _turn_continuity_identity(current_worker_payload)
     if current_identity is not None:
         rows = _current_owned_turn_content_rows_conn(
             conn,
             str(host_id),
             current_identity,
-        )
-        current_projection = _current_worker_turn_projection(
-            str(host_id),
-            str(worker_id),
-            current_worker_payload,
         )
         return _merge_owned_turn_content_conn(
             conn,
@@ -22599,6 +22885,28 @@ def _turn_delta_payload_from_store(
             ),
         }
 
+    sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
+        db_path,
+        host,
+        purpose="submission_links",
+        current_clock=clock,
+        refresh_interval_seconds=DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
+    )
+    if sweep_due:
+        try:
+            sweep_submission_links(
+                Path(db_path),
+                host_id=host,
+                now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
+            )
+        except Exception:
+            _release_failed_lazy_turn_claim_sweep(
+                sweep_key,
+                current_clock=clock,
+            )
+            # Delta remains available if opportunistic linkage is contended.
+            pass
+
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
         conn.execute("BEGIN")
@@ -22943,13 +23251,38 @@ def turns_payload_from_store(
         }
     current_clock = time.time() if now is None else float(now)
     refresh_interval = float(turn_refresh_interval_seconds)
-    sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
+    submission_sweep_key, submission_sweep_due = _reserve_lazy_turn_claim_sweep(
         db_path,
         str(host_id),
+        purpose="submission_links",
         current_clock=current_clock,
         refresh_interval_seconds=refresh_interval,
     )
-    if sweep_due:
+    if submission_sweep_due:
+        try:
+            sweep_submission_links(
+                Path(db_path),
+                host_id=str(host_id),
+                now=datetime.fromtimestamp(
+                    current_clock,
+                    tz=timezone.utc,
+                ).isoformat(),
+            )
+        except Exception:
+            _release_failed_lazy_turn_claim_sweep(
+                submission_sweep_key,
+                current_clock=current_clock,
+            )
+            # Listing remains available if opportunistic maintenance is contended.
+            pass
+    claim_sweep_key, claim_sweep_due = _reserve_lazy_turn_claim_sweep(
+        db_path,
+        str(host_id),
+        purpose="turn_claims",
+        current_clock=current_clock,
+        refresh_interval_seconds=refresh_interval,
+    )
+    if claim_sweep_due:
         try:
             sweep_turn_claims(
                 db_path,
@@ -22966,7 +23299,7 @@ def turns_payload_from_store(
             )
         except Exception:
             _release_failed_lazy_turn_claim_sweep(
-                sweep_key,
+                claim_sweep_key,
                 current_clock=current_clock,
             )
             # Listing remains available if opportunistic maintenance is contended.
@@ -23671,6 +24004,7 @@ def get_turn_content(
     field: str,
     cursor: str | None = None,
     schema_version: int = 1,
+    turn_model: str = DEFAULT_TURN_MODEL,
     work_counters: TurnContentWorkCounters | None = None,
 ) -> dict[str, Any]:
     """Read one bounded page directly from the canonical SQLite value."""
@@ -23696,6 +24030,19 @@ def get_turn_content(
     try:
         with _connect(db_path) as conn:
             _ensure_schema(conn)
+            if str(turn_model or "").strip().lower() == "observed":
+                canonical_turn_id = _resolve_canonical_turn_id_conn(
+                    conn,
+                    str(host_id),
+                    turn_id,
+                )
+                if canonical_turn_id is None:
+                    return {
+                        "schema_version": 1,
+                        "ok": False,
+                        "status": "content_revision_not_found",
+                    }
+                turn_id = canonical_turn_id
             row = conn.execute(
                 """
                 SELECT
@@ -24079,8 +24426,13 @@ def save_snapshot(
     binding_backend: str | None = None,
     binding_observation_authoritative: bool = False,
     binding_workers_present: bool = True,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> bool:
     """Persist a canonical snapshot; return whether it became the host projection."""
+    normalized_turn_model = str(turn_model or "").strip().lower()
+    if normalized_turn_model not in TURN_MODELS:
+        allowed = ", ".join(sorted(TURN_MODELS))
+        raise ValueError(f"turn_model must be one of: {allowed}")
     context = observation or SnapshotObservationContext()
     binding_list = (
         None
@@ -24139,8 +24491,13 @@ def save_snapshot(
                 # Turn model construction and pending serialization can recurse
                 # through the public sanitizer. Keep that CPU work outside the
                 # SQLite writer transaction.
-                prepared_turn_items = tuple(
-                    turn.to_dict() for turn in turns_from_snapshot(public_snapshot)
+                prepared_turn_items = (
+                    ()
+                    if normalized_turn_model == "observed"
+                    else tuple(
+                        turn.to_dict()
+                        for turn in turns_from_snapshot(public_snapshot)
+                    )
                 )
                 prepared_pending_items = tuple(
                     pending.to_dict()
@@ -24167,8 +24524,13 @@ def save_snapshot(
                 # read-only preflight and BEGIN IMMEDIATE. Retry after preparing
                 # the now-required projection inputs without holding the lock.
                 conn.rollback()
-                prepared_turn_items = tuple(
-                    turn.to_dict() for turn in turns_from_snapshot(public_snapshot)
+                prepared_turn_items = (
+                    ()
+                    if normalized_turn_model == "observed"
+                    else tuple(
+                        turn.to_dict()
+                        for turn in turns_from_snapshot(public_snapshot)
+                    )
                 )
                 prepared_pending_items = tuple(
                     pending.to_dict()
@@ -25226,6 +25588,87 @@ def sweep_expired_turn_submissions(
         except Exception:
             conn.rollback()
             raise
+
+
+def sweep_submission_links(
+    db_path: Path,
+    *,
+    host_id: str | None = None,
+    now: str | None = None,
+) -> int:
+    """Settle due submission components and expire their hard-TTL stragglers."""
+    if not _sqlite_store_exists(db_path):
+        return 0
+    current = _command_request_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = _settle_due_submission_links_conn(
+                conn,
+                host_id=None if host_id is None else str(host_id),
+                now=current,
+            )
+            _expire_turn_submissions_conn(
+                conn,
+                current=current,
+                host_id=None if host_id is None else str(host_id),
+            )
+            conn.commit()
+            return changed
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def linked_turn_for_submission(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+) -> dict[str, Any] | None:
+    """Return only the canonical observed turn proven by the durable link."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT linked_turn_id
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+              AND state = 'linked' AND linked_turn_id IS NOT NULL
+            """,
+            (str(host_id), str(request_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        canonical_turn_id = _resolve_canonical_turn_id_conn(
+            conn,
+            str(host_id),
+            row[0],
+        )
+        if canonical_turn_id is None:
+            return None
+        turn_row = conn.execute(
+            """
+            SELECT payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (str(host_id), canonical_turn_id),
+        ).fetchone()
+        if turn_row is None:
+            return None
+        payload = sanitize_public_mapping(_json_object(turn_row[0]))
+        if (
+            not payload
+            or _turn_is_tombstoned(payload)
+            or not str(payload.get("source_turn_id") or "").strip()
+        ):
+            return None
+        payload["id"] = canonical_turn_id
+        return payload
 
 
 def cancel_turn_submission(

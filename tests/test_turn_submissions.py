@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1281,3 +1282,115 @@ def test_two_racing_refreshes_cannot_double_link_one_observation(
             """,
             (turn_ids[0],),
         ).fetchone() == (1,)
+
+
+def test_idle_observation_first_submission_links_from_lazy_turn_read(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "idle-observation-first.db"
+    owner_key = _seed_link_worker(db_path)
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="idle-observation-source",
+    )
+    _insert_link_submission(
+        db_path,
+        request_id="idle-observation-first",
+        owner_key=owner_key,
+    )
+
+    payload = store_sqlite.turns_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-02-01T12:00:01+00:00"
+        ).timestamp(),
+    )
+
+    assert payload["turns"]
+    assert _submission_rows(db_path) == [
+        ("idle-observation-first", "linked", observed_turn_id)
+    ]
+
+
+def test_turn_alias_resolves_public_content_and_final_root(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "alias-lookup.db"
+    _seed_link_worker(db_path)
+    canonical_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="alias-source",
+    )
+    legacy_turn_id = "turn-" + ("1" * 24)
+    with sqlite3.connect(str(db_path)) as conn:
+        revision = str(
+            conn.execute(
+                """
+                SELECT content_revision FROM turn_content_revisions
+                WHERE host_id = 'host-a' AND turn_id = ? AND is_current = 1
+                """,
+                (canonical_turn_id,),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO turn_supersessions (
+                host_id, superseded_turn_id, canonical_turn_id,
+                reason, created_at
+            ) VALUES ('host-a', ?, ?, 'phase1_migration', ?)
+            """,
+            (
+                legacy_turn_id,
+                canonical_turn_id,
+                "2026-02-01T12:00:01+00:00",
+            ),
+        )
+
+    legacy_page = store_sqlite.get_turn_content(
+        db_path,
+        "host-a",
+        turn_id=legacy_turn_id,
+        content_revision=revision,
+        field="assistant_final_text",
+    )
+    assert legacy_page["status"] == "content_revision_not_found"
+
+    page = store_sqlite.get_turn_content(
+        db_path,
+        "host-a",
+        turn_id=legacy_turn_id,
+        content_revision=revision,
+        field="assistant_final_text",
+        turn_model="observed",
+    )
+    assert page["turn_id"] == canonical_turn_id
+    assert page["text"] == "answer for alias-source"
+
+    leased = store_sqlite.poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        now="2026-02-01T12:00:02+00:00",
+    )["items"][0]
+    begun = store_sqlite.prepare_connector_plan_begin(
+        db_path,
+        "host-a",
+        name="turn-final",
+        turn_id=legacy_turn_id,
+        content_revision=revision,
+        presentation_version="alias-aware-v1",
+        part_count=1,
+        source_ref=leased["ref"],
+        turn_model="observed",
+        now="2026-02-01T12:00:03+00:00",
+    )
+    assert begun["ok"] is True
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT turn_id FROM turn_presentation_plans
+            WHERE plan_token = ?
+            """,
+            (begun["plan_token"],),
+        ).fetchone() == (canonical_turn_id,)

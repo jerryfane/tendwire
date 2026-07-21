@@ -70,6 +70,7 @@ from tendwire.store.sqlite import (
     store_status,
     tail_event_metadata,
     merge_turn_content,
+    turn_delta_payload_from_store,
     turns_payload_from_store,
     upsert_worker_bindings,
 )
@@ -7308,6 +7309,44 @@ def test_turn_list_lazy_sweep_is_rate_limited(
             datetime.fromtimestamp(1_002.0, tz=timezone.utc).isoformat(),
         ),
     ]
+
+
+def test_submission_link_and_turn_claim_sweeps_have_independent_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "independent-sweep-cadence.db"
+    host_id = "independent-sweep-cadence-host"
+    init_store(db_path)
+    submission_calls: list[str | None] = []
+    claim_calls: list[str | None] = []
+
+    def capture_submission(*_args: Any, now=None, **_kwargs: Any) -> int:
+        submission_calls.append(now)
+        return 0
+
+    def capture_claim(*_args: Any, now=None, **_kwargs: Any) -> int:
+        claim_calls.append(now)
+        return 0
+
+    monkeypatch.setattr(store_sqlite, "sweep_submission_links", capture_submission)
+    monkeypatch.setattr(store_sqlite, "sweep_turn_claims", capture_claim)
+
+    for current in (1_000.0, 1_001.0, 1_002.0):
+        turn_delta_payload_from_store(db_path, host_id, now=current)
+        turns_payload_from_store(
+            db_path,
+            host_id,
+            now=current,
+            turn_refresh_interval_seconds=2.0,
+        )
+
+    expected = [
+        datetime.fromtimestamp(current, tz=timezone.utc).isoformat()
+        for current in (1_000.0, 1_002.0)
+    ]
+    assert submission_calls == expected
+    assert claim_calls == expected
 
 
 def test_ingestion_ambiguity_fallthrough_emits_structured_diagnostic(
