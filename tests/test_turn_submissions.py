@@ -890,6 +890,30 @@ def _insert_link_submission(
         )
 
 
+def _set_link_worker_prod_shape(
+    db_path: Path,
+    *,
+    worker_id: str = "worker-a",
+    host_id: str = "host-a",
+    explicit_null: bool = False,
+) -> None:
+    version_update = (
+        "json_set(payload_json, '$.meta.stable_key_version', NULL)"
+        if explicit_null
+        else "json_remove(payload_json, '$.meta.stable_key_version')"
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        updated = conn.execute(
+            f"""
+            UPDATE workers
+            SET payload_json = {version_update}
+            WHERE host_id = ? AND worker_id = ?
+            """,
+            (host_id, worker_id),
+        )
+        assert updated.rowcount == 1
+
+
 def _observe_link_turn(
     db_path: Path,
     *,
@@ -999,6 +1023,195 @@ def test_shadow_linker_handles_both_race_directions_without_changing_turn_id(
     assert refreshed_turn_id == observed_turn_id
     assert _submission_rows(observation_first) == [
         ("observation-first", "linked", observed_turn_id)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order", "explicit_null"),
+    (("submission-first", True), ("observation-first", False)),
+)
+def test_observed_linker_accepts_prod_shape_turn_owner_version(
+    tmp_path: Path,
+    order: str,
+    explicit_null: bool,
+) -> None:
+    db_path = tmp_path / f"prod-shape-{order}.db"
+    owner_key = _seed_link_worker(db_path)
+    assert store_sqlite._turn_submission_owner_identity(
+        {
+            "id": "worker-a",
+            "meta": {"stable_key": owner_key, "stable_key_version": 1},
+        }
+    ) == (owner_key, 1)
+    _set_link_worker_prod_shape(db_path, explicit_null=explicit_null)
+
+    if order == "submission-first":
+        _insert_link_submission(
+            db_path,
+            request_id=order,
+            owner_key=owner_key,
+        )
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id=f"prod-shape-{order}-source",
+        turn_model="observed",
+    )
+    if order == "observation-first":
+        _insert_link_submission(
+            db_path,
+            request_id=order,
+            owner_key=owner_key,
+        )
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+
+    assert _submission_rows(db_path) == [(order, "linked", observed_turn_id)]
+    with sqlite3.connect(str(db_path)) as conn:
+        turn_shape = conn.execute(
+            """
+            SELECT json_extract(turns.payload_json, '$.meta.stable_key'),
+                   json_extract(turns.payload_json, '$.meta.stable_key_version'),
+                   json_extract(turns.payload_json, '$.stable_key_version'),
+                   json_extract(turns.payload_json, '$.user_text'),
+                   revisions.user_text
+            FROM turns
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = 'host-a' AND turns.turn_id = ?
+            """,
+            (observed_turn_id,),
+        ).fetchone()
+        turn_payload = store_sqlite._json_object(
+            conn.execute(
+                """
+                SELECT payload_json FROM turns
+                WHERE host_id = 'host-a' AND turn_id = ?
+                """,
+                (observed_turn_id,),
+            ).fetchone()[0]
+        )
+    assert turn_shape == (owner_key, None, None, None, "hello")
+    turn_worker = {"id": "worker-a", "meta": turn_payload.get("meta")}
+    assert store_sqlite._turn_submission_owner_identity(turn_worker) == (
+        "legacy-worker:worker-a",
+        0,
+    )
+    assert store_sqlite._turn_link_candidate_owner_identity(turn_worker) == (
+        owner_key,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("submission_count", "observation_count"),
+    ((2, 1), (1, 2), (2, 2)),
+)
+def test_observed_linker_prod_shape_turns_still_fail_closed_on_ambiguity(
+    tmp_path: Path,
+    submission_count: int,
+    observation_count: int,
+) -> None:
+    db_path = tmp_path / (
+        f"prod-shape-ambiguous-{submission_count}-{observation_count}.db"
+    )
+    owner_key = _seed_link_worker(db_path)
+    _set_link_worker_prod_shape(db_path)
+    for index in range(submission_count):
+        _insert_link_submission(
+            db_path,
+            request_id=f"prod-shape-{index}",
+            owner_key=owner_key,
+        )
+
+    for index in range(observation_count):
+        _observe_link_turn(
+            db_path,
+            source_turn_id=f"prod-shape-ambiguous-source-{index}",
+            turn_model="observed",
+        )
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+
+    rows = _submission_rows(db_path)
+    assert [state for _request, state, _turn in rows] == [
+        "ambiguous"
+    ] * submission_count
+    assert all(linked_turn_id is None for _request, _state, linked_turn_id in rows)
+
+
+def test_observed_linker_prod_shape_turns_keep_owner_hash_isolated(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "prod-shape-owner-isolation.db"
+    first_owner = _seed_link_worker(db_path)
+    second_owner = "wsk1_" + ("b" * 64)
+    snapshot = project_from_raw(
+        Config(host_id="host-a", db_path=db_path),
+        workers=[
+            {
+                "id": "worker-a",
+                "name": "worker-a",
+                "status": "active",
+                "meta": {
+                    "stable_key": first_owner,
+                    "stable_key_version": 1,
+                },
+            },
+            {
+                "id": "worker-b",
+                "name": "worker-b",
+                "status": "active",
+                "meta": {
+                    "stable_key": second_owner,
+                    "stable_key_version": 1,
+                },
+            },
+        ],
+    )
+    store_sqlite.save_snapshot(db_path, snapshot)
+    _set_link_worker_prod_shape(db_path, worker_id="worker-a")
+    _set_link_worker_prod_shape(db_path, worker_id="worker-b", explicit_null=True)
+    _insert_link_submission(
+        db_path,
+        request_id="first-owner",
+        owner_key=first_owner,
+    )
+
+    _observe_link_turn(
+        db_path,
+        worker_id="worker-b",
+        source_turn_id="wrong-owner-source",
+        turn_model="observed",
+    )
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+    assert _submission_rows(db_path) == [("first-owner", "submitted", None)]
+
+    matching_turn_id = _observe_link_turn(
+        db_path,
+        worker_id="worker-a",
+        source_turn_id="first-owner-source",
+        turn_model="observed",
+    )
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+    assert _submission_rows(db_path) == [
+        ("first-owner", "linked", matching_turn_id)
     ]
 
 
