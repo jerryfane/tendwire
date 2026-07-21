@@ -32,6 +32,8 @@ from ..config import (
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
     DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
+    DEFAULT_TURN_MODEL,
+    TURN_MODELS,
 )
 from ..local_state import (
     EntryIdentity,
@@ -161,7 +163,9 @@ _COMMAND_REQUEST_STATES = frozenset(
 _COMMAND_REQUEST_ACTIVE_STATES = frozenset({"reserved", "send_started"})
 _COMMAND_REQUEST_TERMINAL_STATES = frozenset({"accepted", "rejected", "uncertain"})
 TURN_SUBMISSION_STATE_TRANSITIONS = {
-    "send_started": frozenset({"submitted", "uncertain", "expired", "cancelled"}),
+    "send_started": frozenset(
+        {"submitted", "uncertain", "linked", "ambiguous", "expired", "cancelled"}
+    ),
     "submitted": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
     "uncertain": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
     "linked": frozenset(),
@@ -17230,6 +17234,230 @@ def _expire_turn_submissions_conn(
     return int(updated.rowcount or 0)
 
 
+def _submission_link_candidate_turns_conn(
+    conn: sqlite3.Connection,
+    *,
+    host_id: str,
+    owner_key: str,
+    instruction_fingerprint_value: str,
+) -> list[tuple[str, int, datetime]]:
+    """Return unlinked, source-identity observations for one match component."""
+    rows = conn.execute(
+        """
+        SELECT turns.turn_id, turns.worker_id, turns.payload_json,
+               revisions.user_text, MIN(history.created_at)
+        FROM turns
+        JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        JOIN turn_content_revisions AS history
+          ON history.host_id = turns.host_id
+         AND history.turn_id = turns.turn_id
+        WHERE turns.host_id = ?
+          AND COALESCE(json_extract(turns.payload_json, '$.source_turn_id'), '') != ''
+          AND COALESCE(json_extract(turns.payload_json, '$.superseded_at'), '') = ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM turn_submissions AS linked
+              WHERE linked.host_id = turns.host_id
+                AND linked.linked_turn_id = turns.turn_id
+          )
+        GROUP BY turns.host_id, turns.turn_id, turns.worker_id,
+                 turns.payload_json, revisions.user_text
+        ORDER BY turns.turn_id
+        """,
+        (str(host_id),),
+    ).fetchall()
+    candidates: list[tuple[str, int, datetime]] = []
+    for turn_id, worker_id, payload_json, user_text, first_observed_at in rows:
+        payload = _json_object(payload_json)
+        if not _turn_uses_current_canonical_identity(str(turn_id), payload):
+            continue
+        try:
+            candidate_owner, owner_version = _turn_submission_owner_identity(
+                {"id": str(worker_id), "meta": payload.get("meta")}
+            )
+        except StoreSchemaError:
+            continue
+        if owner_version != 1 or candidate_owner != str(owner_key):
+            continue
+        if user_text is None:
+            continue
+        if instruction_fingerprint(user_text) != instruction_fingerprint_value:
+            continue
+        canonical_observed_at = _strict_utc_timestamp(first_observed_at)
+        if canonical_observed_at is None:
+            continue
+        candidates.append(
+            (
+                str(turn_id),
+                int(owner_version),
+                datetime.fromisoformat(canonical_observed_at),
+            )
+        )
+    return candidates
+
+
+def settle_submission_links_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    owner_key: str,
+    instruction_fingerprint_value: str,
+    *,
+    now: str | None = None,
+) -> int:
+    """Fail closed while settling all temporal 1:1 components for one key.
+
+    The caller owns the surrounding ``BEGIN IMMEDIATE`` transaction. Candidate
+    edges exist only when an observation falls inside a submission's symmetric
+    link window. Disconnected windows settle independently; any connected
+    component larger than 1x1 terminalizes its submissions as ambiguous.
+    """
+    current, current_dt = _pending_observed_time(now)
+    open_states = ("send_started", "submitted", "uncertain")
+    submissions = []
+    for row in conn.execute(
+        """
+        SELECT submission_id, owner_key_version, link_not_before, link_expires_at
+        FROM turn_submissions
+        WHERE host_id = ?
+          AND owner_key = ?
+          AND instruction_fingerprint = ?
+          AND linked_turn_id IS NULL
+          AND state IN (?, ?, ?)
+        ORDER BY submission_id
+        """,
+        (
+            str(host_id),
+            str(owner_key),
+            str(instruction_fingerprint_value),
+            *open_states,
+        ),
+    ).fetchall():
+        lower = _strict_utc_timestamp(row[2])
+        upper = _strict_utc_timestamp(row[3])
+        if lower is None or upper is None:
+            continue
+        submissions.append(
+            (
+                str(row[0]),
+                int(row[1]),
+                datetime.fromisoformat(lower),
+                datetime.fromisoformat(upper),
+            )
+        )
+    if not submissions:
+        return 0
+
+    turns = _submission_link_candidate_turns_conn(
+        conn,
+        host_id=str(host_id),
+        owner_key=str(owner_key),
+        instruction_fingerprint_value=str(instruction_fingerprint_value),
+    )
+    if not turns:
+        return 0
+
+    submission_edges: dict[str, set[str]] = {
+        submission_id: set()
+        for submission_id, _owner_version, _lower, _upper in submissions
+    }
+    turn_edges: dict[str, set[str]] = {
+        turn_id: set() for turn_id, _owner_version, _at in turns
+    }
+    submission_expires = {
+        submission_id: upper
+        for submission_id, _owner_version, _lower, upper in submissions
+    }
+    for submission_id, owner_version, lower, upper in submissions:
+        for turn_id, turn_owner_version, observed_at in turns:
+            if owner_version == turn_owner_version and lower <= observed_at <= upper:
+                submission_edges[submission_id].add(turn_id)
+                turn_edges[turn_id].add(submission_id)
+
+    changed = 0
+    visited_submissions: set[str] = set()
+    for initial_submission, _owner_version, _lower, _upper in submissions:
+        if (
+            initial_submission in visited_submissions
+            or not submission_edges[initial_submission]
+        ):
+            continue
+        component_submissions: set[str] = set()
+        component_turns: set[str] = set()
+        pending_submissions = [initial_submission]
+        pending_turns: list[str] = []
+        while pending_submissions or pending_turns:
+            while pending_submissions:
+                submission_id = pending_submissions.pop()
+                if submission_id in component_submissions:
+                    continue
+                component_submissions.add(submission_id)
+                pending_turns.extend(submission_edges[submission_id])
+            while pending_turns:
+                turn_id = pending_turns.pop()
+                if turn_id in component_turns:
+                    continue
+                component_turns.add(turn_id)
+                pending_submissions.extend(turn_edges[turn_id])
+        visited_submissions.update(component_submissions)
+
+        # A 1:1 decision is irreversible. Wait until every submission window in
+        # the connected component is closed so a later in-window observation
+        # cannot turn an apparent match into an ambiguity.
+        if any(
+            current_dt < submission_expires[submission_id]
+            for submission_id in component_submissions
+        ):
+            continue
+
+        if len(component_submissions) == len(component_turns) == 1:
+            submission_id = next(iter(component_submissions))
+            turn_id = next(iter(component_turns))
+            updated = conn.execute(
+                """
+                UPDATE turn_submissions
+                SET linked_turn_id = ?, state = 'linked', linked_at = ?,
+                    updated_at = ?
+                WHERE host_id = ? AND submission_id = ?
+                  AND linked_turn_id IS NULL
+                  AND state IN (?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    current,
+                    current,
+                    str(host_id),
+                    submission_id,
+                    *open_states,
+                ),
+            )
+            if int(updated.rowcount or 0) == 1:
+                changed += 1
+            continue
+
+        placeholders = ", ".join("?" for _ in component_submissions)
+        updated = conn.execute(
+            f"""
+            UPDATE turn_submissions
+            SET state = 'ambiguous', updated_at = ?
+            WHERE host_id = ?
+              AND submission_id IN ({placeholders})
+              AND linked_turn_id IS NULL
+              AND state IN (?, ?, ?)
+            """,
+            (
+                current,
+                str(host_id),
+                *sorted(component_submissions),
+                *open_states,
+            ),
+        )
+        changed += int(updated.rowcount or 0)
+    return changed
+
+
 def _turn_uses_current_canonical_identity(
     turn_id: str,
     payload: Mapping[str, Any],
@@ -20360,6 +20588,7 @@ def _merge_owned_turn_content_conn(
     incoming_final: str | None,
     observed_at: str,
     snapshot_content_fingerprint: str,
+    turn_model: str,
 ) -> int:
     incoming_source_turn = str(
         clean_content.get("source_turn_id") or ""
@@ -20427,8 +20656,6 @@ def _merge_owned_turn_content_conn(
             revision_repaired = False
         selected_turn_id = str(turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
-        if not changed:
-            return 0
         source_origin = str(
             persisted_item.get("origin_command_id") or ""
         ).strip()
@@ -20483,7 +20710,7 @@ def _merge_owned_turn_content_conn(
             )
 
         if incoming_source_turn:
-            if len(command_rows) == 1:
+            if len(command_rows) == 1 and turn_model == "legacy":
                 (
                     command_turn_id,
                     command_payload,
@@ -20704,6 +20931,18 @@ def _merge_owned_turn_content_conn(
             changed = True
 
     if selected_turn_id is not None:
+        if incoming_source_turn and turn_model != "legacy":
+            owner_key, owner_key_version = _turn_submission_owner_identity(
+                current_projection
+            )
+            if owner_key_version == 1:
+                settle_submission_links_conn(
+                    conn,
+                    str(host_id),
+                    owner_key,
+                    instruction_fingerprint(incoming_user),
+                    now=str(observed_at),
+                )
         current_revision = conn.execute(
             """
             SELECT content_revision
@@ -20749,6 +20988,7 @@ def _merge_turn_content_conn(
     content: Mapping[str, Any],
     *,
     observed_at: str,
+    turn_model: str,
 ) -> int:
     if not any(key in content for key in _TURN_CONTENT_FIELDS):
         return 0
@@ -20811,6 +21051,7 @@ def _merge_turn_content_conn(
             incoming_final=incoming_final,
             observed_at=observed_at,
             snapshot_content_fingerprint=current_snapshot_fingerprint,
+            turn_model=turn_model,
         )
 
     # The no-owner path is the frozen worker-scoped legacy algorithm.
@@ -20871,39 +21112,46 @@ def _merge_turn_content_conn(
     command_predecessor_turn_id: str | None = None
     if exact_source_rows:
         turn_id, payload, current, stored_observed_at = exact_source_rows[0]
-        if not _turn_observation_is_newer(observed_at, stored_observed_at):
-            return 0
-        payload.update(
-            _retain_authoritative_completion(
-                clean_content,
-                current,
+        observation_is_newer = _turn_observation_is_newer(
+            observed_at,
+            stored_observed_at,
+        )
+        if observation_is_newer:
+            payload.update(
+                _retain_authoritative_completion(
+                    clean_content,
+                    current,
+                    payload,
+                    incoming_final=incoming_final,
+                    observed_at=observed_at,
+                )
+            )
+            metadata_changed = _update_turn_row(
+                conn,
+                host_id,
+                turn_id,
                 payload,
+                observed_at,
+            )
+            revision_changed = _replace_current_turn_content_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
+                current=current,
+                incoming_user=incoming_user,
                 incoming_final=incoming_final,
+                current_time=observed_at,
+            )
+            revision_repaired = _ensure_absent_turn_content_revision_conn(
+                conn,
+                host_id=str(host_id),
+                turn_id=str(turn_id),
                 observed_at=observed_at,
             )
-        )
-        metadata_changed = _update_turn_row(
-            conn,
-            host_id,
-            turn_id,
-            payload,
-            observed_at,
-        )
-        revision_changed = _replace_current_turn_content_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(turn_id),
-            current=current,
-            incoming_user=incoming_user,
-            incoming_final=incoming_final,
-            current_time=observed_at,
-        )
-        revision_repaired = _ensure_absent_turn_content_revision_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(turn_id),
-            observed_at=observed_at,
-        )
+        else:
+            metadata_changed = False
+            revision_changed = False
+            revision_repaired = False
         selected_turn_id = str(turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
     elif incoming_source_turn:
@@ -21038,6 +21286,18 @@ def _merge_turn_content_conn(
         selected_turn_id = str(base_turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
     if selected_turn_id is not None:
+        if incoming_source_turn and turn_model != "legacy":
+            owner_key, owner_key_version = _turn_submission_owner_identity(
+                current_worker_payload
+            )
+            if owner_key_version == 1:
+                settle_submission_links_conn(
+                    conn,
+                    str(host_id),
+                    owner_key,
+                    instruction_fingerprint(incoming_user),
+                    now=str(observed_at),
+                )
         current_revision = conn.execute(
             """
             SELECT content_revision
@@ -21172,10 +21432,15 @@ def apply_turn_refresh(
     cancelled: Callable[[], bool] | None = None,
     observed_at: str | None = None,
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> TurnRefreshApplyResult:
     """Atomically apply one binding's turn observation and optional pending state."""
     if not _sqlite_store_exists(db_path):
         return TurnRefreshApplyResult(0, False)
+    normalized_turn_model = str(turn_model or "").strip().lower()
+    if normalized_turn_model not in TURN_MODELS:
+        allowed = ", ".join(sorted(TURN_MODELS))
+        raise ValueError(f"turn_model must be one of: {allowed}")
     current_time, _ = _pending_observed_time(observed_at)
     if (
         backend_pending is not _UNSET
@@ -21214,6 +21479,7 @@ def apply_turn_refresh(
                 str(worker_id),
                 content,
                 observed_at=current_time,
+                turn_model=normalized_turn_model,
             )
             if backend_pending_observation is not _UNSET:
                 if not isinstance(
@@ -21269,6 +21535,7 @@ def merge_turn_content(
     content: Mapping[str, Any],
     *,
     observed_at: str | None = None,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> int:
     """Compatibility wrapper for the transactional authoritative turn merge."""
     return apply_turn_refresh(
@@ -21277,6 +21544,7 @@ def merge_turn_content(
         worker_id,
         content,
         observed_at=observed_at,
+        turn_model=turn_model,
     ).updated
 
 
