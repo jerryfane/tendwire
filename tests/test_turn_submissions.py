@@ -10,12 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from tendwire.config import Config
+from tendwire.core import turns as core_turns
 from tendwire.core.commands import (
     instruction_fingerprint,
     normalize_instruction_text,
     turn_submission_id,
 )
-from tendwire.config import Config
 from tendwire.core.projector import project_from_raw
 from tendwire.core.turns import Turn
 from tendwire.store import sqlite as store_sqlite
@@ -1518,11 +1519,185 @@ def test_idle_observation_first_submission_links_from_lazy_turn_read(
         now=datetime.fromisoformat(
             "2026-02-01T12:00:01+00:00"
         ).timestamp(),
+        turn_model="observed",
     )
 
     assert payload["turns"]
     assert _submission_rows(db_path) == [
         ("idle-observation-first", "linked", observed_turn_id)
+    ]
+
+
+def test_legacy_reads_and_maintenance_skip_submission_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "legacy-no-link-settlement.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="legacy-no-link-settlement",
+        owner_key=owner_key,
+    )
+    settle_calls = 0
+    candidate_calls = 0
+
+    def record_settle(*_args: object, **_kwargs: object) -> int:
+        nonlocal settle_calls
+        settle_calls += 1
+        return 0
+
+    def record_candidates(*_args: object, **_kwargs: object) -> list[object]:
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return []
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "settle_submission_links_conn",
+        record_settle,
+    )
+    monkeypatch.setattr(
+        store_sqlite,
+        "_submission_link_candidate_turns_conn",
+        record_candidates,
+    )
+
+    current = datetime.fromisoformat("2026-02-01T12:00:01+00:00").timestamp()
+    store_sqlite.turns_payload_from_store(
+        db_path,
+        "host-a",
+        now=current,
+        turn_model="legacy",
+    )
+    store_sqlite.turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=current,
+        turn_model="legacy",
+    )
+    store_sqlite.maybe_run_automatic_store_maintenance(
+        db_path,
+        policy=store_sqlite.SnapshotRetentionPolicy(
+            retention_days=14,
+            retention_count=4096,
+            batch_size=100,
+        ),
+        turn_model="legacy",
+        now="2026-02-01T12:00:01+00:00",
+    )
+
+    assert settle_calls == 0
+    assert candidate_calls == 0
+
+
+def test_observed_prod_shape_sweep_never_runs_public_sanitizers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "prod-shape-no-public-sanitize.db"
+    owner_key = _seed_link_worker(db_path)
+    _set_link_worker_prod_shape(db_path)
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="prod-shape-no-public-sanitize-source",
+        turn_model="observed",
+    )
+    _insert_link_submission(
+        db_path,
+        request_id="prod-shape-no-public-sanitize",
+        owner_key=owner_key,
+    )
+    contains_calls = 0
+    sanitize_calls = 0
+    original_contains = core_turns._contains_forbidden_public_text
+    original_sanitize = core_turns.sanitize_public_text
+
+    def record_contains(value: str) -> bool:
+        nonlocal contains_calls
+        contains_calls += 1
+        return original_contains(value)
+
+    def record_sanitize(value: object, **kwargs: object) -> str:
+        nonlocal sanitize_calls
+        sanitize_calls += 1
+        return original_sanitize(value, **kwargs)
+
+    monkeypatch.setattr(
+        core_turns,
+        "_contains_forbidden_public_text",
+        record_contains,
+    )
+    monkeypatch.setattr(core_turns, "sanitize_public_text", record_sanitize)
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+
+    assert contains_calls == 0
+    assert sanitize_calls == 0
+    assert _submission_rows(db_path) == [
+        ("prod-shape-no-public-sanitize", "linked", observed_turn_id)
+    ]
+
+
+def test_submission_link_sweep_backs_off_until_matching_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "submission-link-backoff.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="submission-link-backoff",
+        owner_key=owner_key,
+    )
+    candidate_calls = 0
+    original_candidates = store_sqlite._submission_link_candidate_turns_conn
+
+    def record_candidates(*args: object, **kwargs: object):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_submission_link_candidate_turns_conn",
+        record_candidates,
+    )
+
+    for _ in range(2):
+        store_sqlite.sweep_submission_links(
+            db_path,
+            host_id="host-a",
+            now="2026-02-01T11:59:30+00:00",
+        )
+    assert candidate_calls == 1
+
+    # Production observations can persist the authenticated stable owner key
+    # without its version marker. That shape cannot use the observation-time
+    # direct settlement path, so this specifically proves that the observation
+    # re-arms the component for the next sweep.
+    _set_link_worker_prod_shape(db_path)
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="submission-link-backoff-source",
+        observed_at="2026-02-01T12:00:00+00:00",
+        turn_model="observed",
+    )
+    assert candidate_calls == 1
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:01+00:00",
+    )
+
+    assert candidate_calls == 2
+    assert _submission_rows(db_path) == [
+        ("submission-link-backoff", "linked", observed_turn_id)
     ]
 
 

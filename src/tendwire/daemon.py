@@ -708,6 +708,7 @@ class TendwireDaemon:
             result = maybe_run_automatic_store_maintenance(
                 Path(self.config.db_path),
                 policy=policy,
+                turn_model=self.config.turn_model,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
@@ -1088,6 +1089,7 @@ class TendwireDaemon:
             since=since,
             turn_refresh_interval_seconds=self.config.turn_refresh_interval_seconds,
             claim_hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
+            turn_model=self.config.turn_model,
         )
 
     def get_turn_content(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1139,6 +1141,7 @@ class TendwireDaemon:
             watermark=watermark,
             cursor=cursor,
             limit=limit,
+            turn_model=self.config.turn_model,
         )
 
     def connector_call(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:

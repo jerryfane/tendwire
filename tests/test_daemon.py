@@ -947,6 +947,7 @@ def test_daemon_turn_list_is_store_projection_only(
             "since": None,
             "turn_refresh_interval_seconds": 2.0,
             "claim_hard_ttl_seconds": 86400,
+            "turn_model": config.turn_model,
         }
         for call in projection_calls
     )
@@ -2235,6 +2236,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         path: Path,
         *,
         policy: Any,
+        turn_model: str = "legacy",
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
         command_retry_horizon_seconds: int = 604_800,
@@ -2244,6 +2246,7 @@ def test_cli_snapshot_barrier_checks_maintenance_once_and_reads_do_not(
         now: str | None = None,
     ) -> dict[str, Any]:
         assert now is None
+        assert turn_model == config.turn_model
         calls.append(
             (
                 path,

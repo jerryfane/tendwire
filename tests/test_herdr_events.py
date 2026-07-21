@@ -2248,6 +2248,7 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         db_path: Path,
         *,
         policy: SnapshotRetentionPolicy,
+        turn_model: str = "legacy",
         acknowledged_final_retention_days: int = 30,
         acknowledged_final_retention_count: int = 4096,
         command_retry_horizon_seconds: int = 604_800,
@@ -2260,6 +2261,7 @@ def test_same_fingerprint_observations_refresh_attention_and_run_bounded_cadence
         result = maybe_run_automatic_store_maintenance(
             db_path,
             policy=policy,
+            turn_model=turn_model,
             cadence_seconds=cadence_seconds,
             acknowledged_final_retention_days=acknowledged_final_retention_days,
             acknowledged_final_retention_count=acknowledged_final_retention_count,

@@ -190,6 +190,117 @@ _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _LOGGER = logging.getLogger(__name__)
 _TURN_CLAIM_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
 _TURN_CLAIM_SWEEP_LOCK = threading.Lock()
+_SUBMISSION_LINK_BACKOFF: dict[
+    tuple[str, str, str, str], datetime | None
+] = {}
+_SUBMISSION_LINK_BACKOFF_LOCK = threading.Lock()
+_SUBMISSION_LINK_BACKOFF_MISSING = object()
+
+
+def _submission_linking_enabled(turn_model: str) -> bool:
+    normalized = str(turn_model or "").strip().lower()
+    if normalized not in TURN_MODELS:
+        allowed = ", ".join(sorted(TURN_MODELS))
+        raise ValueError(f"turn_model must be one of: {allowed}")
+    return normalized != "legacy"
+
+
+def _submission_link_backoff_key(
+    db_path: Path | str,
+    host_id: str,
+    owner_key: str,
+    instruction_fingerprint_value: str,
+) -> tuple[str, str, str, str]:
+    return (
+        str(Path(db_path).absolute()),
+        str(host_id),
+        str(owner_key),
+        str(instruction_fingerprint_value),
+    )
+
+
+def _submission_link_component_is_due(
+    key: tuple[str, str, str, str],
+    current: datetime,
+) -> bool:
+    with _SUBMISSION_LINK_BACKOFF_LOCK:
+        next_eligible = _SUBMISSION_LINK_BACKOFF.get(
+            key,
+            _SUBMISSION_LINK_BACKOFF_MISSING,
+        )
+        if next_eligible is _SUBMISSION_LINK_BACKOFF_MISSING:
+            return True
+        if next_eligible is None or current < next_eligible:
+            return False
+        _SUBMISSION_LINK_BACKOFF.pop(key, None)
+        return True
+
+
+def _backoff_submission_link_component(
+    key: tuple[str, str, str, str],
+    next_eligible_at: datetime | None,
+) -> None:
+    with _SUBMISSION_LINK_BACKOFF_LOCK:
+        _SUBMISSION_LINK_BACKOFF[key] = next_eligible_at
+
+
+def _rearm_submission_link_component(
+    db_path: Path | str,
+    host_id: str,
+    owner_key: str,
+    instruction_fingerprint_value: str,
+) -> None:
+    key = _submission_link_backoff_key(
+        db_path,
+        host_id,
+        owner_key,
+        instruction_fingerprint_value,
+    )
+    with _SUBMISSION_LINK_BACKOFF_LOCK:
+        _SUBMISSION_LINK_BACKOFF.pop(key, None)
+
+
+def _rearm_submission_link_component_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    owner_key: str,
+    instruction_fingerprint_value: str,
+) -> None:
+    database_row = next(
+        (
+            row
+            for row in conn.execute("PRAGMA database_list").fetchall()
+            if str(row[1]) == "main"
+        ),
+        None,
+    )
+    if database_row is None or not str(database_row[2] or ""):
+        return
+    _rearm_submission_link_component(
+        str(database_row[2]),
+        host_id,
+        owner_key,
+        instruction_fingerprint_value,
+    )
+
+
+def _prune_submission_link_backoff(
+    db_path: Path | str,
+    host_id: str | None,
+    active_keys: set[tuple[str, str, str, str]],
+) -> None:
+    path = str(Path(db_path).absolute())
+    host = None if host_id is None else str(host_id)
+    with _SUBMISSION_LINK_BACKOFF_LOCK:
+        stale = [
+            key
+            for key in _SUBMISSION_LINK_BACKOFF
+            if key[0] == path
+            and (host is None or key[1] == host)
+            and key not in active_keys
+        ]
+        for key in stale:
+            _SUBMISSION_LINK_BACKOFF.pop(key, None)
 
 
 class StoreSchemaError(RuntimeError):
@@ -378,6 +489,7 @@ class _TurnContentMergeResult:
 
     updated: int
     submission_link: tuple[str, str] | None = None
+    submission_link_rearm: tuple[str, str] | None = None
 
 
 _UNSET = object()
@@ -15410,6 +15522,7 @@ def maybe_run_automatic_store_maintenance(
     db_path: Path,
     *,
     policy: SnapshotRetentionPolicy,
+    turn_model: str = DEFAULT_TURN_MODEL,
     acknowledged_final_retention_days: int = ACKNOWLEDGED_FINAL_RETENTION_DAYS,
     acknowledged_final_retention_count: int = ACKNOWLEDGED_FINAL_RETENTION_COUNT,
     command_retry_horizon_seconds: int = COMMAND_RETRY_HORIZON_SECONDS,
@@ -15532,10 +15645,12 @@ def maybe_run_automatic_store_maintenance(
                     "command_requests": empty_command_requests,
                     "batch_size": policy.batch_size,
                 }))
-            _settle_due_submission_links_conn(
-                conn,
-                now=current_at,
-            )
+            if _submission_linking_enabled(turn_model):
+                _settle_due_submission_links_conn(
+                    conn,
+                    db_path=db_path,
+                    now=current_at,
+                )
             _expire_turn_submissions_conn(
                 conn,
                 current=current_at,
@@ -17477,6 +17592,7 @@ def _insert_turn_submission_conn(
     hard_expires_at = (current_time + timedelta(seconds=hard_ttl)).isoformat(
         timespec="seconds"
     )
+    fingerprint = instruction_fingerprint(instruction_text)
     conn.execute(
         """
         INSERT INTO turn_submissions (
@@ -17497,13 +17613,19 @@ def _insert_turn_submission_conn(
             str(request_id),
             owner_key,
             owner_key_version,
-            instruction_fingerprint(instruction_text),
+            fingerprint,
             link_not_before,
             link_expires_at,
             hard_expires_at,
             current,
             current,
         ),
+    )
+    _rearm_submission_link_component_conn(
+        conn,
+        str(host_id),
+        owner_key,
+        fingerprint,
     )
     return submission_id
 
@@ -17613,8 +17735,13 @@ def _submission_link_candidate_turns_conn(
     """Return unlinked, source-identity observations for one match component."""
     rows = conn.execute(
         """
-        SELECT turns.turn_id, turns.worker_id, turns.payload_json,
-               revisions.user_text, MIN(history.created_at)
+        SELECT turns.turn_id,
+               turns.worker_id,
+               json_extract(turns.payload_json, '$.meta.stable_key'),
+               json_extract(turns.payload_json, '$.meta.stable_key_version'),
+               json_extract(turns.payload_json, '$.source_turn_id'),
+               revisions.user_text,
+               MIN(history.created_at)
         FROM turns
         JOIN turn_content_revisions AS revisions
           ON revisions.host_id = turns.host_id
@@ -17624,6 +17751,9 @@ def _submission_link_candidate_turns_conn(
           ON history.host_id = turns.host_id
          AND history.turn_id = turns.turn_id
         WHERE turns.host_id = ?
+          AND json_valid(turns.payload_json)
+          AND json_type(turns.payload_json, '$.id') = 'text'
+          AND json_extract(turns.payload_json, '$.id') = turns.turn_id
           AND COALESCE(json_extract(turns.payload_json, '$.source_turn_id'), '') != ''
           AND COALESCE(json_extract(turns.payload_json, '$.superseded_at'), '') = ''
           AND NOT EXISTS (
@@ -17633,19 +17763,35 @@ def _submission_link_candidate_turns_conn(
                 AND linked.linked_turn_id = turns.turn_id
           )
         GROUP BY turns.host_id, turns.turn_id, turns.worker_id,
-                 turns.payload_json, revisions.user_text
+                 json_extract(turns.payload_json, '$.meta.stable_key'),
+                 json_extract(turns.payload_json, '$.meta.stable_key_version'),
+                 json_extract(turns.payload_json, '$.source_turn_id'),
+                 revisions.user_text
         ORDER BY turns.turn_id
         """,
         (str(host_id),),
     ).fetchall()
     candidates: list[tuple[str, int, datetime]] = []
-    for turn_id, worker_id, payload_json, user_text, first_observed_at in rows:
-        payload = _json_object(payload_json)
-        if not _turn_uses_current_canonical_identity(str(turn_id), payload):
+    for (
+        turn_id,
+        worker_id,
+        stable_key,
+        stable_key_version,
+        source_turn_id,
+        user_text,
+        first_observed_at,
+    ) in rows:
+        if not isinstance(source_turn_id, str) or not source_turn_id.strip():
             continue
         try:
             candidate_owner, owner_version = _turn_link_candidate_owner_identity(
-                {"id": str(worker_id), "meta": payload.get("meta")}
+                {
+                    "id": str(worker_id),
+                    "meta": {
+                        "stable_key": stable_key,
+                        "stable_key_version": stable_key_version,
+                    },
+                }
             )
         except StoreSchemaError:
             continue
@@ -17675,6 +17821,7 @@ def settle_submission_links_conn(
     instruction_fingerprint_value: str,
     *,
     now: str | None = None,
+    _next_eligible_out: list[datetime | None] | None = None,
 ) -> int:
     """Fail closed while settling all temporal 1:1 components for one key.
 
@@ -17717,6 +17864,8 @@ def settle_submission_links_conn(
             )
         )
     if not submissions:
+        if _next_eligible_out is not None:
+            _next_eligible_out.append(None)
         return 0
 
     turns = _submission_link_candidate_turns_conn(
@@ -17726,6 +17875,8 @@ def settle_submission_links_conn(
         instruction_fingerprint_value=str(instruction_fingerprint_value),
     )
     if not turns:
+        if _next_eligible_out is not None:
+            _next_eligible_out.append(None)
         return 0
 
     submission_edges: dict[str, set[str]] = {
@@ -17746,6 +17897,7 @@ def settle_submission_links_conn(
                 turn_edges[turn_id].add(submission_id)
 
     changed = 0
+    waiting_boundaries: list[datetime] = []
     visited_submissions: set[str] = set()
     for initial_submission, _owner_version, _lower, _upper in submissions:
         if (
@@ -17775,10 +17927,12 @@ def settle_submission_links_conn(
         # A 1:1 decision is irreversible. Wait until every submission window in
         # the connected component is closed so a later in-window observation
         # cannot turn an apparent match into an ambiguity.
-        if any(
-            current_dt < submission_expires[submission_id]
+        component_boundary = max(
+            submission_expires[submission_id]
             for submission_id in component_submissions
-        ):
+        )
+        if current_dt < component_boundary:
+            waiting_boundaries.append(component_boundary)
             continue
 
         if len(component_submissions) == len(component_turns) == 1:
@@ -17824,17 +17978,22 @@ def settle_submission_links_conn(
             ),
         )
         changed += int(updated.rowcount or 0)
+    if _next_eligible_out is not None:
+        _next_eligible_out.append(
+            min(waiting_boundaries) if waiting_boundaries else None
+        )
     return changed
 
 
 def _settle_due_submission_links_conn(
     conn: sqlite3.Connection,
     *,
+    db_path: Path | str,
     host_id: str | None = None,
     now: str | None = None,
 ) -> int:
     """Settle every due open owner/fingerprint component in one transaction."""
-    current, _current_dt = _pending_observed_time(now)
+    current, current_dt = _pending_observed_time(now)
     scope_sql = "" if host_id is None else "AND host_id = :host_id"
     rows = conn.execute(
         f"""
@@ -17848,15 +18007,45 @@ def _settle_due_submission_links_conn(
         """,
         {"current": current, "host_id": host_id},
     ).fetchall()
+    active_keys = {
+        _submission_link_backoff_key(
+            db_path,
+            str(candidate_host),
+            str(owner_key),
+            str(fingerprint),
+        )
+        for candidate_host, owner_key, fingerprint in rows
+    }
+    _prune_submission_link_backoff(db_path, host_id, active_keys)
     changed = 0
     for candidate_host, owner_key, fingerprint in rows:
-        changed += settle_submission_links_conn(
+        key = _submission_link_backoff_key(
+            db_path,
+            str(candidate_host),
+            str(owner_key),
+            str(fingerprint),
+        )
+        if not _submission_link_component_is_due(key, current_dt):
+            continue
+        next_eligible: list[datetime | None] = []
+        component_changed = settle_submission_links_conn(
             conn,
             str(candidate_host),
             str(owner_key),
             str(fingerprint),
             now=current,
+            _next_eligible_out=next_eligible,
         )
+        changed += component_changed
+        if component_changed:
+            _rearm_submission_link_component(
+                db_path,
+                str(candidate_host),
+                str(owner_key),
+                str(fingerprint),
+            )
+        elif next_eligible:
+            _backoff_submission_link_component(key, next_eligible[0])
     return changed
 
 
@@ -21369,6 +21558,14 @@ def _merge_observed_turn_content_conn(
         if owner_key_version == 1
         else None
     )
+    candidate_owner_key, candidate_owner_key_version = (
+        _turn_link_candidate_owner_identity(current_worker_payload)
+    )
+    submission_link_rearm = (
+        (candidate_owner_key, instruction_fingerprint(incoming_user))
+        if candidate_owner_key_version == 1
+        else None
+    )
     current_revision = conn.execute(
         """
         SELECT content_revision
@@ -21385,7 +21582,11 @@ def _merge_observed_turn_content_conn(
             content_revision_value=str(current_revision[0]),
             now=str(observed_at),
         )
-    return _TurnContentMergeResult(int(changed), submission_link)
+    return _TurnContentMergeResult(
+        int(changed),
+        submission_link,
+        submission_link_rearm,
+    )
 
 
 def _merge_owned_turn_content_conn(
@@ -22327,6 +22528,18 @@ def apply_turn_refresh(
                 turn_model=normalized_turn_model,
             )
             updated = merge_result.updated
+            rearm_key = (
+                merge_result.submission_link_rearm
+                or merge_result.submission_link
+            )
+            if rearm_key is not None:
+                owner_key, fingerprint = rearm_key
+                _rearm_submission_link_component(
+                    db_path,
+                    str(host_id),
+                    owner_key,
+                    fingerprint,
+                )
             if merge_result.submission_link is not None:
                 owner_key, fingerprint = merge_result.submission_link
                 conn.execute("SAVEPOINT settle_submission_links")
@@ -23117,6 +23330,7 @@ def _turn_delta_payload_from_store(
     batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
     bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
     bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Return one atomic, frozen, byte-bounded public turn-delta page."""
     started = time.perf_counter()
@@ -23163,27 +23377,28 @@ def _turn_delta_payload_from_store(
             ),
         }
 
-    sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
-        db_path,
-        host,
-        purpose="submission_links",
-        current_clock=clock,
-        refresh_interval_seconds=DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
-    )
-    if sweep_due:
-        try:
-            sweep_submission_links(
-                Path(db_path),
-                host_id=host,
-                now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
-            )
-        except Exception:
-            _release_failed_lazy_turn_claim_sweep(
-                sweep_key,
-                current_clock=clock,
-            )
-            # Delta remains available if opportunistic linkage is contended.
-            pass
+    if _submission_linking_enabled(turn_model):
+        sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
+            db_path,
+            host,
+            purpose="submission_links",
+            current_clock=clock,
+            refresh_interval_seconds=DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
+        )
+        if sweep_due:
+            try:
+                sweep_submission_links(
+                    Path(db_path),
+                    host_id=host,
+                    now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
+                )
+            except Exception:
+                _release_failed_lazy_turn_claim_sweep(
+                    sweep_key,
+                    current_clock=clock,
+                )
+                # Delta remains available if opportunistic linkage is contended.
+                pass
 
     with _connect(db_path, isolation_level=None) as conn:
         _ensure_schema(conn)
@@ -23459,6 +23674,7 @@ def turn_delta_payload_from_store(
     batch_sequence_ceiling: int = TURN_DELTA_MAX_BATCH_SEQUENCES,
     bootstrap_max_rows: int = TURN_DELTA_BOOTSTRAP_MAX_ROWS,
     bootstrap_max_pages: int = TURN_DELTA_BOOTSTRAP_MAX_PAGES,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Fail closed to the documented public outcome for unavailable stores."""
     try:
@@ -23473,6 +23689,7 @@ def turn_delta_payload_from_store(
             batch_sequence_ceiling=batch_sequence_ceiling,
             bootstrap_max_rows=bootstrap_max_rows,
             bootstrap_max_pages=bootstrap_max_pages,
+            turn_model=turn_model,
         )
     except (sqlite3.Error, StoreSchemaError, LocalStateError, OSError):
         return {
@@ -23497,6 +23714,7 @@ def turns_payload_from_store(
     work_counters: TurnContentWorkCounters | None = None,
     turn_refresh_interval_seconds: float = 2.0,
     claim_hard_ttl_seconds: float = TURN_CLAIM_HARD_TTL_SECONDS,
+    turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Return one insertion-stable, byte-bounded turn-list page."""
     requested_schema = int(schema_version)
@@ -23529,30 +23747,31 @@ def turns_payload_from_store(
         }
     current_clock = time.time() if now is None else float(now)
     refresh_interval = float(turn_refresh_interval_seconds)
-    submission_sweep_key, submission_sweep_due = _reserve_lazy_turn_claim_sweep(
-        db_path,
-        str(host_id),
-        purpose="submission_links",
-        current_clock=current_clock,
-        refresh_interval_seconds=refresh_interval,
-    )
-    if submission_sweep_due:
-        try:
-            sweep_submission_links(
-                Path(db_path),
-                host_id=str(host_id),
-                now=datetime.fromtimestamp(
-                    current_clock,
-                    tz=timezone.utc,
-                ).isoformat(),
-            )
-        except Exception:
-            _release_failed_lazy_turn_claim_sweep(
-                submission_sweep_key,
-                current_clock=current_clock,
-            )
-            # Listing remains available if opportunistic maintenance is contended.
-            pass
+    if _submission_linking_enabled(turn_model):
+        submission_sweep_key, submission_sweep_due = _reserve_lazy_turn_claim_sweep(
+            db_path,
+            str(host_id),
+            purpose="submission_links",
+            current_clock=current_clock,
+            refresh_interval_seconds=refresh_interval,
+        )
+        if submission_sweep_due:
+            try:
+                sweep_submission_links(
+                    Path(db_path),
+                    host_id=str(host_id),
+                    now=datetime.fromtimestamp(
+                        current_clock,
+                        tz=timezone.utc,
+                    ).isoformat(),
+                )
+            except Exception:
+                _release_failed_lazy_turn_claim_sweep(
+                    submission_sweep_key,
+                    current_clock=current_clock,
+                )
+                # Listing remains available if opportunistic maintenance is contended.
+                pass
     claim_sweep_key, claim_sweep_due = _reserve_lazy_turn_claim_sweep(
         db_path,
         str(host_id),
@@ -25884,6 +26103,7 @@ def sweep_submission_links(
         try:
             changed = _settle_due_submission_links_conn(
                 conn,
+                db_path=db_path,
                 host_id=None if host_id is None else str(host_id),
                 now=current,
             )

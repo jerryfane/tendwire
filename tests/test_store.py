@@ -7333,12 +7333,18 @@ def test_submission_link_and_turn_claim_sweeps_have_independent_cadence(
     monkeypatch.setattr(store_sqlite, "sweep_turn_claims", capture_claim)
 
     for current in (1_000.0, 1_001.0, 1_002.0):
-        turn_delta_payload_from_store(db_path, host_id, now=current)
+        turn_delta_payload_from_store(
+            db_path,
+            host_id,
+            now=current,
+            turn_model="observed",
+        )
         turns_payload_from_store(
             db_path,
             host_id,
             now=current,
             turn_refresh_interval_seconds=2.0,
+            turn_model="observed",
         )
 
     expected = [

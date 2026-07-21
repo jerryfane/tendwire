@@ -509,6 +509,7 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
                 "since": None,
                 "turn_refresh_interval_seconds": 2.0,
                 "claim_hard_ttl_seconds": 86400,
+                "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "legacy"),
             },
         )
     ]
@@ -586,6 +587,7 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
             "since": position_value if position_flag == "--since" else None,
             "turn_refresh_interval_seconds": 2.0,
             "claim_hard_ttl_seconds": 86400,
+            "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "legacy"),
         }
     ]
 

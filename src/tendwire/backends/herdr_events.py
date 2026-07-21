@@ -728,6 +728,7 @@ class HerdrEventBackend:
             result = maybe_run_automatic_store_maintenance(
                 self.db_path,
                 policy=policy,
+                turn_model=self.config.turn_model,
                 acknowledged_final_retention_days=(
                     self.config.acknowledged_final_retention_days
                 ),
