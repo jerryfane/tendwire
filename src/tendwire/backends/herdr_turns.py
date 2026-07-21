@@ -3968,6 +3968,7 @@ def _refresh_turn_binding(
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
                 pending_stale_grace_seconds=grace_seconds,
+                turn_model=config.turn_model,
             )
         except Exception:
             return TurnRefreshResult(status, 0)
@@ -4024,6 +4025,7 @@ def _refresh_turn_binding(
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
                 pending_stale_grace_seconds=grace_seconds,
+                turn_model=config.turn_model,
             )
         elif content is not None:
             applied = apply_turn_refresh(
@@ -4035,6 +4037,7 @@ def _refresh_turn_binding(
                 deadline_monotonic=apply_deadline_monotonic,
                 cancelled=cancel_event.is_set if cancel_event is not None else None,
                 observed_at=current_time,
+                turn_model=config.turn_model,
             )
         else:
             return TurnRefreshResult("missing", 0)
