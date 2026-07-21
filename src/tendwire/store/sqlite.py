@@ -135,7 +135,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 19
+STORE_SCHEMA_VERSION = 20
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
 TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
@@ -145,6 +145,7 @@ TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 SUBMISSION_LINK_WINDOW_SECONDS = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
 SUBMISSION_HARD_TTL_SECONDS = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
+TURN_LEDGER_BACKFILL_BATCH_SIZE = 500
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
 COMMAND_RETRY_HORIZON_SECONDS = 604_800
@@ -12297,6 +12298,281 @@ def _migrate_v18_to_v19_conn(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _backfill_submission_state(receipt_state: Any, receipt_status: Any) -> str | None:
+    """Map a historical send receipt to the shadow-ledger state it earned."""
+    state = str(receipt_state or "").strip().lower()
+    status = str(receipt_status or "").strip().lower()
+    if state == "purged" or status == "purged":
+        return None
+    if state in {"rejected", "cancelled", "canceled"} or status in {
+        "rejected",
+        "cancelled",
+        "canceled",
+    }:
+        return "cancelled"
+    if state == "send_started":
+        return "send_started"
+    if state == "accepted":
+        return "submitted"
+    if state == "uncertain":
+        return "uncertain"
+    # A reservation has not crossed the send boundary, so Stage 2 would not
+    # have created a submission row for it. Unknown legacy states fail closed.
+    return None
+
+
+def _receipt_instruction_text(canonical_request_json: Any) -> str | None:
+    """Recover only a validated canonical send-instruction payload."""
+    try:
+        payload = json.loads(str(canonical_request_json))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("action") != "send_instruction":
+        return None
+    instruction = payload.get("instruction")
+    if not isinstance(instruction, Mapping):
+        return None
+    text = instruction.get("text")
+    if not isinstance(text, str) or validate_instruction_text(text) is not None:
+        return None
+    return text
+
+
+def _backfill_turn_submissions_conn(conn: sqlite3.Connection) -> None:
+    """Backfill historical send receipts without changing live dual-write rows."""
+    required_columns = {
+        "id",
+        "host_id",
+        "request_id",
+        "action",
+        "canonical_request_json",
+        "public_worker_id",
+        "state",
+        "status",
+        "created_at",
+        "reserved_at",
+        "send_started_at",
+        "terminal_at",
+        "updated_at",
+    }
+    if not required_columns <= _table_columns(conn, "command_receipts"):
+        return
+    hosts = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT host_id
+            FROM command_receipts
+            WHERE action = 'send_instruction' AND TRIM(host_id) <> ''
+            ORDER BY host_id
+            """
+        ).fetchall()
+    ]
+    for host_id in hosts:
+        after_id = 0
+        while True:
+            rows = conn.execute(
+                """
+                SELECT id, request_id, canonical_request_json,
+                       public_worker_id, state, status, created_at,
+                       reserved_at, send_started_at, terminal_at, updated_at
+                FROM command_receipts
+                WHERE host_id = ? AND action = 'send_instruction' AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (host_id, after_id, TURN_LEDGER_BACKFILL_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                break
+            after_id = int(rows[-1][0])
+            for row in rows:
+                request_id = str(row[1] or "").strip()
+                public_worker_id = str(row[3] or "").strip()
+                ledger_state = _backfill_submission_state(row[4], row[5])
+                instruction_text = _receipt_instruction_text(row[2])
+                if (
+                    not request_id
+                    or not public_worker_id
+                    or ledger_state is None
+                    or instruction_text is None
+                ):
+                    continue
+
+                anchor = _strict_utc_timestamp(row[8] or row[7] or row[6])
+                updated_at = _strict_utc_timestamp(row[10])
+                if anchor is None or updated_at is None:
+                    continue
+                anchor_time = datetime.fromisoformat(anchor)
+                link_not_before = (
+                    anchor_time
+                    - timedelta(seconds=SUBMISSION_LINK_WINDOW_SECONDS)
+                ).isoformat(timespec="seconds")
+                link_expires_at = (
+                    anchor_time
+                    + timedelta(seconds=SUBMISSION_LINK_WINDOW_SECONDS)
+                ).isoformat(timespec="seconds")
+                hard_expires_at = (
+                    anchor_time
+                    + timedelta(seconds=SUBMISSION_HARD_TTL_SECONDS)
+                ).isoformat(timespec="seconds")
+                terminal_at = (
+                    _strict_utc_timestamp(row[9])
+                    if ledger_state in {"submitted", "uncertain", "cancelled"}
+                    else None
+                )
+                if (
+                    ledger_state in {"submitted", "uncertain", "cancelled"}
+                    and terminal_at is None
+                ):
+                    continue
+                send_started_at = (
+                    _strict_utc_timestamp(row[8]) if row[8] is not None else None
+                )
+                conn.execute(
+                    """
+                    INSERT INTO turn_submissions (
+                        host_id, submission_id, request_id, owner_key,
+                        owner_key_version, instruction_fingerprint, state,
+                        linked_turn_id, link_not_before, link_expires_at,
+                        hard_expires_at, linked_at, terminal_at, submitted_at,
+                        send_started_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?
+                    )
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        host_id,
+                        turn_submission_id(host_id, request_id),
+                        request_id,
+                        f"legacy-worker:{public_worker_id}",
+                        instruction_fingerprint(instruction_text),
+                        ledger_state,
+                        link_not_before,
+                        link_expires_at,
+                        hard_expires_at,
+                        terminal_at,
+                        terminal_at if ledger_state == "submitted" else None,
+                        send_started_at,
+                        updated_at,
+                    ),
+                )
+
+
+def _linked_canonical_turn_id_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    replacement_turn_id: Any,
+) -> str | None:
+    """Follow only explicit tombstone links to a source-observed identity."""
+    current = str(replacement_turn_id or "").strip()
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        row = conn.execute(
+            """
+            SELECT payload_json
+            FROM turns
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (str(host_id), current),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _json_object(row[0])
+        if _turn_is_tombstoned(payload):
+            current = str(payload.get("superseded_by_turn_id") or "").strip()
+            continue
+        if not str(payload.get("source_turn_id") or "").strip():
+            return None
+        # Phase 1 freezes an adopted command row's published turn_id instead
+        # of re-keying it after source_turn_id is learned. The row we just
+        # resolved is therefore the only canonical identity we can prove.
+        return current
+    return None
+
+
+def _backfill_turn_supersessions_conn(conn: sqlite3.Connection) -> None:
+    """Alias only legacy command turns with deterministic Phase 1 linkage."""
+    if not {"host_id", "turn_id", "payload_json", "observed_at", "list_sequence"} <= (
+        _table_columns(conn, "turns")
+    ):
+        return
+    hosts = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT host_id
+            FROM turns
+            WHERE json_extract(payload_json, '$.source') = 'command'
+            ORDER BY host_id
+            """
+        ).fetchall()
+    ]
+    for host_id in hosts:
+        after_sequence = 0
+        while True:
+            rows = conn.execute(
+                """
+                SELECT turn_id, payload_json, observed_at, list_sequence
+                FROM turns
+                WHERE host_id = ?
+                  AND list_sequence > ?
+                  AND json_extract(payload_json, '$.source') = 'command'
+                ORDER BY list_sequence
+                LIMIT ?
+                """,
+                (host_id, after_sequence, TURN_LEDGER_BACKFILL_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                break
+            after_sequence = int(rows[-1][3])
+            for turn_id, payload_json, observed_at, _sequence in rows:
+                legacy_turn_id = str(turn_id)
+                payload = _json_object(payload_json)
+                # A live adopted command turn was never superseded. Its row ID
+                # is deliberately frozen by Phase 1, so recomputing a Turn ID
+                # from its updated payload could only invent a dangling alias.
+                if not _turn_is_tombstoned(payload):
+                    continue
+                canonical_turn_id = _linked_canonical_turn_id_conn(
+                    conn,
+                    host_id,
+                    payload.get("superseded_by_turn_id"),
+                )
+                if not canonical_turn_id or canonical_turn_id == legacy_turn_id:
+                    continue
+                created_at = _strict_utc_timestamp(
+                    payload.get("superseded_at")
+                    or payload.get("updated_at")
+                    or observed_at
+                )
+                if created_at is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO turn_supersessions (
+                        host_id, superseded_turn_id, canonical_turn_id,
+                        reason, created_at
+                    ) VALUES (?, ?, ?, 'phase1_migration', ?)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        host_id,
+                        legacy_turn_id,
+                        canonical_turn_id,
+                        created_at,
+                    ),
+                )
+
+
+def _migrate_v19_to_v20_conn(conn: sqlite3.Connection) -> None:
+    """Backfill Phase 1 history into the non-authoritative Phase 2 ledgers."""
+    _backfill_turn_submissions_conn(conn)
+    _backfill_turn_supersessions_conn(conn)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -12317,6 +12593,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(16, 17, _migrate_v16_to_v17_conn),
     Migration(17, 18, _migrate_v17_to_v18_conn),
     Migration(18, 19, _migrate_v18_to_v19_conn),
+    Migration(19, 20, _migrate_v19_to_v20_conn),
 )
 
 
