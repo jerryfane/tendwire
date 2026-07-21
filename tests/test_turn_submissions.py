@@ -1607,3 +1607,30 @@ def test_turn_alias_resolves_public_content_and_final_root(
             """,
             (begun["plan_token"],),
         ).fetchone() == (canonical_turn_id,)
+
+
+def test_link_candidate_owner_identity_normalizes_only_missing_version() -> None:
+    # Guard-regression for the prod-shape normalization: ONLY a syntactically
+    # valid stable key whose version is exactly None is treated as v1; every
+    # other shape falls through to the strict submission-side identity.
+    valid_key = "wsk1_" + ("a" * 64)
+    normalized = store_sqlite._turn_link_candidate_owner_identity(
+        {"id": "worker-x", "meta": {"stable_key": valid_key, "stable_key_version": None}}
+    )
+    assert normalized == (valid_key, 1)
+
+    fallthrough_cases = [
+        {"stable_key": valid_key, "stable_key_version": 2},
+        {"stable_key": valid_key, "stable_key_version": 0},
+        {"stable_key": valid_key, "stable_key_version": "1"},
+        {"stable_key": valid_key, "stable_key_version": True},
+        {"stable_key": "wsk1_short", "stable_key_version": None},
+        {"stable_key": "not-a-key", "stable_key_version": None},
+        {"stable_key": "", "stable_key_version": None},
+        {"stable_key": None, "stable_key_version": None},
+    ]
+    for meta in fallthrough_cases:
+        result = store_sqlite._turn_link_candidate_owner_identity(
+            {"id": "worker-x", "meta": meta}
+        )
+        assert result == ("legacy-worker:worker-x", 0), meta
