@@ -20706,6 +20706,243 @@ def _owned_source_turn_matches(
     return stored in candidates
 
 
+def _raw_owned_source_turn_candidates(
+    raw_value: Any,
+    *,
+    owner_key: str,
+    source: str,
+    kind: str,
+) -> tuple[str, ...]:
+    """Derive exact-source lookup tokens without invoking the public sanitizer.
+
+    This is only a speculative no-op lookup. A mismatch falls through to the
+    canonical sanitizer and merge path, so non-canonical or unsafe input can
+    never be persisted through this shortcut.
+    """
+    if not isinstance(raw_value, str):
+        return ()
+    raw = raw_value.strip()
+    if not raw:
+        return ()
+    if (
+        raw.startswith("turnsrc-")
+        and len(raw) == len("turnsrc-") + FINGERPRINT_HEX_LENGTH
+        and all(char in "0123456789abcdef" for char in raw[len("turnsrc-") :])
+    ):
+        return (raw,)
+    owner_token = "turnsrc-" + stable_fingerprint(
+        {
+            "seed": raw,
+            "public": {
+                "identity_domain": "stable-owner-source-v1",
+                "stable_key": str(owner_key),
+                "stable_key_version": 1,
+                "kind": str(kind),
+            },
+        }
+    )
+    legacy_token = "turnsrc-" + stable_fingerprint(
+        {
+            "seed": raw,
+            "public": {"source": str(source), "kind": str(kind)},
+        }
+    )
+    if owner_token == legacy_token:
+        return (owner_token,)
+    return owner_token, legacy_token
+
+
+def _canonical_reobservation_text_matches(
+    content: Mapping[str, Any],
+    key: str,
+    stored_text: Any,
+    stored_state: Any,
+) -> bool:
+    if key not in content or content.get(key) in (None, ""):
+        return True
+    raw = content.get(key)
+    return (
+        isinstance(raw, str)
+        and raw == stored_text
+        and str(stored_state) == "complete"
+    )
+
+
+def _unchanged_owned_turn_reobservation_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    worker_id: str,
+    worker_payload: Mapping[str, Any],
+    content: Mapping[str, Any],
+    *,
+    observed_at: str,
+    turn_model: str,
+) -> _TurnContentMergeResult | None:
+    """Return a no-op merge result without decoding or sanitizing turn payloads.
+
+    The fast path is deliberately exact and fail-closed. It accepts only a
+    canonical re-observation whose persisted projection, metadata, and content
+    revision already equal the incoming values. Anything uncertain uses the
+    normal public-sanitizing merge path.
+    """
+    owner_identity = _turn_continuity_identity(worker_payload)
+    if owner_identity is None:
+        return None
+    _owner_kind, owner_key, owner_version = owner_identity
+    if owner_version != 1:
+        return None
+    if not isinstance(content.get("source_turn_id"), str):
+        return None
+    rows = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            turns.payload_json,
+            turns.observed_at,
+            revisions.content_revision,
+            revisions.user_text,
+            revisions.assistant_final_text,
+            revisions.user_state,
+            revisions.final_state
+        FROM turns
+        LEFT JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        WHERE turns.host_id = ?
+          AND json_valid(turns.payload_json)
+          AND json_type(turns.payload_json, '$.meta.stable_key') = 'text'
+          AND json_extract(turns.payload_json, '$.meta.stable_key') = ?
+          AND json_type(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = 'integer'
+          AND json_extract(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = ?
+          AND COALESCE(json_extract(turns.payload_json, '$.source_turn_id'), '') != ''
+          AND COALESCE(json_extract(turns.payload_json, '$.superseded_at'), '') = ''
+        """,
+        (
+            str(host_id),
+            str(owner_key),
+            int(owner_version),
+        ),
+    ).fetchall()
+    matching_rows: list[tuple[tuple[Any, ...], dict[str, Any], tuple[str, ...]]] = []
+    for row in rows:
+        payload = _json_object(row[1])
+        source_candidates = _raw_owned_source_turn_candidates(
+            content.get("source_turn_id"),
+            owner_key=owner_key,
+            source=str(payload.get("source") or "snapshot"),
+            kind=str(payload.get("kind") or "unknown"),
+        )
+        if str(payload.get("source_turn_id") or "") in source_candidates:
+            matching_rows.append((row, payload, source_candidates))
+    if len(matching_rows) != 1:
+        return None
+    row, payload, source_candidates = matching_rows[0]
+    (
+        turn_id,
+        _payload_json,
+        stored_observed_at,
+        content_revision_value,
+        user_text,
+        final_text,
+        user_state,
+        final_state,
+    ) = row
+    if (
+        content_revision_value is None
+        or _turn_continuity_identity(payload) != owner_identity
+        or str(payload.get("source_turn_id") or "") not in source_candidates
+        or not _canonical_reobservation_text_matches(
+            content,
+            "user_text",
+            user_text,
+            user_state,
+        )
+        or not _canonical_reobservation_text_matches(
+            content,
+            "assistant_final_text",
+            final_text,
+            final_state,
+        )
+    ):
+        return None
+
+    worker_meta = worker_payload.get("meta")
+    projection_values = {
+        "host_id": str(host_id),
+        "worker_id": str(worker_id),
+        "worker_fingerprint": worker_payload.get("fingerprint") or None,
+        "space_id": worker_payload.get("space_id"),
+        "status": str(worker_payload.get("status") or "unknown"),
+        "kind": "task",
+        "title": worker_payload.get("name"),
+        "summary": worker_payload.get("summary"),
+        "updated_at": worker_payload.get("last_seen_at"),
+        "meta": dict(worker_meta) if isinstance(worker_meta, Mapping) else {},
+    }
+    if any(payload.get(key) != value for key, value in projection_values.items()):
+        return None
+
+    incoming_final = content.get("assistant_final_text")
+    terminal = (
+        payload.get("complete") is True
+        or str(final_state or "") == "complete"
+    )
+    completes_now = content.get("complete") is True or (
+        isinstance(incoming_final, str) and bool(incoming_final)
+    )
+    expected_updates: dict[str, Any] = {}
+    for key in ("model", "assistant_stream_text"):
+        if key in content:
+            raw = content.get(key)
+            if raw is not None and not isinstance(raw, str):
+                return None
+            expected_updates[key] = raw
+    for key in ("complete", "has_open_turn"):
+        if key in content:
+            raw = content.get(key)
+            if raw is not None and not isinstance(raw, bool):
+                return None
+            expected_updates[key] = raw
+    if terminal or completes_now:
+        if not payload.get("completed_at"):
+            return None
+        expected_updates.update(
+            {
+                "complete": True,
+                "has_open_turn": False,
+                "assistant_stream_text": None,
+            }
+        )
+    if any(payload.get(key) != value for key, value in expected_updates.items()):
+        return None
+
+    if _turn_observation_is_newer(str(observed_at), str(stored_observed_at or "")):
+        conn.execute(
+            """
+            UPDATE turns SET observed_at = ?
+            WHERE host_id = ? AND turn_id = ?
+            """,
+            (str(observed_at), str(host_id), str(turn_id)),
+        )
+    submission_link = None
+    if turn_model != "legacy":
+        incoming_user = content.get("user_text")
+        submission_link = (
+            str(owner_key),
+            instruction_fingerprint(
+                incoming_user if isinstance(incoming_user, str) else None
+            ),
+        )
+    return _TurnContentMergeResult(0, submission_link)
+
+
 def _merge_canonical_field(
     incoming: str | None,
     current_text: Any,
@@ -21215,6 +21452,18 @@ def _merge_owned_turn_content_conn(
             revision_repaired = False
         selected_turn_id = str(turn_id)
         changed = metadata_changed or revision_changed or revision_repaired
+        if not changed:
+            submission_link = None
+            if incoming_source_turn and turn_model != "legacy":
+                owner_key, owner_key_version = _turn_submission_owner_identity(
+                    current_projection
+                )
+                if owner_key_version == 1:
+                    submission_link = (
+                        owner_key,
+                        instruction_fingerprint(incoming_user),
+                    )
+            return _TurnContentMergeResult(0, submission_link)
         source_origin = str(
             persisted_item.get("origin_command_id") or ""
         ).strip()
@@ -21549,6 +21798,28 @@ def _merge_turn_content_conn(
 ) -> _TurnContentMergeResult:
     if not any(key in content for key in _TURN_CONTENT_FIELDS):
         return _TurnContentMergeResult(0)
+    current_worker_row = conn.execute(
+        """
+        SELECT payload_json, snapshot_content_fingerprint
+        FROM workers
+        WHERE host_id = ? AND worker_id = ?
+        """,
+        (str(host_id), str(worker_id)),
+    ).fetchone()
+    if current_worker_row is None:
+        return _TurnContentMergeResult(0)
+    current_worker_payload = _json_object(current_worker_row[0])
+    unchanged = _unchanged_owned_turn_reobservation_conn(
+        conn,
+        str(host_id),
+        str(worker_id),
+        current_worker_payload,
+        content,
+        observed_at=observed_at,
+        turn_model=turn_model,
+    )
+    if unchanged is not None:
+        return unchanged
     incoming_user = (
         sanitize_canonical_turn_text(content.get("user_text"))
         if "user_text" in content
@@ -21573,17 +21844,6 @@ def _merge_turn_content_conn(
     }
     if is_internal_automation_turn_payload(automation_probe):
         return _TurnContentMergeResult(0)
-    current_worker_row = conn.execute(
-        """
-        SELECT payload_json, snapshot_content_fingerprint
-        FROM workers
-        WHERE host_id = ? AND worker_id = ?
-        """,
-        (str(host_id), str(worker_id)),
-    ).fetchone()
-    if current_worker_row is None:
-        return _TurnContentMergeResult(0)
-    current_worker_payload = _json_object(current_worker_row[0])
     current_snapshot_fingerprint = str(current_worker_row[1] or "")
     current_projection = _current_worker_turn_projection(
         str(host_id),
