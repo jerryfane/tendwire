@@ -17414,6 +17414,24 @@ def _turn_submission_owner_identity(worker: Any) -> tuple[str, int]:
     return f"legacy-worker:{worker_id}", 0
 
 
+def _turn_link_candidate_owner_identity(worker: Any) -> tuple[str, int]:
+    """Normalize prod turns that persisted a stable key without its version."""
+    meta = getattr(worker, "meta", None)
+    if meta is None and isinstance(worker, Mapping):
+        meta = worker.get("meta")
+    if isinstance(meta, Mapping):
+        stable_key = meta.get("stable_key")
+        if (
+            _valid_final_stable_key(stable_key)
+            and meta.get("stable_key_version") is None
+        ):
+            # The authenticated owner hash is the continuity identity. Some
+            # production observations omitted its v1 metadata marker, so
+            # normalize only that missing marker for candidate matching.
+            return str(stable_key), 1
+    return _turn_submission_owner_identity(worker)
+
+
 def _turn_submission_policy(
     link_window_seconds: Any,
     hard_ttl_seconds: Any,
@@ -17626,7 +17644,7 @@ def _submission_link_candidate_turns_conn(
         if not _turn_uses_current_canonical_identity(str(turn_id), payload):
             continue
         try:
-            candidate_owner, owner_version = _turn_submission_owner_identity(
+            candidate_owner, owner_version = _turn_link_candidate_owner_identity(
                 {"id": str(worker_id), "meta": payload.get("meta")}
             )
         except StoreSchemaError:
