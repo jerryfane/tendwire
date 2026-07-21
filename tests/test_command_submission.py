@@ -4029,3 +4029,287 @@ def test_completed_source_command_replay_after_owner_churn_adopts_current_projec
     assert current_revision_count == 1
     assert foreign_keys == []
     assert raw_source not in json.dumps(after_public, sort_keys=True)
+
+
+def test_observed_submit_writes_only_submission_and_returns_nullable_v3_turn(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, turn_model="observed")
+    assert config.db_path is not None
+    stable_key = "wsk1_" + ("e" * 64)
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    _seed(config, [worker], [_binding(worker)])
+
+    accepted = submit_command(
+        config,
+        _request(request_id="observed-submit", response_schema_version=3),
+        socket_client_factory=_factory([]),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.schema_version == 3
+    assert accepted.result["turn_id"] is None
+    assert accepted.result["submission_id"] == turn_submission_id(
+        config.host_id,
+        "observed-submit",
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM turns").fetchone() == (0,)
+        assert conn.execute(
+            """
+            SELECT state, linked_turn_id FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, "observed-submit"),
+        ).fetchone() == ("submitted", None)
+
+
+def test_observed_turn_identity_and_link_are_order_independent(
+    tmp_path: Path,
+) -> None:
+    def exercise(order: str) -> tuple[str, dict[str, Any]]:
+        case_path = tmp_path / order
+        config = _config(
+            case_path,
+            turn_model="observed",
+            submission_link_window_seconds=2,
+        )
+        assert config.db_path is not None
+        worker = Worker(
+            id="w-1",
+            name="Alpha",
+            status="active",
+            meta={
+                "stable_key": "wsk1_" + ("f" * 64),
+                "stable_key_version": 1,
+            },
+        )
+        _seed(config, [worker], [_binding(worker)])
+        request = _request(
+            request_id=f"observed-{order}",
+            response_schema_version=3,
+        )
+
+        if order == "observation-first":
+            assert merge_turn_content(
+                config.db_path,
+                config.host_id,
+                worker.id,
+                {
+                    "source_turn_id": "shared-source-turn",
+                    "user_text": "hello",
+                    "assistant_final_text": "done",
+                    "complete": True,
+                    "has_open_turn": False,
+                },
+                turn_model="observed",
+            ) == 1
+        accepted = submit_command(
+            config,
+            request,
+            socket_client_factory=_factory([]),
+        )
+        if order == "submission-first":
+            assert merge_turn_content(
+                config.db_path,
+                config.host_id,
+                worker.id,
+                {
+                    "source_turn_id": "shared-source-turn",
+                    "user_text": "hello",
+                    "assistant_final_text": "done",
+                    "complete": True,
+                    "has_open_turn": False,
+                },
+                turn_model="observed",
+            ) == 1
+        assert accepted.result["turn_id"] is None
+        with sqlite3.connect(str(config.db_path)) as conn:
+            expires_at = str(
+                conn.execute(
+                    """
+                    SELECT link_expires_at FROM turn_submissions
+                    WHERE host_id = ? AND request_id = ?
+                    """,
+                    (config.host_id, f"observed-{order}"),
+                ).fetchone()[0]
+            )
+        store_sqlite.sweep_submission_links(
+            config.db_path,
+            host_id=config.host_id,
+            now=(datetime.fromisoformat(expires_at) + timedelta(seconds=1)).isoformat(),
+        )
+        replayed = submit_command(
+            config,
+            request,
+            socket_client_factory=_factory([]),
+        )
+        assert replayed.schema_version == 3
+        assert isinstance(replayed.result["turn_id"], str)
+        with sqlite3.connect(str(config.db_path)) as conn:
+            rows = conn.execute(
+                "SELECT turn_id, payload_json FROM turns ORDER BY turn_id"
+            ).fetchall()
+            link = conn.execute(
+                """
+                SELECT state, linked_turn_id FROM turn_submissions
+                WHERE host_id = ? AND request_id = ?
+                """,
+                (config.host_id, f"observed-{order}"),
+            ).fetchone()
+        assert len(rows) == 1
+        turn_id, payload_json = rows[0]
+        payload = json.loads(payload_json)
+        assert payload.get("origin_command_id") is None
+        assert Turn.from_dict(payload).id == turn_id
+        assert link == ("linked", turn_id)
+        return str(turn_id), replayed.result
+
+    submission_first = exercise("submission-first")
+    observation_first = exercise("observation-first")
+    assert submission_first[0] == observation_first[0]
+    assert submission_first[1]["turn_id"] == observation_first[1]["turn_id"]
+
+
+def test_observed_identical_submissions_fail_closed_and_unobserved_expires(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        turn_model="observed",
+        submission_link_window_seconds=5,
+        submission_hard_ttl_seconds=30,
+    )
+    assert config.db_path is not None
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="active",
+        meta={
+            "stable_key": "wsk1_" + ("1" * 64),
+            "stable_key_version": 1,
+        },
+    )
+    _seed(config, [worker], [_binding(worker)])
+    for request_id in ("identical-a", "identical-b"):
+        assert submit_command(
+            config,
+            _request(request_id=request_id, response_schema_version=3),
+            socket_client_factory=_factory([]),
+        ).status == STATUS_ACCEPTED
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "identical-source",
+            "user_text": "hello",
+            "assistant_final_text": "one observation",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        turn_model="observed",
+    ) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        latest_expiry = max(
+            datetime.fromisoformat(str(row[0]))
+            for row in conn.execute(
+                "SELECT link_expires_at FROM turn_submissions"
+            ).fetchall()
+        )
+    store_sqlite.sweep_submission_links(
+        config.db_path,
+        host_id=config.host_id,
+        now=(latest_expiry + timedelta(seconds=1)).isoformat(),
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            "SELECT state, linked_turn_id FROM turn_submissions ORDER BY request_id"
+        ).fetchall() == [("ambiguous", None), ("ambiguous", None)]
+
+    expiry_config = _config(
+        tmp_path / "expiry",
+        turn_model="observed",
+        submission_link_window_seconds=1,
+        submission_hard_ttl_seconds=1,
+    )
+    assert expiry_config.db_path is not None
+    _seed(expiry_config, [worker], [_binding(worker)])
+    assert submit_command(
+        expiry_config,
+        _request(request_id="never-observed", response_schema_version=3),
+        socket_client_factory=_factory([]),
+    ).status == STATUS_ACCEPTED
+    with sqlite3.connect(str(expiry_config.db_path)) as conn:
+        hard_expiry = datetime.fromisoformat(
+            str(
+                conn.execute(
+                    "SELECT hard_expires_at FROM turn_submissions"
+                ).fetchone()[0]
+            )
+        )
+    store_sqlite.sweep_submission_links(
+        expiry_config.db_path,
+        host_id=expiry_config.host_id,
+        now=(hard_expiry + timedelta(seconds=1)).isoformat(),
+    )
+    with sqlite3.connect(str(expiry_config.db_path)) as conn:
+        assert conn.execute("SELECT state FROM turn_submissions").fetchone() == (
+            "expired",
+        )
+        assert conn.execute("SELECT COUNT(*) FROM turns").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM turn_change_journal"
+        ).fetchone() == (0,)
+
+
+def test_terminal_id_binding_falls_back_to_agent_list_when_agent_get_refuses(monkeypatch) -> None:
+    # Herdr 0.7.5 regression: agent.get no longer resolves terminal-id targets;
+    # agent.list still publishes terminal_id -> pane_id. A definite error from
+    # agent.get must fall back to the listing instead of terminalizing.
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    calls = []
+
+    def fake_socket_request(client, method, params, *, timeout):
+        calls.append(method)
+        if method == "agent.get":
+            raise HerdrErrorResponse({"code": "agent_not_found", "message": "agent target term_new not found"}, "req-1")
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term_other", "pane_id": "w1:p1"},
+                    {"terminal_id": "term_new", "pane_id": "w1:p9"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term_new"
+
+    pane_id = cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+    assert pane_id == "w1:p9"
+    assert calls == ["agent.get", "agent.list"]
+
+    # A non-terminal binding kind must NOT consult the listing: the original
+    # error propagates.
+    class _SessionBinding:
+        target_kind = "agent_session"
+        target_value = "sess-1"
+
+    calls.clear()
+    try:
+        cs._private_pane_id_for_binding(object(), _SessionBinding(), timeout=5.0)
+        raise AssertionError("expected HerdrErrorResponse to propagate")
+    except HerdrErrorResponse:
+        pass
+    assert calls == ["agent.get"]

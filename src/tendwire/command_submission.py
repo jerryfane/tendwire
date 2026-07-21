@@ -338,12 +338,32 @@ def _pane_id_from_agent_info(value: Any) -> str:
 def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout: float) -> str:
     if binding.target_kind == "pane_id":
         return str(binding.target_value or "").strip()
-    response = _socket_request(
-        client,
-        "agent.get",
-        {"target": binding.target_value},
-        timeout=timeout,
-    )
+    try:
+        response = _socket_request(
+            client,
+            "agent.get",
+            {"target": binding.target_value},
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        from .backends.herdr_protocol import HerdrErrorResponse
+
+        # Herdr 0.7.5 stopped resolving terminal-id targets through agent.get
+        # while agent.list still publishes the terminal_id -> pane_id mapping,
+        # so a definite target-lookup error falls back to the listing before
+        # the caller terminalizes the request.
+        if not isinstance(exc, HerdrErrorResponse) or binding.target_kind != "terminal_id":
+            raise
+        listing = _socket_request(client, "agent.list", {}, timeout=timeout)
+        agents = listing.get("agents") if isinstance(listing, Mapping) else None
+        for agent in agents or []:
+            if not isinstance(agent, Mapping):
+                continue
+            if str(agent.get("terminal_id") or "") == str(binding.target_value or ""):
+                pane_id = str(agent.get("pane_id") or "").strip()
+                if pane_id:
+                    return pane_id
+        raise
     return _pane_id_from_agent_info(response)
 
 
