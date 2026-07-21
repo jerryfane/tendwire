@@ -2097,6 +2097,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     )
     captured: list[SnapshotObservationContext] = []
     captured_atomic: list[tuple[list[WorkerBinding], str | None, bool, bool]] = []
+    captured_turn_models: list[str] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_snapshot_observation",
@@ -2107,12 +2108,14 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
         worker_bindings: list[WorkerBinding],
         binding_backend: str | None,
         binding_observation_authoritative: bool,
         binding_workers_present: bool,
     ) -> bool:
+        captured_turn_models.append(turn_model)
         captured.append(observation)
         captured_atomic.append(
             (
@@ -2134,6 +2137,7 @@ def test_cli_snapshot_persistence_passes_explicit_observation_authority(
     assert captured_atomic == [
         ([], "herdr", health.status == "healthy", bool(workers))
     ]
+    assert captured_turn_models == [config.turn_model]
 
 
 def test_rejected_stale_snapshot_does_not_persist_stale_worker_bindings(
@@ -2282,6 +2286,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     worker = Worker(id="worker-1", name="Worker One", status="blocked")
     captured: list[SnapshotObservationContext] = []
     captured_atomic: list[tuple[list[WorkerBinding], str | None]] = []
+    captured_turn_models: list[str] = []
 
     monkeypatch.setattr(
         "tendwire.cli.fetch_herdr_state",
@@ -2292,12 +2297,14 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
         worker_bindings: list[WorkerBinding],
         binding_backend: str | None,
         binding_observation_authoritative: bool,
         binding_workers_present: bool,
     ) -> bool:
+        captured_turn_models.append(turn_model)
         captured.append(observation)
         captured_atomic.append((worker_bindings, binding_backend))
         return True
@@ -2309,6 +2316,7 @@ def test_cli_legacy_observation_cannot_claim_complete_authority(
     assert len(captured) == 1
     assert captured[0].authority == "none"
     assert captured_atomic == [([], "herdr")]
+    assert captured_turn_models == [config.turn_model]
 
 
 def test_cli_attention_json_reads_store_backed_lifecycle(

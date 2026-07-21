@@ -1098,8 +1098,12 @@ class CommandEnvelope:
                 self.action != "send_instruction"
                 or self.disposition != DISPOSITION_TERMINAL_ACCEPTED
                 or not is_turn_submission_id(submission_id)
-                or not isinstance(turn_id, str)
-                or not turn_id
+                or not isinstance(clean_result, Mapping)
+                or "turn_id" not in clean_result
+                or not (
+                    turn_id is None
+                    or (isinstance(turn_id, str) and bool(turn_id))
+                )
             ):
                 raise ValueError(
                     "schema-v3 envelopes require an accepted instruction submission"

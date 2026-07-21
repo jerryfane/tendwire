@@ -1377,8 +1377,10 @@ def test_socket_daemon_fallback_drops_unordered_health_timestamp(
         _db_path: Path,
         _snapshot: Snapshot,
         *,
+        turn_model: str,
         observation: SnapshotObservationContext,
     ) -> None:
+        assert turn_model == config.turn_model
         captured.append(observation)
 
     backend = _Backend()

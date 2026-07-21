@@ -7,6 +7,7 @@ import math
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -813,6 +814,62 @@ def test_goal13_capture_is_trigger_backed_immutable_and_public_minimal(tmp_path:
     assert "private-pane-sentinel" not in serialized
     assert "private-token-sentinel" not in serialized
     assert bootstrap["changes"][0]["turn"]["summary"] == "public summary"
+
+
+def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "sweep-byte-stability.db"
+    init_store(db_path)
+    worker = {"id": "worker-0"}
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._insert_turn_submission_conn(
+            conn,
+            host_id=HOST,
+            request_id="submission-to-expire",
+            worker=worker,
+            instruction_text="unobserved instruction",
+            current=TS,
+            link_window_seconds=1,
+            hard_ttl_seconds=2,
+        )
+        assert store_sqlite._terminalize_turn_submission_conn(
+            conn,
+            host_id=HOST,
+            request_id="submission-to-expire",
+            terminal_state="accepted",
+            current=TS,
+        )
+        _insert_turn(conn, "stable-turn", 1, summary="stable page")
+        conn.commit()
+
+    sweep_due = iter((False, True))
+
+    def reserve_sweep(*_args: Any, **_kwargs: Any) -> tuple[tuple[str, str, str], bool]:
+        return ((str(db_path), HOST, "submission_links"), next(sweep_due))
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_reserve_lazy_turn_claim_sweep",
+        reserve_sweep,
+    )
+    monkeypatch.setattr(store_sqlite.time, "perf_counter", lambda: 100.0)
+    current = datetime.fromisoformat(TS).timestamp() + 3
+
+    before = stable_json_dumps(
+        turn_delta_payload_from_store(db_path, HOST, now=current)
+    ).encode("utf-8")
+    during = stable_json_dumps(
+        turn_delta_payload_from_store(db_path, HOST, now=current)
+    ).encode("utf-8")
+
+    assert during == before
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            "SELECT state FROM turn_submissions WHERE host_id = ? AND request_id = ?",
+            (HOST, "submission-to-expire"),
+        ).fetchone() == ("expired",)
 
 
 def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:

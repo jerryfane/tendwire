@@ -711,6 +711,7 @@ class HerdrEventBackend:
         if not save_snapshot(
             self.db_path,
             snapshot,
+            turn_model=self.config.turn_model,
             observation=observation,
             worker_bindings=worker_bindings,
             binding_backend=BACKEND_NAME if worker_bindings is not None else None,

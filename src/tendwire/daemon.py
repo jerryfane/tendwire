@@ -789,6 +789,7 @@ class TendwireDaemon:
         save_snapshot(
             Path(self.config.db_path),
             snapshot,
+            turn_model=self.config.turn_model,
             observation=SnapshotObservationContext(
                 authority="none",
                 observed_at=_valid_observation_timestamp(backend_health.observed_at),
@@ -1111,6 +1112,7 @@ class TendwireDaemon:
             field=params.get("field"),
             cursor=params.get("cursor"),
             schema_version=params.get("schema_version", 1),
+            turn_model=self.config.turn_model,
         )
 
     def get_turn_delta(
@@ -1161,6 +1163,7 @@ class TendwireDaemon:
             max_lease_seconds=self.config.connector_max_claim_ttl_seconds,
             ack_ttl_seconds=self.config.connector_ack_ttl_seconds,
             max_attempts=self.config.max_outbox_attempts,
+            turn_model=self.config.turn_model,
         ).dispatch(method, params)
 
     def _connector_periodic_tick(self) -> None:

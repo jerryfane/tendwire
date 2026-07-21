@@ -500,6 +500,18 @@ def test_command_envelope_v3_roundtrips_only_accepted_submission_fields() -> Non
 
     assert envelope.schema_version == 3
     assert CommandEnvelope.from_dict(envelope.to_dict()).to_dict() == envelope.to_dict()
+    pending_link = CommandEnvelope.from_result(
+        request,
+        ok=True,
+        status=STATUS_ACCEPTED,
+        disposition=DISPOSITION_TERMINAL_ACCEPTED,
+        result={
+            "turn_id": None,
+            "submission_id": turn_submission_id("host-a", "v3-request"),
+        },
+        schema_version=COMMAND_ENVELOPE_V3_SCHEMA_VERSION,
+    )
+    assert pending_link.result["turn_id"] is None
     with pytest.raises(ValueError, match="accepted instruction submission"):
         CommandEnvelope.from_result(
             request,
