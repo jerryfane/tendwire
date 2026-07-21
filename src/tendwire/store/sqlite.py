@@ -196,6 +196,13 @@ _SUBMISSION_LINK_BACKOFF: dict[
 _SUBMISSION_LINK_BACKOFF_LOCK = threading.Lock()
 _SUBMISSION_LINK_BACKOFF_MISSING = object()
 
+# A component that settles with no candidate observations at all gets a
+# BOUNDED deferral, never an indefinite one: the matching observation may
+# arrive through a path that cannot re-arm the key (e.g. dual/shadow modes,
+# or workers whose payload lacks the version marker), so an unbounded skip
+# would wedge the link until process restart or hard TTL.
+_SUBMISSION_LINK_EMPTY_COMPONENT_RECHECK_SECONDS = 30.0
+
 
 def _submission_linking_enabled(turn_model: str) -> bool:
     normalized = str(turn_model or "").strip().lower()
@@ -230,7 +237,7 @@ def _submission_link_component_is_due(
         )
         if next_eligible is _SUBMISSION_LINK_BACKOFF_MISSING:
             return True
-        if next_eligible is None or current < next_eligible:
+        if next_eligible is not None and current < next_eligible:
             return False
         _SUBMISSION_LINK_BACKOFF.pop(key, None)
         return True
@@ -239,7 +246,13 @@ def _submission_link_component_is_due(
 def _backoff_submission_link_component(
     key: tuple[str, str, str, str],
     next_eligible_at: datetime | None,
+    *,
+    current: datetime,
 ) -> None:
+    if next_eligible_at is None:
+        next_eligible_at = current + timedelta(
+            seconds=_SUBMISSION_LINK_EMPTY_COMPONENT_RECHECK_SECONDS
+        )
     with _SUBMISSION_LINK_BACKOFF_LOCK:
         _SUBMISSION_LINK_BACKOFF[key] = next_eligible_at
 
@@ -18045,7 +18058,7 @@ def _settle_due_submission_links_conn(
                 str(fingerprint),
             )
         elif next_eligible:
-            _backoff_submission_link_component(key, next_eligible[0])
+            _backoff_submission_link_component(key, next_eligible[0], current=current_dt)
     return changed
 
 

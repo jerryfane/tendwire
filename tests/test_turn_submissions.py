@@ -1809,3 +1809,71 @@ def test_link_candidate_owner_identity_normalizes_only_missing_version() -> None
             {"id": "worker-x", "meta": meta}
         )
         assert result == ("legacy-worker:worker-x", 0), meta
+
+
+def test_empty_component_backoff_is_bounded_for_dual_mode_prod_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Wedge regression: a component that sweeps with ZERO candidates used to
+    # store an indefinite backoff. Under turn_model='dual'/'shadow' with a
+    # prod-shape worker (stable_key without version marker) NO re-arm signal
+    # fires on observation, so the link stalled until restart or hard TTL.
+    # The empty-component backoff must be time-bounded instead.
+    db_path = tmp_path / "submission-link-bounded.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="submission-link-bounded",
+        owner_key=owner_key,
+    )
+    candidate_calls = 0
+    original_candidates = store_sqlite._submission_link_candidate_turns_conn
+
+    def record_candidates(*args: object, **kwargs: object):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_submission_link_candidate_turns_conn",
+        record_candidates,
+    )
+
+    # First sweep: no candidate observation yet -> component backs off.
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T11:59:00+00:00",
+    )
+    assert candidate_calls == 1
+
+    # Observation arrives via a path that does NOT re-arm: dual mode with the
+    # prod-shape worker (version marker absent -> strict identity mismatch).
+    _set_link_worker_prod_shape(db_path)
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="submission-link-bounded-source",
+        observed_at="2026-02-01T11:59:10+00:00",
+        turn_model="dual",
+    )
+
+    # A sweep inside the bounded window stays backed off...
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T11:59:20+00:00",
+    )
+    assert candidate_calls == 1
+
+    # ...but a sweep past the bound re-evaluates and links WITHOUT any re-arm.
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:31+00:00",
+    )
+    assert candidate_calls == 2
+    assert _submission_rows(db_path) == [
+        ("submission-link-bounded", "linked", observed_turn_id)
+    ]
