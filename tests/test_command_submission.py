@@ -4600,3 +4600,50 @@ def test_observed_identical_submissions_fail_closed_and_unobserved_expires(
         assert conn.execute(
             "SELECT COUNT(*) FROM turn_change_journal"
         ).fetchone() == (0,)
+
+
+def test_terminal_id_binding_falls_back_to_agent_list_when_agent_get_refuses(monkeypatch) -> None:
+    # Herdr 0.7.5 regression: agent.get no longer resolves terminal-id targets;
+    # agent.list still publishes terminal_id -> pane_id. A definite error from
+    # agent.get must fall back to the listing instead of terminalizing.
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    calls = []
+
+    def fake_socket_request(client, method, params, *, timeout):
+        calls.append(method)
+        if method == "agent.get":
+            raise HerdrErrorResponse({"code": "agent_not_found", "message": "agent target term_new not found"}, "req-1")
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term_other", "pane_id": "w1:p1"},
+                    {"terminal_id": "term_new", "pane_id": "w1:p9"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term_new"
+
+    pane_id = cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+    assert pane_id == "w1:p9"
+    assert calls == ["agent.get", "agent.list"]
+
+    # A non-terminal binding kind must NOT consult the listing: the original
+    # error propagates.
+    class _SessionBinding:
+        target_kind = "agent_session"
+        target_value = "sess-1"
+
+    calls.clear()
+    try:
+        cs._private_pane_id_for_binding(object(), _SessionBinding(), timeout=5.0)
+        raise AssertionError("expected HerdrErrorResponse to propagate")
+    except HerdrErrorResponse:
+        pass
+    assert calls == ["agent.get"]
