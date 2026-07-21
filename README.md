@@ -1457,8 +1457,18 @@ never another raw instruction copy, and advances to `submitted` or `uncertain`
 with the terminal receipt transaction. Unlinked rows expire after
 `TENDWIRE_SUBMISSION_HARD_TTL_SECONDS` (default `86400`); candidate linkage uses
 the symmetric observation window configured by
-`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). Stage 2 does not read
-this ledger to make turn, command, observation, or delivery decisions.
+`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). In non-legacy turn
+modes, source-derived observations settle this ledger only after the matching
+window closes: a component links only when it contains exactly one submission
+and one unlinked observation; larger components become `ambiguous`. Linkage is
+shadow metadata and does not influence the legacy turn merge, turn-list order,
+Goal 10 delivery, or Herdres consumption.
+
+Observation-first settlement remains opportunistic through Stage 5. If a
+submission is recorded after its matching observation, it stays open until a
+later refresh for that worker re-runs settlement. Before Stage 6 allows any
+decision to read `linked_turn_id`, it must add a lazy or periodic settlement
+sweep so an idle pane cannot leave a match open until hard TTL.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

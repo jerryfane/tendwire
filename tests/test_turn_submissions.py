@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ from tendwire.core.commands import (
     normalize_instruction_text,
     turn_submission_id,
 )
+from tendwire.config import Config
+from tendwire.core.projector import project_from_raw
+from tendwire.core.turns import Turn
 from tendwire.store import sqlite as store_sqlite
 from tendwire.store.sqlite import (
     TURN_SUBMISSION_STATE_TRANSITIONS,
@@ -19,6 +23,7 @@ from tendwire.store.sqlite import (
     init_store,
     is_valid_turn_submission_state_transition,
     sweep_expired_turn_submissions,
+    turn_delta_payload_from_store,
 )
 
 
@@ -180,7 +185,14 @@ def test_every_prior_schema_upgrades_to_identical_empty_v19_ledgers(
 def test_turn_submission_state_transition_table() -> None:
     assert TURN_SUBMISSION_STATE_TRANSITIONS == {
         "send_started": frozenset(
-            {"submitted", "uncertain", "expired", "cancelled"}
+            {
+                "submitted",
+                "uncertain",
+                "linked",
+                "ambiguous",
+                "expired",
+                "cancelled",
+            }
         ),
         "submitted": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
         "uncertain": frozenset({"linked", "ambiguous", "expired", "cancelled"}),
@@ -331,3 +343,465 @@ def test_submission_cancellation_is_terminal_and_idempotent(tmp_path: Path) -> N
             WHERE host_id = 'host-a' AND request_id = 'cancel-me'
             """
         ).fetchone() == ("cancelled", "2026-02-01T00:00:00+00:00")
+
+
+def _seed_link_worker(
+    db_path: Path,
+    *,
+    host_id: str = "host-a",
+    worker_id: str = "worker-a",
+    owner_char: str = "a",
+) -> str:
+    owner_key = "wsk1_" + (owner_char * 64)
+    snapshot = project_from_raw(
+        Config(host_id=host_id, db_path=db_path),
+        workers=[
+            {
+                "id": worker_id,
+                "name": worker_id,
+                "status": "active",
+                "meta": {
+                    "stable_key": owner_key,
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+    )
+    init_store(db_path)
+    store_sqlite.save_snapshot(db_path, snapshot)
+    return owner_key
+
+
+def _insert_link_submission(
+    db_path: Path,
+    *,
+    request_id: str,
+    owner_key: str,
+    instruction_text: str = "hello",
+    host_id: str = "host-a",
+    state: str = "submitted",
+    link_not_before: str = "2026-02-01T11:59:00+00:00",
+    link_expires_at: str = "2026-02-01T12:00:00+00:00",
+) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO turn_submissions (
+                host_id, submission_id, request_id, owner_key,
+                owner_key_version, instruction_fingerprint, state,
+                linked_turn_id, link_not_before, link_expires_at,
+                hard_expires_at, linked_at, terminal_at, submitted_at,
+                send_started_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?,
+                '2026-02-02T12:00:00+00:00', NULL, NULL,
+                '2026-02-01T12:00:00+00:00',
+                '2026-02-01T12:00:00+00:00',
+                '2026-02-01T12:00:00+00:00'
+            )
+            """,
+            (
+                host_id,
+                turn_submission_id(host_id, request_id),
+                request_id,
+                owner_key,
+                instruction_fingerprint(instruction_text),
+                state,
+                link_not_before,
+                link_expires_at,
+            ),
+        )
+
+
+def _observe_link_turn(
+    db_path: Path,
+    *,
+    source_turn_id: str,
+    worker_id: str = "worker-a",
+    host_id: str = "host-a",
+    instruction_text: str = "hello",
+    observed_at: str = "2026-02-01T12:00:00+00:00",
+    turn_model: str = "dual",
+) -> str:
+    result = store_sqlite.apply_turn_refresh(
+        db_path,
+        host_id,
+        worker_id,
+        {
+            "source_turn_id": source_turn_id,
+            "user_text": instruction_text,
+            "assistant_final_text": f"answer for {source_turn_id}",
+            "complete": True,
+            "has_open_turn": False,
+        },
+        observed_at=observed_at,
+        turn_model=turn_model,
+    )
+    assert result.updated in {0, 1}
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            """
+            SELECT turn_id, payload_json
+            FROM turns
+            WHERE host_id = ?
+              AND COALESCE(json_extract(payload_json, '$.source_turn_id'), '') != ''
+            ORDER BY turn_id
+            """,
+            (host_id,),
+        ).fetchall()
+    matching = [
+        (str(turn_id), store_sqlite._json_object(payload_json))
+        for turn_id, payload_json in rows
+        if store_sqlite._json_object(payload_json).get("source_turn_id")
+        in store_sqlite.turn_source_id_candidates(
+            source_turn_id,
+            meta=store_sqlite._json_object(payload_json).get("meta") or {},
+            source=store_sqlite._json_object(payload_json).get("source"),
+            kind=store_sqlite._json_object(payload_json).get("kind"),
+        )
+    ]
+    assert len(matching) == 1
+    turn_id, payload = matching[0]
+    assert Turn.from_dict(payload).id == turn_id
+    return turn_id
+
+
+def _submission_rows(db_path: Path) -> list[tuple[str, str, str | None]]:
+    with sqlite3.connect(str(db_path)) as conn:
+        return [
+            (str(row[0]), str(row[1]), None if row[2] is None else str(row[2]))
+            for row in conn.execute(
+                """
+                SELECT request_id, state, linked_turn_id
+                FROM turn_submissions ORDER BY request_id
+                """
+            ).fetchall()
+        ]
+
+
+def test_shadow_linker_handles_both_race_directions_without_changing_turn_id(
+    tmp_path: Path,
+) -> None:
+    submission_first = tmp_path / "submission-first.db"
+    owner_key = _seed_link_worker(submission_first)
+    _insert_link_submission(
+        submission_first,
+        request_id="submission-first",
+        owner_key=owner_key,
+    )
+    first_turn_id = _observe_link_turn(
+        submission_first,
+        source_turn_id="submission-first-source",
+    )
+    assert _submission_rows(submission_first) == [
+        ("submission-first", "linked", first_turn_id)
+    ]
+
+    observation_first = tmp_path / "observation-first.db"
+    owner_key = _seed_link_worker(observation_first)
+    observed_turn_id = _observe_link_turn(
+        observation_first,
+        source_turn_id="observation-first-source",
+    )
+    _insert_link_submission(
+        observation_first,
+        request_id="observation-first",
+        owner_key=owner_key,
+    )
+    # Through Stage 5, observation-first settlement is opportunistic: the
+    # submission stays open until this worker produces another refresh. Stage 6
+    # must add a lazy or periodic sweep before linked_turn_id gains authority.
+    assert _submission_rows(observation_first) == [
+        ("observation-first", "submitted", None)
+    ]
+    refreshed_turn_id = _observe_link_turn(
+        observation_first,
+        source_turn_id="observation-first-source",
+        observed_at="2026-02-01T12:00:01+00:00",
+    )
+    assert refreshed_turn_id == observed_turn_id
+    assert _submission_rows(observation_first) == [
+        ("observation-first", "linked", observed_turn_id)
+    ]
+
+
+def test_shadow_linker_failure_keeps_observation_and_rolls_back_link_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "settle-failure.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="settle-failure",
+        owner_key=owner_key,
+    )
+
+    def fail_after_partial_settlement(
+        conn: sqlite3.Connection,
+        *_args: object,
+        **_kwargs: object,
+    ) -> int:
+        conn.execute(
+            """
+            UPDATE turn_submissions
+            SET state = 'ambiguous'
+            WHERE host_id = 'host-a' AND request_id = 'settle-failure'
+            """
+        )
+        raise RuntimeError("injected settlement failure")
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "settle_submission_links_conn",
+        fail_after_partial_settlement,
+    )
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="settle-failure-source",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("settle-failure", "submitted", None)
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        observed = conn.execute(
+            """
+            SELECT json_extract(turns.payload_json, '$.source_turn_id'),
+                   revisions.user_text, revisions.assistant_final_text
+            FROM turns
+            JOIN turn_content_revisions AS revisions
+              ON revisions.host_id = turns.host_id
+             AND revisions.turn_id = turns.turn_id
+             AND revisions.is_current = 1
+            WHERE turns.host_id = 'host-a' AND turns.turn_id = ?
+            """,
+            (turn_id,),
+        ).fetchone()
+        assert observed is not None
+        assert str(observed[0])
+        assert tuple(observed[1:]) == (
+            "hello",
+            "answer for settle-failure-source",
+        )
+
+
+def test_shadow_linker_settles_send_started_to_linked_and_ambiguous(
+    tmp_path: Path,
+) -> None:
+    linked_path = tmp_path / "send-started-linked.db"
+    owner_key = _seed_link_worker(linked_path)
+    _insert_link_submission(
+        linked_path,
+        request_id="send-started-linked",
+        owner_key=owner_key,
+        state="send_started",
+    )
+    turn_id = _observe_link_turn(
+        linked_path,
+        source_turn_id="send-started-linked-source",
+    )
+    assert _submission_rows(linked_path) == [
+        ("send-started-linked", "linked", turn_id)
+    ]
+
+    ambiguous_path = tmp_path / "send-started-ambiguous.db"
+    owner_key = _seed_link_worker(ambiguous_path)
+    for index in range(2):
+        _insert_link_submission(
+            ambiguous_path,
+            request_id=f"send-started-ambiguous-{index}",
+            owner_key=owner_key,
+            state="send_started",
+        )
+    _observe_link_turn(
+        ambiguous_path,
+        source_turn_id="send-started-ambiguous-source",
+    )
+    assert _submission_rows(ambiguous_path) == [
+        ("send-started-ambiguous-0", "ambiguous", None),
+        ("send-started-ambiguous-1", "ambiguous", None),
+    ]
+
+
+def test_shadow_linker_waits_for_window_close_before_failing_closed(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "delayed.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="delayed",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+    _observe_link_turn(db_path, source_turn_id="delayed-source-a")
+    assert _submission_rows(db_path) == [("delayed", "submitted", None)]
+    _observe_link_turn(
+        db_path,
+        source_turn_id="delayed-source-b",
+        observed_at="2026-02-01T12:00:30+00:00",
+    )
+    assert _submission_rows(db_path) == [("delayed", "submitted", None)]
+    _observe_link_turn(
+        db_path,
+        source_turn_id="delayed-source-a",
+        observed_at="2026-02-01T12:01:00+00:00",
+    )
+    assert _submission_rows(db_path) == [("delayed", "ambiguous", None)]
+
+
+@pytest.mark.parametrize(
+    ("submission_count", "observation_count"),
+    ((2, 1), (1, 2), (2, 2)),
+)
+def test_shadow_linker_marks_larger_identical_components_ambiguous(
+    tmp_path: Path,
+    submission_count: int,
+    observation_count: int,
+) -> None:
+    db_path = tmp_path / f"ambiguous-{submission_count}-{observation_count}.db"
+    owner_key = _seed_link_worker(db_path)
+    for index in range(observation_count):
+        _observe_link_turn(
+            db_path,
+            source_turn_id=f"ambiguous-source-{index}",
+        )
+    for index in range(submission_count):
+        _insert_link_submission(
+            db_path,
+            request_id=f"ambiguous-request-{index}",
+            owner_key=owner_key,
+        )
+    _observe_link_turn(
+        db_path,
+        source_turn_id="ambiguous-source-0",
+        observed_at="2026-02-01T12:00:01+00:00",
+    )
+    rows = _submission_rows(db_path)
+    assert [state for _request, state, _turn in rows] == [
+        "ambiguous"
+    ] * submission_count
+    assert all(linked_turn_id is None for _request, _state, linked_turn_id in rows)
+
+
+def test_shadow_linker_isolates_owners_and_legacy_mode_is_a_noop(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "owners.db"
+    first_owner = _seed_link_worker(first_path)
+    second_owner = "wsk1_" + ("b" * 64)
+    snapshot = project_from_raw(
+        Config(host_id="host-a", db_path=first_path),
+        workers=[
+            {
+                "id": "worker-a",
+                "name": "worker-a",
+                "status": "active",
+                "meta": {"stable_key": first_owner, "stable_key_version": 1},
+            },
+            {
+                "id": "worker-b",
+                "name": "worker-b",
+                "status": "active",
+                "meta": {"stable_key": second_owner, "stable_key_version": 1},
+            },
+        ],
+    )
+    store_sqlite.save_snapshot(first_path, snapshot)
+    _insert_link_submission(first_path, request_id="owner-a", owner_key=first_owner)
+    _insert_link_submission(first_path, request_id="owner-b", owner_key=second_owner)
+    first_turn_id = _observe_link_turn(
+        first_path,
+        source_turn_id="owner-a-source",
+    )
+    second_turn_id = _observe_link_turn(
+        first_path,
+        worker_id="worker-b",
+        source_turn_id="owner-b-source",
+    )
+    assert _submission_rows(first_path) == [
+        ("owner-a", "linked", first_turn_id),
+        ("owner-b", "linked", second_turn_id),
+    ]
+
+    legacy_path = tmp_path / "legacy.db"
+    owner_key = _seed_link_worker(legacy_path)
+    _insert_link_submission(legacy_path, request_id="legacy", owner_key=owner_key)
+    _observe_link_turn(
+        legacy_path,
+        source_turn_id="legacy-source",
+        turn_model="legacy",
+    )
+    assert _submission_rows(legacy_path) == [("legacy", "submitted", None)]
+
+
+def test_goal13_delta_is_unperturbed_when_observed_turn_links_later(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "delta.db"
+    owner_key = _seed_link_worker(db_path)
+    bootstrap = turn_delta_payload_from_store(db_path, "host-a")
+    assert bootstrap["has_more"] is False
+    checkpoint = str(bootstrap["checkpoint"])
+
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="delta-source",
+    )
+    observed_delta = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        watermark=checkpoint,
+    )
+    observed_changes = [
+        change
+        for change in observed_delta["changes"]
+        if change["turn_id"] == observed_turn_id
+    ]
+    assert [(change["op"], change["turn_id"]) for change in observed_changes] == [
+        ("upsert", observed_turn_id)
+    ]
+
+    _insert_link_submission(db_path, request_id="delta-request", owner_key=owner_key)
+    assert _observe_link_turn(
+        db_path,
+        source_turn_id="delta-source",
+        observed_at="2026-02-01T12:00:01+00:00",
+    ) == observed_turn_id
+    linked_delta = turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        watermark=str(observed_delta["checkpoint"]),
+    )
+    assert not any(
+        change["turn_id"] == observed_turn_id
+        for change in linked_delta["changes"]
+    )
+
+
+def test_two_racing_refreshes_cannot_double_link_one_observation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "race.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(db_path, request_id="race", owner_key=owner_key)
+
+    def refresh() -> str:
+        return _observe_link_turn(
+            db_path,
+            source_turn_id="race-source",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        turn_ids = list(pool.map(lambda _index: refresh(), range(2)))
+    assert len(set(turn_ids)) == 1
+    assert _submission_rows(db_path) == [("race", "linked", turn_ids[0])]
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM turn_submissions
+            WHERE linked_turn_id = ?
+            """,
+            (turn_ids[0],),
+        ).fetchone() == (1,)
