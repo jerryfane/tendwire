@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from tendwire.backends import herdr_turns
+from tendwire.backends import herdr_cli, herdr_turns
 from tendwire.backends.herdr_events import (
     DEFAULT_SUBSCRIBE_METHOD,
     HerdrEventBackend,
@@ -43,16 +43,20 @@ from tendwire.backends.herdr_protocol import (
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
 from tendwire.core.projector import project_from_observations
+from tendwire.core.turns import PendingObservation
 from tendwire.daemon import DaemonHooks, TendwireDaemon
 from tendwire.store.sqlite import (
     SnapshotObservationContext,
     SnapshotRetentionPolicy,
+    apply_backend_pending_observation,
     init_store,
     latest_snapshot,
     list_attention_items,
+    list_backend_pending,
     list_worker_bindings,
     maybe_run_automatic_store_maintenance,
     merge_turn_content,
+    pending_payload_from_store,
     save_snapshot,
     turns_payload_from_store,
 )
@@ -354,6 +358,106 @@ def _status_event(status: str) -> dict[str, Any]:
     }
 
 
+def _write_decision_adapter(tmp_path: Path) -> Path:
+    adapter = tmp_path / "fake-herdr-turn-adapter"
+    adapter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'result': {'turn': {"
+        "'available': True, 'complete': False, 'awaiting_input': True, "
+        "'user_text': 'Choose a rollout.', 'source_turn_id': 'producer-decision-turn', "
+        "'pending_decision': {'prompt': 'Choose a rollout.', 'mode': 'buttons', "
+        "'options': [{'id': 'alpha', 'label': 'Alpha', 'send_text': 'Alpha'}, "
+        "{'id': 'beta', 'label': 'Beta', 'send_text': 'Beta'}]}}}}))\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o700)
+    return adapter
+
+
+def _decision_backend(
+    tmp_path: Path,
+    turn_model: str,
+) -> tuple[HerdrEventBackend, WorkerBinding]:
+    adapter = _write_decision_adapter(tmp_path)
+    config = Config(
+        host_id=f"decision-{turn_model}",
+        data_dir=tmp_path,
+        db_path=tmp_path / f"decision-{turn_model}.db",
+        herdr_backend="socket",
+        herdr_bin=str(adapter),
+        herdr_timeout_seconds=1,
+        turn_model=turn_model,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
+    snapshot = backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[
+                {
+                    "pane_id": "w123456789abcde:pA",
+                    "terminal_id": "terminal-decision",
+                    "agent": "claude",
+                    "workspace_id": "w123456789abcde",
+                    "agent_status": "working",
+                }
+            ],
+            agents=[],
+        )
+    )
+    binding = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )[0]
+    # Reproduce the production wedge: the stable worker still has a durable
+    # no-prompt row owned by an expired pane binding.
+    assert apply_backend_pending_observation(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot.workers[0].id,
+        PendingObservation("read_succeeded_no_prompt"),
+        binding_private_fingerprint="expired-pane-binding",
+        observed_turn_target_value="old-pane",
+    )
+    return backend, binding
+
+
+def _assert_decision_persisted(backend: HerdrEventBackend) -> None:
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    worker = snapshot.workers[0]
+    backend_pending = list_backend_pending(backend.db_path, backend.config.host_id)
+    assert list(backend_pending) == [worker.id]
+    assert [choice["label"] for choice in backend_pending[worker.id]["choices"]] == [
+        "Alpha",
+        "Beta",
+    ]
+    pending = pending_payload_from_store(backend.db_path, backend.config.host_id)
+    interaction = next(
+        item for item in pending["pending_interactions"] if item["worker_id"] == worker.id
+    )
+    assert [choice["label"] for choice in interaction["choices"]] == ["Alpha", "Beta"]
+    turns = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=snapshot,
+    )["turns"]
+    turn = next(item for item in turns if item.get("awaiting_input") is True)
+    assert turn["complete"] is False
+    assert turn["pending_decision"] == {
+        "prompt": "Choose a rollout.",
+        "mode": "buttons",
+        "options": [
+            {"id": "1", "label": "Alpha"},
+            {"id": "2", "label": "Beta"},
+        ],
+        "multi_select": False,
+        "question_count": 1,
+    }
+
+
 def test_startup_reconcile_uses_socket_client_persists_projection_and_private_bindings(tmp_path: Path) -> None:
     def handler(conn: _SocketConnection) -> None:
         results = {
@@ -436,6 +540,7 @@ def test_normalize_event_accepts_each_official_event_name(event_name: str) -> No
         ("agent.status_changed", "pane.agent_status_changed"),
         ("agent_status_changed", "pane.agent_status_changed"),
         ("agent.detected", "pane.agent_detected"),
+        ("pane_output_changed", "pane.updated"),
         ("pane.observed", "pane.created"),
         ("workspace.observed", "workspace.updated"),
         ("worktree.updated", "worktree.opened"),
@@ -604,7 +709,13 @@ def test_backend_default_subscription_uses_official_shape_without_legacy_default
 
     backend.run_forever()
 
-    expected_params = build_events_subscribe_params(HERDR_OFFICIAL_EVENT_NAMES)
+    expected_params = {
+        "subscriptions": [
+            {"type": name}
+            for name in HERDR_OFFICIAL_EVENT_NAMES
+            if name not in {"pane.agent_status_changed", "pane.output_matched"}
+        ]
+    }
     assert DEFAULT_SUBSCRIBE_METHOD == HERDR_EVENTS_SUBSCRIBE_METHOD
     assert client.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected_params)]
     subscribed_names = {subscription["type"] for subscription in expected_params["subscriptions"]}
@@ -616,7 +727,7 @@ def test_backend_default_subscription_uses_official_shape_without_legacy_default
     }.isdisjoint(subscribed_names)
 
 
-def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path: Path) -> None:
+def test_backend_falls_back_to_herdr_074_pane_scoped_event_subscriptions(tmp_path: Path) -> None:
     config = _config(tmp_path, "pane-scoped-subscribe")
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
@@ -634,7 +745,7 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
                     }
                 ],
             )
-            self.global_attempts = 0
+            self.mixed_attempts = 0
             self.subscriptions: list[tuple[str, dict[str, Any]]] = []
             self.closed = 0
             self.connected = 0
@@ -652,8 +763,7 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
             timeout: float | None = None,
             event_timeout: float | None = None,
         ) -> Any:
-            self.global_attempts += 1
-            raise HerdrEnvelopeError("Herdr envelope id must be a non-empty string")
+            raise AssertionError("0.7.4 fallback must retain the pane-scoped request")
 
         def subscribe(
             self,
@@ -664,6 +774,12 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
             event_timeout: float | None = None,
         ) -> Any:
             self.subscriptions.append((method, dict(params)))
+            if any(
+                item.get("type") == "pane.updated"
+                for item in params.get("subscriptions", [])
+            ):
+                self.mixed_attempts += 1
+                raise HerdrEnvelopeError("0.7.4 does not know pane.updated")
             backend.stop_event.set()
             return SimpleNamespace(subscription_id="pane-scoped-sub")
 
@@ -672,15 +788,16 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
 
     backend.run_forever()
 
-    assert client.global_attempts == 1
+    assert client.mixed_attempts == 1
     assert client.closed >= 1
     assert client.connected >= 1
-    assert len(client.subscriptions) == 1
-    method, params = client.subscriptions[0]
+    assert len(client.subscriptions) == 2
+    method, params = client.subscriptions[1]
     assert method == HERDR_EVENTS_SUBSCRIBE_METHOD
     subscriptions = params["subscriptions"]
     fallback_names = set(HERDR_OFFICIAL_EVENT_NAMES) - {
         "workspace.focused",
+        "pane.updated",
         "pane.focused",
         "pane.agent_detected",
         "pane.output_matched",
@@ -688,6 +805,344 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
     assert len(subscriptions) == len(fallback_names)
     assert {item["type"] for item in subscriptions} == fallback_names
     assert {item["pane_id"] for item in subscriptions} == {"pane-private"}
+
+
+def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Feed one pane through every event path without changing its identity bytes."""
+    fixed_installation_key = b"tendwire-identity-regression-key"
+    assert len(fixed_installation_key) == 32
+    derivation_inputs: list[bytes] = []
+    real_stable_worker_key = herdr_cli.stable_worker_key
+
+    def capture_stable_worker_key(
+        installation_key: bytes,
+        *,
+        backend: str,
+        host_id: str,
+        workspace_id: str,
+        pane_id: str,
+    ) -> str:
+        derivation_inputs.append(
+            installation_key
+            + b"\0"
+            + json.dumps(
+                {
+                    "backend": backend,
+                    "host_id": host_id,
+                    "pane_id": pane_id,
+                    "workspace_id": workspace_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        return real_stable_worker_key(
+            installation_key,
+            backend=backend,
+            host_id=host_id,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+        )
+
+    monkeypatch.setattr(
+        herdr_cli,
+        "load_or_create_installation_key",
+        lambda _data_dir: fixed_installation_key,
+    )
+    monkeypatch.setattr(herdr_cli, "stable_worker_key", capture_stable_worker_key)
+
+    pane = {
+        "pane_id": "w123456789abcde:pA",
+        "terminal_id": "terminal-identity",
+        "agent": "claude",
+        "workspace_id": "w123456789abcde",
+        "agent_status": "working",
+        "label": "identity-pane",
+    }
+    workspaces = [{"id": "w123456789abcde", "name": "Build"}]
+
+    def reconciled_backend(name: str) -> HerdrEventBackend:
+        data_dir = tmp_path / name
+        config = Config(
+            host_id="identity-host",
+            data_dir=data_dir,
+            db_path=data_dir / "tendwire.db",
+            herdr_backend="socket",
+        )
+        init_store(Path(config.db_path))
+        backend = HerdrEventBackend(config, debounce_seconds=0)
+        backend.reconcile_once(
+            client=_StaticClient(
+                workspaces=workspaces,
+                panes=[dict(pane)],
+                agents=[],
+            )
+        )
+        return backend
+
+    def stable_key_bytes(backend: HerdrEventBackend) -> bytes:
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert snapshot is not None
+        return snapshot.workers[0].meta["stable_key"].encode("ascii")
+
+    def worker_meta_bytes(backend: HerdrEventBackend) -> bytes:
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert snapshot is not None
+        return json.dumps(
+            snapshot.workers[0].meta,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    reference_backend = reconciled_backend("474-reference-reconcile")
+    assert len(derivation_inputs) == 1
+    reference_input = derivation_inputs[0]
+    reference_key = stable_key_bytes(reference_backend)
+    reference_meta = worker_meta_bytes(reference_backend)
+
+    legacy_backend = reconciled_backend("herdr-074-status-path")
+    legacy_path_start = len(derivation_inputs) - 1
+    assert legacy_backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {**pane, "agent_status": "blocked"},
+        }
+    )
+    assert derivation_inputs[legacy_path_start:] == [reference_input, reference_input]
+    assert stable_key_bytes(legacy_backend) == reference_key
+    assert worker_meta_bytes(legacy_backend) == reference_meta
+
+    new_backend = reconciled_backend("herdr-075-pane-updated-path")
+    new_path_start = len(derivation_inputs) - 1
+    before_new_meta = worker_meta_bytes(new_backend)
+    refreshes: list[None] = []
+    new_backend.set_turn_refresh_callback(lambda: refreshes.append(None))
+
+    # Herdr 0.7.5's update carries the same pane fixture as the old status
+    # path. It is a refresh notification only, so pane metadata must not be
+    # re-projected from this differently shaped event family.
+    assert new_backend.queue_event_envelope(
+        {
+            "event": "pane.updated",
+            "data": {
+                "type": "pane_updated",
+                "pane": {**pane, "agent_status": "blocked"},
+            },
+        }
+    )
+    assert refreshes == [None]
+    assert derivation_inputs[new_path_start:] == [reference_input]
+    assert stable_key_bytes(new_backend) == reference_key
+    assert before_new_meta == worker_meta_bytes(new_backend) == reference_meta
+
+    class Herdr074FallbackClient:
+        def __init__(self) -> None:
+            self.params: list[dict[str, Any]] = []
+            self.closed = 0
+            self.connected = 0
+
+        def subscribe(self, _method: str, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            copied = json.loads(json.dumps(params))
+            self.params.append(copied)
+            if any(
+                item.get("type") == "pane.updated"
+                for item in copied["subscriptions"]
+            ):
+                raise HerdrEnvelopeError("Herdr 0.7.4 does not know pane.updated")
+            return SimpleNamespace(subscription_id="herdr-074-compatible")
+
+        def close(self) -> None:
+            self.closed += 1
+
+        def connect(self) -> None:
+            self.connected += 1
+
+    fallback = Herdr074FallbackClient()
+    before_fallback_inputs = list(derivation_inputs)
+    before_fallback = latest_snapshot(new_backend.db_path, new_backend.config.host_id)
+    stream = new_backend._subscribe_event_stream(fallback)
+    after_fallback = latest_snapshot(new_backend.db_path, new_backend.config.host_id)
+    assert stream.subscription_id == "herdr-074-compatible"
+    assert fallback.closed == fallback.connected == 1
+    assert len(fallback.params) == 2
+    assert all(
+        item["type"] != "pane.updated"
+        for item in fallback.params[1]["subscriptions"]
+    )
+    assert {item["pane_id"] for item in fallback.params[1]["subscriptions"]} == {
+        pane["pane_id"]
+    }
+    assert derivation_inputs == before_fallback_inputs
+    assert before_fallback == after_fallback
+
+    fallback_event_start = len(derivation_inputs)
+    assert new_backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {**pane, "agent_status": "blocked"},
+        }
+    )
+    assert derivation_inputs[fallback_event_start:] == [reference_input]
+    assert stable_key_bytes(new_backend) == reference_key
+    assert worker_meta_bytes(new_backend) == reference_meta
+
+    # This models the live failure: the same terminal arrives with a second,
+    # identity-looking pane tuple. The reworked refresh path must neither call
+    # the derivation function nor replace any persisted worker metadata.
+    before_dangerous_update_inputs = list(derivation_inputs)
+    before_dangerous_update_meta = worker_meta_bytes(new_backend)
+    assert new_backend.queue_event_envelope(
+        {
+            "event": "pane.updated",
+            "data": {
+                "type": "pane_updated",
+                "pane": {
+                    **pane,
+                    "workspace_id": "wD2",
+                    "pane_id": "wD2:p7",
+                    "agent_status": "blocked",
+                },
+            },
+        }
+    )
+    assert refreshes == [None, None, None]
+    assert derivation_inputs == before_dangerous_update_inputs
+    assert stable_key_bytes(new_backend) == reference_key
+    assert worker_meta_bytes(new_backend) == before_dangerous_update_meta
+
+
+@pytest.mark.parametrize("turn_model", ["legacy", "observed"])
+@pytest.mark.parametrize(
+    "event_envelope",
+    [
+        pytest.param(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {
+                    "pane_id": "w123456789abcde:pA",
+                    "workspace_id": "w123456789abcde",
+                    "agent": "claude",
+                    "agent_status": "blocked",
+                },
+            },
+            id="herdr-074-status-event",
+        ),
+        pytest.param(
+            {
+                "event": "pane_updated",
+                "data": {
+                    "type": "pane_updated",
+                    "pane": {
+                        "pane_id": "w123456789abcde:pA",
+                        "workspace_id": "w123456789abcde",
+                        "terminal_id": "terminal-decision",
+                        "agent": "claude",
+                        "agent_status": "blocked",
+                    },
+                },
+            },
+            id="herdr-075-pane-updated-event",
+        ),
+        pytest.param(
+            {
+                "event": "pane_agent_status_changed",
+                "data": {
+                    "type": "pane_agent_status_changed",
+                    "pane_id": "w123456789abcde:pA",
+                    "workspace_id": "w123456789abcde",
+                    "agent": "claude",
+                    "display_agent": "Claude",
+                    "agent_status": "blocked",
+                    "state_labels": {},
+                    "title": None,
+                },
+            },
+            id="herdr-075-agent-status-event",
+        ),
+    ],
+)
+def test_idless_blocked_event_persists_and_lists_decision(
+    tmp_path: Path,
+    turn_model: str,
+    event_envelope: dict[str, Any],
+) -> None:
+    backend, _binding = _decision_backend(tmp_path, turn_model)
+    refreshes: list[Any] = []
+
+    def refresh_current() -> None:
+        binding = next(iter(backend._bindings.values()))
+        refreshes.append(
+            herdr_turns.refresh_turn_binding(
+                backend.config, binding, adapter_timeout_seconds=1
+            )
+        )
+
+    backend.set_turn_refresh_callback(refresh_current)
+
+    def handler(conn: _SocketConnection) -> None:
+        request = conn.read_request()
+        subscriptions = request["params"]["subscriptions"]
+        assert {"type": "pane.updated"} in subscriptions
+        assert {
+            "type": "pane.agent_status_changed",
+            "pane_id": "w123456789abcde:pA",
+        } in subscriptions
+        conn.send_json(
+            {"id": request["id"], "result": {"type": "subscription_started"}}
+        )
+        conn.send_json(event_envelope)
+
+    with _FakeHerdrSocketServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        stream = backend._subscribe_event_stream(client)
+        envelope = client.read_event(stream.subscription_id, timeout=1)
+        assert envelope.get("id") is None
+        assert backend.queue_event_envelope(envelope) is True
+        client.close()
+
+    assert refreshes == [herdr_turns.TurnRefreshResult("updated", 1, True)]
+    _assert_decision_persisted(backend)
+
+
+@pytest.mark.parametrize("turn_model", ["legacy", "observed"])
+def test_reconcile_fallback_refreshes_and_lists_decision_without_status_event(
+    tmp_path: Path,
+    turn_model: str,
+) -> None:
+    backend, _binding = _decision_backend(tmp_path, turn_model)
+    refreshes: list[Any] = []
+
+    def refresh_current() -> None:
+        binding = next(iter(backend._bindings.values()))
+        refreshes.append(
+            herdr_turns.refresh_turn_binding(
+                backend.config, binding, adapter_timeout_seconds=1
+            )
+        )
+
+    backend.set_turn_refresh_callback(refresh_current)
+
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[
+                {
+                    "pane_id": "w123456789abcde:pA",
+                    "terminal_id": "terminal-decision",
+                    "agent": "claude",
+                    "workspace_id": "w123456789abcde",
+                    "agent_status": "blocked",
+                }
+            ],
+            agents=[],
+        )
+    )
+
+    assert refreshes == [herdr_turns.TurnRefreshResult("updated", 1, True)]
+    _assert_decision_persisted(backend)
 
 
 def test_backend_rejects_non_official_subscribe_method(tmp_path: Path) -> None:
@@ -1817,7 +2272,14 @@ def test_run_forever_reconnect_accepts_identical_idless_event_again(tmp_path: Pa
 
     backend.run_forever()
 
-    expected = build_events_subscribe_params(HERDR_OFFICIAL_EVENT_NAMES)
+    expected = {
+        "subscriptions": [
+            {"type": name}
+            for name in HERDR_OFFICIAL_EVENT_NAMES
+            if name not in {"pane.agent_status_changed", "pane.output_matched"}
+        ]
+        + [{"type": "pane.agent_status_changed", "pane_id": "pane-1"}]
+    }
     assert first.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
     assert second.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
     assert first.read_calls == 2
@@ -2850,6 +3312,17 @@ def test_reconcile_turn_refresh_observes_durable_state_and_replaced_ownership_ma
                 "agent": "Agent One",
                 "workspace_id": "space-1",
                 "status": "working",
+            },
+        ),
+        (
+            "pane.updated",
+            {
+                "pane": {
+                    "pane_id": "pane-1",
+                    "agent": "Agent One",
+                    "workspace_id": "space-1",
+                    "status": "working",
+                },
             },
         ),
         (

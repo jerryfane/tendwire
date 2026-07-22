@@ -17445,6 +17445,8 @@ _TURN_CONTENT_FIELDS = frozenset(
         "model",
         "complete",
         "has_open_turn",
+        "awaiting_input",
+        "pending_decision",
         "source_turn_id",
     }
 )
@@ -18225,7 +18227,23 @@ def _normalized_persisted_turn_payload(
         # kind. Keep it alongside the stored opaque token so later raw-source
         # observations continue to resolve the same compatibility row.
         normalized["kind"] = stored_kind
+    normalized.update(_public_pending_turn_extension(payload))
     return _strip_canonical_turn_payload(normalized)
+
+
+def _public_pending_turn_extension(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep only the safe, opt-in pending projection outside the frozen Turn model."""
+    if payload.get("awaiting_input") is not True:
+        return {}
+    decision = sanitize_public_mapping(payload.get("pending_decision"))
+    if not decision:
+        return {}
+    return {
+        "awaiting_input": True,
+        "pending_decision": decision,
+    }
 
 
 def _update_persisted_turn_row(
@@ -18462,6 +18480,7 @@ def _apply_backend_pending_observation_conn(
     stale_grace_seconds: float,
     binding_private_fingerprint: str = "",
     observed_turn_target_value: str = "",
+    binding_authoritative: bool = False,
 ) -> bool:
     """Apply one binding-scoped durable backend-pending transition."""
     current_time, current_dt = _pending_observed_time(observed_at)
@@ -18524,7 +18543,7 @@ def _apply_backend_pending_observation_conn(
         and stored_binding
         and source_binding != stored_binding
     )
-    if binding_changed:
+    if binding_changed and not binding_authoritative:
         return False
     effective_binding = source_binding or stored_binding
     effective_target = source_target or stored_target
@@ -21450,6 +21469,7 @@ def _merge_observed_turn_content_conn(
     )
     seed["source_turn_id"] = incoming_source_turn
     item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
+    item.update(_public_pending_turn_extension(seed))
     item.pop("origin_command_id", None)
     turn_id = str(item.get("id") or "")
     if not turn_id:
@@ -21823,6 +21843,7 @@ def _merge_owned_turn_content_conn(
                 item = _strip_canonical_turn_payload(
                     Turn.from_dict(seed).to_dict()
                 )
+                item.update(_public_pending_turn_extension(seed))
                 turn_id = str(item.get("id") or "")
                 collision = conn.execute(
                     """
@@ -21945,6 +21966,7 @@ def _merge_owned_turn_content_conn(
             item = _strip_canonical_turn_payload(
                 Turn.from_dict(seed).to_dict()
             )
+            item.update(_public_pending_turn_extension(seed))
             turn_id = _insert_owned_turn_conn(
                 conn,
                 host_id=str(host_id),
@@ -22600,6 +22622,11 @@ def apply_turn_refresh(
                         if expected_binding is not None
                         else ""
                     ),
+                    # The expected binding was checked against the active row
+                    # above in this same transaction.  It may therefore take
+                    # ownership from stale pending state left by an expired
+                    # pane binding for the same stable worker.
+                    binding_authoritative=expected_binding is not None,
                 )
             elif backend_pending is not _UNSET:
                 pending_changed = _merge_backend_pending_conn(
@@ -24090,6 +24117,7 @@ def turns_payload_from_store(
             continue
         serialized = Turn.from_dict(turn_payload).to_dict()
         item = _strip_canonical_turn_payload(serialized)
+        item.update(_public_pending_turn_extension(turn_payload))
         item["id"] = str(turn_id)
         stored_source_turn_id = str(
             turn_payload.get("source_turn_id") or ""
