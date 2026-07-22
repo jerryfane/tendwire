@@ -19293,6 +19293,159 @@ def _current_owned_turn_content_rows_conn(
     ]
 
 
+def _current_owned_source_turn_content_rows_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    owner_identity: tuple[str, str, int],
+    incoming_source_turn: str,
+    projection: Mapping[str, Any],
+    content: Mapping[str, Any],
+) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
+    """Hydrate only rows that can match one stable-owner source observation."""
+
+    owner_kind, owner_key, owner_version = owner_identity
+    meta = projection.get("meta")
+    if (
+        owner_kind != "stable_key"
+        or owner_version != 1
+        or not incoming_source_turn
+        or not isinstance(meta, Mapping)
+    ):
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            json_extract(turns.payload_json, '$.source_turn_id'),
+            json_extract(turns.payload_json, '$.source'),
+            json_extract(turns.payload_json, '$.kind')
+        FROM turns
+        WHERE turns.host_id = ?
+          AND json_valid(turns.payload_json)
+          AND json_type(turns.payload_json, '$.meta.stable_key') = 'text'
+          AND json_extract(turns.payload_json, '$.meta.stable_key') = ?
+          AND json_type(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = 'integer'
+          AND json_extract(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = ?
+          AND json_type(turns.payload_json, '$.source_turn_id') = 'text'
+          AND COALESCE(json_extract(
+                turns.payload_json,
+                '$.superseded_at'
+              ), '') = ''
+        """,
+        (
+            str(host_id),
+            str(owner_key),
+            int(owner_version),
+        ),
+    ).fetchall()
+    matching_turn_ids = [
+        str(turn_id)
+        for turn_id, stored_source_turn, stored_source, stored_kind in rows
+        if str(stored_source_turn or "")
+        in turn_source_id_candidates(
+            incoming_source_turn,
+            meta={
+                "stable_key": owner_key,
+                "stable_key_version": owner_version,
+            },
+            source=stored_source,
+            kind=stored_kind,
+        )
+    ]
+    if len(matching_turn_ids) > 1:
+        raise StoreSchemaError("turn_owner_source_ambiguous")
+    if not matching_turn_ids:
+        return []
+    row = _current_turn_content_row_by_id_conn(
+        conn,
+        str(host_id),
+        matching_turn_ids[0],
+    )
+    if (
+        row is None
+        or _turn_is_tombstoned(row[1])
+        or _turn_continuity_identity(row[1]) != owner_identity
+        or not _owned_source_turn_matches(row[1], incoming_source_turn)
+    ):
+        return []
+    return [row]
+
+
+def _current_owned_origin_command_content_rows_conn(
+    conn: sqlite3.Connection,
+    host_id: str,
+    owner_identity: tuple[str, str, int],
+    origin_command_id: str,
+) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
+    owner_kind, owner_key, owner_version = owner_identity
+    if (
+        owner_kind != "stable_key"
+        or owner_version != 1
+        or not origin_command_id
+    ):
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            turns.payload_json,
+            revisions.content_revision,
+            revisions.user_text,
+            revisions.assistant_final_text,
+            revisions.user_state,
+            revisions.final_state,
+            turns.observed_at
+        FROM turns
+        LEFT JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        WHERE turns.host_id = ?
+          AND json_valid(turns.payload_json)
+          AND json_type(turns.payload_json, '$.meta.stable_key') = 'text'
+          AND json_extract(turns.payload_json, '$.meta.stable_key') = ?
+          AND json_type(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = 'integer'
+          AND json_extract(
+                turns.payload_json,
+                '$.meta.stable_key_version'
+              ) = ?
+          AND COALESCE(json_extract(
+                turns.payload_json,
+                '$.source_turn_id'
+              ), '') = ''
+          AND json_extract(
+                turns.payload_json,
+                '$.origin_command_id'
+              ) = ?
+          AND COALESCE(json_extract(
+                turns.payload_json,
+                '$.superseded_at'
+              ), '') = ''
+        """,
+        (
+            str(host_id),
+            str(owner_key),
+            int(owner_version),
+            str(origin_command_id),
+        ),
+    ).fetchall()
+    return [
+        row
+        for row in _decode_turn_content_rows(rows)
+        if not _turn_is_tombstoned(row[1])
+        and _turn_continuity_identity(row[1]) == owner_identity
+    ]
+
+
 def _snapshot_owned_turn_candidate_ref_conn(
     conn: sqlite3.Connection,
     host_id: str,
@@ -19482,10 +19635,45 @@ def _tombstone_matching_command_sibling_conn(
     *,
     observed_at: str,
 ) -> bool:
-    rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
-    completing = next(
-        (row for row in rows if str(row[0]) == str(completing_turn_id)),
-        None,
+    rows = conn.execute(
+        """
+        SELECT
+            turns.turn_id,
+            turns.payload_json,
+            revisions.content_revision,
+            revisions.user_text,
+            revisions.assistant_final_text,
+            revisions.user_state,
+            revisions.final_state,
+            turns.observed_at
+        FROM turns
+        LEFT JOIN turn_content_revisions AS revisions
+          ON revisions.host_id = turns.host_id
+         AND revisions.turn_id = turns.turn_id
+         AND revisions.is_current = 1
+        WHERE turns.host_id = ?
+          AND turns.worker_id = ?
+          AND turns.turn_id != ?
+          AND json_valid(turns.payload_json)
+          AND json_extract(turns.payload_json, '$.source') = 'command'
+          AND COALESCE(json_extract(
+                turns.payload_json,
+                '$.source_turn_id'
+              ), '') = ''
+          AND COALESCE(json_extract(
+                turns.payload_json,
+                '$.superseded_at'
+              ), '') = ''
+          AND json_extract(turns.payload_json, '$.has_open_turn') = 1
+        """,
+        (str(host_id), str(worker_id), str(completing_turn_id)),
+    ).fetchall()
+    if not rows:
+        return False
+    completing = _current_turn_content_row_by_id_conn(
+        conn,
+        str(host_id),
+        str(completing_turn_id),
     )
     if completing is None:
         return False
@@ -19496,11 +19684,11 @@ def _tombstone_matching_command_sibling_conn(
         and str(completing[2].get("final_state") or "") == "complete"
     ):
         return False
+    decoded = _decode_turn_content_rows(rows)
     candidates = [
         row
-        for row in rows
-        if str(row[0]) != str(completing_turn_id)
-        and str(row[1].get("source") or "") == "command"
+        for row in decoded
+        if str(row[1].get("source") or "") == "command"
         and not str(row[1].get("source_turn_id") or "").strip()
         and not _turn_is_tombstoned(row[1])
         and row[1].get("has_open_turn") is True
@@ -20487,15 +20675,54 @@ def _merge_turn_content_conn(
     current_snapshot_fingerprint = str(current_worker_row[1] or "")
     current_identity = _turn_continuity_identity(current_worker_payload)
     if current_identity is not None:
-        rows = _current_owned_turn_content_rows_conn(
-            conn,
-            str(host_id),
-            current_identity,
-        )
         current_projection = _current_worker_turn_projection(
             str(host_id),
             str(worker_id),
             current_worker_payload,
+        )
+        incoming_source_turn = str(
+            clean_content.get("source_turn_id") or ""
+        ).strip()
+        if incoming_source_turn:
+            source_rows = _current_owned_source_turn_content_rows_conn(
+                conn,
+                str(host_id),
+                current_identity,
+                incoming_source_turn,
+                current_projection,
+                clean_content,
+            )
+            if len(source_rows) > 1:
+                raise StoreSchemaError("turn_owner_source_ambiguous")
+            if source_rows:
+                source_origin = str(
+                    source_rows[0][1].get("origin_command_id") or ""
+                ).strip()
+                if source_origin:
+                    source_rows.extend(
+                        _current_owned_origin_command_content_rows_conn(
+                            conn,
+                            str(host_id),
+                            current_identity,
+                            source_origin,
+                        )
+                    )
+                return _merge_owned_turn_content_conn(
+                    conn,
+                    str(host_id),
+                    source_rows,
+                    current_projection,
+                    clean_content,
+                    automation_probe,
+                    incoming_user=incoming_user,
+                    incoming_final=incoming_final,
+                    observed_at=observed_at,
+                    snapshot_content_fingerprint=current_snapshot_fingerprint,
+                )
+        rows = _current_owned_turn_content_rows_conn(
+            conn,
+            str(host_id),
+            current_identity,
         )
         return _merge_owned_turn_content_conn(
             conn,

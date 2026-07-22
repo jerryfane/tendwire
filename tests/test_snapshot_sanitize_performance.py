@@ -4,8 +4,11 @@ import sqlite3
 from pathlib import Path
 from time import perf_counter
 
+import pytest
+
 from tendwire.core import models
 from tendwire.core.models import Snapshot, Space, Worker
+from tendwire.core.turns import Turn
 from tendwire.store import sqlite as store_sqlite
 
 
@@ -263,3 +266,101 @@ def test_forbidden_phrase_scan_is_bounded_for_token_dense_text() -> None:
     large = elapsed(500_000)
 
     assert large <= small * 4 + 0.01
+
+
+def test_repeated_owned_turn_refresh_hydrates_only_the_matching_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "owned-refresh.db"
+    stable_key = "wsk1_" + ("a" * 64)
+    worker = Worker(
+        id="worker-current",
+        name="Current Worker",
+        status="active",
+        meta={"stable_key": stable_key, "stable_key_version": 1},
+    )
+    snapshot = Snapshot(
+        host_id=HOST_ID,
+        updated_at="2026-07-20T00:01:00+00:00",
+        workers=[worker],
+    )
+    current_source = "019f7777-0000-7000-8000-999999999999"
+    current_final = "current final"
+
+    store_sqlite.init_store(db_path)
+    store_sqlite.save_snapshot(db_path, snapshot)
+    with store_sqlite._connect(db_path, isolation_level=None) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for index in range(760):
+            raw_source = (
+                current_source
+                if index == 759
+                else f"019f7777-0000-7000-8000-{index:012d}"
+            )
+            final_text = current_final if index == 759 else "x" * 8_000
+            item = Turn(
+                host_id=HOST_ID,
+                worker_id=worker.id,
+                worker_fingerprint=worker.fingerprint,
+                status="idle",
+                kind="task",
+                source="snapshot",
+                user_text=f"prompt {index}",
+                assistant_final_text=None,
+                complete=True,
+                has_open_turn=False,
+                source_turn_id=raw_source,
+                updated_at=f"2026-07-20T00:00:{index % 60:02d}+00:00",
+                meta={"stable_key": stable_key, "stable_key_version": 1},
+            ).to_dict()
+            turn_id = store_sqlite._insert_owned_turn_conn(
+                conn,
+                host_id=HOST_ID,
+                item=item,
+                snapshot_content_fingerprint="seed",
+                observed_at=str(item["updated_at"]),
+            )
+            store_sqlite._replace_current_turn_content_conn(
+                conn,
+                host_id=HOST_ID,
+                turn_id=turn_id,
+                current=None,
+                incoming_user=str(item["user_text"]),
+                incoming_final=final_text,
+                current_time=str(item["updated_at"]),
+            )
+        conn.commit()
+
+    decoded_counts: list[int] = []
+    original_decode = store_sqlite._decode_turn_content_rows
+
+    def recording_decode(rows):
+        materialized = list(rows)
+        decoded_counts.append(len(materialized))
+        return original_decode(materialized)
+
+    monkeypatch.setattr(store_sqlite, "_decode_turn_content_rows", recording_decode)
+    monkeypatch.setattr(
+        store_sqlite,
+        "_current_owned_turn_content_rows_conn",
+        lambda *_args, **_kwargs: pytest.fail("broad owner hydration is not bounded"),
+    )
+    assert (
+        store_sqlite.merge_turn_content(
+            db_path,
+            HOST_ID,
+            worker.id,
+            {
+                "source_turn_id": current_source,
+                "user_text": "prompt 759",
+                "assistant_final_text": current_final,
+                "complete": True,
+                "has_open_turn": False,
+            },
+            observed_at="2026-07-20T00:02:00+00:00",
+        )
+        == 1
+    )
+
+    assert decoded_counts == [1]
