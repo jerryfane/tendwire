@@ -31,6 +31,7 @@ HERDR_OFFICIAL_EVENT_NAMES = (
     "workspace.focused",
     "pane.created",
     "pane.closed",
+    "pane.updated",
     "pane.focused",
     "pane.moved",
     "pane.exited",
@@ -271,9 +272,14 @@ def is_event(envelope: Mapping[str, Any]) -> bool:
 
 def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
-    _validated_id(envelope)
     if not is_response(envelope):
         raise HerdrEnvelopeError("Herdr response must contain exactly one of result or error")
+    # Herdr 0.7.5 emits ``{"id":"", "error":...}`` when subscription
+    # parameters fail schema validation.  Preserve that error response so the
+    # caller can take its compatibility fallback; successful responses remain
+    # strictly correlated.
+    if not is_error_response(envelope) or envelope.get("id") != "":
+        _validated_id(envelope)
     return dict(envelope)
 
 
