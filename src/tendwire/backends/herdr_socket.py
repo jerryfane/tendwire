@@ -334,6 +334,12 @@ class HerdrSocketClient:
                     )
                 self._pending_events.append(envelope)
                 continue
+            if is_error_response(envelope) and envelope.get("id") == "":
+                # Herdr 0.7.5 does not correlate request-schema errors.  They
+                # still belong to the only in-flight synchronous request and
+                # must reach the caller as a server error, not tear down the
+                # event loop as a malformed envelope.
+                raise HerdrErrorResponse(error_payload(envelope), request_id)
             ensure_response_id(envelope, request_id)
             if not (is_result_response(envelope) or is_error_response(envelope)):
                 raise HerdrEnvelopeError("expected Herdr response envelope")

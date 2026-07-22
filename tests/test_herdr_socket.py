@@ -369,6 +369,26 @@ def test_subscription_buffers_idless_event_before_correlated_ack(tmp_path: Path)
         client.close()
 
 
+def test_subscription_surfaces_herdr_075_empty_id_schema_error(tmp_path: Path) -> None:
+    def handler(conn: _Connection) -> None:
+        conn.read_request()
+        conn.send_json(
+            {
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: missing field pane_id",
+                },
+            }
+        )
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        with pytest.raises(HerdrErrorResponse, match="missing field pane_id"):
+            client.events_subscribe(["pane.agent_status_changed"])
+        client.close()
+
+
 def test_events_subscribe_wrapper_sends_official_method_and_params(tmp_path: Path) -> None:
     event_names = ("workspace.created", "pane.agent_status_changed")
 

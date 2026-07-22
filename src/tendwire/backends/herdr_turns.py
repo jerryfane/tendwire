@@ -51,6 +51,8 @@ _TURN_CONTENT_KEYS = (
     "model",
     "complete",
     "has_open_turn",
+    "awaiting_input",
+    "pending_decision",
 )
 _CODEX_SESSION_TURN_KIND = "codex_session_id"
 _OMP_SESSION_TURN_KIND = "omp_session_path"
@@ -608,6 +610,32 @@ def _backend_pending_from_turn(turn: Mapping[str, Any]) -> dict[str, Any] | None
     }
 
 
+def _public_turn_pending_projection(
+    observation: PendingObservation,
+) -> dict[str, Any]:
+    """Return the private-neutral decision fields persisted with an open turn."""
+    if observation.kind != "open_prompt" or observation.decision_kind is None:
+        return {}
+    mode = {
+        "single": "buttons",
+        "multi": "multi",
+        "plan": "plan",
+    }[observation.decision_kind]
+    return {
+        "awaiting_input": True,
+        "pending_decision": {
+            "prompt": observation.question,
+            "mode": mode,
+            "options": [
+                {"id": str(ordinal), "label": label}
+                for ordinal, label in enumerate(observation.decision_options, 1)
+            ],
+            "multi_select": observation.decision_multi_select,
+            "question_count": observation.decision_question_count,
+        },
+    }
+
+
 class _TurnReadTimeout(Exception):
     """Fixed internal timeout signal; never serialized with private details."""
 
@@ -701,6 +729,7 @@ def _read_private_turn(
             raise _TurnReadFailed
         return None
     pending_observation = _pending_observation_from_turn(turn)
+    pending_projection = _public_turn_pending_projection(pending_observation)
     if turn.get("available") is False:
         return (
             {"_backend_pending_observation": pending_observation}
@@ -721,12 +750,14 @@ def _read_private_turn(
         )
         if raise_timeout:
             opened_data = dict(opened or {})
+            opened_data.update(pending_projection)
             opened_data["_backend_pending_observation"] = pending_observation
             return opened_data
 
         return opened
 
     content = {key: turn.get(key) for key in _TURN_CONTENT_KEYS if key in turn}
+    content.update(pending_projection)
     if raise_timeout:
         content["_backend_pending_observation"] = pending_observation
     # Prefer the stable prompt-scoped id so a turn keeps one identity from
