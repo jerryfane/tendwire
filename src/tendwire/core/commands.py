@@ -295,6 +295,11 @@ def _contains_c1_control(text: str) -> bool:
     return any(0x80 <= ord(char) <= 0x9F for char in text)
 
 
+def _is_raw_instruction_control(char: str) -> bool:
+    code = ord(char)
+    return (code < 32 and code not in {9, 10}) or code == 127
+
+
 def validate_instruction_text(text: Any) -> dict[str, Any] | None:
     """Validate instruction text and return an error dict, or None if valid."""
     if text is None:
@@ -327,8 +332,7 @@ def validate_instruction_text(text: Any) -> dict[str, Any] | None:
         )
     # Reject C0 controls except LF and tab, plus DEL.
     for char in text:
-        code = ord(char)
-        if (code < 32 and code not in {9, 10}) or code == 127:
+        if _is_raw_instruction_control(char):
             return instruction_text_error(
                 STATUS_INVALID_REQUEST,
                 "instruction.text must not contain raw control characters",
@@ -342,9 +346,28 @@ def normalize_instruction_text(text: Any) -> str:
     Line boundaries remain significant, while runs of horizontal or other
     intra-line whitespace are collapsed. The function is deliberately pure so
     claim matching and the Phase-2 ledger cannot drift apart.
+
+    Herdr observations may retain terminal framing bytes at the outer edge of
+    otherwise exact input (for example a trailing U+0001). Submitted
+    instructions reject every such C0/C1 byte, so ignoring only edge controls
+    is collision-safe for ledger matching. Controls inside the instruction
+    remain significant and therefore fail closed.
     """
+    raw = str(text or "")
+    start = 0
+    end = len(raw)
+    while start < end and (
+        _is_raw_instruction_control(raw[start])
+        or 0x80 <= ord(raw[start]) <= 0x9F
+    ):
+        start += 1
+    while end > start and (
+        _is_raw_instruction_control(raw[end - 1])
+        or 0x80 <= ord(raw[end - 1]) <= 0x9F
+    ):
+        end -= 1
     return "\n".join(
-        " ".join(line.split()) for line in str(text or "").splitlines()
+        " ".join(line.split()) for line in raw[start:end].splitlines()
     ).strip()
 
 
