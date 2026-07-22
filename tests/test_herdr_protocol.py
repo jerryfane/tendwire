@@ -224,6 +224,23 @@ def test_validate_server_envelope_rejects_missing_id() -> None:
         validate_server_envelope({"result": {"ok": True}})
 
 
+def test_validate_server_envelope_accepts_herdr_075_uncorrelated_error() -> None:
+    envelope = {
+        "id": "",
+        "error": {
+            "code": "invalid_request",
+            "message": "invalid request: missing field pane_id",
+        },
+    }
+
+    assert validate_server_envelope(envelope) == envelope
+
+
+def test_validate_server_envelope_rejects_missing_id_error() -> None:
+    with pytest.raises(HerdrEnvelopeError):
+        validate_server_envelope({"error": {"message": "uncorrelated"}})
+
+
 @pytest.mark.parametrize(
     "envelope",
     [
