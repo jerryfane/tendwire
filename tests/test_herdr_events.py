@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from tendwire.backends import herdr_turns
+from tendwire.backends import herdr_cli, herdr_turns
 from tendwire.backends.herdr_events import (
     DEFAULT_SUBSCRIBE_METHOD,
     HerdrEventBackend,
@@ -38,7 +38,6 @@ from tendwire.backends.herdr_protocol import (
     HERDR_EVENTS_SUBSCRIBE_METHOD,
     HERDR_OFFICIAL_EVENT_NAMES,
     HerdrEnvelopeError,
-    build_events_subscribe_params,
 )
 from tendwire.config import Config
 from tendwire.core.models import BackendHealth, Snapshot, Worker, WorkerBinding
@@ -604,7 +603,13 @@ def test_backend_default_subscription_uses_official_shape_without_legacy_default
 
     backend.run_forever()
 
-    expected_params = build_events_subscribe_params(HERDR_OFFICIAL_EVENT_NAMES)
+    expected_params = {
+        "subscriptions": [
+            {"type": name}
+            for name in HERDR_OFFICIAL_EVENT_NAMES
+            if name not in {"pane.agent_status_changed", "pane.output_matched"}
+        ]
+    }
     assert DEFAULT_SUBSCRIBE_METHOD == HERDR_EVENTS_SUBSCRIBE_METHOD
     assert client.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected_params)]
     subscribed_names = {subscription["type"] for subscription in expected_params["subscriptions"]}
@@ -616,7 +621,7 @@ def test_backend_default_subscription_uses_official_shape_without_legacy_default
     }.isdisjoint(subscribed_names)
 
 
-def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path: Path) -> None:
+def test_backend_falls_back_to_herdr_074_pane_scoped_event_subscriptions(tmp_path: Path) -> None:
     config = _config(tmp_path, "pane-scoped-subscribe")
     init_store(Path(config.db_path))
     backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
@@ -634,7 +639,7 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
                     }
                 ],
             )
-            self.global_attempts = 0
+            self.mixed_attempts = 0
             self.subscriptions: list[tuple[str, dict[str, Any]]] = []
             self.closed = 0
             self.connected = 0
@@ -652,8 +657,7 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
             timeout: float | None = None,
             event_timeout: float | None = None,
         ) -> Any:
-            self.global_attempts += 1
-            raise HerdrEnvelopeError("Herdr envelope id must be a non-empty string")
+            raise AssertionError("0.7.4 fallback must retain the pane-scoped request")
 
         def subscribe(
             self,
@@ -664,6 +668,12 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
             event_timeout: float | None = None,
         ) -> Any:
             self.subscriptions.append((method, dict(params)))
+            if any(
+                item.get("type") == "pane.updated"
+                for item in params.get("subscriptions", [])
+            ):
+                self.mixed_attempts += 1
+                raise HerdrEnvelopeError("0.7.4 does not know pane.updated")
             backend.stop_event.set()
             return SimpleNamespace(subscription_id="pane-scoped-sub")
 
@@ -672,15 +682,24 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
 
     backend.run_forever()
 
-    assert client.global_attempts == 1
+    assert client.mixed_attempts == 1
     assert client.closed >= 1
     assert client.connected >= 1
-    assert len(client.subscriptions) == 1
-    method, params = client.subscriptions[0]
+    assert len(client.subscriptions) == 2
+    mixed_method, mixed_params = client.subscriptions[0]
+    assert mixed_method == HERDR_EVENTS_SUBSCRIBE_METHOD
+    assert {"type": "pane.updated"} in mixed_params["subscriptions"]
+    assert {
+        "type": "pane.agent_status_changed",
+        "pane_id": "pane-private",
+    } in mixed_params["subscriptions"]
+    assert {"type": "pane.agent_status_changed"} not in mixed_params["subscriptions"]
+    method, params = client.subscriptions[1]
     assert method == HERDR_EVENTS_SUBSCRIBE_METHOD
     subscriptions = params["subscriptions"]
     fallback_names = set(HERDR_OFFICIAL_EVENT_NAMES) - {
         "workspace.focused",
+        "pane.updated",
         "pane.focused",
         "pane.agent_detected",
         "pane.output_matched",
@@ -688,6 +707,93 @@ def test_backend_falls_back_to_private_pane_scoped_event_subscriptions(tmp_path:
     assert len(subscriptions) == len(fallback_names)
     assert {item["type"] for item in subscriptions} == fallback_names
     assert {item["pane_id"] for item in subscriptions} == {"pane-private"}
+
+
+def test_pane_updated_does_not_reproject_worker_identity_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_installation_key = b"tendwire-identity-regression-key"
+    derivation_inputs: list[tuple[bytes, str, str, str, str]] = []
+    real_stable_worker_key = herdr_cli.stable_worker_key
+
+    def capture_stable_worker_key(
+        installation_key: bytes,
+        *,
+        backend: str,
+        host_id: str,
+        workspace_id: str,
+        pane_id: str,
+    ) -> str:
+        derivation_inputs.append(
+            (installation_key, backend, host_id, workspace_id, pane_id)
+        )
+        return real_stable_worker_key(
+            installation_key,
+            backend=backend,
+            host_id=host_id,
+            workspace_id=workspace_id,
+            pane_id=pane_id,
+        )
+
+    monkeypatch.setattr(
+        herdr_cli,
+        "load_or_create_installation_key",
+        lambda _data_dir: fixed_installation_key,
+    )
+    monkeypatch.setattr(herdr_cli, "stable_worker_key", capture_stable_worker_key)
+
+    backend = _backend(tmp_path, "pane-updated-identity")
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[
+                {
+                    "pane_id": "w123456789abcde:pA",
+                    "terminal_id": "terminal-1",
+                    "agent": "claude",
+                    "workspace_id": "w123456789abcde",
+                    "agent_status": "working",
+                    "label": "identity-pane",
+                }
+            ],
+        )
+    )
+    before = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert before is not None
+    assert len(before.workers) == len(derivation_inputs) == 1
+    before_identity = (
+        before.workers[0].id,
+        json.dumps(before.workers[0].meta, sort_keys=True, separators=(",", ":")),
+        tuple(derivation_inputs),
+    )
+    refreshes: list[None] = []
+    backend.set_turn_refresh_callback(lambda: refreshes.append(None))
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.updated",
+            "data": {
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": "different-pane",
+                    "terminal_id": "terminal-1",
+                    "agent": "claude",
+                    "workspace_id": "different-space",
+                    "agent_status": "blocked",
+                },
+            },
+        }
+    )
+
+    after = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert after is not None
+    assert refreshes == [None]
+    assert (
+        after.workers[0].id,
+        json.dumps(after.workers[0].meta, sort_keys=True, separators=(",", ":")),
+        tuple(derivation_inputs),
+    ) == before_identity
 
 
 def test_backend_rejects_non_official_subscribe_method(tmp_path: Path) -> None:
@@ -1817,7 +1923,14 @@ def test_run_forever_reconnect_accepts_identical_idless_event_again(tmp_path: Pa
 
     backend.run_forever()
 
-    expected = build_events_subscribe_params(HERDR_OFFICIAL_EVENT_NAMES)
+    expected = {
+        "subscriptions": [
+            {"type": name}
+            for name in HERDR_OFFICIAL_EVENT_NAMES
+            if name not in {"pane.agent_status_changed", "pane.output_matched"}
+        ]
+        + [{"type": "pane.agent_status_changed", "pane_id": "pane-1"}]
+    }
     assert first.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
     assert second.subscriptions == [(HERDR_EVENTS_SUBSCRIBE_METHOD, expected)]
     assert first.read_calls == 2
