@@ -708,6 +708,15 @@ def test_instruction_fingerprint_is_normalized_deterministic_and_opaque() -> Non
     assert fingerprint.startswith("twins1.")
     assert "deploy" not in fingerprint
     assert instruction_fingerprint("deploy the other build") != fingerprint
+    assert normalize_instruction_text("\x01deploy the build\x7f") == (
+        "deploy the build"
+    )
+    assert instruction_fingerprint("deploy the build\x01") == (
+        instruction_fingerprint("deploy the build")
+    )
+    assert instruction_fingerprint("deploy\x01 the build") != (
+        instruction_fingerprint("deploy the build")
+    )
     assert normalize_instruction_text(" \n\t ") == ""
     assert instruction_fingerprint(" \n\t ") != instruction_fingerprint("\n")
 
@@ -860,6 +869,7 @@ def _insert_link_submission(
     state: str = "submitted",
     link_not_before: str = "2026-02-01T11:59:00+00:00",
     link_expires_at: str = "2026-02-01T12:00:00+00:00",
+    hard_expires_at: str = "2026-02-02T12:00:00+00:00",
 ) -> None:
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute(
@@ -872,7 +882,7 @@ def _insert_link_submission(
                 send_started_at, updated_at
             ) VALUES (
                 ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?,
-                '2026-02-02T12:00:00+00:00', NULL, NULL,
+                ?, NULL, NULL,
                 '2026-02-01T12:00:00+00:00',
                 '2026-02-01T12:00:00+00:00',
                 '2026-02-01T12:00:00+00:00'
@@ -887,6 +897,7 @@ def _insert_link_submission(
                 state,
                 link_not_before,
                 link_expires_at,
+                hard_expires_at,
             ),
         )
 
@@ -1876,4 +1887,247 @@ def test_empty_component_backoff_is_bounded_for_dual_mode_prod_shape(
     assert candidate_calls == 2
     assert _submission_rows(db_path) == [
         ("submission-link-bounded", "linked", observed_turn_id)
+    ]
+
+
+def test_observed_lazy_delta_sweep_links_first_poll_after_live_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror the idle-pane production canary timeline through turn.delta."""
+    db_path = tmp_path / "observed-live-timeline.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="observed-live-timeline",
+        owner_key=owner_key,
+        link_not_before="2026-07-22T12:01:23+00:00",
+        link_expires_at="2026-07-22T12:03:23+00:00",
+        hard_expires_at="2026-07-23T12:02:23+00:00",
+    )
+
+    # Herdres polls turn.delta every ~5s.  The early empty sweeps exercise the
+    # component backoff before the idle pane produces its first observation.
+    for second in range(23, 36, 5):
+        turn_delta_payload_from_store(
+            db_path,
+            "host-a",
+            now=datetime.fromisoformat(
+                f"2026-07-22T12:01:{second:02d}+00:00"
+            ).timestamp(),
+            turn_model="observed",
+        )
+    for second in range(38, 60, 5):
+        turn_delta_payload_from_store(
+            db_path,
+            "host-a",
+            now=datetime.fromisoformat(
+                f"2026-07-22T12:01:{second:02d}+00:00"
+            ).timestamp(),
+            turn_model="observed",
+        )
+    for second in range(3, 34, 5):
+        turn_delta_payload_from_store(
+            db_path,
+            "host-a",
+            now=datetime.fromisoformat(
+                f"2026-07-22T12:02:{second:02d}+00:00"
+            ).timestamp(),
+            turn_model="observed",
+        )
+
+    candidate_calls = 0
+    original_candidates = store_sqlite._submission_link_candidate_turns_conn
+
+    def record_candidates(*args: object, **kwargs: object):
+        nonlocal candidate_calls
+        candidate_calls += 1
+        return original_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_submission_link_candidate_turns_conn",
+        record_candidates,
+    )
+    # The live observed prompt retained Herdr's trailing U+0001 framing byte.
+    # Submission input rejects that byte, so matching must ignore it only at
+    # the observation edge and re-arm the original component key.
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="turn-803b8be4224ccec08a20c794",
+        instruction_text="hello\x01",
+        observed_at="2026-07-22T12:02:36+00:00",
+        turn_model="observed",
+    )
+    assert _submission_rows(db_path) == [
+        ("observed-live-timeline", "submitted", None)
+    ]
+    candidate_calls_after_observation = candidate_calls
+
+    turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-07-22T12:02:38+00:00"
+        ).timestamp(),
+        turn_model="observed",
+    )
+    assert candidate_calls == candidate_calls_after_observation + 1
+
+    first_poll_after_boundary = None
+    for minute, second in (
+        *((2, second) for second in range(43, 60, 5)),
+        *((3, second) for second in range(3, 29, 5)),
+    ):
+        current = f"2026-07-22T12:{minute:02d}:{second:02d}+00:00"
+        turn_delta_payload_from_store(
+            db_path,
+            "host-a",
+            now=datetime.fromisoformat(current).timestamp(),
+            turn_model="observed",
+        )
+        if current >= "2026-07-22T12:03:23+00:00":
+            first_poll_after_boundary = current
+            break
+
+    assert first_poll_after_boundary == "2026-07-22T12:03:23+00:00"
+    assert _submission_rows(db_path) == [
+        ("observed-live-timeline", "linked", observed_turn_id)
+    ]
+
+
+def test_observed_link_rearm_uses_stable_owner_across_worker_renumber(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "observed-renumber.db"
+    owner_key = _seed_link_worker(db_path, worker_id="claude-1")
+    _insert_link_submission(
+        db_path,
+        request_id="observed-renumber",
+        owner_key=owner_key,
+        link_not_before="2026-07-22T12:01:23+00:00",
+        link_expires_at="2026-07-22T12:03:23+00:00",
+        hard_expires_at="2026-07-23T12:02:23+00:00",
+    )
+    turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-07-22T12:02:33+00:00"
+        ).timestamp(),
+        turn_model="observed",
+    )
+
+    renumbered = project_from_raw(
+        Config(host_id="host-a", db_path=db_path),
+        workers=[
+            {
+                "id": "claude-9",
+                "name": "claude-9",
+                "status": "active",
+                "meta": {
+                    "stable_key": owner_key,
+                    "stable_key_version": 1,
+                },
+            }
+        ],
+        timestamp=datetime.fromisoformat("2099-01-01T00:00:00+00:00"),
+    )
+    assert store_sqlite.save_snapshot(
+        db_path,
+        renumbered,
+        turn_model="observed",
+    )
+
+    rearmed_keys: list[tuple[str, str]] = []
+    original_rearm = store_sqlite._rearm_submission_link_component
+
+    def record_rearm(
+        db: Path | str,
+        host: str,
+        owner: str,
+        fingerprint: str,
+    ) -> None:
+        rearmed_keys.append((owner, fingerprint))
+        original_rearm(db, host, owner, fingerprint)
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "_rearm_submission_link_component",
+        record_rearm,
+    )
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        worker_id="claude-9",
+        source_turn_id="renumbered-source",
+        instruction_text="hello\x01",
+        observed_at="2026-07-22T12:02:36+00:00",
+        turn_model="observed",
+    )
+    assert (owner_key, instruction_fingerprint("hello")) in rearmed_keys
+    assert all(not owner.startswith("legacy-worker:") for owner, _ in rearmed_keys)
+
+    turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-07-22T12:03:23+00:00"
+        ).timestamp(),
+        turn_model="observed",
+    )
+    assert _submission_rows(db_path) == [
+        ("observed-renumber", "linked", observed_turn_id)
+    ]
+
+
+def test_observed_busy_pane_completion_still_links_after_window(
+    tmp_path: Path,
+) -> None:
+    """Preserve the observation-first ordering from the working busy-pane case."""
+    db_path = tmp_path / "observed-busy-pane.db"
+    owner_key = _seed_link_worker(db_path)
+    started = store_sqlite.apply_turn_refresh(
+        db_path,
+        "host-a",
+        "worker-a",
+        {
+            "source_turn_id": "busy-pane-source",
+            "user_text": "hello",
+            "assistant_stream_text": "working",
+            "complete": False,
+            "has_open_turn": True,
+        },
+        observed_at="2026-07-22T12:01:30+00:00",
+        turn_model="observed",
+    )
+    assert started.updated == 1
+    _insert_link_submission(
+        db_path,
+        request_id="observed-busy-pane",
+        owner_key=owner_key,
+        link_not_before="2026-07-22T12:01:23+00:00",
+        link_expires_at="2026-07-22T12:03:23+00:00",
+        hard_expires_at="2026-07-23T12:02:23+00:00",
+    )
+    observed_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="busy-pane-source",
+        observed_at="2026-07-22T12:02:36+00:00",
+        turn_model="observed",
+    )
+    assert _submission_rows(db_path) == [
+        ("observed-busy-pane", "submitted", None)
+    ]
+
+    turn_delta_payload_from_store(
+        db_path,
+        "host-a",
+        now=datetime.fromisoformat(
+            "2026-07-22T12:03:23+00:00"
+        ).timestamp(),
+        turn_model="observed",
+    )
+    assert _submission_rows(db_path) == [
+        ("observed-busy-pane", "linked", observed_turn_id)
     ]
