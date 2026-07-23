@@ -20,7 +20,7 @@ import pytest
 from tendwire.backends import herdr_cli
 from tendwire.cli import _build_parser, main, observe_public_snapshot
 from tendwire.config import Config
-from tendwire.core.models import AttentionSignal, Snapshot, Space, SuggestedAction, Worker, WorkerBinding
+from tendwire.core.models import AttentionSignal, Snapshot, SuggestedAction, Worker, WorkerBinding
 from tendwire.core.projector import project_from_raw
 from tendwire.daemon_api import TendwireDaemonAPI, UnixSocketJSONServer
 from tendwire.store.sqlite import (
@@ -508,8 +508,7 @@ def test_cli_turns_definite_unavailable_refreshes_once_then_reads_exact_page(
                 "cursor": None,
                 "since": None,
                 "turn_refresh_interval_seconds": 2.0,
-                "claim_hard_ttl_seconds": 86400,
-                "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "legacy"),
+                "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
             },
         )
     ]
@@ -586,8 +585,7 @@ def test_cli_turns_continuation_unavailable_reads_cache_without_refresh(
             "cursor": position_value if position_flag == "--cursor" else None,
             "since": position_value if position_flag == "--since" else None,
             "turn_refresh_interval_seconds": 2.0,
-            "claim_hard_ttl_seconds": 86400,
-            "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "legacy"),
+            "turn_model": os.environ.get("TENDWIRE_TURN_MODEL", "observed"),
         }
     ]
 
@@ -1081,6 +1079,7 @@ def test_cli_long_content_pages_match_direct_store_and_daemon(
         "long-host",
         "worker-1",
         {
+            "source_turn_id": "cli-long-content-source",
             "user_text": "short prompt",
             "assistant_final_text": canonical,
             "complete": True,
@@ -1279,6 +1278,7 @@ def test_cli_short_v1_compatibility_then_known_incomplete_refusal(
         "compat-host",
         "worker-1",
         {
+            "source_turn_id": "cli-short-content-source",
             "user_text": "  short prompt\n",
             "assistant_final_text": "\n short final  ",
             "complete": True,
@@ -2689,7 +2689,13 @@ def test_cli_module_invocation() -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stderr == ""
+    turn_model = env.get("TENDWIRE_TURN_MODEL", "observed").strip().lower()
+    expected_stderr = (
+        ""
+        if turn_model == "observed"
+        else f"turn_model={turn_model} is a compatibility alias and behaves as observed\n"
+    )
+    assert result.stderr == expected_stderr
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == 2
     assert payload["host_id"] == "module-host"

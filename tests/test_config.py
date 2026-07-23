@@ -14,7 +14,6 @@ from tendwire.config import (
     DEFAULT_COMMAND_RETRY_HORIZON_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
     DEFAULT_TURN_MODEL,
     MAX_COMMAND_RETRY_HORIZON_SECONDS,
     MIN_COMMAND_RECEIPT_RETENTION_SECONDS,
@@ -28,14 +27,18 @@ from tendwire.config import (
 )
 
 
-def test_turn_model_defaults_to_legacy_and_accepts_env_override(monkeypatch) -> None:
+def test_turn_model_defaults_to_observed_and_accepts_compatibility_aliases(
+    monkeypatch,
+    caplog,
+) -> None:
     monkeypatch.delenv("TENDWIRE_TURN_MODEL", raising=False)
-    assert DEFAULT_TURN_MODEL == "legacy"
-    assert load_config().turn_model == "legacy"
+    assert DEFAULT_TURN_MODEL == "observed"
+    assert load_config().turn_model == "observed"
 
     monkeypatch.setenv("TENDWIRE_TURN_MODEL", "shadow")
     assert load_config().turn_model == "shadow"
     assert load_config(turn_model="dual").turn_model == "dual"
+    assert "behaves as observed" in caplog.text
 
 
 @pytest.mark.parametrize("value", ["", "future", "legacy,dual"])
@@ -397,7 +400,6 @@ def test_command_receipt_retention_must_strictly_exceed_retry_horizon(
 
 
 TURN_REFRESH_ENV_NAMES = (
-    "TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS",
     "TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS",
     "TENDWIRE_TURN_REFRESH_WORKERS",
 )
@@ -411,31 +413,25 @@ def test_turn_refresh_knobs_have_documented_defaults(monkeypatch) -> None:
 
     assert DEFAULT_TURN_REFRESH_INTERVAL_SECONDS == 2.0
     assert DEFAULT_TURN_REFRESH_WORKERS == 4
-    assert DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS == 86_400
     assert config.turn_refresh_interval_seconds == 2.0
     assert config.turn_refresh_workers == 4
-    assert config.turn_claim_hard_ttl_seconds == 86_400
 
 
 def test_turn_refresh_knobs_use_explicit_before_environment(monkeypatch) -> None:
     monkeypatch.setenv("TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS", "3.5")
     monkeypatch.setenv("TENDWIRE_TURN_REFRESH_WORKERS", "8")
-    monkeypatch.setenv("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS", "7200")
 
     env_config = load_config(max_workers=16)
     explicit = load_config(
         max_workers=16,
         turn_refresh_interval_seconds="0.25",
         turn_refresh_workers="6",
-        turn_claim_hard_ttl_seconds="3600",
     )
 
     assert env_config.turn_refresh_interval_seconds == 3.5
     assert env_config.turn_refresh_workers == 8
-    assert env_config.turn_claim_hard_ttl_seconds == 7200
     assert explicit.turn_refresh_interval_seconds == 0.25
     assert explicit.turn_refresh_workers == 6
-    assert explicit.turn_claim_hard_ttl_seconds == 3600
 
 
 @pytest.mark.parametrize("value", [0, -0.01, "nan", "inf", "-inf"])

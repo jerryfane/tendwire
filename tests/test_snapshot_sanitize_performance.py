@@ -230,7 +230,7 @@ def test_unchanged_snapshot_decodes_and_sanitizes_no_retained_turns(
     assert _turn_update_count(db_path) == 0
 
 
-def test_changed_snapshot_decodes_only_the_changed_owned_turn(
+def test_changed_snapshot_updates_worker_without_decoding_a_legacy_turn(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -260,9 +260,21 @@ def test_changed_snapshot_decodes_only_the_changed_owned_turn(
     changed = [_worker(1), _worker(2, status="waiting")]
     store_sqlite.save_snapshot(db_path, _snapshot(2, changed))
 
-    assert decoded_counts == [1]
-    assert sanitize_calls == 1
-    assert _turn_update_count(db_path) == 1
+    with sqlite3.connect(db_path) as conn:
+        projected_status = conn.execute(
+            "SELECT status FROM workers WHERE host_id = ? AND worker_id = ?",
+            (HOST_ID, "worker-2"),
+        ).fetchone()[0]
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ?",
+            (HOST_ID,),
+        ).fetchone()[0]
+
+    assert projected_status == "waiting"
+    assert turn_count == 0
+    assert decoded_counts == []
+    assert sanitize_calls == 0
+    assert _turn_update_count(db_path) == 0
 
 
 def test_space_timestamp_change_refreshes_projection_with_same_content_fingerprint(
@@ -305,7 +317,7 @@ def test_space_timestamp_change_refreshes_projection_with_same_content_fingerpri
     assert projected_at == "2026-07-20T00:00:02+00:00"
 
 
-def test_turn_timestamp_shortcut_observes_worker_last_seen_change(
+def test_worker_timestamp_shortcut_does_not_synthesize_a_turn(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "turn-timestamp.db"
@@ -345,13 +357,13 @@ def test_turn_timestamp_shortcut_observes_worker_last_seen_change(
             "SELECT last_seen_at FROM workers WHERE host_id = ? AND worker_id = ?",
             (HOST_ID, "worker-1"),
         ).fetchone()[0]
-        turn_updated_at = conn.execute(
-            "SELECT updated_at FROM turns WHERE host_id = ?",
+        turn_count = conn.execute(
+            "SELECT COUNT(*) FROM turns WHERE host_id = ?",
             (HOST_ID,),
         ).fetchone()[0]
     assert first_worker.fingerprint == second_worker.fingerprint
     assert worker_last_seen_at == "2026-07-20T00:00:02+00:00"
-    assert turn_updated_at == "2026-07-20T00:00:02+00:00"
+    assert turn_count == 0
 
 
 def test_public_text_sanitize_cache_hits_and_separates_configurations(monkeypatch) -> None:

@@ -31,7 +31,6 @@ from ..config import (
     DEFAULT_PENDING_STALE_GRACE_SECONDS,
     DEFAULT_SUBMISSION_HARD_TTL_SECONDS,
     DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS,
-    DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
     DEFAULT_TURN_MODEL,
     DEFAULT_TURN_REFRESH_INTERVAL_SECONDS,
     TURN_MODELS,
@@ -108,7 +107,6 @@ from ..core.turns import (
     TURN_SCHEMA_VERSION,
     TURN_TEXT_MAX_CHARS,
     ContentCursorPosition,
-    TurnListCursorPosition,
     content_cursor,
     content_revision,
     content_segment_id,
@@ -130,16 +128,13 @@ from ..core.turns import (
     turn_list_cursor,
     turn_since_token,
     turn_source_id_candidates,
-    turns_from_snapshot,
-    turns_payload_from_snapshot,
 )
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
 STORE_SCHEMA_VERSION = 20
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
-TURN_CLAIM_HARD_TTL_SECONDS = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
-TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS = 60.0
+_LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
 TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
@@ -188,8 +183,8 @@ ATTENTION_MISSING_REQUIRED = 2
 ATTENTION_MISSING_GRACE_SECONDS = 120
 _ATTENTION_SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 _LOGGER = logging.getLogger(__name__)
-_TURN_CLAIM_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
-_TURN_CLAIM_SWEEP_LOCK = threading.Lock()
+_SUBMISSION_LINK_SWEEP_LAST_AT: dict[tuple[str, str, str], float] = {}
+_SUBMISSION_LINK_SWEEP_LOCK = threading.Lock()
 _SUBMISSION_LINK_BACKOFF: dict[
     tuple[str, str, str, str], datetime | None
 ] = {}
@@ -198,9 +193,9 @@ _SUBMISSION_LINK_BACKOFF_MISSING = object()
 
 # A component that settles with no candidate observations at all gets a
 # BOUNDED deferral, never an indefinite one: the matching observation may
-# arrive through a path that cannot re-arm the key (e.g. dual/shadow modes,
-# or workers whose payload lacks the version marker), so an unbounded skip
-# would wedge the link until process restart or hard TTL.
+# arrive through a path that cannot re-arm the key (for example, a worker
+# payload missing its version marker), so an unbounded skip would wedge the
+# link until process restart or hard TTL.
 _SUBMISSION_LINK_EMPTY_COMPONENT_RECHECK_SECONDS = 30.0
 
 
@@ -209,7 +204,7 @@ def _submission_linking_enabled(turn_model: str) -> bool:
     if normalized not in TURN_MODELS:
         allowed = ", ".join(sorted(TURN_MODELS))
         raise ValueError(f"turn_model must be one of: {allowed}")
-    return normalized != "legacy"
+    return True
 
 
 def _submission_link_backoff_key(
@@ -335,19 +330,6 @@ def is_valid_turn_submission_state_transition(
         current_state,
         frozenset(),
     )
-
-
-def _configured_turn_claim_hard_ttl_seconds() -> int:
-    raw = os.environ.get("TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS")
-    if raw is None:
-        return TURN_CLAIM_HARD_TTL_SECONDS
-    try:
-        configured = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise StoreSchemaError("turn_claim_hard_ttl_invalid") from exc
-    if configured <= 0:
-        raise StoreSchemaError("turn_claim_hard_ttl_invalid")
-    return configured
 
 
 @dataclass(frozen=True)
@@ -3019,18 +3001,16 @@ def _final_ready_payload_conn(
     turn_id: str,
     content_revision_value: str,
     allow_unroutable: bool = False,
-    working_predecessor_turn_id: str | None = None,
     turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any] | None:
-    if str(turn_model or "").strip().lower() == "observed":
-        canonical_turn_id = _resolve_canonical_turn_id_conn(
-            conn,
-            str(host_id),
-            turn_id,
-        )
-        if canonical_turn_id is None:
-            return None
-        turn_id = canonical_turn_id
+    canonical_turn_id = _resolve_canonical_turn_id_conn(
+        conn,
+        str(host_id),
+        turn_id,
+    )
+    if canonical_turn_id is None:
+        return None
+    turn_id = canonical_turn_id
     row = conn.execute(
         """
         SELECT
@@ -3118,11 +3098,6 @@ def _final_ready_payload_conn(
     if routable:
         payload["stable_key"] = str(stable_key)
         payload["stable_key_version"] = 1
-        predecessor = str(
-            working_predecessor_turn_id or ""
-        ).strip()
-        if predecessor and predecessor != str(turn_id):
-            payload["working_predecessor_turn_id"] = predecessor
     return payload
 
 
@@ -3554,7 +3529,6 @@ def _ensure_final_ready_anchor_conn(
     turn_id: str,
     content_revision_value: str,
     now: str,
-    working_predecessor_turn_id: str | None = None,
 ) -> int | None:
     payload = _final_ready_payload_conn(
         conn,
@@ -3562,7 +3536,6 @@ def _ensure_final_ready_anchor_conn(
         turn_id=str(turn_id),
         content_revision_value=str(content_revision_value),
         allow_unroutable=True,
-        working_predecessor_turn_id=working_predecessor_turn_id,
     )
     if payload is None:
         return None
@@ -4007,20 +3980,19 @@ def prepare_connector_plan_begin(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if str(turn_model or "").strip().lower() == "observed":
-                canonical_turn_id = _resolve_canonical_turn_id_conn(
-                    conn,
-                    str(host_id),
-                    turn_id,
+            canonical_turn_id = _resolve_canonical_turn_id_conn(
+                conn,
+                str(host_id),
+                turn_id,
+            )
+            if canonical_turn_id is None:
+                conn.rollback()
+                return _presentation_error(
+                    "content_revision_not_found",
+                    host_id=host_id,
+                    name=name,
                 )
-                if canonical_turn_id is None:
-                    conn.rollback()
-                    return _presentation_error(
-                        "content_revision_not_found",
-                        host_id=host_id,
-                        name=name,
-                    )
-                turn_id = canonical_turn_id
+            turn_id = canonical_turn_id
             _, revision_error = _current_presentation_revision_conn(
                 conn,
                 host_id=str(host_id),
@@ -8321,17 +8293,14 @@ def _prune_host_projection(
 
 
 def _turn_payload_is_prune_protected(payload_json: Any) -> bool:
-    """Rows tied to a command or a concrete backend turn outlive snapshot rewrites."""
+    """Source-observed turns outlive snapshot projection rewrites."""
     try:
         payload = json.loads(str(payload_json or "{}"))
     except json.JSONDecodeError:
         return False
     if not isinstance(payload, Mapping):
         return False
-    return bool(
-        str(payload.get("origin_command_id") or "").strip()
-        or str(payload.get("source_turn_id") or "").strip()
-    )
+    return bool(str(payload.get("source_turn_id") or "").strip())
 
 
 def _typed_final_reference_exists_conn(
@@ -9219,7 +9188,7 @@ def _refresh_snapshot_projections_conn(
     payload_data: Mapping[str, Any],
     *,
     content_fingerprint: str,
-    turn_items: Iterable[Mapping[str, Any]] | None = None,
+    turn_items: Iterable[Mapping[str, Any]],
     pending_items: Iterable[Mapping[str, Any]] | None = None,
 ) -> None:
     host_id = str(snapshot.host_id)
@@ -9314,94 +9283,9 @@ def _refresh_snapshot_projections_conn(
 
 
     turn_ids: set[str] = set()
-    prepared_turn_items = (
-        [dict(item) for item in turn_items]
-        if turn_items is not None
-        else [turn.to_dict() for turn in turns_from_snapshot(snapshot)]
-    )
+    prepared_turn_items = [dict(item) for item in turn_items]
     for item in prepared_turn_items:
         turn_id = str(item.get("id") or "unknown")
-        owner_identity = _turn_continuity_identity(item)
-        if owner_identity is not None:
-            owned_ref = _snapshot_owned_turn_candidate_ref_conn(
-                conn,
-                host_id,
-                owner_identity,
-                item,
-            )
-            if (
-                owned_ref is not None
-                and owned_ref[1] == str(item.get("worker_fingerprint") or "")
-                and owned_ref[2] == str(item.get("updated_at") or "")
-            ):
-                turn_ids.add(owned_ref[0])
-                continue
-            owned_candidate = (
-                _current_turn_content_row_by_id_conn(
-                    conn,
-                    host_id,
-                    owned_ref[0],
-                )
-                if owned_ref is not None
-                else None
-            )
-            if owned_candidate is not None:
-                (
-                    persisted_turn_id,
-                    stored_payload,
-                    _current,
-                    _stored_observed_at,
-                ) = owned_candidate
-                adopted = _adopt_turn_projection(stored_payload, item)
-                _metadata_changed, item = _update_persisted_turn_row(
-                    conn,
-                    host_id,
-                    str(persisted_turn_id),
-                    adopted,
-                    stored_payload,
-                    observed_at,
-                    snapshot_content_fingerprint=str(
-                        content_fingerprint
-                    ),
-                )
-                turn_id = str(persisted_turn_id)
-                turn_ids.add(turn_id)
-                _ensure_payload_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=turn_id,
-                    payload=item,
-                    observed_at=str(observed_at) if observed_at else None,
-                )
-                current_revision = conn.execute(
-                    """
-                    SELECT content_revision
-                    FROM turn_content_revisions
-                    WHERE host_id = ? AND turn_id = ? AND is_current = 1
-                    """,
-                    (host_id, turn_id),
-                ).fetchone()
-                if current_revision is not None:
-                    _ensure_final_ready_anchor_conn(
-                        conn,
-                        host_id=host_id,
-                        turn_id=turn_id,
-                        content_revision_value=str(current_revision[0]),
-                        now=observed_at,
-                    )
-                continue
-            collision = conn.execute(
-                """
-                SELECT payload_json
-                FROM turns
-                WHERE host_id = ? AND turn_id = ?
-                """,
-                (host_id, turn_id),
-            ).fetchone()
-            if collision is not None:
-                raise StoreSchemaError(
-                    "turn_owner_projection_identity_conflict"
-                )
         existing_turn = conn.execute(
             """
             SELECT payload_json, worker_fingerprint, updated_at
@@ -9420,7 +9304,7 @@ def _refresh_snapshot_projections_conn(
             continue
         if existing_turn is not None:
             existing_payload = _json_object(existing_turn[0])
-            for provenance_key in ("origin_command_id", "source_turn_id"):
+            for provenance_key in ("source_turn_id",):
                 if not str(item.get(provenance_key) or "").strip():
                     retained = existing_payload.get(provenance_key)
                     if str(retained or "").strip():
@@ -12221,7 +12105,7 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         ]
         if len(matching_claims) != 1:
             continue
-        if _tombstone_turn_conn(
+        if _migrate_tombstone_command_turn_conn(
             conn,
             claim[0],
             claim[1],
@@ -12231,7 +12115,7 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
             affected_hosts.add(claim[0])
             used_done.add(matches[0][1])
 
-    configured_hard_ttl = _configured_turn_claim_hard_ttl_seconds()
+    configured_hard_ttl = _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS
     for claim in claims:
         stored = conn.execute(
             "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
@@ -12242,7 +12126,7 @@ def _migrate_v14_to_v15_conn(conn: sqlite3.Connection) -> None:
         claim_dt = _turn_row_time(claim[3], claim[5])
         if claim_dt is None or (now_dt - claim_dt).total_seconds() < configured_hard_ttl:
             continue
-        if _tombstone_turn_conn(
+        if _migrate_tombstone_command_turn_conn(
             conn,
             claim[0],
             claim[1],
@@ -17461,7 +17345,6 @@ _TURN_IDENTITY_SEED_FIELDS = (
     "status",
     "kind",
     "source",
-    "origin_command_id",
     "title",
     "summary",
     "meta",
@@ -17470,41 +17353,6 @@ _TURN_IDENTITY_SEED_FIELDS = (
 
 def _turn_merge_match_text(value: Any) -> str:
     return normalize_instruction_text(value)
-
-
-def _turn_merge_score(payload: Mapping[str, Any], content: Mapping[str, Any]) -> tuple[int, str, str]:
-    incoming_user = _turn_merge_match_text(content.get("user_text"))
-    existing_user = _turn_merge_match_text(payload.get("user_text"))
-    source = str(payload.get("source") or "")
-    has_origin = bool(str(payload.get("origin_command_id") or "").strip())
-    open_turn = payload.get("has_open_turn") is True or payload.get("complete") is False
-    has_existing_content = bool(
-        existing_user
-        or str(payload.get("assistant_final_text") or "").strip()
-        or str(payload.get("assistant_stream_text") or "").strip()
-    )
-    score = 0
-    if incoming_user and existing_user == incoming_user:
-        score += 1000
-    elif incoming_user and has_origin and existing_user:
-        score -= 500
-    if has_origin and incoming_user and existing_user == incoming_user:
-        score += 250
-    elif has_origin:
-        score -= 40
-    if open_turn:
-        score += 80
-    if source == "command":
-        score += 40 if incoming_user and existing_user == incoming_user else -20
-    elif source == "snapshot":
-        score += 10
-    if not has_existing_content:
-        score += 5
-    return (
-        score,
-        str(payload.get("updated_at") or payload.get("observed_at") or ""),
-        str(payload.get("id") or payload.get("turn_id") or ""),
-    )
 
 
 def _turn_continuity_identity(payload: Mapping[str, Any]) -> tuple[str, str, int] | None:
@@ -18081,45 +17929,6 @@ def _turn_content_matches_origin(payload: Mapping[str, Any], content: Mapping[st
     return incoming_user == _turn_merge_match_text(payload.get("user_text"))
 
 
-def _snapshot_owned_turn_candidate(
-    rows: Iterable[
-        tuple[Any, dict[str, Any], dict[str, Any] | None, str]
-    ],
-    projection: Mapping[str, Any],
-) -> tuple[Any, dict[str, Any], dict[str, Any] | None, str] | None:
-    origin_command_id = str(
-        projection.get("origin_command_id") or ""
-    ).strip()
-    if origin_command_id:
-        source_rows = [
-            row
-            for row in rows
-            if not _turn_is_tombstoned(row[1])
-            and str(row[1].get("source_turn_id") or "").strip()
-            and str(row[1].get("origin_command_id") or "").strip()
-            == origin_command_id
-        ]
-        if len(source_rows) > 1:
-            raise StoreSchemaError("turn_owner_source_ambiguous")
-        if source_rows:
-            return source_rows[0]
-        command_rows = [
-            row
-            for row in rows
-            if not _turn_is_tombstoned(row[1])
-            and not str(row[1].get("source_turn_id") or "").strip()
-            and str(row[1].get("origin_command_id") or "").strip()
-            == origin_command_id
-        ]
-        if len(command_rows) > 1:
-            raise StoreSchemaError("turn_owner_command_ambiguous")
-        return command_rows[0] if command_rows else None
-    placeholder_rows = _owned_placeholder_candidates(rows)
-    if len(placeholder_rows) > 1:
-        raise StoreSchemaError("turn_owner_placeholder_ambiguous")
-    return placeholder_rows[0] if placeholder_rows else None
-
-
 def _current_worker_turn_projection(
     host_id: str,
     worker_id: str,
@@ -18150,83 +17959,14 @@ def _current_worker_turn_projection(
     )
 
 
-def _adopt_turn_projection(
-    payload: Mapping[str, Any],
-    projection: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Adopt current mutable routing fields without changing provenance."""
-    adopted = dict(payload)
-    for key in (
-        "host_id",
-        "worker_id",
-        "worker_fingerprint",
-        "space_id",
-        "status",
-        "kind",
-        "title",
-        "summary",
-        "updated_at",
-        "meta",
-    ):
-        if key in projection:
-            adopted[key] = projection.get(key)
-    return adopted
-
-
-def _normalized_persisted_turn_payload(
+def _observed_turn_payload(
     turn_id: str,
     payload: Mapping[str, Any],
-    stored_payload: Mapping[str, Any],
-    *,
-    adopt_source_turn_id: bool = False,
-    adopt_origin_command_id: bool = False,
 ) -> dict[str, Any]:
-    """Sanitize a row update while retaining every published identity."""
-    stored_source_turn_id = str(
-        stored_payload.get("source_turn_id") or ""
-    ).strip()
-    stored_origin_command_id = str(
-        stored_payload.get("origin_command_id") or ""
-    ).strip()
-    incoming_origin_command_id = str(
-        payload.get("origin_command_id") or ""
-    ).strip()
-    origin_command_id = (
-        stored_origin_command_id
-        or (incoming_origin_command_id if adopt_origin_command_id else "")
-    )
-    stored_kind = str(stored_payload.get("kind") or "").strip()
+    """Sanitize one source-observed row without command-derived identity."""
     normalized = Turn.from_dict(payload).to_dict()
-    source_turn_id = stored_source_turn_id or (
-        str(normalized.get("source_turn_id") or "").strip()
-        if adopt_source_turn_id
-        else ""
-    )
-    if source_turn_id:
-        normalized["source_turn_id"] = source_turn_id
-    else:
-        normalized.pop("source_turn_id", None)
-    if origin_command_id:
-        normalized["origin_command_id"] = origin_command_id
-    else:
-        normalized.pop("origin_command_id", None)
-    # Recompute the fingerprint from the preserved compatibility token and
-    # provenance, then restore the published row identity after normalization.
-    normalized = Turn.from_dict(normalized).to_dict()
     normalized["id"] = str(turn_id)
-    if source_turn_id:
-        normalized["source_turn_id"] = source_turn_id
-    else:
-        normalized.pop("source_turn_id", None)
-    if origin_command_id:
-        normalized["origin_command_id"] = origin_command_id
-    else:
-        normalized.pop("origin_command_id", None)
-    if stored_kind:
-        # The frozen legacy source-token transform includes the historical
-        # kind. Keep it alongside the stored opaque token so later raw-source
-        # observations continue to resolve the same compatibility row.
-        normalized["kind"] = stored_kind
+    normalized.pop("origin_command_id", None)
     normalized.update(_public_pending_turn_extension(payload))
     return _strip_canonical_turn_payload(normalized)
 
@@ -18246,26 +17986,17 @@ def _public_pending_turn_extension(
     }
 
 
-def _update_persisted_turn_row(
+def _update_observed_turn_row(
     conn: sqlite3.Connection,
     host_id: str,
     turn_id: str,
     payload: Mapping[str, Any],
-    stored_payload: Mapping[str, Any],
     current_time: str,
     *,
     snapshot_content_fingerprint: str | None = None,
-    adopt_source_turn_id: bool = False,
-    adopt_origin_command_id: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
-    """Update a current projection without rekeying its persisted turn."""
-    item = _normalized_persisted_turn_payload(
-        str(turn_id),
-        payload,
-        stored_payload,
-        adopt_source_turn_id=adopt_source_turn_id,
-        adopt_origin_command_id=adopt_origin_command_id,
-    )
+    """Update an existing source-observed turn row."""
+    item = _observed_turn_payload(str(turn_id), payload)
     encoded = _canonical_json(item)
     row = conn.execute(
         """
@@ -20398,125 +20129,6 @@ def _current_turn_content_rows_conn(
     ]
 
 
-def _current_owned_turn_content_rows_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    owner_identity: tuple[str, str, int],
-) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
-    owner_kind, owner_key, owner_version = owner_identity
-    if owner_kind != "stable_key" or owner_version != 1:
-        return []
-    rows = conn.execute(
-        """
-        SELECT
-            turns.turn_id,
-            turns.payload_json,
-            revisions.content_revision,
-            revisions.user_text,
-            revisions.assistant_final_text,
-            revisions.user_state,
-            revisions.final_state,
-            turns.observed_at
-        FROM turns
-        LEFT JOIN turn_content_revisions AS revisions
-          ON revisions.host_id = turns.host_id
-         AND revisions.turn_id = turns.turn_id
-         AND revisions.is_current = 1
-        WHERE turns.host_id = ?
-          AND json_valid(turns.payload_json)
-          AND json_type(turns.payload_json, '$.meta.stable_key') = 'text'
-          AND json_extract(turns.payload_json, '$.meta.stable_key') = ?
-          AND json_type(
-                turns.payload_json,
-                '$.meta.stable_key_version'
-              ) = 'integer'
-          AND json_extract(
-                turns.payload_json,
-                '$.meta.stable_key_version'
-              ) = ?
-        """,
-        (str(host_id), str(owner_key), int(owner_version)),
-    ).fetchall()
-    # SQL JSON affinity must not decide owner authority: Python's strict
-    # validator rejects booleans, malformed keys, and unsupported versions.
-    return [
-        row
-        for row in _decode_turn_content_rows(rows)
-        if not _turn_is_tombstoned(row[1])
-        and _turn_continuity_identity(row[1]) == owner_identity
-    ]
-
-
-def _snapshot_owned_turn_candidate_ref_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    owner_identity: tuple[str, str, int],
-    projection: Mapping[str, Any],
-) -> tuple[str, str, str] | None:
-    """Resolve an owned snapshot row without decoding or sanitizing its payload."""
-    owner_kind, owner_key, owner_version = owner_identity
-    if owner_kind != "stable_key" or owner_version != 1:
-        return None
-    rows = conn.execute(
-        """
-        SELECT
-            turn_id,
-            worker_fingerprint,
-            updated_at,
-            json_extract(payload_json, '$.source_turn_id'),
-            json_extract(payload_json, '$.origin_command_id')
-        FROM turns
-        WHERE host_id = ?
-          AND json_valid(payload_json)
-          AND json_type(payload_json, '$.meta.stable_key') = 'text'
-          AND json_extract(payload_json, '$.meta.stable_key') = ?
-          AND json_type(payload_json, '$.meta.stable_key_version') = 'integer'
-          AND json_extract(payload_json, '$.meta.stable_key_version') = ?
-          AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
-        """,
-        (str(host_id), str(owner_key), int(owner_version)),
-    ).fetchall()
-    candidates = [
-        (
-            str(turn_id),
-            str(worker_fingerprint or ""),
-            str(updated_at or ""),
-            str(source_turn_id or "").strip(),
-            str(origin_command_id or "").strip(),
-        )
-        for (
-            turn_id,
-            worker_fingerprint,
-            updated_at,
-            source_turn_id,
-            origin_command_id,
-        ) in rows
-    ]
-    expected_origin = str(projection.get("origin_command_id") or "").strip()
-    if expected_origin:
-        source_rows = [
-            row for row in candidates if row[3] and row[4] == expected_origin
-        ]
-        if len(source_rows) > 1:
-            raise StoreSchemaError("turn_owner_source_ambiguous")
-        if source_rows:
-            return source_rows[0][0], source_rows[0][1], source_rows[0][2]
-        command_rows = [
-            row for row in candidates if not row[3] and row[4] == expected_origin
-        ]
-        if len(command_rows) > 1:
-            raise StoreSchemaError("turn_owner_command_ambiguous")
-        if command_rows:
-            return command_rows[0][0], command_rows[0][1], command_rows[0][2]
-        return None
-    placeholder_rows = [row for row in candidates if not row[3] and not row[4]]
-    if len(placeholder_rows) > 1:
-        raise StoreSchemaError("turn_owner_placeholder_ambiguous")
-    if not placeholder_rows:
-        return None
-    return placeholder_rows[0][0], placeholder_rows[0][1], placeholder_rows[0][2]
-
-
 def _turn_with_current_content(
     payload: Mapping[str, Any],
     current: Mapping[str, Any] | None,
@@ -20532,7 +20144,7 @@ def _turn_is_tombstoned(payload: Mapping[str, Any]) -> bool:
     return bool(str(payload.get("superseded_at") or "").strip())
 
 
-def _tombstone_turn_conn(
+def _migrate_tombstone_command_turn_conn(
     conn: sqlite3.Connection,
     host_id: str,
     turn_id: str,
@@ -20566,112 +20178,14 @@ def _tombstone_turn_conn(
             "superseded_at": superseded_at,
         }
     )
-    _update_persisted_turn_row(
+    _update_turn_row(
         conn,
         str(host_id),
         str(turn_id),
         payload,
-        stored,
         superseded_at,
     )
     return True
-
-
-def _superseding_turn_content_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    turn_id: str,
-) -> dict[str, Any] | None:
-    """Follow a tombstone chain to the current list-visible successor."""
-    current_turn_id = str(turn_id)
-    seen: set[str] = set()
-    first = True
-    while current_turn_id and current_turn_id not in seen:
-        seen.add(current_turn_id)
-        row = conn.execute(
-            """
-            SELECT turns.payload_json,
-                   revisions.user_text,
-                   revisions.assistant_final_text,
-                   revisions.user_state,
-                   revisions.final_state
-            FROM turns
-            LEFT JOIN turn_content_revisions AS revisions
-              ON revisions.host_id = turns.host_id
-             AND revisions.turn_id = turns.turn_id
-             AND revisions.is_current = 1
-            WHERE turns.host_id = ? AND turns.turn_id = ?
-            """,
-            (str(host_id), current_turn_id),
-        ).fetchone()
-        if row is None:
-            return None
-        payload = _json_object(row[0])
-        if not _turn_is_tombstoned(payload):
-            if first:
-                return None
-            current = (
-                {
-                    "user_text": row[1],
-                    "assistant_final_text": row[2],
-                    "user_state": str(row[3]),
-                    "final_state": str(row[4]),
-                }
-                if row[3] is not None
-                else None
-            )
-            return _turn_with_current_content(payload, current)
-        first = False
-        current_turn_id = str(
-            payload.get("superseded_by_turn_id") or ""
-        ).strip()
-    return None
-
-
-def _tombstone_matching_command_sibling_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    worker_id: str,
-    completing_turn_id: str,
-    *,
-    observed_at: str,
-) -> bool:
-    rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
-    completing = next(
-        (row for row in rows if str(row[0]) == str(completing_turn_id)),
-        None,
-    )
-    if completing is None:
-        return False
-    completing_view = _turn_with_current_content(completing[1], completing[2])
-    if not (
-        completing_view.get("complete") is True
-        or completing[2] is not None
-        and str(completing[2].get("final_state") or "") == "complete"
-    ):
-        return False
-    candidates = [
-        row
-        for row in rows
-        if str(row[0]) != str(completing_turn_id)
-        and str(row[1].get("source") or "") == "command"
-        and not str(row[1].get("source_turn_id") or "").strip()
-        and not _turn_is_tombstoned(row[1])
-        and row[1].get("has_open_turn") is True
-        and _turn_content_matches_origin(
-            _turn_with_current_content(row[1], row[2]),
-            completing_view,
-        )
-    ]
-    if len(candidates) != 1:
-        return False
-    return _tombstone_turn_conn(
-        conn,
-        str(host_id),
-        str(candidates[0][0]),
-        superseded_by_turn_id=str(completing_turn_id),
-        superseded_at=str(observed_at),
-    )
 
 
 def _turn_row_time(payload: Mapping[str, Any], observed_at: str) -> datetime | None:
@@ -20686,206 +20200,7 @@ def _turn_row_time(payload: Mapping[str, Any], observed_at: str) -> datetime | N
     return None
 
 
-def _turn_is_open_or_incomplete(
-    payload: Mapping[str, Any],
-    current: Mapping[str, Any] | None,
-) -> bool:
-    return bool(
-        payload.get("has_open_turn") is True
-        or payload.get("complete") is not True
-        or current is not None
-        and str(current.get("final_state") or "") != "complete"
-    )
-
-
-def _turn_observed_near_submission(
-    observed_at: str,
-    send_started_at: str,
-) -> bool:
-    observed = _strict_utc_timestamp(observed_at)
-    started = _strict_utc_timestamp(send_started_at)
-    if observed is None or started is None:
-        return False
-    delta = abs(
-        (
-            datetime.fromisoformat(started)
-            - datetime.fromisoformat(observed)
-        ).total_seconds()
-    )
-    return delta <= TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS
-
-
-def _sweep_turn_claims_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    *,
-    grace_seconds: float,
-    hard_ttl_seconds: float,
-    now: str,
-) -> int:
-    current_timestamp = _strict_utc_timestamp(now)
-    if current_timestamp is None:
-        raise ValueError("invalid sweep timestamp")
-    current_dt = datetime.fromisoformat(current_timestamp)
-    has_claim = conn.execute(
-        """
-        SELECT 1
-        FROM turns
-        WHERE host_id = ?
-          AND json_extract(payload_json, '$.source') = 'command'
-          AND COALESCE(json_extract(payload_json, '$.origin_command_id'), '') != ''
-          AND COALESCE(json_extract(payload_json, '$.source_turn_id'), '') = ''
-          AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
-          AND json_extract(payload_json, '$.has_open_turn') = 1
-        LIMIT 1
-        """,
-        (str(host_id),),
-    ).fetchone()
-    if has_claim is None:
-        return 0
-    rows = conn.execute(
-        """
-        SELECT turns.turn_id, turns.worker_id, turns.payload_json,
-               turns.observed_at, revisions.user_text,
-               revisions.assistant_final_text, revisions.user_state,
-               revisions.final_state
-        FROM turns
-        LEFT JOIN turn_content_revisions AS revisions
-          ON revisions.host_id = turns.host_id
-         AND revisions.turn_id = turns.turn_id
-         AND revisions.is_current = 1
-        WHERE turns.host_id = ?
-        """,
-        (str(host_id),),
-    ).fetchall()
-    decoded: list[tuple[str, str, dict[str, Any], dict[str, Any] | None, str]] = []
-    for row in rows:
-        payload = _json_object(row[2])
-        current = (
-            {
-                "user_text": row[4],
-                "assistant_final_text": row[5],
-                "user_state": str(row[6]),
-                "final_state": str(row[7]),
-            }
-            if row[6] is not None
-            else None
-        )
-        decoded.append((str(row[0]), str(row[1]), payload, current, str(row[3] or "")))
-
-    claims = [
-        row
-        for row in decoded
-        if str(row[2].get("source") or "") == "command"
-        and str(row[2].get("origin_command_id") or "").strip()
-        and not str(row[2].get("source_turn_id") or "").strip()
-        and not _turn_is_tombstoned(row[2])
-        and row[2].get("has_open_turn") is True
-    ]
-    claims.sort(
-        key=lambda row: (
-            _turn_row_time(row[2], row[4]) or current_dt,
-            row[0],
-        )
-    )
-    done = [
-        row
-        for row in decoded
-        if str(row[2].get("source_turn_id") or "").strip()
-        and not _turn_is_tombstoned(row[2])
-        and (
-            row[2].get("complete") is True
-            or row[3] is not None
-            and str(row[3].get("final_state") or "") == "complete"
-        )
-    ]
-    used_done = {
-        str(row[2].get("superseded_by_turn_id") or "")
-        for row in decoded
-        if _turn_is_tombstoned(row[2])
-    }
-    changed = 0
-    for claim in claims:
-        claim_dt = _turn_row_time(claim[2], claim[4])
-        if claim_dt is None or (current_dt - claim_dt).total_seconds() < grace_seconds:
-            continue
-        claim_view = _turn_with_current_content(claim[2], claim[3])
-        matches = [
-            candidate
-            for candidate in done
-            if candidate[1] == claim[1]
-            and candidate[0] not in used_done
-            and _turn_content_matches_origin(
-                _turn_with_current_content(candidate[2], candidate[3]),
-                claim_view,
-            )
-        ]
-        if len(matches) == 1:
-            if _tombstone_turn_conn(
-                conn,
-                str(host_id),
-                claim[0],
-                superseded_by_turn_id=matches[0][0],
-                superseded_at=current_timestamp,
-            ):
-                changed += 1
-                used_done.add(matches[0][0])
-
-    for claim in claims:
-        row = conn.execute(
-            "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
-            (str(host_id), claim[0]),
-        ).fetchone()
-        if row is None or _turn_is_tombstoned(_json_object(row[0])):
-            continue
-        claim_dt = _turn_row_time(claim[2], claim[4])
-        if claim_dt is None or (current_dt - claim_dt).total_seconds() < hard_ttl_seconds:
-            continue
-        if _tombstone_turn_conn(
-            conn,
-            str(host_id),
-            claim[0],
-            superseded_by_turn_id=None,
-            superseded_at=current_timestamp,
-        ):
-            changed += 1
-    return changed
-
-
-def sweep_turn_claims(
-    db_path: Path | str,
-    host_id: str,
-    *,
-    grace_seconds: float,
-    hard_ttl_seconds: float = TURN_CLAIM_HARD_TTL_SECONDS,
-    now: str | None = None,
-) -> int:
-    """Resolve or expire durable command claims without deleting referenced rows."""
-    if grace_seconds <= 0 or hard_ttl_seconds <= 0:
-        raise ValueError("turn claim TTL values must be positive")
-    if not _sqlite_store_exists(db_path):
-        return 0
-    current = now or utc_timestamp()
-    with _connect(db_path, isolation_level=None) as conn:
-        _ensure_schema(conn)
-        conn.execute("PRAGMA busy_timeout=50")
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            changed = _sweep_turn_claims_conn(
-                conn,
-                str(host_id),
-                grace_seconds=float(grace_seconds),
-                hard_ttl_seconds=float(hard_ttl_seconds),
-                now=current,
-            )
-            conn.commit()
-            return changed
-        except Exception:
-            conn.rollback()
-            raise
-
-
-def _reserve_lazy_turn_claim_sweep(
+def _reserve_lazy_submission_link_sweep(
     db_path: Path | str,
     host_id: str,
     *,
@@ -20894,26 +20209,26 @@ def _reserve_lazy_turn_claim_sweep(
     refresh_interval_seconds: float,
 ) -> tuple[tuple[str, str, str], bool]:
     key = (str(Path(db_path).absolute()), str(host_id), str(purpose))
-    with _TURN_CLAIM_SWEEP_LOCK:
-        last = _TURN_CLAIM_SWEEP_LAST_AT.get(key)
+    with _SUBMISSION_LINK_SWEEP_LOCK:
+        last = _SUBMISSION_LINK_SWEEP_LAST_AT.get(key)
         if (
             last is not None
             and current_clock >= last
             and current_clock - last < refresh_interval_seconds
         ):
             return key, False
-        _TURN_CLAIM_SWEEP_LAST_AT[key] = current_clock
+        _SUBMISSION_LINK_SWEEP_LAST_AT[key] = current_clock
     return key, True
 
 
-def _release_failed_lazy_turn_claim_sweep(
+def _release_failed_submission_link_sweep(
     key: tuple[str, str, str],
     *,
     current_clock: float,
 ) -> None:
-    with _TURN_CLAIM_SWEEP_LOCK:
-        if _TURN_CLAIM_SWEEP_LAST_AT.get(key) == current_clock:
-            _TURN_CLAIM_SWEEP_LAST_AT.pop(key, None)
+    with _SUBMISSION_LINK_SWEEP_LOCK:
+        if _SUBMISSION_LINK_SWEEP_LAST_AT.get(key) == current_clock:
+            _SUBMISSION_LINK_SWEEP_LAST_AT.pop(key, None)
 
 
 def _source_turn_matches(payload: Mapping[str, Any], incoming_source_turn: str) -> bool:
@@ -21170,15 +20485,13 @@ def _unchanged_owned_turn_reobservation_conn(
             """,
             (str(observed_at), str(host_id), str(turn_id)),
         )
-    submission_link = None
-    if turn_model != "legacy":
-        incoming_user = content.get("user_text")
-        submission_link = (
-            str(owner_key),
-            instruction_fingerprint(
-                incoming_user if isinstance(incoming_user, str) else None
-            ),
-        )
+    incoming_user = content.get("user_text")
+    submission_link = (
+        str(owner_key),
+        instruction_fingerprint(
+            incoming_user if isinstance(incoming_user, str) else None
+        ),
+    )
     return _TurnContentMergeResult(0, submission_link)
 
 
@@ -21329,48 +20642,6 @@ def _strip_canonical_turn_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return lightweight
 
 
-def _owned_command_candidates(
-    rows: Iterable[
-        tuple[Any, dict[str, Any], dict[str, Any] | None, str]
-    ],
-    content: Mapping[str, Any],
-    *,
-    origin_command_id: str | None = None,
-) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
-    expected_origin = str(origin_command_id or "").strip()
-    candidates = []
-    for row in rows:
-        payload = row[1]
-        row_origin = str(payload.get("origin_command_id") or "").strip()
-        if (
-            _turn_is_tombstoned(payload)
-            or str(payload.get("source_turn_id") or "").strip()
-            or not row_origin
-            or expected_origin and row_origin != expected_origin
-            or not _turn_content_matches_origin(
-                _turn_with_current_content(payload, row[2]),
-                content,
-            )
-        ):
-            continue
-        candidates.append(row)
-    return candidates
-
-
-def _owned_placeholder_candidates(
-    rows: Iterable[
-        tuple[Any, dict[str, Any], dict[str, Any] | None, str]
-    ],
-) -> list[tuple[Any, dict[str, Any], dict[str, Any] | None, str]]:
-    return [
-        row
-        for row in rows
-        if not _turn_is_tombstoned(row[1])
-        and not str(row[1].get("source_turn_id") or "").strip()
-        and not str(row[1].get("origin_command_id") or "").strip()
-    ]
-
-
 def _insert_owned_turn_conn(
     conn: sqlite3.Connection,
     *,
@@ -21392,11 +20663,7 @@ def _insert_owned_turn_conn(
     ).fetchone()
     if collision is not None:
         raise StoreSchemaError("turn_owner_source_identity_conflict")
-    item = _normalized_persisted_turn_payload(
-        turn_id,
-        item,
-        item,
-    )
+    item = _observed_turn_payload(turn_id, item)
     list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
     conn.execute(
         """
@@ -21553,12 +20820,11 @@ def _merge_observed_turn_content_conn(
                     observed_at=observed_at,
                 )
             )
-        metadata_changed, _persisted_item = _update_persisted_turn_row(
+        metadata_changed, _persisted_item = _update_observed_turn_row(
             conn,
             str(host_id),
             turn_id,
             payload,
-            stored_payload,
             observed_at,
             snapshot_content_fingerprint=snapshot_content_fingerprint,
         )
@@ -21622,424 +20888,6 @@ def _merge_observed_turn_content_conn(
     )
 
 
-def _merge_owned_turn_content_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    rows: list[
-        tuple[Any, dict[str, Any], dict[str, Any] | None, str]
-    ],
-    current_projection: Mapping[str, Any],
-    clean_content: Mapping[str, Any],
-    automation_probe: Mapping[str, Any],
-    *,
-    incoming_user: str | None,
-    incoming_final: str | None,
-    observed_at: str,
-    snapshot_content_fingerprint: str,
-    turn_model: str,
-) -> _TurnContentMergeResult:
-    incoming_source_turn = str(
-        clean_content.get("source_turn_id") or ""
-    ).strip()
-    exact_source_rows = [
-        row
-        for row in rows
-        if incoming_source_turn
-        and _owned_source_turn_matches(row[1], incoming_source_turn)
-    ]
-    if len(exact_source_rows) > 1:
-        raise StoreSchemaError("turn_owner_source_ambiguous")
-
-    changed = False
-    selected_turn_id: str | None = None
-    command_predecessor_turn_id: str | None = None
-    if exact_source_rows:
-        turn_id, stored_payload, current, stored_observed_at = (
-            exact_source_rows[0]
-        )
-        payload = _adopt_turn_projection(
-            stored_payload,
-            current_projection,
-        )
-        observation_is_newer = _turn_observation_is_newer(
-            observed_at,
-            stored_observed_at,
-        )
-        if observation_is_newer:
-            payload.update(
-                _retain_authoritative_completion(
-                    clean_content,
-                    current,
-                    payload,
-                    incoming_final=incoming_final,
-                    observed_at=observed_at,
-                )
-            )
-        metadata_changed, persisted_item = _update_persisted_turn_row(
-            conn,
-            host_id,
-            str(turn_id),
-            payload,
-            stored_payload,
-            observed_at,
-        )
-        if observation_is_newer:
-            revision_changed = _replace_current_turn_content_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                current=current,
-                incoming_user=incoming_user,
-                incoming_final=incoming_final,
-                current_time=observed_at,
-            )
-            revision_repaired = _ensure_absent_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                observed_at=observed_at,
-            )
-        else:
-            revision_changed = False
-            revision_repaired = False
-        selected_turn_id = str(turn_id)
-        changed = metadata_changed or revision_changed or revision_repaired
-        if not changed:
-            submission_link = None
-            if incoming_source_turn and turn_model != "legacy":
-                owner_key, owner_key_version = _turn_submission_owner_identity(
-                    current_projection
-                )
-                if owner_key_version == 1:
-                    submission_link = (
-                        owner_key,
-                        instruction_fingerprint(incoming_user),
-                    )
-            return _TurnContentMergeResult(0, submission_link)
-        source_origin = str(
-            persisted_item.get("origin_command_id") or ""
-        ).strip()
-        if source_origin:
-            matching_commands = _owned_command_candidates(
-                rows,
-                automation_probe,
-                origin_command_id=source_origin,
-            )
-            if len(matching_commands) == 1:
-                predecessor_id = str(matching_commands[0][0])
-                if predecessor_id != selected_turn_id:
-                    command_predecessor_turn_id = predecessor_id
-    else:
-        command_rows = _owned_command_candidates(rows, automation_probe)
-        if len(command_rows) > 1:
-            _LOGGER.warning(
-                "turn_ingestion_ambiguity_fallthrough",
-                extra={
-                    "tendwire_diagnostic": {
-                        "code": "turn_ingestion_ambiguity_fallthrough",
-                        "host_id": str(host_id),
-                        "worker_id": str(
-                            current_projection.get("worker_id") or ""
-                        ),
-                        "candidate_count": len(command_rows),
-                    }
-                },
-            )
-        if len(command_rows) == 1:
-            base_row = command_rows[0]
-        else:
-            placeholder_rows = _owned_placeholder_candidates(rows)
-            if len(placeholder_rows) > 1:
-                raise StoreSchemaError("turn_owner_placeholder_ambiguous")
-            base_row = placeholder_rows[0] if placeholder_rows else None
-
-        if base_row is None:
-            base_payload = dict(current_projection)
-            base_current = None
-            base_observed_at = ""
-        else:
-            (
-                base_turn_id,
-                stored_base_payload,
-                base_current,
-                base_observed_at,
-            ) = base_row
-            base_payload = _adopt_turn_projection(
-                stored_base_payload,
-                current_projection,
-            )
-
-        if incoming_source_turn:
-            if len(command_rows) == 1 and turn_model == "legacy":
-                (
-                    command_turn_id,
-                    command_payload,
-                    command_current,
-                    _command_observed_at,
-                ) = command_rows[0]
-                payload = _adopt_turn_projection(
-                    command_payload,
-                    current_projection,
-                )
-                payload.update(
-                    _retain_authoritative_completion(
-                        clean_content,
-                        command_current,
-                        payload,
-                        incoming_final=incoming_final,
-                        observed_at=observed_at,
-                    )
-                )
-                payload["source_turn_id"] = incoming_source_turn
-                metadata_changed, persisted_item = _update_persisted_turn_row(
-                    conn,
-                    str(host_id),
-                    str(command_turn_id),
-                    payload,
-                    command_payload,
-                    observed_at,
-                    snapshot_content_fingerprint=snapshot_content_fingerprint,
-                    adopt_source_turn_id=True,
-                )
-                revision_changed = _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(command_turn_id),
-                    current=command_current,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=observed_at,
-                )
-                revision_repaired = _ensure_absent_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(command_turn_id),
-                    observed_at=observed_at,
-                )
-                selected_turn_id = str(command_turn_id)
-                changed = (
-                    metadata_changed
-                    or revision_changed
-                    or revision_repaired
-                )
-            else:
-                seed = {
-                    key: base_payload.get(key)
-                    for key in _TURN_IDENTITY_SEED_FIELDS
-                    if base_payload.get(key) is not None
-                }
-                seed.pop("origin_command_id", None)
-                if str(seed.get("source") or "") == "command":
-                    seed["source"] = "snapshot"
-                seed.update(
-                    _retain_authoritative_completion(
-                        clean_content,
-                        None,
-                        {},
-                        incoming_final=incoming_final,
-                        observed_at=observed_at,
-                    )
-                )
-                item = _strip_canonical_turn_payload(
-                    Turn.from_dict(seed).to_dict()
-                )
-                item.update(_public_pending_turn_extension(seed))
-                turn_id = str(item.get("id") or "")
-                collision = conn.execute(
-                    """
-                    SELECT payload_json
-                    FROM turns
-                    WHERE host_id = ? AND turn_id = ?
-                    """,
-                    (str(host_id), turn_id),
-                ).fetchone()
-                if collision is not None:
-                    collision_payload = _json_object(collision[0])
-                    if (
-                        _turn_continuity_identity(collision_payload)
-                        != _turn_continuity_identity(item)
-                        or not _owned_source_turn_matches(
-                            collision_payload,
-                            incoming_source_turn,
-                        )
-                    ):
-                        raise StoreSchemaError(
-                            "turn_owner_source_identity_conflict"
-                        )
-                    raise StoreSchemaError("turn_owner_source_ambiguous")
-                turn_id = _insert_owned_turn_conn(
-                    conn,
-                    host_id=str(host_id),
-                    item=item,
-                    snapshot_content_fingerprint=snapshot_content_fingerprint,
-                    observed_at=observed_at,
-                )
-                _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=turn_id,
-                    current=None,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=observed_at,
-                )
-                _ensure_absent_turn_content_revision_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=turn_id,
-                    observed_at=observed_at,
-                )
-                selected_turn_id = turn_id
-                changed = True
-        elif base_row is not None:
-            authoritative_older = (
-                _turn_has_authoritative_observation(
-                    stored_base_payload,
-                    base_current,
-                )
-                and not _turn_observation_is_newer(
-                    observed_at,
-                    base_observed_at,
-                )
-            )
-            payload = dict(base_payload)
-            if not authoritative_older:
-                payload.update(
-                    _retain_authoritative_completion(
-                        clean_content,
-                        base_current,
-                        payload,
-                        incoming_final=incoming_final,
-                        observed_at=observed_at,
-                    )
-                )
-            metadata_changed, _persisted_item = (
-                _update_persisted_turn_row(
-                    conn,
-                    host_id,
-                    str(base_turn_id),
-                    payload,
-                    stored_base_payload,
-                    observed_at,
-                )
-            )
-            if authoritative_older:
-                revision_changed = False
-                revision_repaired = False
-            else:
-                revision_changed = _replace_current_turn_content_conn(
-                    conn,
-                    host_id=str(host_id),
-                    turn_id=str(base_turn_id),
-                    current=base_current,
-                    incoming_user=incoming_user,
-                    incoming_final=incoming_final,
-                    current_time=observed_at,
-                )
-                revision_repaired = (
-                    _ensure_absent_turn_content_revision_conn(
-                        conn,
-                        host_id=str(host_id),
-                        turn_id=str(base_turn_id),
-                        observed_at=observed_at,
-                    )
-                )
-            selected_turn_id = str(base_turn_id)
-            changed = (
-                metadata_changed
-                or revision_changed
-                or revision_repaired
-            )
-            if not changed:
-                return _TurnContentMergeResult(0)
-        else:
-            seed = dict(current_projection)
-            seed.update(
-                _retain_authoritative_completion(
-                    clean_content,
-                    None,
-                    {},
-                    incoming_final=incoming_final,
-                    observed_at=observed_at,
-                )
-            )
-            item = _strip_canonical_turn_payload(
-                Turn.from_dict(seed).to_dict()
-            )
-            item.update(_public_pending_turn_extension(seed))
-            turn_id = _insert_owned_turn_conn(
-                conn,
-                host_id=str(host_id),
-                item=item,
-                snapshot_content_fingerprint=snapshot_content_fingerprint,
-                observed_at=observed_at,
-            )
-            _replace_current_turn_content_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=turn_id,
-                current=None,
-                incoming_user=incoming_user,
-                incoming_final=incoming_final,
-                current_time=observed_at,
-            )
-            _ensure_absent_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=turn_id,
-                observed_at=observed_at,
-            )
-            selected_turn_id = turn_id
-            changed = True
-
-    submission_link: tuple[str, str] | None = None
-    if selected_turn_id is not None:
-        if incoming_source_turn and turn_model != "legacy":
-            owner_key, owner_key_version = _turn_submission_owner_identity(
-                current_projection
-            )
-            if owner_key_version == 1:
-                submission_link = (
-                    owner_key,
-                    instruction_fingerprint(incoming_user),
-                )
-        current_revision = conn.execute(
-            """
-            SELECT content_revision
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id = ? AND is_current = 1
-            """,
-            (str(host_id), selected_turn_id),
-        ).fetchone()
-        anchor_id = (
-            _ensure_final_ready_anchor_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=selected_turn_id,
-                content_revision_value=str(current_revision[0]),
-                now=str(observed_at),
-                working_predecessor_turn_id=command_predecessor_turn_id,
-            )
-            if current_revision is not None
-            else None
-        )
-        _tombstone_matching_command_sibling_conn(
-            conn,
-            str(host_id),
-            str(current_projection.get("worker_id") or ""),
-            selected_turn_id,
-            observed_at=str(observed_at),
-        )
-        if anchor_id is not None and command_predecessor_turn_id is not None:
-            _tombstone_turn_conn(
-                conn,
-                str(host_id),
-                command_predecessor_turn_id,
-                superseded_by_turn_id=selected_turn_id,
-                superseded_at=str(observed_at),
-            )
-    return _TurnContentMergeResult(int(changed), submission_link)
-
 
 def _merge_turn_content_conn(
     conn: sqlite3.Connection,
@@ -22098,323 +20946,22 @@ def _merge_turn_content_conn(
     }
     if is_internal_automation_turn_payload(automation_probe):
         return _TurnContentMergeResult(0)
-    current_snapshot_fingerprint = str(current_worker_row[1] or "")
     current_projection = _current_worker_turn_projection(
         str(host_id),
         str(worker_id),
         current_worker_payload,
     )
-    if turn_model == "observed":
-        return _merge_observed_turn_content_conn(
-            conn,
-            str(host_id),
-            current_worker_payload,
-            current_projection,
-            clean_content,
-            incoming_user=incoming_user,
-            incoming_final=incoming_final,
-            observed_at=observed_at,
-            snapshot_content_fingerprint=current_snapshot_fingerprint,
-        )
-    current_identity = _turn_continuity_identity(current_worker_payload)
-    if current_identity is not None:
-        rows = _current_owned_turn_content_rows_conn(
-            conn,
-            str(host_id),
-            current_identity,
-        )
-        return _merge_owned_turn_content_conn(
-            conn,
-            str(host_id),
-            rows,
-            current_projection,
-            clean_content,
-            automation_probe,
-            incoming_user=incoming_user,
-            incoming_final=incoming_final,
-            observed_at=observed_at,
-            snapshot_content_fingerprint=current_snapshot_fingerprint,
-            turn_model=turn_model,
-        )
-
-    # The no-owner path is the frozen worker-scoped legacy algorithm.
-    rows = _current_turn_content_rows_conn(conn, host_id, worker_id)
-    if not rows:
-        return _TurnContentMergeResult(0)
-    placeholder_ids = {
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT turn_id
-            FROM turns
-            WHERE host_id = ?
-              AND worker_id = ?
-              AND snapshot_content_fingerprint = ?
-            """,
-            (
-                str(host_id),
-                str(worker_id),
-                current_snapshot_fingerprint,
-            ),
-        ).fetchall()
-    }
-    rows = [
-        row
-        for row in rows
-        if str(row[0]) in placeholder_ids
-        or (
-            _turn_continuity_identity(row[1]) is None
-            and _turn_uses_current_canonical_identity(str(row[0]), row[1])
-        )
-    ]
-    if not rows:
-        return _TurnContentMergeResult(0)
-    incoming_source_turn = str(clean_content.get("source_turn_id") or "").strip()
-    exact_source_rows = [
-        row
-        for row in rows
-        if incoming_source_turn
-        and _source_turn_matches(row[1], incoming_source_turn)
-    ]
-    scored_rows = [
-        (
-            turn_id,
-            payload,
-            current,
-            stored_observed_at,
-            _turn_with_current_content(payload, current),
-        )
-        for turn_id, payload, current, stored_observed_at in rows
-    ]
-    base_turn_id, base_payload, base_current, base_observed_at, base_view = max(
-        scored_rows,
-        key=lambda row: _turn_merge_score(row[4], automation_probe),
+    return _merge_observed_turn_content_conn(
+        conn,
+        str(host_id),
+        current_worker_payload,
+        current_projection,
+        clean_content,
+        incoming_user=incoming_user,
+        incoming_final=incoming_final,
+        observed_at=observed_at,
+        snapshot_content_fingerprint=str(current_worker_row[1] or ""),
     )
-    changed = False
-    selected_turn_id: str | None = None
-    command_predecessor_turn_id: str | None = None
-    if exact_source_rows:
-        turn_id, payload, current, stored_observed_at = exact_source_rows[0]
-        observation_is_newer = _turn_observation_is_newer(
-            observed_at,
-            stored_observed_at,
-        )
-        if observation_is_newer:
-            payload.update(
-                _retain_authoritative_completion(
-                    clean_content,
-                    current,
-                    payload,
-                    incoming_final=incoming_final,
-                    observed_at=observed_at,
-                )
-            )
-            metadata_changed = _update_turn_row(
-                conn,
-                host_id,
-                turn_id,
-                payload,
-                observed_at,
-            )
-            revision_changed = _replace_current_turn_content_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                current=current,
-                incoming_user=incoming_user,
-                incoming_final=incoming_final,
-                current_time=observed_at,
-            )
-            revision_repaired = _ensure_absent_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=str(turn_id),
-                observed_at=observed_at,
-            )
-        else:
-            metadata_changed = False
-            revision_changed = False
-            revision_repaired = False
-        selected_turn_id = str(turn_id)
-        changed = metadata_changed or revision_changed or revision_repaired
-    elif incoming_source_turn:
-        seed = {
-            key: base_payload.get(key)
-            for key in _TURN_IDENTITY_SEED_FIELDS
-            if base_payload.get(key) is not None
-        }
-        if seed.get("origin_command_id") and not _turn_content_matches_origin(
-            base_view,
-            automation_probe,
-        ):
-            seed.pop("origin_command_id", None)
-            if str(seed.get("source") or "") == "command":
-                seed["source"] = "snapshot"
-        seed.update(
-            _retain_authoritative_completion(
-                clean_content,
-                None,
-                {},
-                incoming_final=incoming_final,
-                observed_at=observed_at,
-            )
-        )
-        item = _strip_canonical_turn_payload(Turn.from_dict(seed).to_dict())
-        turn_id = str(item.get("id") or "unknown")
-        list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
-        conn.execute(
-            """
-            INSERT INTO turns (
-                host_id, turn_id, worker_id, worker_fingerprint, space_id,
-                status, kind, updated_at, fingerprint,
-                snapshot_content_fingerprint, observed_at, payload_json,
-                list_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, turn_id) DO UPDATE SET
-                status = excluded.status,
-                kind = excluded.kind,
-                updated_at = excluded.updated_at,
-                fingerprint = excluded.fingerprint,
-                observed_at = excluded.observed_at,
-                payload_json = excluded.payload_json
-            """,
-            (
-                str(host_id),
-                turn_id,
-                str(item.get("worker_id") or worker_id),
-                item.get("worker_fingerprint"),
-                item.get("space_id"),
-                str(item.get("status") or "unknown"),
-                str(item.get("kind") or "unknown"),
-                observed_at,
-                str(item.get("fingerprint") or ""),
-                "",
-                observed_at,
-                _canonical_json(item),
-                list_sequence,
-            ),
-        )
-        _replace_current_turn_content_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=turn_id,
-            current=None,
-            incoming_user=incoming_user,
-            incoming_final=incoming_final,
-            current_time=observed_at,
-        )
-        _ensure_absent_turn_content_revision_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(turn_id),
-            observed_at=observed_at,
-        )
-        selected_turn_id = str(turn_id)
-        if (
-            str(item.get("origin_command_id") or "").strip()
-            and str(base_payload.get("origin_command_id") or "").strip()
-            == str(item.get("origin_command_id") or "").strip()
-            and not str(base_payload.get("source_turn_id") or "").strip()
-            and str(base_turn_id) != str(turn_id)
-        ):
-            command_predecessor_turn_id = str(base_turn_id)
-        if not str(base_payload.get("source_turn_id") or "").strip():
-            base_payload["assistant_stream_text"] = None
-            _update_turn_row(
-                conn,
-                host_id,
-                base_turn_id,
-                base_payload,
-                observed_at,
-            )
-        changed = True
-    else:
-        if (
-            _turn_has_authoritative_observation(base_payload, base_current)
-            and not _turn_observation_is_newer(observed_at, base_observed_at)
-        ):
-            return _TurnContentMergeResult(0)
-        payload = dict(base_payload)
-        payload.update(
-            _retain_authoritative_completion(
-                clean_content,
-                base_current,
-                payload,
-                incoming_final=incoming_final,
-                observed_at=observed_at,
-            )
-        )
-        metadata_changed = _update_turn_row(
-            conn,
-            host_id,
-            base_turn_id,
-            payload,
-            observed_at,
-        )
-        revision_changed = _replace_current_turn_content_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(base_turn_id),
-            current=base_current,
-            incoming_user=incoming_user,
-            incoming_final=incoming_final,
-            current_time=observed_at,
-        )
-        revision_repaired = _ensure_absent_turn_content_revision_conn(
-            conn,
-            host_id=str(host_id),
-            turn_id=str(base_turn_id),
-            observed_at=observed_at,
-        )
-        selected_turn_id = str(base_turn_id)
-        changed = metadata_changed or revision_changed or revision_repaired
-    submission_link: tuple[str, str] | None = None
-    if selected_turn_id is not None:
-        if incoming_source_turn and turn_model != "legacy":
-            owner_key, owner_key_version = _turn_submission_owner_identity(
-                current_worker_payload
-            )
-            if owner_key_version == 1:
-                submission_link = (
-                    owner_key,
-                    instruction_fingerprint(incoming_user),
-                )
-        current_revision = conn.execute(
-            """
-            SELECT content_revision
-            FROM turn_content_revisions
-            WHERE host_id = ? AND turn_id = ? AND is_current = 1
-            """,
-            (str(host_id), selected_turn_id),
-        ).fetchone()
-        anchor_id = (
-            _ensure_final_ready_anchor_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=selected_turn_id,
-                content_revision_value=str(current_revision[0]),
-                now=str(observed_at),
-                working_predecessor_turn_id=command_predecessor_turn_id,
-            )
-            if current_revision is not None
-            else None
-        )
-        _tombstone_matching_command_sibling_conn(
-            conn,
-            str(host_id),
-            str(worker_id),
-            selected_turn_id,
-            observed_at=str(observed_at),
-        )
-        if anchor_id is not None and command_predecessor_turn_id is not None:
-            _tombstone_turn_conn(
-                conn,
-                str(host_id),
-                command_predecessor_turn_id,
-                superseded_by_turn_id=selected_turn_id,
-                superseded_at=str(observed_at),
-            )
-    return _TurnContentMergeResult(int(changed), submission_link)
 
 
 def _turn_refresh_binding_matches_conn(
@@ -22723,480 +21270,6 @@ def _update_turn_row(
 
 
 
-def _upsert_command_pending_turn_impl(
-    db_path: Path | None,
-    host_id: str,
-    worker: Any,
-    *,
-    request_id: str,
-    instruction_text: str,
-    observed_at: str | None = None,
-    _conn: sqlite3.Connection | None = None,
-) -> dict[str, Any] | None:
-    """Upsert a public pending turn for an accepted command submission."""
-    clean_request_id = str(request_id or "").strip()
-    # Instruction validation rejects the empty string but deliberately permits
-    # whitespace-only text. Keep that raw text here: trimming it to empty would
-    # make the transactional legacy pending-turn effect abort a valid send.
-    clean_text = str(instruction_text or "")
-    if not clean_request_id or not clean_text:
-        return None
-    current_time = observed_at or utc_timestamp()
-    worker_id = str(getattr(worker, "id", "") or "").strip()
-    if not worker_id and isinstance(worker, Mapping):
-        worker_id = str(worker.get("id") or "").strip()
-    if not worker_id:
-        return None
-    worker_meta = getattr(worker, "meta", None)
-    if worker_meta is None and isinstance(worker, Mapping):
-        worker_meta = worker.get("meta")
-    if isinstance(worker, Mapping):
-        worker_projection_payload = dict(worker)
-    else:
-        worker_projection_payload = {
-            "id": worker_id,
-            "fingerprint": getattr(worker, "fingerprint", None),
-            "space_id": getattr(worker, "space_id", None),
-            "status": getattr(worker, "status", None),
-            "name": getattr(worker, "name", None),
-            "summary": getattr(worker, "summary", None),
-            "last_seen_at": getattr(worker, "last_seen_at", None),
-            "meta": worker_meta,
-        }
-    item = sanitize_public_mapping(Turn(
-        host_id=str(host_id),
-        worker_id=worker_id,
-        worker_fingerprint=str(getattr(worker, "fingerprint", "") or ""),
-        space_id=getattr(worker, "space_id", None),
-        status="active",
-        kind="task",
-        source="command",
-        user_text=clean_text,
-        assistant_final_text="",
-        assistant_stream_text="",
-        complete=False,
-        has_open_turn=True,
-        started_at=current_time,
-        updated_at=current_time,
-        origin_command_id=clean_request_id,
-        meta=worker_meta if isinstance(worker_meta, Mapping) else {},
-    ).to_dict())
-    turn_id = str(item.get("id") or "")
-    if not turn_id:
-        return None
-    content_fingerprint = stable_fingerprint(
-        {
-            "source": "command",
-            "host_id": str(host_id),
-            "worker_id": worker_id,
-            "request_id": clean_request_id,
-            "turn_fingerprint": item.get("fingerprint"),
-        }
-    )
-    owns_transaction = _conn is None
-    if owns_transaction and db_path is None:
-        raise ValueError("db_path is required without an existing connection")
-    connection_context = (
-        _connect(db_path, prepare=True, isolation_level=None)
-        if _conn is None
-        else nullcontext(_conn)
-    )
-    with connection_context as conn:
-        if owns_transaction:
-            _ensure_schema(conn)
-            conn.execute("BEGIN IMMEDIATE")
-        try:
-            superseding_turn = _superseding_turn_content_conn(
-                conn,
-                str(host_id),
-                turn_id,
-            )
-            if superseding_turn is not None:
-                if owns_transaction:
-                    conn.commit()
-                return sanitize_public_mapping(superseding_turn)
-            owner_identity = _turn_continuity_identity(item)
-            if owner_identity is not None:
-                owned_rows = _current_owned_turn_content_rows_conn(
-                    conn,
-                    str(host_id),
-                    owner_identity,
-                )
-                source_rows = [
-                    row
-                    for row in owned_rows
-                    if str(
-                        row[1].get("source_turn_id") or ""
-                    ).strip()
-                    and str(
-                        row[1].get("origin_command_id") or ""
-                    ).strip()
-                    == clean_request_id
-                ]
-                if len(source_rows) > 1:
-                    raise StoreSchemaError(
-                        "turn_owner_source_ambiguous"
-                    )
-                if source_rows:
-                    (
-                        persisted_turn_id,
-                        stored_payload,
-                        current,
-                        _stored_observed_at,
-                    ) = source_rows[0]
-                    current_projection = _current_worker_turn_projection(
-                        str(host_id),
-                        worker_id,
-                        worker_projection_payload,
-                    )
-                    adopted_payload = _adopt_turn_projection(
-                        stored_payload,
-                        current_projection,
-                    )
-                    _metadata_changed, persisted_item = (
-                        _update_persisted_turn_row(
-                            conn,
-                            str(host_id),
-                            str(persisted_turn_id),
-                            adopted_payload,
-                            stored_payload,
-                            current_time,
-                        )
-                    )
-                    existing_item = _turn_with_current_content(
-                        persisted_item,
-                        current,
-                    )
-                    if owns_transaction:
-                        conn.commit()
-                    return sanitize_public_mapping(existing_item)
-                observation_rows = [
-                    row
-                    for row in owned_rows
-                    if str(row[1].get("source_turn_id") or "").strip()
-                    and not str(
-                        row[1].get("origin_command_id") or ""
-                    ).strip()
-                    and not _turn_is_tombstoned(row[1])
-                    and (
-                        _turn_is_open_or_incomplete(row[1], row[2])
-                        or _turn_observed_near_submission(
-                            row[3],
-                            current_time,
-                        )
-                    )
-                    and _turn_content_matches_origin(
-                        _turn_with_current_content(row[1], row[2]),
-                        {"user_text": clean_text},
-                    )
-                ]
-                if len(observation_rows) == 1:
-                    (
-                        persisted_turn_id,
-                        stored_payload,
-                        current,
-                        _stored_observed_at,
-                    ) = observation_rows[0]
-                    adopted_payload = _adopt_turn_projection(
-                        stored_payload,
-                        item,
-                    )
-                    adopted_payload["origin_command_id"] = clean_request_id
-                    adopted_payload["source"] = "command"
-                    _metadata_changed, persisted_item = (
-                        _update_persisted_turn_row(
-                            conn,
-                            str(host_id),
-                            str(persisted_turn_id),
-                            adopted_payload,
-                            stored_payload,
-                            current_time,
-                            snapshot_content_fingerprint=content_fingerprint,
-                            adopt_origin_command_id=True,
-                        )
-                    )
-                    existing_item = _turn_with_current_content(
-                        persisted_item,
-                        current,
-                    )
-                    if owns_transaction:
-                        conn.commit()
-                    return sanitize_public_mapping(existing_item)
-                command_rows = [
-                    row
-                    for row in owned_rows
-                    if not str(
-                        row[1].get("source_turn_id") or ""
-                    ).strip()
-                    and str(
-                        row[1].get("origin_command_id") or ""
-                    ).strip()
-                    == clean_request_id
-                ]
-                if len(command_rows) > 1:
-                    raise StoreSchemaError(
-                        "turn_owner_command_ambiguous"
-                    )
-                if command_rows:
-                    (
-                        persisted_turn_id,
-                        stored_payload,
-                        current,
-                        _stored_observed_at,
-                    ) = command_rows[0]
-                    terminal = bool(
-                        stored_payload.get("complete") is True
-                        or stored_payload.get("has_open_turn") is False
-                        or current is not None
-                        and str(current.get("final_state") or "")
-                        == "complete"
-                    )
-                    if terminal:
-                        accepted_payload = _adopt_turn_projection(
-                            stored_payload,
-                            item,
-                        )
-                    else:
-                        accepted_payload = dict(stored_payload)
-                        accepted_payload.update(item)
-                    _metadata_changed, persisted_item = (
-                        _update_persisted_turn_row(
-                            conn,
-                            str(host_id),
-                            str(persisted_turn_id),
-                            accepted_payload,
-                            stored_payload,
-                            current_time,
-                            snapshot_content_fingerprint=(
-                                content_fingerprint
-                            ),
-                        )
-                    )
-                    if not terminal:
-                        _replace_current_turn_content_conn(
-                            conn,
-                            host_id=str(host_id),
-                            turn_id=str(persisted_turn_id),
-                            current=current,
-                            incoming_user=clean_text,
-                            incoming_final=None,
-                            current_time=current_time,
-                        )
-                        _ensure_absent_turn_content_revision_conn(
-                            conn,
-                            host_id=str(host_id),
-                            turn_id=str(persisted_turn_id),
-                            observed_at=current_time,
-                        )
-                    current_row = conn.execute(
-                        """
-                        SELECT
-                            content_revision,
-                            user_text,
-                            assistant_final_text,
-                            user_state,
-                            final_state
-                        FROM turn_content_revisions
-                        WHERE host_id = ?
-                          AND turn_id = ?
-                          AND is_current = 1
-                        """,
-                        (str(host_id), str(persisted_turn_id)),
-                    ).fetchone()
-                    current_payload = (
-                        {
-                            "content_revision": str(current_row[0]),
-                            "user_text": current_row[1],
-                            "assistant_final_text": current_row[2],
-                            "user_state": str(current_row[3]),
-                            "final_state": str(current_row[4]),
-                        }
-                        if current_row is not None
-                        else None
-                    )
-                    if owns_transaction:
-                        conn.commit()
-                    return sanitize_public_mapping(
-                        _turn_with_current_content(
-                            persisted_item,
-                            current_payload,
-                        )
-                    )
-                collision = conn.execute(
-                    """
-                    SELECT 1
-                    FROM turns
-                    WHERE host_id = ? AND turn_id = ?
-                    """,
-                    (str(host_id), turn_id),
-                ).fetchone()
-                if collision is not None:
-                    raise StoreSchemaError(
-                        "turn_owner_command_identity_conflict"
-                    )
-            list_sequence = _turn_list_sequence_conn(conn, host_id, turn_id)
-            conn.execute(
-            """
-            INSERT INTO turns (
-                host_id,
-                turn_id,
-                worker_id,
-                worker_fingerprint,
-                space_id,
-                status,
-                kind,
-                updated_at,
-                fingerprint,
-                snapshot_content_fingerprint,
-                observed_at,
-                payload_json,
-                list_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(host_id, turn_id) DO UPDATE SET
-                worker_id = excluded.worker_id,
-                worker_fingerprint = excluded.worker_fingerprint,
-                space_id = excluded.space_id,
-                status = excluded.status,
-                kind = excluded.kind,
-                updated_at = excluded.updated_at,
-                fingerprint = excluded.fingerprint,
-                snapshot_content_fingerprint = excluded.snapshot_content_fingerprint,
-                observed_at = excluded.observed_at,
-                payload_json = excluded.payload_json
-            """,
-            (
-                str(host_id),
-                turn_id,
-                worker_id,
-                item.get("worker_fingerprint"),
-                item.get("space_id"),
-                str(item.get("status") or "unknown"),
-                str(item.get("kind") or "unknown"),
-                item.get("updated_at"),
-                str(item.get("fingerprint") or ""),
-                content_fingerprint,
-                current_time,
-                _canonical_json(item),
-                list_sequence,
-            ),
-            )
-            _ensure_payload_turn_content_revision_conn(
-                conn,
-                host_id=str(host_id),
-                turn_id=turn_id,
-                payload=item,
-                observed_at=current_time,
-            )
-            if owns_transaction:
-                conn.commit()
-        except Exception:
-            if owns_transaction:
-                conn.rollback()
-            raise
-    return sanitize_public_mapping(item)
-
-
-def _upsert_command_pending_turn_conn(
-    conn: sqlite3.Connection,
-    host_id: str,
-    worker: Any,
-    *,
-    request_id: str,
-    instruction_text: str,
-    observed_at: str | None = None,
-) -> dict[str, Any] | None:
-    return _upsert_command_pending_turn_impl(
-        None,
-        host_id,
-        worker,
-        request_id=request_id,
-        instruction_text=instruction_text,
-        observed_at=observed_at,
-        _conn=conn,
-    )
-
-
-def upsert_command_pending_turn(
-    db_path: Path,
-    host_id: str,
-    worker: Any,
-    *,
-    request_id: str,
-    instruction_text: str,
-    observed_at: str | None = None,
-) -> dict[str, Any] | None:
-    """Upsert a public pending turn for an accepted command submission."""
-    return _upsert_command_pending_turn_impl(
-        db_path,
-        host_id,
-        worker,
-        request_id=request_id,
-        instruction_text=instruction_text,
-        observed_at=observed_at,
-    )
-
-
-def command_pending_turn_terminal_effect(
-    *,
-    host_id: str,
-    worker: Any,
-    request_id: str,
-    instruction_text: str,
-) -> Callable[[sqlite3.Connection], dict[str, Any]]:
-    """Build a transactional pending-turn upsert effect."""
-    def effect(conn: sqlite3.Connection) -> dict[str, Any]:
-        item = _upsert_command_pending_turn_conn(
-            conn,
-            host_id,
-            worker,
-            request_id=request_id,
-            instruction_text=instruction_text,
-            observed_at=utc_timestamp(),
-        )
-        if item is None:
-            raise StoreSchemaError("command_pending_turn_terminal_effect_failed")
-        return item
-
-    return effect
-
-
-def delete_command_pending_turn_claim_effect(
-    *,
-    host_id: str,
-    request_id: str,
-) -> Callable[[sqlite3.Connection], bool]:
-    """Build a transactional delete for a claim proven not to have been sent."""
-    clean_request_id = str(request_id or "").strip()
-
-    def effect(conn: sqlite3.Connection) -> bool:
-        rows = conn.execute(
-            """
-            SELECT turn_id, payload_json
-            FROM turns
-            WHERE host_id = ?
-              AND json_extract(payload_json, '$.source') = 'command'
-              AND json_extract(payload_json, '$.origin_command_id') = ?
-              AND COALESCE(
-                    json_extract(payload_json, '$.source_turn_id'),
-                    ''
-                  ) = ''
-            """,
-            (str(host_id), clean_request_id),
-        ).fetchall()
-        if not clean_request_id or len(rows) != 1:
-            return False
-        payload = _json_object(rows[0][1])
-        if _turn_is_tombstoned(payload):
-            return False
-        return _delete_turn_if_unreferenced_conn(
-            conn,
-            str(host_id),
-            str(rows[0][0]),
-        )
-
-    return effect
-
-
 _TURN_DELTA_PROJECTION_SELECT = """
     turns.payload_json, turns.observed_at, turns.turn_id, turns.worker_id,
     turns.list_sequence, revisions.content_revision, revisions.user_state,
@@ -23418,7 +21491,7 @@ def _turn_delta_payload_from_store(
         }
 
     if _submission_linking_enabled(turn_model):
-        sweep_key, sweep_due = _reserve_lazy_turn_claim_sweep(
+        sweep_key, sweep_due = _reserve_lazy_submission_link_sweep(
             db_path,
             host,
             purpose="submission_links",
@@ -23433,7 +21506,7 @@ def _turn_delta_payload_from_store(
                     now=datetime.fromtimestamp(clock, tz=timezone.utc).isoformat(),
                 )
             except Exception:
-                _release_failed_lazy_turn_claim_sweep(
+                _release_failed_submission_link_sweep(
                     sweep_key,
                     current_clock=clock,
                 )
@@ -23753,7 +21826,6 @@ def turns_payload_from_store(
     now: float | int | None = None,
     work_counters: TurnContentWorkCounters | None = None,
     turn_refresh_interval_seconds: float = 2.0,
-    claim_hard_ttl_seconds: float = TURN_CLAIM_HARD_TTL_SECONDS,
     turn_model: str = DEFAULT_TURN_MODEL,
 ) -> dict[str, Any]:
     """Return one insertion-stable, byte-bounded turn-list page."""
@@ -23788,7 +21860,7 @@ def turns_payload_from_store(
     current_clock = time.time() if now is None else float(now)
     refresh_interval = float(turn_refresh_interval_seconds)
     if _submission_linking_enabled(turn_model):
-        submission_sweep_key, submission_sweep_due = _reserve_lazy_turn_claim_sweep(
+        submission_sweep_key, submission_sweep_due = _reserve_lazy_submission_link_sweep(
             db_path,
             str(host_id),
             purpose="submission_links",
@@ -23806,41 +21878,12 @@ def turns_payload_from_store(
                     ).isoformat(),
                 )
             except Exception:
-                _release_failed_lazy_turn_claim_sweep(
+                _release_failed_submission_link_sweep(
                     submission_sweep_key,
                     current_clock=current_clock,
                 )
                 # Listing remains available if opportunistic maintenance is contended.
                 pass
-    claim_sweep_key, claim_sweep_due = _reserve_lazy_turn_claim_sweep(
-        db_path,
-        str(host_id),
-        purpose="turn_claims",
-        current_clock=current_clock,
-        refresh_interval_seconds=refresh_interval,
-    )
-    if claim_sweep_due:
-        try:
-            sweep_turn_claims(
-                db_path,
-                str(host_id),
-                grace_seconds=max(
-                    TURN_CLAIM_SWEEP_MIN_GRACE_SECONDS,
-                    10.0 * refresh_interval,
-                ),
-                hard_ttl_seconds=float(claim_hard_ttl_seconds),
-                now=datetime.fromtimestamp(
-                    current_clock,
-                    tz=timezone.utc,
-                ).isoformat(),
-            )
-        except Exception:
-            _release_failed_lazy_turn_claim_sweep(
-                claim_sweep_key,
-                current_clock=current_clock,
-            )
-            # Listing remains available if opportunistic maintenance is contended.
-            pass
     try:
         decoded_cursor = (
             decode_turn_list_cursor(
@@ -24568,19 +22611,18 @@ def get_turn_content(
     try:
         with _connect(db_path) as conn:
             _ensure_schema(conn)
-            if str(turn_model or "").strip().lower() == "observed":
-                canonical_turn_id = _resolve_canonical_turn_id_conn(
-                    conn,
-                    str(host_id),
-                    turn_id,
-                )
-                if canonical_turn_id is None:
-                    return {
-                        "schema_version": 1,
-                        "ok": False,
-                        "status": "content_revision_not_found",
-                    }
-                turn_id = canonical_turn_id
+            canonical_turn_id = _resolve_canonical_turn_id_conn(
+                conn,
+                str(host_id),
+                turn_id,
+            )
+            if canonical_turn_id is None:
+                return {
+                    "schema_version": 1,
+                    "ok": False,
+                    "status": "content_revision_not_found",
+                }
+            turn_id = canonical_turn_id
             row = conn.execute(
                 """
                 SELECT
@@ -25029,14 +23071,7 @@ def save_snapshot(
                 # Turn model construction and pending serialization can recurse
                 # through the public sanitizer. Keep that CPU work outside the
                 # SQLite writer transaction.
-                prepared_turn_items = (
-                    ()
-                    if normalized_turn_model == "observed"
-                    else tuple(
-                        turn.to_dict()
-                        for turn in turns_from_snapshot(public_snapshot)
-                    )
-                )
+                prepared_turn_items = ()
                 prepared_pending_items = tuple(
                     pending.to_dict()
                     for pending in pending_from_snapshot(public_snapshot)
@@ -25062,14 +23097,7 @@ def save_snapshot(
                 # read-only preflight and BEGIN IMMEDIATE. Retry after preparing
                 # the now-required projection inputs without holding the lock.
                 conn.rollback()
-                prepared_turn_items = (
-                    ()
-                    if normalized_turn_model == "observed"
-                    else tuple(
-                        turn.to_dict()
-                        for turn in turns_from_snapshot(public_snapshot)
-                    )
-                )
+                prepared_turn_items = ()
                 prepared_pending_items = tuple(
                     pending.to_dict()
                     for pending in pending_from_snapshot(public_snapshot)

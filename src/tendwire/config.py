@@ -6,8 +6,9 @@ No external config-file parser is required.
 
 from __future__ import annotations
 
-import os
+import logging
 import math
+import os
 import platform
 import socket
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ from pathlib import Path
 
 HERDR_BACKENDS = frozenset({"cli", "socket"})
 TURN_MODELS = frozenset({"legacy", "dual", "shadow", "observed"})
-DEFAULT_TURN_MODEL = "legacy"
+DEFAULT_TURN_MODEL = "observed"
 DEFAULT_EVENT_DEBOUNCE_SECONDS = 0.05
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 DEFAULT_EVENT_RETENTION_DAYS = 7
@@ -23,7 +24,6 @@ DEFAULT_OUTPUT_EXCERPT_CHARS = 200
 DEFAULT_MAX_WORKERS = 512
 DEFAULT_TURN_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_TURN_REFRESH_WORKERS = 4
-DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS = 60
 DEFAULT_SUBMISSION_HARD_TTL_SECONDS = 86_400
 DEFAULT_PENDING_STALE_GRACE_SECONDS = 30.0
@@ -49,6 +49,7 @@ MAX_SNAPSHOT_MAINTENANCE_BATCH_SIZE = 1000
 MAX_RETENTION_DAYS = 365_000
 MAX_SQLITE_INTEGER = (1 << 63) - 1
 MAX_MAINTENANCE_CADENCE_SECONDS = MAX_RETENTION_DAYS * 24 * 60 * 60
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,6 @@ class Config:
     max_workers: int = DEFAULT_MAX_WORKERS
     turn_refresh_interval_seconds: float = DEFAULT_TURN_REFRESH_INTERVAL_SECONDS
     turn_refresh_workers: int = DEFAULT_TURN_REFRESH_WORKERS
-    turn_claim_hard_ttl_seconds: int = DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS
     submission_link_window_seconds: int = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
     submission_hard_ttl_seconds: int = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
     pending_stale_grace_seconds: float = DEFAULT_PENDING_STALE_GRACE_SECONDS
@@ -121,6 +121,11 @@ class Config:
             allowed = ", ".join(sorted(TURN_MODELS))
             raise ValueError(f"turn_model must be one of: {allowed}")
         object.__setattr__(self, "turn_model", turn_model)
+        if turn_model != "observed":
+            _LOGGER.warning(
+                "turn_model=%s is a compatibility alias and behaves as observed",
+                turn_model,
+            )
         object.__setattr__(
             self,
             "event_debounce_seconds",
@@ -169,15 +174,6 @@ class Config:
         )
         if self.turn_refresh_workers > self.max_workers:
             raise ValueError("turn_refresh_workers must be <= max_workers")
-        object.__setattr__(
-            self,
-            "turn_claim_hard_ttl_seconds",
-            _bounded_positive_int(
-                self.turn_claim_hard_ttl_seconds,
-                "turn_claim_hard_ttl_seconds",
-                maximum=MAX_MAINTENANCE_CADENCE_SECONDS,
-            ),
-        )
         object.__setattr__(
             self,
             "submission_link_window_seconds",
@@ -454,7 +450,6 @@ def load_config(
     max_workers: int | str | None = None,
     turn_refresh_interval_seconds: float | str | None = None,
     turn_refresh_workers: int | str | None = None,
-    turn_claim_hard_ttl_seconds: int | str | None = None,
     submission_link_window_seconds: int | str | None = None,
     submission_hard_ttl_seconds: int | str | None = None,
     pending_stale_grace_seconds: float | str | None = None,
@@ -577,11 +572,6 @@ def load_config(
             turn_refresh_workers,
             "TENDWIRE_TURN_REFRESH_WORKERS",
             DEFAULT_TURN_REFRESH_WORKERS,
-        ),
-        turn_claim_hard_ttl_seconds=_resolve_value(
-            turn_claim_hard_ttl_seconds,
-            "TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS",
-            DEFAULT_TURN_CLAIM_HARD_TTL_SECONDS,
         ),
         submission_link_window_seconds=_resolve_value(
             submission_link_window_seconds,

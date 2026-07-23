@@ -1081,6 +1081,7 @@ def test_boundary_secret_stays_redacted_through_store_pages_and_plan_outbox(
         host_id,
         worker_id,
         {
+            "source_turn_id": "boundary-content-source",
             "assistant_final_text": dirty_final,
             "complete": True,
             "has_open_turn": False,
