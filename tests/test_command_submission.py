@@ -3840,3 +3840,36 @@ def test_terminal_id_binding_falls_back_to_agent_list_when_agent_get_refuses(mon
     except HerdrErrorResponse:
         pass
     assert calls == ["agent.get"]
+
+
+def test_terminal_id_agent_list_fallback_rejects_duplicate_matches(monkeypatch) -> None:
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    original_error = HerdrErrorResponse(
+        {"code": "agent_not_found", "message": "agent target term_dup not found"},
+        "req-1",
+    )
+
+    def fake_socket_request(client, method, params, *, timeout):
+        if method == "agent.get":
+            raise original_error
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term_dup", "pane_id": "w1:p1"},
+                    {"terminal_id": "term_dup", "pane_id": "w1:p2"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term_dup"
+
+    with pytest.raises(HerdrErrorResponse) as raised:
+        cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+
+    assert raised.value is original_error

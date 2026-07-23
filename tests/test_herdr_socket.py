@@ -237,6 +237,26 @@ def test_client_malformed_envelope_shape_raises_protocol_error(tmp_path: Path) -
         client.close()
 
 
+def test_ordinary_request_rejects_uncorrelated_empty_id_error(tmp_path: Path) -> None:
+    def handler(conn: _Connection) -> None:
+        conn.read_request()
+        conn.send_json(
+            {
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "uncorrelated ordinary request error",
+                },
+            }
+        )
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        with pytest.raises(HerdrEnvelopeError):
+            client.request("workspace.list")
+        client.close()
+
+
 def test_client_non_utf8_response_raises_protocol_error(tmp_path: Path) -> None:
     def handler(conn: _Connection) -> None:
         conn.read_request()

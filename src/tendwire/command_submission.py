@@ -357,13 +357,20 @@ def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout
             raise
         listing = _socket_request(client, "agent.list", {}, timeout=timeout)
         agents = listing.get("agents") if isinstance(listing, Mapping) else None
-        for agent in agents or []:
-            if not isinstance(agent, Mapping):
-                continue
-            if str(agent.get("terminal_id") or "") == str(binding.target_value or ""):
-                pane_id = str(agent.get("pane_id") or "").strip()
-                if pane_id:
-                    return pane_id
+        matches = [
+            agent
+            for agent in agents or []
+            if isinstance(agent, Mapping)
+            and str(agent.get("terminal_id") or "")
+            == str(binding.target_value or "")
+        ]
+        if len(matches) == 1:
+            pane_id = str(matches[0].get("pane_id") or "").strip()
+            if pane_id:
+                return pane_id
+        # Zero matches, an unusable single match, and duplicate authoritative
+        # matches all preserve the original resolution error. In particular,
+        # duplicate terminal ids must never pick the first listed pane.
         raise
     return _pane_id_from_agent_info(response)
 
