@@ -1039,23 +1039,40 @@ def _run_herdres_phase(
         os.environ.clear()
         os.environ.update(environment)
     records = [json.loads(line) for line in call_log.read_text(encoding="utf-8").splitlines()]
+    def _normalized_client_call(argv: list[str]) -> list[str]:
+        # Watermark tokens are run-specific; validate their shape, then
+        # normalize so the sequence stays exactly comparable.
+        normalized = list(argv)
+        for index, value in enumerate(normalized):
+            if (
+                index > 0
+                and normalized[index - 1] == "--watermark"
+                and value.startswith("twdelta1.")
+            ):
+                normalized[index] = "<WATERMARK>"
+        return normalized
+
     expected_commands = []
-    for _ in range(3):
+    for pass_index in range(3):
+        delta_call = [
+            "--socket-path",
+            str(socket_path),
+            "turn",
+            "delta",
+            "--json",
+            "--limit",
+            "500",
+        ]
+        if pass_index > 0:
+            delta_call.extend(("--watermark", "<WATERMARK>"))
         expected_commands.extend(
             (["--socket-path", str(socket_path), "snapshot", "--json"],
-             [
-                 "--socket-path",
-                 str(socket_path),
-                 "turns",
-                 "--schema-version",
-                 "2",
-                 "--limit",
-                 str(turn_page_limit),
-                 "--json",
-             ],
+             delta_call,
              ["--socket-path", str(socket_path), "pending", "--json"])
         )
-    commands_exact = records == expected_commands
+    commands_exact = [
+        _normalized_client_call(record) for record in records
+    ] == expected_commands
     noop_results = results[1:]
     return {
         "mode": "source",
