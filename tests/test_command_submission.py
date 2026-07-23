@@ -3875,6 +3875,39 @@ def test_terminal_id_agent_list_fallback_rejects_distinct_conflicting_matches(
         cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
 
 
+def test_terminal_id_agent_list_zero_matches_reraise_original_error(
+    monkeypatch,
+) -> None:
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    original_error = HerdrErrorResponse(
+        {"code": "agent_not_found", "message": "agent target term_gone not found"},
+        "req-1",
+    )
+
+    def fake_socket_request(client, method, params, *, timeout):
+        if method == "agent.get":
+            raise original_error
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term_other", "pane_id": "w1:p9"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term_gone"
+
+    with pytest.raises(HerdrErrorResponse) as excinfo:
+        cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)
+    assert excinfo.value is original_error
+
+
 def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
     tmp_path: Path,
 ) -> None:
