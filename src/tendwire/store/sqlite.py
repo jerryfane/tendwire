@@ -141,6 +141,11 @@ TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 SUBMISSION_LINK_WINDOW_SECONDS = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
 SUBMISSION_HARD_TTL_SECONDS = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
+# A send that has not produced an authoritative accepted/uncertain receipt
+# within the backend command timeout is no longer safe for instant linking.
+# Keep this classification local to the shadow linker: receipts and the
+# submission lifecycle remain authoritative and unchanged.
+SUBMISSION_SEND_ACK_TIMEOUT_SECONDS = 5.0
 TURN_LEDGER_BACKFILL_BATCH_SIZE = 500
 ACKNOWLEDGED_FINAL_RETENTION_DAYS = 30
 ACKNOWLEDGED_FINAL_RETENTION_COUNT = 4096
@@ -17686,11 +17691,14 @@ def settle_submission_links_conn(
     now: str | None = None,
     _next_eligible_out: list[datetime | None] | None = None,
 ) -> int:
-    """Fail closed while settling all temporal 1:1 components for one key.
+    """Settle unambiguous live links and fail closed for degraded components.
 
     The caller owns the surrounding ``BEGIN IMMEDIATE`` transaction. Candidate
     edges exist only when an observation falls inside a submission's symmetric
-    link window. Disconnected windows settle independently; any connected
+    link window. A sole fresh open submission may link immediately to its first
+    post-send observation. Multiple same-fingerprint submissions, uncertain
+    submissions, and stale send-started submissions retain the window-close
+    graph settlement. Disconnected windows settle independently; any connected
     component larger than 1x1 terminalizes its submissions as ambiguous.
     """
     current, current_dt = _pending_observed_time(now)
@@ -17698,7 +17706,9 @@ def settle_submission_links_conn(
     submissions = []
     for row in conn.execute(
         """
-        SELECT submission_id, owner_key_version, link_not_before, link_expires_at
+        SELECT submission_id, owner_key_version, state,
+               link_not_before, link_expires_at,
+               submitted_at, send_started_at
         FROM turn_submissions
         WHERE host_id = ?
           AND owner_key = ?
@@ -17714,16 +17724,29 @@ def settle_submission_links_conn(
             *open_states,
         ),
     ).fetchall():
-        lower = _strict_utc_timestamp(row[2])
-        upper = _strict_utc_timestamp(row[3])
+        lower = _strict_utc_timestamp(row[3])
+        upper = _strict_utc_timestamp(row[4])
         if lower is None or upper is None:
             continue
+        submitted_at = _strict_utc_timestamp(row[5])
+        send_started_at = _strict_utc_timestamp(row[6])
         submissions.append(
             (
                 str(row[0]),
                 int(row[1]),
+                str(row[2]),
                 datetime.fromisoformat(lower),
                 datetime.fromisoformat(upper),
+                (
+                    None
+                    if submitted_at is None
+                    else datetime.fromisoformat(submitted_at)
+                ),
+                (
+                    None
+                    if send_started_at is None
+                    else datetime.fromisoformat(send_started_at)
+                ),
             )
         )
     if not submissions:
@@ -17737,23 +17760,58 @@ def settle_submission_links_conn(
         owner_key=str(owner_key),
         instruction_fingerprint_value=str(instruction_fingerprint_value),
     )
-    if not turns:
-        if _next_eligible_out is not None:
-            _next_eligible_out.append(None)
-        return 0
-
     submission_edges: dict[str, set[str]] = {
         submission_id: set()
-        for submission_id, _owner_version, _lower, _upper in submissions
+        for (
+            submission_id,
+            _owner_version,
+            _state,
+            _lower,
+            _upper,
+            _submitted_at,
+            _send_started_at,
+        ) in submissions
     }
     turn_edges: dict[str, set[str]] = {
         turn_id: set() for turn_id, _owner_version, _at in turns
     }
     submission_expires = {
         submission_id: upper
-        for submission_id, _owner_version, _lower, upper in submissions
+        for (
+            submission_id,
+            _owner_version,
+            _state,
+            _lower,
+            upper,
+            _submitted_at,
+            _send_started_at,
+        ) in submissions
     }
-    for submission_id, owner_version, lower, upper in submissions:
+    submission_details = {
+        submission_id: (state, submitted_at, send_started_at)
+        for (
+            submission_id,
+            _owner_version,
+            state,
+            _lower,
+            _upper,
+            submitted_at,
+            send_started_at,
+        ) in submissions
+    }
+    turn_observed_at = {
+        turn_id: observed_at
+        for turn_id, _owner_version, observed_at in turns
+    }
+    for (
+        submission_id,
+        owner_version,
+        _state,
+        lower,
+        upper,
+        _submitted_at,
+        _send_started_at,
+    ) in submissions:
         for turn_id, turn_owner_version, observed_at in turns:
             if owner_version == turn_owner_version and lower <= observed_at <= upper:
                 submission_edges[submission_id].add(turn_id)
@@ -17761,12 +17819,44 @@ def settle_submission_links_conn(
 
     changed = 0
     waiting_boundaries: list[datetime] = []
+
     visited_submissions: set[str] = set()
-    for initial_submission, _owner_version, _lower, _upper in submissions:
-        if (
-            initial_submission in visited_submissions
-            or not submission_edges[initial_submission]
-        ):
+    for (
+        initial_submission,
+        _owner_version,
+        _state,
+        _lower,
+        _upper,
+        _submitted_at,
+        _send_started_at,
+    ) in submissions:
+        if initial_submission in visited_submissions:
+            continue
+        if not submission_edges[initial_submission]:
+            # A no-edge submission is its own disconnected component. Surface
+            # the missed link as soon as its window closes even when another
+            # same-fingerprint component remains open.
+            boundary = submission_expires[initial_submission]
+            if current_dt < boundary:
+                waiting_boundaries.append(boundary)
+                continue
+            updated = conn.execute(
+                """
+                UPDATE turn_submissions
+                SET state = 'expired', terminal_at = ?, updated_at = ?
+                WHERE host_id = ? AND submission_id = ?
+                  AND linked_turn_id IS NULL
+                  AND state IN (?, ?, ?)
+                """,
+                (
+                    current,
+                    current,
+                    str(host_id),
+                    initial_submission,
+                    *open_states,
+                ),
+            )
+            changed += int(updated.rowcount or 0)
             continue
         component_submissions: set[str] = set()
         component_turns: set[str] = set()
@@ -17795,6 +17885,55 @@ def settle_submission_links_conn(
             for submission_id in component_submissions
         )
         if current_dt < component_boundary:
+            # Only a live 1x1 component is provably unambiguous. Any second
+            # same-fingerprint submission or candidate retains the existing
+            # fail-closed window settlement. Uncertain and stale send-started
+            # submissions stay on that degraded path too.
+            if len(component_submissions) == len(component_turns) == 1:
+                submission_id = next(iter(component_submissions))
+                turn_id = next(iter(component_turns))
+                state, submitted_at, send_started_at = submission_details[
+                    submission_id
+                ]
+                stale_send_started = state == "send_started" and (
+                    send_started_at is None
+                    or current_dt
+                    > send_started_at
+                    + timedelta(seconds=SUBMISSION_SEND_ACK_TIMEOUT_SECONDS)
+                )
+                instant_anchor = (
+                    send_started_at if state == "send_started" else submitted_at
+                )
+                if (
+                    state != "uncertain"
+                    and not stale_send_started
+                    and instant_anchor is not None
+                    and turn_observed_at[turn_id] <= current_dt
+                    # Timestamps are stored to whole seconds. Equality cannot
+                    # prove the observation followed the send boundary.
+                    and turn_observed_at[turn_id] > instant_anchor
+                ):
+                    updated = conn.execute(
+                        """
+                        UPDATE turn_submissions
+                        SET linked_turn_id = ?, state = 'linked', linked_at = ?,
+                            updated_at = ?
+                        WHERE host_id = ? AND submission_id = ?
+                          AND linked_turn_id IS NULL
+                          AND state IN (?, ?, ?)
+                        """,
+                        (
+                            turn_id,
+                            current,
+                            current,
+                            str(host_id),
+                            submission_id,
+                            *open_states,
+                        ),
+                    )
+                    changed += int(updated.rowcount or 0)
+                    if int(updated.rowcount or 0) == 1:
+                        continue
             waiting_boundaries.append(component_boundary)
             continue
 
@@ -17827,13 +17966,14 @@ def settle_submission_links_conn(
         updated = conn.execute(
             f"""
             UPDATE turn_submissions
-            SET state = 'ambiguous', updated_at = ?
+            SET state = 'ambiguous', terminal_at = ?, updated_at = ?
             WHERE host_id = ?
               AND submission_id IN ({placeholders})
               AND linked_turn_id IS NULL
               AND state IN (?, ?, ?)
             """,
             (
+                current,
                 current,
                 str(host_id),
                 *sorted(component_submissions),

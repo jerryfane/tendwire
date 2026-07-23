@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -933,6 +933,7 @@ def test_observed_linker_prod_shape_turns_keep_owner_hash_isolated(
         db_path,
         request_id="first-owner",
         owner_key=first_owner,
+        link_expires_at="2026-02-01T12:01:00+00:00",
     )
 
     _observe_link_turn(
@@ -952,12 +953,13 @@ def test_observed_linker_prod_shape_turns_keep_owner_hash_isolated(
         db_path,
         worker_id="worker-a",
         source_turn_id="first-owner-source",
+        observed_at="2026-02-01T12:00:02+00:00",
         turn_model="observed",
     )
     store_sqlite.sweep_submission_links(
         db_path,
         host_id="host-a",
-        now="2026-02-01T12:00:01+00:00",
+        now="2026-02-01T12:00:03+00:00",
     )
     assert _submission_rows(db_path) == [
         ("first-owner", "linked", matching_turn_id)
@@ -1088,6 +1090,344 @@ def test_shadow_linker_waits_for_window_close_before_failing_closed(
         observed_at="2026-02-01T12:01:00+00:00",
     )
     assert _submission_rows(db_path) == [("delayed", "ambiguous", None)]
+
+
+@pytest.mark.parametrize("turn_model", ("dual", "observed"))
+def test_single_open_submission_links_on_first_sweep_after_observation(
+    tmp_path: Path,
+    turn_model: str,
+) -> None:
+    db_path = tmp_path / f"instant-single-{turn_model}.db"
+    owner_key = _seed_link_worker(db_path)
+    _set_link_worker_prod_shape(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id=f"instant-single-{turn_model}",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+    observed_at = "2026-02-01T12:00:03+00:00"
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id=f"instant-single-{turn_model}-source",
+        observed_at=observed_at,
+        turn_model=turn_model,
+    )
+    assert _submission_rows(db_path) == [
+        (f"instant-single-{turn_model}", "submitted", None)
+    ]
+
+    swept_at = "2026-02-01T12:00:05+00:00"
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now=swept_at,
+    )
+
+    assert _submission_rows(db_path) == [
+        (f"instant-single-{turn_model}", "linked", turn_id)
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        linked_at = conn.execute(
+            """
+            SELECT linked_at FROM turn_submissions
+            WHERE host_id = 'host-a' AND request_id = ?
+            """,
+            (f"instant-single-{turn_model}",),
+        ).fetchone()[0]
+    assert linked_at == swept_at
+    assert (
+        datetime.fromisoformat(linked_at)
+        - datetime.fromisoformat(observed_at)
+    ).total_seconds() == 2
+    assert linked_at < "2026-02-01T12:01:00+00:00"
+
+
+def test_two_open_same_fingerprint_submissions_do_not_instant_link(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "two-open-no-instant.db"
+    owner_key = _seed_link_worker(db_path)
+    for index in range(2):
+        _insert_link_submission(
+            db_path,
+            request_id=f"two-open-{index}",
+            owner_key=owner_key,
+            link_expires_at="2026-02-01T12:01:00+00:00",
+        )
+
+    _observe_link_turn(
+        db_path,
+        source_turn_id="two-open-source",
+        observed_at="2026-02-01T12:00:03+00:00",
+    )
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:05+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("two-open-0", "submitted", None),
+        ("two-open-1", "submitted", None),
+    ]
+
+
+def test_disconnected_singleton_component_still_links_immediately(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "disconnected-singleton-instant.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="old-disconnected",
+        owner_key=owner_key,
+        link_not_before="2026-02-01T11:00:00+00:00",
+        link_expires_at="2026-02-01T11:01:00+00:00",
+    )
+    _insert_link_submission(
+        db_path,
+        request_id="live-singleton",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="live-singleton-source",
+        observed_at="2026-02-01T12:00:03+00:00",
+    )
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:05+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("live-singleton", "linked", turn_id),
+        ("old-disconnected", "expired", None),
+    ]
+
+
+def test_manual_same_text_turn_links_single_open_submission(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "manual-same-text.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="manual-same-text",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="manually-entered-turn",
+        observed_at="2026-02-01T12:00:03+00:00",
+    )
+
+    # The linker sees content and worker identity, not the origin of typed text.
+    # With one open same-fingerprint submission this attribution is harmless.
+    assert _submission_rows(db_path) == [
+        ("manual-same-text", "linked", turn_id)
+    ]
+
+
+def test_stale_send_started_submission_uses_windowed_settlement(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "stale-send-started.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="stale-send-started",
+        owner_key=owner_key,
+        state="send_started",
+        link_expires_at="2026-02-01T12:01:00+00:00",
+    )
+    observed_at = (
+        datetime.fromisoformat("2026-02-01T12:00:00+00:00")
+        + timedelta(
+            seconds=store_sqlite.SUBMISSION_SEND_ACK_TIMEOUT_SECONDS + 1
+        )
+    ).isoformat()
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="stale-send-started-source",
+        observed_at=observed_at,
+    )
+
+    assert _submission_rows(db_path) == [
+        ("stale-send-started", "send_started", None)
+    ]
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:30+00:00",
+    )
+    assert _submission_rows(db_path) == [
+        ("stale-send-started", "send_started", None)
+    ]
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:01:00+00:00",
+    )
+    assert _submission_rows(db_path) == [
+        ("stale-send-started", "linked", turn_id)
+    ]
+
+
+def test_ambiguous_component_is_stamped_at_window_close_not_hard_ttl(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ambiguous-at-window-close.db"
+    owner_key = _seed_link_worker(db_path)
+    for index in range(2):
+        _insert_link_submission(
+            db_path,
+            request_id=f"ambiguous-at-close-{index}",
+            owner_key=owner_key,
+            link_expires_at="2026-02-01T12:01:00+00:00",
+            hard_expires_at="2026-02-02T12:00:00+00:00",
+        )
+    _observe_link_turn(
+        db_path,
+        source_turn_id="ambiguous-at-close-source",
+        observed_at="2026-02-01T12:00:03+00:00",
+    )
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:01:00+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("ambiguous-at-close-0", "ambiguous", None),
+        ("ambiguous-at-close-1", "ambiguous", None),
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        stamps = conn.execute(
+            """
+            SELECT terminal_at, hard_expires_at
+            FROM turn_submissions
+            WHERE host_id = 'host-a'
+            ORDER BY request_id
+            """
+        ).fetchall()
+    assert stamps == [
+        ("2026-02-01T12:01:00+00:00", "2026-02-02T12:00:00+00:00"),
+        ("2026-02-01T12:01:00+00:00", "2026-02-02T12:00:00+00:00"),
+    ]
+
+
+def test_lone_submission_without_candidate_expires_at_window_close(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "no-candidate-at-window-close.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="no-candidate-at-window-close",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:01:00+00:00",
+        hard_expires_at="2026-02-02T12:00:00+00:00",
+    )
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:00:30+00:00",
+    )
+    assert _submission_rows(db_path) == [
+        ("no-candidate-at-window-close", "submitted", None)
+    ]
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:01:00+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("no-candidate-at-window-close", "expired", None)
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT terminal_at, hard_expires_at
+            FROM turn_submissions
+            WHERE host_id = 'host-a'
+              AND request_id = 'no-candidate-at-window-close'
+            """
+        ).fetchone() == (
+            "2026-02-01T12:01:00+00:00",
+            "2026-02-02T12:00:00+00:00",
+        )
+
+
+def test_each_no_candidate_component_expires_at_its_window_close(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "multiple-no-candidate-components.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="closed-no-candidate",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:00:10+00:00",
+    )
+    _insert_link_submission(
+        db_path,
+        request_id="open-no-candidate",
+        owner_key=owner_key,
+        link_not_before="2026-02-01T12:01:00+00:00",
+        link_expires_at="2026-02-01T12:02:00+00:00",
+    )
+
+    store_sqlite.sweep_submission_links(
+        db_path,
+        host_id="host-a",
+        now="2026-02-01T12:01:30+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("closed-no-candidate", "expired", None),
+        ("open-no-candidate", "submitted", None),
+    ]
+
+
+def test_turn_observed_outside_link_window_never_links(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "outside-link-window.db"
+    owner_key = _seed_link_worker(db_path)
+    _insert_link_submission(
+        db_path,
+        request_id="outside-link-window",
+        owner_key=owner_key,
+        link_expires_at="2026-02-01T12:00:10+00:00",
+        hard_expires_at="2026-02-02T12:00:00+00:00",
+    )
+    turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="outside-link-window-source",
+        observed_at="2026-02-01T12:00:11+00:00",
+    )
+
+    assert _submission_rows(db_path) == [
+        ("outside-link-window", "expired", None)
+    ]
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM turn_submissions
+            WHERE host_id = 'host-a' AND linked_turn_id = ?
+            """,
+            (turn_id,),
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize(
@@ -1489,7 +1829,7 @@ def test_link_candidate_owner_identity_normalizes_only_missing_version() -> None
         assert result == ("legacy-worker:worker-x", 0), meta
 
 
-def test_observed_lazy_delta_sweep_links_first_poll_after_live_window(
+def test_observed_lazy_delta_sweep_links_first_poll_after_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1504,6 +1844,7 @@ def test_observed_lazy_delta_sweep_links_first_poll_after_live_window(
         link_expires_at="2026-07-22T12:03:23+00:00",
         hard_expires_at="2026-07-23T12:02:23+00:00",
     )
+    _set_link_worker_prod_shape(db_path)
 
     # Herdres polls turn.delta every ~5s.  The early empty sweeps exercise the
     # component backoff before the idle pane produces its first observation.
@@ -1572,27 +1913,19 @@ def test_observed_lazy_delta_sweep_links_first_poll_after_live_window(
         turn_model="observed",
     )
     assert candidate_calls == candidate_calls_after_observation + 1
-
-    first_poll_after_boundary = None
-    for minute, second in (
-        *((2, second) for second in range(43, 60, 5)),
-        *((3, second) for second in range(3, 29, 5)),
-    ):
-        current = f"2026-07-22T12:{minute:02d}:{second:02d}+00:00"
-        turn_delta_payload_from_store(
-            db_path,
-            "host-a",
-            now=datetime.fromisoformat(current).timestamp(),
-            turn_model="observed",
-        )
-        if current >= "2026-07-22T12:03:23+00:00":
-            first_poll_after_boundary = current
-            break
-
-    assert first_poll_after_boundary == "2026-07-22T12:03:23+00:00"
     assert _submission_rows(db_path) == [
         ("observed-live-timeline", "linked", observed_turn_id)
     ]
+    with sqlite3.connect(str(db_path)) as conn:
+        linked_at = conn.execute(
+            """
+            SELECT linked_at FROM turn_submissions
+            WHERE host_id = 'host-a'
+              AND request_id = 'observed-live-timeline'
+            """
+        ).fetchone()[0]
+    assert linked_at == "2026-07-22T12:02:38+00:00"
+    assert linked_at < "2026-07-22T12:03:23+00:00"
 
 
 def test_observed_link_rearm_uses_stable_owner_across_worker_renumber(
@@ -1680,7 +2013,7 @@ def test_observed_link_rearm_uses_stable_owner_across_worker_renumber(
     ]
 
 
-def test_observed_busy_pane_completion_still_links_after_window(
+def test_observed_busy_pane_completion_links_immediately(
     tmp_path: Path,
 ) -> None:
     """Preserve the observation-first ordering from the working busy-pane case."""
@@ -1713,18 +2046,6 @@ def test_observed_busy_pane_completion_still_links_after_window(
         db_path,
         source_turn_id="busy-pane-source",
         observed_at="2026-07-22T12:02:36+00:00",
-        turn_model="observed",
-    )
-    assert _submission_rows(db_path) == [
-        ("observed-busy-pane", "submitted", None)
-    ]
-
-    turn_delta_payload_from_store(
-        db_path,
-        "host-a",
-        now=datetime.fromisoformat(
-            "2026-07-22T12:03:23+00:00"
-        ).timestamp(),
         turn_model="observed",
     )
     assert _submission_rows(db_path) == [
