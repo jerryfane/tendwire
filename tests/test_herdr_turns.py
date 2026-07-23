@@ -181,9 +181,10 @@ def test_refresh_structured_turn_content_uses_private_binding_without_public_lea
             stdout=json.dumps(
                 {
                     "result": {
-                        "turn": {
-                            "available": True,
-                            "user_text": "Why is Telegram showing lifecycle status?",
+                            "turn": {
+                                "available": True,
+                                "source_turn_id": "private-binding-source",
+                                "user_text": "Why is Telegram showing lifecycle status?",
                             "assistant_final_text": "Use Tendwire turn text, not pane_id pane-private.",
                             "assistant_stream_text": "Checking source mode...",
                             "complete": True,

@@ -2935,7 +2935,7 @@ def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
         for suffix in ("a", "b")
     ]
     with sqlite3.connect(str(db_path)) as conn:
-        assert store_sqlite._tombstone_turn_conn(
+        assert store_sqlite._migrate_tombstone_command_turn_conn(
             conn,
             "host-a",
             tombstoned_turn,

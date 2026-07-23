@@ -1088,7 +1088,6 @@ class TendwireDaemon:
             cursor=cursor,
             since=since,
             turn_refresh_interval_seconds=self.config.turn_refresh_interval_seconds,
-            claim_hard_ttl_seconds=self.config.turn_claim_hard_ttl_seconds,
             turn_model=self.config.turn_model,
         )
 

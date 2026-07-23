@@ -15,7 +15,6 @@ import pytest
 
 from tendwire.cli import main
 from tendwire.config import Config, load_config
-from tendwire.connectors import ConnectorOutboxAPI
 from tendwire.core import turns as turns_core
 from tendwire.core.models import stable_json_dumps
 from tendwire.core.projector import project_from_raw
@@ -851,7 +850,7 @@ def test_delta_page_bytes_do_not_change_when_submission_sweep_fires_mid_request(
 
     monkeypatch.setattr(
         store_sqlite,
-        "_reserve_lazy_turn_claim_sweep",
+        "_reserve_lazy_submission_link_sweep",
         reserve_sweep,
     )
     monkeypatch.setattr(store_sqlite.time, "perf_counter", lambda: 100.0)
@@ -923,30 +922,21 @@ def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:
             ]
 
     before = journal_high()
-    claim = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        HOST,
-        snapshot.workers[0],
-        request_id="journal-command",
-        instruction_text="capture this pending command",
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    assert claim is not None
-    assert (claim["id"], "upsert") in journal_since(before)
-
-    before = journal_high()
     assert store_sqlite.merge_turn_content(
         db_path,
         HOST,
         "worker-0",
         {
+            "source_turn_id": "journal-final-source",
+            "user_text": "capture this observed turn",
             "assistant_stream_text": "working through the request",
             "complete": False,
             "has_open_turn": True,
         },
         observed_at="2026-01-01T00:01:00+00:00",
     ) == 1
-    assert any(op == "upsert" for _turn_id, op in journal_since(before))
+    first_rows = journal_since(before)
+    assert first_rows and all(op == "upsert" for _turn_id, op in first_rows)
 
     before = journal_high()
     applied = store_sqlite.apply_turn_refresh(
@@ -964,100 +954,6 @@ def test_real_turn_writers_all_capture_journal_changes(tmp_path: Path) -> None:
     assert applied.updated == 1
     applied_rows = journal_since(before)
     assert applied_rows and all(op == "upsert" for _turn_id, op in applied_rows)
-    final_turn_id = applied_rows[0][0]
-
-    old_claim = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        HOST,
-        snapshot.workers[0],
-        request_id="journal-expired-command",
-        instruction_text="expire this pending command",
-        observed_at="2026-01-01T00:00:00+00:00",
-    )
-    assert old_claim is not None
-    before = journal_high()
-    assert store_sqlite.sweep_turn_claims(
-        db_path,
-        HOST,
-        grace_seconds=1,
-        hard_ttl_seconds=60,
-        now="2026-01-01T00:10:00+00:00",
-    ) >= 1
-    assert (old_claim["id"], "remove") in journal_since(before)
-
-    api = ConnectorOutboxAPI(db_path, HOST)
-    source_poll = api.poll(
-        {"name": "turn-final", "limit": 100, "lease_seconds": 60}
-    )
-    assert source_poll["ok"] is True
-    source = next(
-        item
-        for item in source_poll["items"]
-        if item["payload"]["turn_id"] == final_turn_id
-    )
-    source_payload = source["payload"]
-    final_length = int(
-        source_payload["content"]["fields"]["assistant_final_text"]["char_length"]
-    )
-    begun = api.prepare(
-        {
-            "schema_version": 1,
-            "action": "begin",
-            "name": "turn-final",
-            "turn_id": final_turn_id,
-            "content_revision": source_payload["content_revision"],
-            "presentation_version": "journal-capture",
-            "part_count": 1,
-            "source_ref": source["ref"],
-        }
-    )
-    assert begun["ok"] is True
-    plan_token = begun["plan_token"]
-    assert api.prepare(
-        {
-            "schema_version": 1,
-            "action": "part",
-            "name": "turn-final",
-            "plan_token": plan_token,
-            "ordinal": 0,
-            "spans": [
-                {
-                    "field": "assistant_final_text",
-                    "start_char": 0,
-                    "end_char": final_length,
-                }
-            ],
-        }
-    )["ok"] is True
-    assert api.prepare(
-        {
-            "schema_version": 1,
-            "action": "commit",
-            "name": "turn-final",
-            "plan_token": plan_token,
-            "source_ref": source["ref"],
-        }
-    )["ok"] is True
-    part = api.poll({"name": "turn-final", "limit": 100})["items"][0]
-    assert api.ack(
-        {
-            "name": "turn-final",
-            "ref": part["ref"],
-            "response": {"accepted": True},
-        }
-    )["status"] == "acknowledged"
-
-    before = journal_high()
-    cleanup = store_sqlite.cleanup_acknowledged_final_retention(
-        db_path,
-        HOST,
-        acknowledged_final_retention_days=1,
-        acknowledged_final_retention_count=1,
-        batch_size=100,
-        now="2099-01-01T00:00:00+00:00",
-    )
-    assert cleanup["deleted"] == 1
-    assert (final_turn_id, "remove") in journal_since(before)
 
 
 def test_turn_delta_rpc_advertises_feature_and_cannot_invoke_delivery(tmp_path: Path) -> None:

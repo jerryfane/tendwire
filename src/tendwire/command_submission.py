@@ -59,8 +59,6 @@ from .store.sqlite import (
     backend_pending_choice_terminal_effect,
     claim_backend_pending_choice,
     claim_backend_pending_decision,
-    command_pending_turn_terminal_effect,
-    delete_command_pending_turn_claim_effect,
     command_reservation_is_live,
     envelope_to_receipt_json,
     finish_command_request,
@@ -74,7 +72,6 @@ from .store.sqlite import (
     sweep_submission_links,
     start_backend_pending_choice_send,
     start_backend_pending_decision_send,
-    upsert_command_pending_turn,
 )
 
 
@@ -1296,20 +1293,6 @@ def _mark_request_send_started(
     if config.db_path is None:
         return _backend_uncertain(request, "command receipt store is unavailable")
     try:
-        send_started_effect = (
-            command_pending_turn_terminal_effect(
-                host_id=config.host_id,
-                worker=worker,
-                request_id=request.request_id or "",
-                instruction_text=instruction_text,
-            )
-            if (
-                config.turn_model != "observed"
-                and worker is not None
-                and instruction_text is not None
-            )
-            else None
-        )
         started = mark_command_send_started(
             config.db_path,
             host_id=config.host_id,
@@ -1317,7 +1300,7 @@ def _mark_request_send_started(
             canonical_fingerprint=reservation.canonical.fingerprint,
             owner_token=reservation.owner_token,
             binding_fingerprint=binding_fingerprint,
-            send_started_effect=send_started_effect,
+            send_started_effect=None,
             submission_worker=worker,
             instruction_text=instruction_text,
             submission_link_window_seconds=(
@@ -1343,19 +1326,14 @@ def _mark_request_send_started(
         and started["receipt"].get("state") == "send_started"
         and _receipt_is_canonical(request, reservation.canonical, started["receipt"])
     ):
-        if send_started_effect is None:
-            if config.turn_model == "observed" and worker is not None:
-                linked = linked_turn_for_submission(
-                    config.db_path,
-                    host_id=config.host_id,
-                    request_id=request.request_id or "",
-                )
-                return linked or {"id": None}
+        if worker is None:
             return None
-        effect_result = started.get("effect_result")
-        if isinstance(effect_result, Mapping):
-            return effect_result
-        return _recover_request(config, request, reservation.canonical)
+        linked = linked_turn_for_submission(
+            config.db_path,
+            host_id=config.host_id,
+            request_id=request.request_id or "",
+        )
+        return linked or {"id": None}
     if isinstance(started, Mapping) and isinstance(started.get("receipt"), Mapping):
         embedded = _envelope_from_receipt(
             request,
@@ -1426,7 +1404,7 @@ def _submit_instruction(
                 request,
                 reservation.canonical,
             )
-        pending_turn = send_started
+        observed_turn = send_started
 
         try:
             _submit_private_pane_input(
@@ -1447,14 +1425,6 @@ def _submit_instruction(
                 envelope,
                 expected_state="send_started",
                 terminal_state="uncertain",
-                terminal_effect=(
-                    delete_command_pending_turn_claim_effect(
-                        host_id=config.host_id,
-                        request_id=request.request_id or "",
-                    )
-                    if config.turn_model != "observed"
-                    else None
-                ),
             )
         except Exception:  # noqa: BLE001
             envelope = _backend_uncertain(
@@ -1470,33 +1440,22 @@ def _submit_instruction(
                 terminal_state="uncertain",
             )
 
-        # The ingestion scheduler can adopt the write-early claim while the
-        # pane call is in flight. Re-read through the idempotent upsert so the
-        # accepted envelope reports the canonical row's observed state rather
-        # than the pre-send snapshot of that row.
+        # The observation may arrive while the pane call is in flight. Re-read
+        # the durable link so the accepted envelope can report it immediately.
         try:
-            if config.turn_model == "observed":
-                refreshed_turn = linked_turn_for_submission(
-                    config.db_path,
-                    host_id=config.host_id,
-                    request_id=request.request_id or "",
-                )
-            else:
-                refreshed_turn = upsert_command_pending_turn(
-                    config.db_path,
-                    config.host_id,
-                    worker,
-                    request_id=request.request_id or "",
-                    instruction_text=_instruction_text(request),
-                )
+            refreshed_turn = linked_turn_for_submission(
+                config.db_path,
+                host_id=config.host_id,
+                request_id=request.request_id or "",
+            )
         except Exception:  # noqa: BLE001
             refreshed_turn = None
         if isinstance(refreshed_turn, Mapping):
-            pending_turn = refreshed_turn
+            observed_turn = refreshed_turn
     finally:
         _close_socket_client(prepared.client)
 
-    accepted = _accepted_send_envelope(request, worker, pending_turn)
+    accepted = _accepted_send_envelope(request, worker, observed_turn)
     return _finish_request(
         config,
         request,
@@ -2451,7 +2410,7 @@ def _negotiated_submission_envelope(
         config.host_id,
         request.request_id or "",
     )
-    if config.turn_model == "observed" and config.db_path is not None:
+    if config.db_path is not None:
         try:
             sweep_submission_links(
                 config.db_path,
@@ -2475,11 +2434,6 @@ def _negotiated_submission_envelope(
             )
         else:
             result["observed_turn_state"] = "pending_observation"
-    elif (
-        not isinstance(result.get("turn_id"), str)
-        or not result.get("turn_id")
-    ):
-        return envelope
     return CommandEnvelope(
         ok=envelope.ok,
         status=envelope.status,

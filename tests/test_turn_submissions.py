@@ -241,6 +241,102 @@ def _insert_historical_send_receipt(
     )
 
 
+def test_v18_to_v20_backfills_historical_submission_receipt(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "submission-backfill.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._run_migrations(conn, target_version=18)
+        _insert_historical_send_receipt(
+            conn,
+            request_id="historical-submit",
+            state="accepted",
+            status="accepted",
+            instruction_text="  historical   prompt  ",
+        )
+        conn.commit()
+        store_sqlite._run_migrations(conn)
+
+        assert conn.execute(
+            """
+            SELECT owner_key, owner_key_version, instruction_fingerprint,
+                   state, linked_turn_id
+            FROM turn_submissions
+            WHERE host_id = 'host-a' AND request_id = 'historical-submit'
+            """
+        ).fetchone() == (
+            "legacy-worker:worker-a",
+            0,
+            instruction_fingerprint("historical prompt"),
+            "submitted",
+            None,
+        )
+
+
+def test_v19_to_v20_backfills_legacy_tombstone_alias(tmp_path: Path) -> None:
+    db_path = tmp_path / "supersession-backfill.db"
+    _seed_link_worker(db_path)
+    canonical_turn_id = _observe_link_turn(
+        db_path,
+        source_turn_id="canonical-source",
+    )
+    legacy_turn_id = "turn-" + ("2" * 24)
+    observed_at = "2026-02-01T12:00:01+00:00"
+    legacy_payload = {
+        "id": legacy_turn_id,
+        "host_id": "host-a",
+        "worker_id": "worker-a",
+        "status": "done",
+        "kind": "task",
+        "source": "command",
+        "origin_command_id": "historical-submit",
+        "complete": True,
+        "has_open_turn": False,
+        "updated_at": observed_at,
+        "superseded_at": observed_at,
+        "superseded_by_turn_id": canonical_turn_id,
+    }
+    with sqlite3.connect(str(db_path)) as conn:
+        next_sequence = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(list_sequence), 0) + 1 FROM turns"
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO turns (
+                host_id, turn_id, worker_id, worker_fingerprint, space_id,
+                status, kind, updated_at, fingerprint,
+                snapshot_content_fingerprint, observed_at, payload_json,
+                list_sequence
+            ) VALUES (
+                'host-a', ?, 'worker-a', NULL, NULL, 'done', 'task', ?, '',
+                '', ?, ?, ?
+            )
+            """,
+            (
+                legacy_turn_id,
+                observed_at,
+                observed_at,
+                json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")),
+                next_sequence,
+            ),
+        )
+        conn.execute("DELETE FROM turn_supersessions")
+        conn.execute("PRAGMA user_version = 19")
+        conn.commit()
+        store_sqlite._run_migrations(conn)
+
+        assert conn.execute(
+            """
+            SELECT canonical_turn_id, reason
+            FROM turn_supersessions
+            WHERE host_id = 'host-a' AND superseded_turn_id = ?
+            """,
+            (legacy_turn_id,),
+        ).fetchone() == (canonical_turn_id, "phase1_migration")
+
+
 @pytest.mark.parametrize(
     ("receipt_state", "receipt_status", "expected"),
     (
@@ -299,365 +395,6 @@ def test_receipt_instruction_text_accepts_valid_send_instruction() -> None:
         store_sqlite._receipt_instruction_text(canonical_request_json)
         == "ship the release"
     )
-
-
-def test_v20_backfill_does_not_alias_live_adopted_command_turn(
-    tmp_path: Path,
-) -> None:
-    db_path = tmp_path / "live-adopted-command.db"
-    owner_key = _seed_link_worker(db_path)
-    adopted = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        "host-a",
-        {
-            "id": "worker-a",
-            "meta": {"stable_key": owner_key, "stable_key_version": 1},
-        },
-        request_id="adopted-live",
-        instruction_text="adopt this prompt",
-        observed_at="2099-01-01T00:00:00+00:00",
-    )
-    assert adopted is not None
-    adopted_turn_id = str(adopted["id"])
-    assert store_sqlite.merge_turn_content(
-        db_path,
-        "host-a",
-        "worker-a",
-        {
-            "source_turn_id": "source-observed-after-command",
-            "user_text": "adopt this prompt",
-            "assistant_final_text": "adopted answer",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2099-01-01T00:00:01+00:00",
-        turn_model="legacy",
-    ) == 1
-
-    with sqlite3.connect(str(db_path)) as conn:
-        live_payload = json.loads(
-            conn.execute(
-                "SELECT payload_json FROM turns WHERE host_id = ? AND turn_id = ?",
-                ("host-a", adopted_turn_id),
-            ).fetchone()[0]
-        )
-        assert live_payload["source"] == "command"
-        assert str(live_payload.get("source_turn_id") or "").strip()
-        assert str(Turn.from_dict(live_payload).id) != adopted_turn_id
-        assert live_payload.get("superseded_by_turn_id") is None
-
-        conn.execute("DELETE FROM turn_supersessions")
-        conn.execute("PRAGMA user_version = 19")
-        conn.commit()
-        store_sqlite._run_migrations(conn)
-
-        assert conn.execute(
-            """
-            SELECT 1 FROM turn_supersessions
-            WHERE host_id = 'host-a' AND superseded_turn_id = ?
-            """,
-            (adopted_turn_id,),
-        ).fetchone() is None
-        assert conn.execute(
-            """
-            SELECT supersession.host_id, supersession.canonical_turn_id
-            FROM turn_supersessions AS supersession
-            LEFT JOIN turns AS canonical
-              ON canonical.host_id = supersession.host_id
-             AND canonical.turn_id = supersession.canonical_turn_id
-            WHERE canonical.turn_id IS NULL
-            """
-        ).fetchall() == []
-
-
-@pytest.mark.parametrize("source_version", (18, 19))
-def test_v20_backfill_production_shape_is_lossless_idempotent_and_fail_closed(
-    tmp_path: Path,
-    source_version: int,
-) -> None:
-    db_path = tmp_path / f"phase2-backfill-v{source_version}.db"
-    owner_key = _seed_link_worker(db_path)
-    assert store_sqlite.merge_turn_content(
-        db_path,
-        "host-a",
-        "worker-a",
-        {
-            "source_turn_id": "observed-source",
-            "user_text": "duplicate prompt",
-            "assistant_final_text": "observed answer",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2099-01-01T00:00:00+00:00",
-        turn_model="dual",
-    ) == 1
-    with sqlite3.connect(str(db_path)) as conn:
-        observed_turn_id = str(
-            conn.execute(
-                """
-                SELECT turn_id FROM turns
-                WHERE host_id = 'host-a'
-                  AND json_extract(payload_json, '$.source_turn_id') IS NOT NULL
-                  AND json_extract(payload_json, '$.source') != 'command'
-                """
-            ).fetchone()[0]
-        )
-
-    duplicate = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        "host-a",
-        {"id": "worker-a", "meta": {"stable_key": owner_key, "stable_key_version": 1}},
-        request_id="duplicate-claim",
-        instruction_text="temporary duplicate prompt",
-        observed_at="2099-01-01T00:00:01+00:00",
-    )
-    indeterminate = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        "host-a",
-        {"id": "worker-a", "meta": {"stable_key": owner_key, "stable_key_version": 1}},
-        request_id="indeterminate-claim",
-        instruction_text="ambiguous prompt",
-        observed_at="2099-01-01T00:00:02+00:00",
-    )
-    adopted = store_sqlite.upsert_command_pending_turn(
-        db_path,
-        "host-a",
-        {"id": "worker-a", "meta": {"stable_key": owner_key, "stable_key_version": 1}},
-        request_id="adopted-claim",
-        instruction_text="adopted prompt",
-        observed_at="2099-01-01T00:00:03+00:00",
-    )
-    assert duplicate is not None and indeterminate is not None and adopted is not None
-    assert store_sqlite.merge_turn_content(
-        db_path,
-        "host-a",
-        "worker-a",
-        {
-            "source_turn_id": "adopted-source",
-            "user_text": "adopted prompt",
-            "assistant_final_text": "adopted answer",
-            "complete": True,
-            "has_open_turn": False,
-        },
-        observed_at="2099-01-01T00:00:04+00:00",
-        turn_model="legacy",
-    ) == 1
-
-    with sqlite3.connect(str(db_path)) as conn:
-        conn.execute(
-            """
-            UPDATE turn_content_revisions
-            SET user_text = 'duplicate prompt'
-            WHERE host_id = 'host-a' AND turn_id = ? AND is_current = 1
-            """,
-            (str(duplicate["id"]),),
-        )
-        assert store_sqlite._tombstone_turn_conn(
-            conn,
-            "host-a",
-            str(duplicate["id"]),
-            superseded_by_turn_id=observed_turn_id,
-            superseded_at="2099-01-01T00:00:05+00:00",
-        )
-        assert store_sqlite._tombstone_turn_conn(
-            conn,
-            "host-a",
-            str(indeterminate["id"]),
-            superseded_by_turn_id=None,
-            superseded_at="2099-01-01T00:00:06+00:00",
-        )
-        revision = str(
-            conn.execute(
-                """
-                SELECT content_revision FROM turn_content_revisions
-                WHERE host_id = 'host-a' AND turn_id = ? AND is_current = 1
-                """,
-                (observed_turn_id,),
-            ).fetchone()[0]
-        )
-        outbox_id = int(
-            conn.execute(
-                """
-                INSERT INTO connector_outbox (
-                    host_id, connector, delivery_key, delivery_kind, turn_id,
-                    content_revision, ordering_key, status, payload_json,
-                    private_state_json, created_at, updated_at
-                ) VALUES (
-                    'host-a', 'migration-test', 'preserved-outbox', 'generic',
-                    ?, ?, 'worker-a', 'dead_letter', '{}', '{}',
-                    '2099-01-01T00:00:07+00:00',
-                    '2099-01-01T00:00:07+00:00'
-                ) RETURNING id
-                """,
-                (observed_turn_id, revision),
-            ).fetchone()[0]
-        )
-        conn.execute(
-            """
-            INSERT INTO turn_presentation_plans (
-                host_id, name, plan_token, turn_id, content_revision,
-                source_outbox_id, presentation_version, generation,
-                part_count, state, created_at
-            ) VALUES (
-                'host-a', 'migration-test', 'preserved-plan', ?, ?, ?,
-                'v1', 1, 1, 'failed', '2099-01-01T00:00:07+00:00'
-            )
-            """,
-            (observed_turn_id, revision, outbox_id),
-        )
-        for request_id, state, status, text in (
-            ("reserved", "reserved", "pending", "reserved prompt"),
-            ("send-started", "send_started", "pending", "send prompt"),
-            ("accepted", "accepted", "accepted", "  accepted   prompt  "),
-            ("uncertain", "uncertain", "request_state_uncertain", "uncertain prompt"),
-            ("rejected", "rejected", "cancelled", "rejected prompt"),
-            ("purged", "rejected", "purged", "purged prompt"),
-            ("accepted-live", "accepted", "accepted", "live prompt"),
-        ):
-            _insert_historical_send_receipt(
-                conn,
-                request_id=request_id,
-                state=state,
-                status=status,
-                instruction_text=text,
-            )
-        conn.execute("DELETE FROM turn_submissions")
-        conn.execute("DELETE FROM turn_supersessions")
-        if source_version == 19:
-            conn.execute(
-                """
-                INSERT INTO turn_submissions (
-                    host_id, submission_id, request_id, owner_key,
-                    owner_key_version, instruction_fingerprint, state,
-                    linked_turn_id, link_not_before, link_expires_at,
-                    hard_expires_at, linked_at, terminal_at, submitted_at,
-                    send_started_at, updated_at
-                ) VALUES (
-                    'host-a', ?, 'accepted-live', ?, 1, ?, 'linked', ?,
-                    '2025-12-31T23:59:02+00:00',
-                    '2026-01-01T00:01:02+00:00',
-                    '2026-01-02T00:00:02+00:00',
-                    '2026-01-01T00:00:04+00:00',
-                    '2026-01-01T00:00:04+00:00',
-                    '2026-01-01T00:00:03+00:00',
-                    '2026-01-01T00:00:02+00:00',
-                    '2026-01-01T00:00:04+00:00'
-                )
-                """,
-                (
-                    turn_submission_id("host-a", "accepted-live"),
-                    owner_key,
-                    instruction_fingerprint("live prompt"),
-                    observed_turn_id,
-                ),
-            )
-        else:
-            conn.execute("DROP TABLE turn_submissions")
-            conn.execute("DROP TABLE turn_supersessions")
-        conn.execute(f"PRAGMA user_version = {source_version}")
-        preserved_tables = (
-            "turns",
-            "turn_content_revisions",
-            "connector_outbox",
-            "turn_presentation_plans",
-        )
-        before = {
-            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-            for table in preserved_tables
-        }
-        conn.commit()
-
-        store_sqlite._run_migrations(conn)
-
-        after = {
-            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-            for table in preserved_tables
-        }
-        assert after == before
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-        rows = conn.execute(
-            """
-            SELECT request_id, owner_key, owner_key_version,
-                   instruction_fingerprint, state, linked_turn_id,
-                   link_not_before, link_expires_at, hard_expires_at,
-                   terminal_at, submitted_at, send_started_at, updated_at
-            FROM turn_submissions ORDER BY request_id
-            """
-        ).fetchall()
-        by_request = {str(row[0]): row for row in rows}
-        assert set(by_request) == {
-            "accepted",
-            "accepted-live",
-            "rejected",
-            "send-started",
-            "uncertain",
-        }
-        assert by_request["accepted"][1:6] == (
-            "legacy-worker:worker-a",
-            0,
-            instruction_fingerprint("accepted prompt"),
-            "submitted",
-            None,
-        )
-        assert by_request["rejected"][4:6] == ("cancelled", None)
-        assert by_request["uncertain"][4:6] == ("uncertain", None)
-        assert by_request["send-started"][4:6] == ("send_started", None)
-        assert by_request["accepted"][6:] == (
-            "2025-12-31T23:59:02+00:00",
-            "2026-01-01T00:01:02+00:00",
-            "2026-01-02T00:00:02+00:00",
-            "2026-01-01T00:00:03+00:00",
-            "2026-01-01T00:00:03+00:00",
-            "2026-01-01T00:00:02+00:00",
-            "2026-01-01T00:00:03+00:00",
-        )
-        if source_version == 19:
-            assert by_request["accepted-live"][1:6] == (
-                owner_key,
-                1,
-                instruction_fingerprint("live prompt"),
-                "linked",
-                observed_turn_id,
-            )
-        else:
-            assert by_request["accepted-live"][4:6] == ("submitted", None)
-
-        aliases = conn.execute(
-            """
-            SELECT superseded_turn_id, canonical_turn_id
-            FROM turn_supersessions ORDER BY superseded_turn_id
-            """
-        ).fetchall()
-        assert aliases == [(str(duplicate["id"]), observed_turn_id)]
-        assert str(adopted["id"]) not in {row[0] for row in aliases}
-        assert str(indeterminate["id"]) not in {row[0] for row in aliases}
-        assert conn.execute(
-            """
-            SELECT supersession.host_id, supersession.canonical_turn_id
-            FROM turn_supersessions AS supersession
-            LEFT JOIN turns AS canonical
-              ON canonical.host_id = supersession.host_id
-             AND canonical.turn_id = supersession.canonical_turn_id
-            WHERE canonical.turn_id IS NULL
-            """
-        ).fetchall() == []
-
-        ledger_before_rerun = (
-            conn.execute("SELECT * FROM turn_submissions ORDER BY request_id").fetchall(),
-            conn.execute(
-                "SELECT * FROM turn_supersessions ORDER BY superseded_turn_id"
-            ).fetchall(),
-        )
-        conn.execute("PRAGMA user_version = 19")
-        store_sqlite._run_migrations(conn)
-        ledger_after_rerun = (
-            conn.execute("SELECT * FROM turn_submissions ORDER BY request_id").fetchall(),
-            conn.execute(
-                "SELECT * FROM turn_supersessions ORDER BY superseded_turn_id"
-            ).fetchall(),
-        )
-        assert ledger_after_rerun == ledger_before_rerun
-        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_turn_submission_state_transition_table() -> None:
@@ -1387,7 +1124,7 @@ def test_shadow_linker_marks_larger_identical_components_ambiguous(
     assert all(linked_turn_id is None for _request, _state, linked_turn_id in rows)
 
 
-def test_shadow_linker_isolates_owners_and_legacy_mode_is_a_noop(
+def test_submission_linker_isolates_owners_and_legacy_alias_links(
     tmp_path: Path,
 ) -> None:
     first_path = tmp_path / "owners.db"
@@ -1430,12 +1167,12 @@ def test_shadow_linker_isolates_owners_and_legacy_mode_is_a_noop(
     legacy_path = tmp_path / "legacy.db"
     owner_key = _seed_link_worker(legacy_path)
     _insert_link_submission(legacy_path, request_id="legacy", owner_key=owner_key)
-    _observe_link_turn(
+    legacy_turn_id = _observe_link_turn(
         legacy_path,
         source_turn_id="legacy-source",
         turn_model="legacy",
     )
-    assert _submission_rows(legacy_path) == [("legacy", "submitted", None)]
+    assert _submission_rows(legacy_path) == [("legacy", "linked", legacy_turn_id)]
 
 
 def test_goal13_delta_is_unperturbed_when_observed_turn_links_later(
@@ -1537,69 +1274,6 @@ def test_idle_observation_first_submission_links_from_lazy_turn_read(
     assert _submission_rows(db_path) == [
         ("idle-observation-first", "linked", observed_turn_id)
     ]
-
-
-def test_legacy_reads_and_maintenance_skip_submission_settlement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db_path = tmp_path / "legacy-no-link-settlement.db"
-    owner_key = _seed_link_worker(db_path)
-    _insert_link_submission(
-        db_path,
-        request_id="legacy-no-link-settlement",
-        owner_key=owner_key,
-    )
-    settle_calls = 0
-    candidate_calls = 0
-
-    def record_settle(*_args: object, **_kwargs: object) -> int:
-        nonlocal settle_calls
-        settle_calls += 1
-        return 0
-
-    def record_candidates(*_args: object, **_kwargs: object) -> list[object]:
-        nonlocal candidate_calls
-        candidate_calls += 1
-        return []
-
-    monkeypatch.setattr(
-        store_sqlite,
-        "settle_submission_links_conn",
-        record_settle,
-    )
-    monkeypatch.setattr(
-        store_sqlite,
-        "_submission_link_candidate_turns_conn",
-        record_candidates,
-    )
-
-    current = datetime.fromisoformat("2026-02-01T12:00:01+00:00").timestamp()
-    store_sqlite.turns_payload_from_store(
-        db_path,
-        "host-a",
-        now=current,
-        turn_model="legacy",
-    )
-    store_sqlite.turn_delta_payload_from_store(
-        db_path,
-        "host-a",
-        now=current,
-        turn_model="legacy",
-    )
-    store_sqlite.maybe_run_automatic_store_maintenance(
-        db_path,
-        policy=store_sqlite.SnapshotRetentionPolicy(
-            retention_days=14,
-            retention_count=4096,
-            batch_size=100,
-        ),
-        turn_model="legacy",
-        now="2026-02-01T12:00:01+00:00",
-    )
-
-    assert settle_calls == 0
-    assert candidate_calls == 0
 
 
 def test_observed_prod_shape_sweep_never_runs_public_sanitizers(
@@ -1712,8 +1386,10 @@ def test_submission_link_sweep_backs_off_until_matching_observation(
     ]
 
 
-def test_turn_alias_resolves_public_content_and_final_root(
+@pytest.mark.parametrize("turn_model", sorted(store_sqlite.TURN_MODELS))
+def test_turn_alias_resolves_public_content_and_final_root_under_every_model(
     tmp_path: Path,
+    turn_model: str,
 ) -> None:
     db_path = tmp_path / "alias-lookup.db"
     _seed_link_worker(db_path)
@@ -1746,22 +1422,13 @@ def test_turn_alias_resolves_public_content_and_final_root(
             ),
         )
 
-    legacy_page = store_sqlite.get_turn_content(
-        db_path,
-        "host-a",
-        turn_id=legacy_turn_id,
-        content_revision=revision,
-        field="assistant_final_text",
-    )
-    assert legacy_page["status"] == "content_revision_not_found"
-
     page = store_sqlite.get_turn_content(
         db_path,
         "host-a",
         turn_id=legacy_turn_id,
         content_revision=revision,
         field="assistant_final_text",
-        turn_model="observed",
+        turn_model=turn_model,
     )
     assert page["turn_id"] == canonical_turn_id
     assert page["text"] == "answer for alias-source"
@@ -1781,7 +1448,7 @@ def test_turn_alias_resolves_public_content_and_final_root(
         presentation_version="alias-aware-v1",
         part_count=1,
         source_ref=leased["ref"],
-        turn_model="observed",
+        turn_model=turn_model,
         now="2026-02-01T12:00:03+00:00",
     )
     assert begun["ok"] is True
@@ -1820,74 +1487,6 @@ def test_link_candidate_owner_identity_normalizes_only_missing_version() -> None
             {"id": "worker-x", "meta": meta}
         )
         assert result == ("legacy-worker:worker-x", 0), meta
-
-
-def test_empty_component_backoff_is_bounded_for_dual_mode_prod_shape(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Wedge regression: a component that sweeps with ZERO candidates used to
-    # store an indefinite backoff. Under turn_model='dual'/'shadow' with a
-    # prod-shape worker (stable_key without version marker) NO re-arm signal
-    # fires on observation, so the link stalled until restart or hard TTL.
-    # The empty-component backoff must be time-bounded instead.
-    db_path = tmp_path / "submission-link-bounded.db"
-    owner_key = _seed_link_worker(db_path)
-    _insert_link_submission(
-        db_path,
-        request_id="submission-link-bounded",
-        owner_key=owner_key,
-    )
-    candidate_calls = 0
-    original_candidates = store_sqlite._submission_link_candidate_turns_conn
-
-    def record_candidates(*args: object, **kwargs: object):
-        nonlocal candidate_calls
-        candidate_calls += 1
-        return original_candidates(*args, **kwargs)
-
-    monkeypatch.setattr(
-        store_sqlite,
-        "_submission_link_candidate_turns_conn",
-        record_candidates,
-    )
-
-    # First sweep: no candidate observation yet -> component backs off.
-    store_sqlite.sweep_submission_links(
-        db_path,
-        host_id="host-a",
-        now="2026-02-01T11:59:00+00:00",
-    )
-    assert candidate_calls == 1
-
-    # Observation arrives via a path that does NOT re-arm: dual mode with the
-    # prod-shape worker (version marker absent -> strict identity mismatch).
-    _set_link_worker_prod_shape(db_path)
-    observed_turn_id = _observe_link_turn(
-        db_path,
-        source_turn_id="submission-link-bounded-source",
-        observed_at="2026-02-01T11:59:10+00:00",
-        turn_model="dual",
-    )
-
-    # A sweep inside the bounded window stays backed off...
-    store_sqlite.sweep_submission_links(
-        db_path,
-        host_id="host-a",
-        now="2026-02-01T11:59:20+00:00",
-    )
-    assert candidate_calls == 1
-
-    # ...but a sweep past the bound re-evaluates and links WITHOUT any re-arm.
-    store_sqlite.sweep_submission_links(
-        db_path,
-        host_id="host-a",
-        now="2026-02-01T12:00:31+00:00",
-    )
-    assert candidate_calls == 2
-    assert _submission_rows(db_path) == [
-        ("submission-link-bounded", "linked", observed_turn_id)
-    ]
 
 
 def test_observed_lazy_delta_sweep_links_first_poll_after_live_window(

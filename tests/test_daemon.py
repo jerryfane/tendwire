@@ -946,7 +946,6 @@ def test_daemon_turn_list_is_store_projection_only(
             "cursor": "twlist1.public",
             "since": None,
             "turn_refresh_interval_seconds": 2.0,
-            "claim_hard_ttl_seconds": 86400,
             "turn_model": config.turn_model,
         }
         for call in projection_calls

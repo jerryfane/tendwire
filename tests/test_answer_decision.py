@@ -76,7 +76,7 @@ def _seed_pending_decision(
     tmp_path: Path,
     *,
     turn: dict[str, Any] | None = None,
-    turn_model: str = "legacy",
+    turn_model: str = "observed",
 ) -> tuple[Any, Worker, str]:
     config = _config(tmp_path, turn_model=turn_model)
     worker = Worker(id="w-1", name="Alpha", status="active")

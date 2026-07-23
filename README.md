@@ -547,7 +547,7 @@ variables:
 | `store_maintenance_cadence_seconds` | `TENDWIRE_STORE_MAINTENANCE_CADENCE_SECONDS` | `3600` | positive integer |
 | `turn_refresh_interval_seconds` | `TENDWIRE_TURN_REFRESH_INTERVAL_SECONDS` | `2.0` | finite positive float |
 | `turn_refresh_workers` | `TENDWIRE_TURN_REFRESH_WORKERS` | `4` | integer from 1 through 32 and no greater than `max_workers` |
-| `turn_claim_hard_ttl_seconds` | `TENDWIRE_TURN_CLAIM_HARD_TTL_SECONDS` | `86400` | positive integer; unobserved command claims become terminal after this interval |
+| `turn_model` | `TENDWIRE_TURN_MODEL` | `observed` | `observed`; `legacy`, `dual`, and `shadow` are deprecated aliases with identical observed behavior |
 
 The socket/event backend uses `event_debounce_seconds` for event batching and
 `reconcile_interval_seconds` for bounded periodic full reconciles. Set
@@ -1450,25 +1450,25 @@ The default and all current Herdres requests remain byte-for-byte schema v2.
 The durable receipt also remains schema v2, so response negotiation does not
 change idempotency evidence.
 
-Each instruction that reaches `send_started` is dual-written atomically to the
-shadow `turn_submissions` ledger while the legacy pending turn is still created
-exactly as before. The ledger stores a whitespace-normalized instruction digest,
-never another raw instruction copy, and advances to `submitted` or `uncertain`
-with the terminal receipt transaction. Unlinked rows expire after
+Each instruction that reaches `send_started` is written atomically to the
+`turn_submissions` ledger. Submission never creates a `turns` row; only a
+source-derived observation can create a public turn. The ledger stores a
+whitespace-normalized instruction digest, never another raw instruction copy,
+and advances to `submitted` or `uncertain` with the terminal receipt transaction.
+Unlinked rows expire after
 `TENDWIRE_SUBMISSION_HARD_TTL_SECONDS` (default `86400`); candidate linkage uses
 the symmetric observation window configured by
-`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). In non-legacy turn
-modes, source-derived observations settle this ledger only after the matching
+`TENDWIRE_SUBMISSION_LINK_WINDOW_SECONDS` (default `60`). Source-derived
+observations settle this ledger only after the matching
 window closes: a component links only when it contains exactly one submission
 and one unlinked observation; larger components become `ambiguous`. Linkage is
-shadow metadata and does not influence the legacy turn merge, turn-list order,
-Goal 10 delivery, or Herdres consumption.
+metadata and does not change observation-derived turn identity, turn-list order,
+Goal 10 delivery, or Herdres consumption. Lazy and periodic settlement cover
+both submission-first and observation-first arrival order.
 
-Observation-first settlement remains opportunistic through Stage 5. If a
-submission is recorded after its matching observation, it stays open until a
-later refresh for that worker re-runs settlement. Before Stage 6 allows any
-decision to read `linked_turn_id`, it must add a lazy or periodic settlement
-sweep so an idle pane cannot leave a match open until hard TTL.
+`TENDWIRE_TURN_MODEL` remains accepted for rollout compatibility. `legacy`,
+`dual`, and `shadow` emit a warning and use the same observation-authoritative
+behavior as `observed`.
 
 `disposition`, not `status` alone, is the receipt-authority and finality
 contract:

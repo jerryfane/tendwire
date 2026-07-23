@@ -1104,7 +1104,6 @@ def cmd_turns(
                 cursor=cursor,
                 since=since,
                 turn_refresh_interval_seconds=config.turn_refresh_interval_seconds,
-                claim_hard_ttl_seconds=config.turn_claim_hard_ttl_seconds,
                 turn_model=config.turn_model,
             )
     elif daemon_attempt.error_kind == "timeout":
