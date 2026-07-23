@@ -9989,7 +9989,7 @@ def test_v13_migration_repairs_nonpositive_turn_sequences_and_blocks_recurrence(
     init_store(db_path)
 
     with sqlite3.connect(str(db_path)) as conn:
-        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 20
+        assert _user_version(conn) == store_sqlite.STORE_SCHEMA_VERSION == 21
         assert conn.execute(
             """
             SELECT turn_id, list_sequence
@@ -13835,3 +13835,42 @@ def test_source_reconciliation_isolates_stable_owners_and_legacy_no_owner(
     assert raw_source not in json.dumps(payload, sort_keys=True)
     with sqlite3.connect(str(db_path)) as conn:
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_v20_to_v21_adds_herdr_turn_watermark_and_provenance_tables(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-v20.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        store_sqlite._run_migrations(conn, target_version=20)
+        assert conn.execute("PRAGMA user_version").fetchone() == (20,)
+        assert conn.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN (
+                  'herdr_turn_watermarks',
+                  'herdr_turn_completions'
+              )
+            """
+        ).fetchone() == (0,)
+    os.chmod(tmp_path, 0o700)
+    os.chmod(db_path, 0o600)
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone() == (21,)
+        assert {
+            str(row[0])
+            for row in conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'herdr_turn_watermarks',
+                      'herdr_turn_completions'
+                  )
+                """
+            )
+        } == {"herdr_turn_watermarks", "herdr_turn_completions"}

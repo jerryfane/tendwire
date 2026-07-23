@@ -271,6 +271,14 @@ class HerdrSocketClient:
     ) -> Any:
         return self.request("pane.read", params, timeout=timeout)
 
+    def pane_turns(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        return self.request("pane.turns", params, timeout=timeout)
+
     def agent_send(
         self,
         params: Mapping[str, Any] | None = None,

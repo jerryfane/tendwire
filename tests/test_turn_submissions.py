@@ -48,8 +48,12 @@ def _ledger_schema(conn: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
     )
 
 
-def _assert_empty_v20_ledgers(conn: sqlite3.Connection) -> None:
-    assert conn.execute("PRAGMA user_version").fetchone() == (20,)
+def _assert_empty_v20_ledgers(
+    conn: sqlite3.Connection,
+    *,
+    expected_version: int = store_sqlite.STORE_SCHEMA_VERSION,
+) -> None:
+    assert conn.execute("PRAGMA user_version").fetchone() == (expected_version,)
     assert conn.execute("SELECT COUNT(*) FROM turn_submissions").fetchone() == (0,)
     assert conn.execute("SELECT COUNT(*) FROM turn_supersessions").fetchone() == (0,)
 
@@ -163,7 +167,7 @@ def test_v18_to_v20_migration_matches_fresh_schema(tmp_path: Path) -> None:
             ).fetchall()
         }
         store_sqlite._run_migrations(upgrade, target_version=20)
-        _assert_empty_v20_ledgers(upgrade)
+        _assert_empty_v20_ledgers(upgrade, expected_version=20)
         assert _ledger_schema(upgrade) == fresh_schema
 
 

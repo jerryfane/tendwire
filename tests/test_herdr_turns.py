@@ -2165,3 +2165,57 @@ def test_complete_reobservation_recovers_known_incomplete_source_turn(
         revision=recovered_revision,
         field="assistant_final_text",
     ) == complete_final
+
+
+def test_completed_pane_refresh_uses_authoritative_binding_hint(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(host_id="completion-route", db_path=tmp_path / "route.db")
+    binding = WorkerBinding(
+        host_id=config.host_id,
+        worker_id="worker-1",
+        worker_fingerprint="worker-fingerprint",
+        backend="herdr",
+        target_kind="agent_id",
+        target_value="agent-private",
+        turn_target_kind="codex_session_id",
+        turn_target_value="session-private",
+        sendable=True,
+        observed_at="2026-07-23T00:00:00+00:00",
+        expires_at="9999-12-31T23:59:59+00:00",
+        private_fingerprint="binding-private",
+    )
+    monkeypatch.setattr(
+        herdr_turns,
+        "list_worker_bindings",
+        lambda *_args, **_kwargs: [binding],
+    )
+    refreshed: list[WorkerBinding] = []
+    monkeypatch.setattr(
+        herdr_turns,
+        "_refresh_turn_binding",
+        lambda _config, current, **_kwargs: (
+            refreshed.append(current)
+            or herdr_turns.TurnRefreshResult("updated", 1)
+        ),
+    )
+    monkeypatch.setattr(
+        herdr_turns,
+        "latest_turn_id_for_worker",
+        lambda *_args, **_kwargs: "public-turn-1",
+    )
+
+    result = herdr_turns.refresh_completed_pane_turn(
+        config,
+        "w123456789abcde:pA",
+        terminal_id="different-terminal",
+        binding_private_fingerprint="binding-private",
+    )
+
+    assert refreshed == [binding]
+    assert result == herdr_turns.CompletedPaneTurnRefreshResult(
+        "updated",
+        worker_id="worker-1",
+        refreshed_turn_id="public-turn-1",
+    )

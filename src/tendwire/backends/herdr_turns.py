@@ -37,6 +37,7 @@ from ..core.turns import (
 )
 from ..store.sqlite import (
     apply_turn_refresh,
+    latest_turn_id_for_worker,
     list_worker_bindings,
     prune_backend_pending,
 )
@@ -3186,6 +3187,15 @@ class TurnRefreshResult:
     binding_validated: bool = False
 
 
+@dataclass(frozen=True)
+class CompletedPaneTurnRefreshResult:
+    """Result of one completion-authoritative, pane-targeted semantic refresh."""
+
+    status: str
+    worker_id: str | None = None
+    refreshed_turn_id: str | None = None
+
+
 _ELIGIBLE_TURN_TARGET_KINDS = frozenset(
     {_CODEX_SESSION_TURN_KIND, _OMP_SESSION_TURN_KIND, _PANE_TURN_KIND}
 )
@@ -4105,6 +4115,80 @@ def refresh_turn_binding(
         config,
         binding,
         adapter_timeout_seconds=adapter_timeout_seconds,
+    )
+
+
+def refresh_completed_pane_turn(
+    config: Config,
+    pane_id: str,
+    *,
+    terminal_id: str | None = None,
+    binding_private_fingerprint: str | None = None,
+    adapter_timeout_seconds: float | None = None,
+) -> CompletedPaneTurnRefreshResult:
+    """Run the existing session-log adapter for exactly one completed pane."""
+    if config.db_path is None:
+        return CompletedPaneTurnRefreshResult("store_unavailable")
+    try:
+        bindings = list_worker_bindings(
+            config.db_path,
+            config.host_id,
+            backend="herdr",
+        )
+    except Exception:
+        return CompletedPaneTurnRefreshResult("store_unavailable")
+    candidates = [
+        binding
+        for binding in bindings
+        if _eligible_turn_binding(binding)
+        and (
+            (
+                binding_private_fingerprint is not None
+                and binding.private_fingerprint
+                == binding_private_fingerprint
+            )
+            or
+            (
+                binding.turn_target_kind == _PANE_TURN_KIND
+                and str(binding.turn_target_value or "") == str(pane_id)
+            )
+            or (
+                terminal_id is not None
+                and str(binding.target_kind or "") == "terminal_id"
+                and str(binding.target_value or "") == str(terminal_id)
+            )
+        )
+    ]
+    if len(candidates) != 1:
+        return CompletedPaneTurnRefreshResult(
+            "binding_missing" if not candidates else "binding_ambiguous"
+        )
+    binding = candidates[0]
+    refreshed = _refresh_turn_binding(
+        config,
+        binding,
+        adapter_timeout_seconds=adapter_timeout_seconds,
+    )
+    if refreshed.status not in {"updated", "unchanged", "missing"}:
+        return CompletedPaneTurnRefreshResult(
+            refreshed.status,
+            worker_id=binding.worker_id,
+        )
+    try:
+        turn_id = latest_turn_id_for_worker(
+            config.db_path,
+            config.host_id,
+            binding.worker_id,
+        )
+    except Exception:
+        return CompletedPaneTurnRefreshResult(
+            "store_unavailable",
+            worker_id=binding.worker_id,
+        )
+    return CompletedPaneTurnRefreshResult(
+        refreshed.status,
+        worker_id=binding.worker_id,
+        refreshed_turn_id=turn_id,
     )
 
 
