@@ -336,6 +336,32 @@ def _pane_id_from_agent_info(value: Any) -> str:
     return str(pane_id or "").strip()
 
 
+def _pane_id_from_terminal_listing(value: Any, terminal_id: str) -> str:
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid agent.list response")
+    agents = value.get("agents")
+    if not isinstance(agents, list):
+        raise ValueError("invalid agent.list agents")
+    matches: set[str] = set()
+    for agent in agents:
+        if not isinstance(agent, Mapping):
+            raise ValueError("invalid agent.list entry")
+        listed_terminal_id = agent.get("terminal_id")
+        listed_pane_id = agent.get("pane_id")
+        if (
+            not isinstance(listed_terminal_id, str)
+            or not listed_terminal_id
+            or not isinstance(listed_pane_id, str)
+            or not listed_pane_id.strip()
+        ):
+            raise ValueError("invalid agent.list entry")
+        if listed_terminal_id == terminal_id:
+            matches.add(listed_pane_id.strip())
+    if len(matches) > 1:
+        raise ValueError("ambiguous agent.list terminal_id match")
+    return next(iter(matches), "")
+
+
 def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout: float) -> str:
     if binding.target_kind == "pane_id":
         return str(binding.target_value or "").strip()
@@ -356,21 +382,12 @@ def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout
         if not isinstance(exc, HerdrErrorResponse) or binding.target_kind != "terminal_id":
             raise
         listing = _socket_request(client, "agent.list", {}, timeout=timeout)
-        agents = listing.get("agents") if isinstance(listing, Mapping) else None
-        matches = [
-            agent
-            for agent in agents or []
-            if isinstance(agent, Mapping)
-            and str(agent.get("terminal_id") or "")
-            == str(binding.target_value or "")
-        ]
-        if len(matches) == 1:
-            pane_id = str(matches[0].get("pane_id") or "").strip()
-            if pane_id:
-                return pane_id
-        # Zero matches, an unusable single match, and duplicate authoritative
-        # matches all preserve the original resolution error. In particular,
-        # duplicate terminal ids must never pick the first listed pane.
+        pane_id = _pane_id_from_terminal_listing(
+            listing,
+            str(binding.target_value or ""),
+        )
+        if pane_id:
+            return pane_id
         raise
     return _pane_id_from_agent_info(response)
 

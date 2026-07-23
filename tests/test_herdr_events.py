@@ -38,6 +38,7 @@ from tendwire.backends.herdr_protocol import (
     HERDR_EVENTS_SUBSCRIBE_METHOD,
     HERDR_OFFICIAL_EVENT_NAMES,
     HerdrEnvelopeError,
+    HerdrErrorResponse,
     build_events_subscribe_params,
 )
 from tendwire.config import Config
@@ -779,7 +780,14 @@ def test_backend_falls_back_to_herdr_074_pane_scoped_event_subscriptions(tmp_pat
                 for item in params.get("subscriptions", [])
             ):
                 self.mixed_attempts += 1
-                raise HerdrEnvelopeError("0.7.4 does not know pane.updated")
+                raise HerdrErrorResponse(
+                    {
+                        "code": "invalid_request",
+                        "message": "invalid request: unknown variant pane.updated",
+                    },
+                    "subscribe-1",
+                    uncorrelated=True,
+                )
             backend.stop_event.set()
             return SimpleNamespace(subscription_id="pane-scoped-sub")
 
@@ -838,7 +846,14 @@ def test_backend_empty_installation_falls_back_to_herdr_074_global_subscription(
             copied = (method, {"subscriptions": [dict(item) for item in params["subscriptions"]]})
             self.subscriptions.append(copied)
             if any(item.get("type") == "pane.updated" for item in params["subscriptions"]):
-                raise HerdrEnvelopeError("0.7.4 does not know pane.updated")
+                raise HerdrErrorResponse(
+                    {
+                        "code": "invalid_request",
+                        "message": "invalid request: unknown variant pane.updated",
+                    },
+                    "subscribe-1",
+                    uncorrelated=True,
+                )
             backend.stop_event.set()
             return SimpleNamespace(subscription_id="empty-global-sub")
 
@@ -858,6 +873,50 @@ def test_backend_empty_installation_falls_back_to_herdr_074_global_subscription(
     assert {item["type"] for item in subscriptions} == set(HERDR_OFFICIAL_EVENT_NAMES) - {
         "pane.updated"
     }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        HerdrErrorResponse(
+            {"code": "permission_denied", "message": "subscription denied"},
+            "subscribe-1",
+        ),
+        HerdrErrorResponse(
+            {"code": "invalid_request", "message": "invalid request: correlated"},
+            "subscribe-1",
+        ),
+        HerdrEnvelopeError("malformed subscription response"),
+    ],
+)
+def test_backend_reconnects_instead_of_downgrading_unrelated_subscription_failures(
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    backend = _backend(tmp_path, "no-unrelated-subscription-downgrade")
+
+    class RejectingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = 0
+            self.connected = 0
+
+        def subscribe(self, method, params, **kwargs):
+            self.calls += 1
+            raise failure
+
+        def close(self) -> None:
+            self.closed += 1
+
+        def connect(self) -> None:
+            self.connected += 1
+
+    client = RejectingClient()
+    with pytest.raises(type(failure)):
+        backend._subscribe_event_stream(client)
+    assert client.calls == 1
+    assert client.closed == 0
+    assert client.connected == 0
 
 
 def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
@@ -1006,7 +1065,14 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
                 item.get("type") == "pane.updated"
                 for item in copied["subscriptions"]
             ):
-                raise HerdrEnvelopeError("Herdr 0.7.4 does not know pane.updated")
+                raise HerdrErrorResponse(
+                    {
+                        "code": "invalid_request",
+                        "message": "invalid request: unknown variant pane.updated",
+                    },
+                    "subscribe-1",
+                    uncorrelated=True,
+                )
             return SimpleNamespace(subscription_id="herdr-074-compatible")
 
         def close(self) -> None:

@@ -404,8 +404,51 @@ def test_subscription_surfaces_herdr_075_empty_id_schema_error(tmp_path: Path) -
 
     with _FakeHerdrServer(tmp_path, handler) as server:
         client = HerdrSocketClient(str(server.path), timeout=1)
-        with pytest.raises(HerdrErrorResponse, match="missing field pane_id"):
+        with pytest.raises(HerdrErrorResponse, match="missing field pane_id") as raised:
             client.events_subscribe(["pane.agent_status_changed"])
+        assert raised.value.uncorrelated is True
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "permission_denied", "message": "invalid request: denied"},
+        {"code": "invalid_request", "message": "subscription unavailable"},
+    ],
+)
+def test_subscription_rejects_other_empty_id_errors(
+    tmp_path: Path,
+    error: dict[str, str],
+) -> None:
+    def handler(conn: _Connection) -> None:
+        conn.read_request()
+        conn.send_json({"id": "", "error": error})
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        with pytest.raises(HerdrEnvelopeError):
+            client.events_subscribe(["pane.agent_status_changed"])
+        client.close()
+
+
+def test_ordinary_request_rejects_herdr_075_empty_id_error(tmp_path: Path) -> None:
+    def handler(conn: _Connection) -> None:
+        conn.read_request()
+        conn.send_json(
+            {
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "invalid request: ordinary request error",
+                },
+            }
+        )
+
+    with _FakeHerdrServer(tmp_path, handler) as server:
+        client = HerdrSocketClient(str(server.path), timeout=1)
+        with pytest.raises(HerdrEnvelopeError):
+            client.pane_list()
         client.close()
 
 
