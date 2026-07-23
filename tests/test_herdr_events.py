@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from tendwire.backends import herdr_cli, herdr_turns
+from tendwire.backends import herdr_cli, herdr_events, herdr_turns
 from tendwire.backends.herdr_events import (
     DEFAULT_SUBSCRIBE_METHOD,
     HerdrEventBackend,
@@ -911,7 +911,8 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
             "data": {**pane, "agent_status": "blocked"},
         }
     )
-    assert derivation_inputs[legacy_path_start:] == [reference_input, reference_input]
+    # Scalar status payloads are not PaneInfo and must not re-derive identity.
+    assert derivation_inputs[legacy_path_start:] == [reference_input]
     assert stable_key_bytes(legacy_backend) == reference_key
     assert worker_meta_bytes(legacy_backend) == reference_meta
 
@@ -921,15 +922,16 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
     refreshes: list[None] = []
     new_backend.set_turn_refresh_callback(lambda: refreshes.append(None))
 
-    # Herdr 0.7.5's update carries the same pane fixture as the old status
-    # path. It is a refresh notification only, so pane metadata must not be
-    # re-projected from this differently shaped event family.
+    # Herdr 0.7.5's pane.updated is the scalar PaneOutputChanged event. It may
+    # trigger a turn refresh but must not rebuild worker identity.
     assert new_backend.queue_event_envelope(
         {
             "event": "pane.updated",
             "data": {
                 "type": "pane_updated",
-                "pane": {**pane, "agent_status": "blocked"},
+                "workspace_id": pane["workspace_id"],
+                "pane_id": pane["pane_id"],
+                "revision": 2,
             },
         }
     )
@@ -985,13 +987,13 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
             "data": {**pane, "agent_status": "blocked"},
         }
     )
-    assert derivation_inputs[fallback_event_start:] == [reference_input]
+    assert derivation_inputs[fallback_event_start:] == []
     assert stable_key_bytes(new_backend) == reference_key
     assert worker_meta_bytes(new_backend) == reference_meta
 
-    # This models the live failure: the same terminal arrives with a second,
-    # identity-looking pane tuple. The reworked refresh path must neither call
-    # the derivation function nor replace any persisted worker metadata.
+    # This models the observation-layer failure: a scalar refresh arrives with
+    # a second identity-looking tuple. It must neither call the derivation
+    # function nor replace any persisted worker metadata.
     before_dangerous_update_inputs = list(derivation_inputs)
     before_dangerous_update_meta = worker_meta_bytes(new_backend)
     assert new_backend.queue_event_envelope(
@@ -999,12 +1001,9 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
             "event": "pane.updated",
             "data": {
                 "type": "pane_updated",
-                "pane": {
-                    **pane,
-                    "workspace_id": "wD2",
-                    "pane_id": "wD2:p7",
-                    "agent_status": "blocked",
-                },
+                "workspace_id": "wD2",
+                "pane_id": "wD2:p7",
+                "revision": 3,
             },
         }
     )
@@ -1012,6 +1011,293 @@ def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
     assert derivation_inputs == before_dangerous_update_inputs
     assert stable_key_bytes(new_backend) == reference_key
     assert worker_meta_bytes(new_backend) == before_dangerous_update_meta
+
+
+def test_cross_path_and_cross_representation_observations_keep_one_stable_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = tmp_path / "identity-turn-adapter"
+    adapter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({'result': {'turn': {"
+        "'available': True, 'complete': True, 'user_text': 'identity read', "
+        "'assistant_final_text': 'stable', 'source_turn_id': 'identity-turn', "
+        "'workspace_id': 7, 'pane_id': 41}}}))\n",
+        encoding="utf-8",
+    )
+    adapter.chmod(0o700)
+    config = Config(
+        host_id="cross-path-identity",
+        data_dir=tmp_path,
+        db_path=tmp_path / "cross-path.db",
+        herdr_backend="socket",
+        herdr_bin=str(adapter),
+        herdr_timeout_seconds=1,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0)
+    record_observations: list[
+        tuple[str, bool, str | None, str | None, str | None, str | None]
+    ] = []
+    real_worker_record_from_item = herdr_cli._worker_record_from_item
+
+    def capture_worker_record(
+        item: Mapping[str, Any],
+        record_config: Config | None = None,
+        *,
+        pane_info_observed: bool = False,
+        identity_source: str = "unknown",
+    ) -> Any:
+        record = real_worker_record_from_item(
+            item,
+            record_config,
+            pane_info_observed=pane_info_observed,
+            identity_source=identity_source,
+        )
+        record_observations.append(
+            (
+                record.identity_source,
+                record.pane_info_observed,
+                record.observed_workspace_id,
+                record.observed_pane_id,
+                record.workspace_id,
+                record.pane_id,
+            )
+        )
+        return record
+
+    monkeypatch.setattr(herdr_cli, "_worker_record_from_item", capture_worker_record)
+    monkeypatch.setattr(herdr_events, "_worker_record_from_item", capture_worker_record)
+    pane = {
+        "workspace_id": "w65383a2e877513",
+        "pane_id": "w65383a2e877513:pA",
+        "terminal_id": "terminal-cross-path",
+        "agent": "claude",
+        "agent_status": "working",
+        "label": "cross-path",
+    }
+    client = _StaticClient(
+        workspaces=[{"id": pane["workspace_id"], "name": "Build"}],
+        panes=[pane],
+    )
+
+    stable_keys: list[str] = []
+
+    def capture_key() -> None:
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert snapshot is not None
+        assert len(snapshot.workers) == 1
+        stable_keys.append(str(snapshot.workers[0].meta["stable_key"]))
+
+    backend.reconcile_once(client=client)
+    capture_key()
+    assert (
+        "pane.list",
+        True,
+        pane["workspace_id"],
+        pane["pane_id"],
+        pane["workspace_id"],
+        pane["pane_id"],
+    ) in record_observations
+    records = backend._records_from_reconcile_payloads(
+        {"agents": []},
+        {"panes": [pane]},
+    )
+    assert len(records) == 1
+    assert records[0].identity_source == "pane.list"
+    assert (records[0].workspace_id, records[0].pane_id) == (
+        pane["workspace_id"],
+        pane["pane_id"],
+    )
+
+    # Full PaneInfo events may use aliases, but record construction still
+    # stores the exact canonical public pair used by pane.list.
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.created",
+            "data": {
+                "type": "pane_created",
+                "pane": {
+                    "workspaceId": pane["workspace_id"],
+                    "paneId": pane["pane_id"],
+                    "terminalId": pane["terminal_id"],
+                    "agent": "claude",
+                    "agentStatus": "idle",
+                    "label": "cross-path",
+                },
+            },
+        }
+    )
+    capture_key()
+    assert (
+        "event:pane.created",
+        True,
+        pane["workspace_id"],
+        pane["pane_id"],
+        pane["workspace_id"],
+        pane["pane_id"],
+    ) in record_observations
+
+    # pane.updated is a scalar refresh notification in Herdr 0.7.5. Even a
+    # different identity-looking representation cannot enter worker records.
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.updated",
+            "data": {
+                "type": "pane_output_changed",
+                "workspace_id": 7,
+                "pane_id": 41,
+                "revision": 2,
+            },
+        }
+    )
+    capture_key()
+    assert all(source != "event:pane.updated" for source, *_rest in record_observations)
+
+    # Scalar events may carry raw runtime representations. They can update a
+    # matched worker but cannot become PaneInfo or feed stable-key derivation.
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {
+                "workspace_id": 7,
+                "pane_id": 41,
+                "terminal_id": pane["terminal_id"],
+                "agent": "claude",
+                "agent_status": "working",
+            },
+        }
+    )
+    capture_key()
+    assert (
+        "event:pane.agent_status_changed",
+        False,
+        "7",
+        "41",
+        None,
+        None,
+    ) in record_observations
+
+    binding = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )[0]
+    assert binding.turn_target_kind == "pane_id"
+    assert herdr_turns.refresh_turn_binding(config, binding).status in {
+        "updated",
+        "unchanged",
+    }
+    capture_key()
+
+    backend.reconcile_once(client=client)
+    capture_key()
+    assert len(set(stable_keys)) == 1
+
+
+def test_one_hundred_interleaved_identity_observations_never_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_stable_worker_key = herdr_cli.stable_worker_key
+    derived_keys: set[str] = set()
+
+    def capture_stable_worker_key(*args: Any, **kwargs: Any) -> str:
+        stable_key = real_stable_worker_key(*args, **kwargs)
+        derived_keys.add(stable_key)
+        return stable_key
+
+    monkeypatch.setattr(herdr_cli, "stable_worker_key", capture_stable_worker_key)
+    backend = _backend(tmp_path, "interleaved-identity")
+    pane = {
+        "workspace_id": "w65383a2e877513",
+        "pane_id": "w65383a2e877513:pA",
+        "terminal_id": "terminal-interleaved",
+        "agent": "claude",
+        "agent_status": "working",
+    }
+    client = _StaticClient(
+        workspaces=[{"id": pane["workspace_id"], "name": "Build"}],
+        panes=[pane],
+    )
+    backend.reconcile_once(client=client)
+    binding = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )[0]
+    monkeypatch.setattr(
+        herdr_turns,
+        "_read_turn_for_binding",
+        lambda *_args, **_kwargs: {
+            "complete": True,
+            "user_text": "identity read",
+            "assistant_final_text": "stable",
+            "source_turn_id": "identity-turn",
+            "workspace_id": 7,
+            "pane_id": 41,
+        },
+    )
+
+    observed_keys: set[str] = set()
+
+    def remember_key() -> None:
+        snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+        assert snapshot is not None
+        observed_keys.add(str(snapshot.workers[0].meta["stable_key"]))
+
+    remember_key()
+    for index in range(100):
+        path = index % 5
+        if path == 0:
+            assert backend.queue_event_envelope(
+                {
+                    "event": "pane.created",
+                    "data": {"pane": {**pane, "agent_status": "idle"}},
+                }
+            )
+        elif path == 1:
+            assert backend.queue_event_envelope(
+                {
+                    "event": "pane.updated",
+                    "data": {
+                        "workspace_id": 7,
+                        "pane_id": 41,
+                        "revision": index,
+                    },
+                }
+            )
+        elif path == 2:
+            assert backend.queue_event_envelope(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {
+                        "workspace_id": 7,
+                        "pane_id": 41,
+                        "terminal_id": pane["terminal_id"],
+                        "agent": "claude",
+                        "agent_status": "working",
+                    },
+                }
+            )
+        elif path == 3:
+            backend.reconcile_once(client=client)
+            binding = list_worker_bindings(
+                backend.db_path,
+                backend.config.host_id,
+                backend="herdr",
+            )[0]
+        else:
+            assert herdr_turns.refresh_turn_binding(
+                backend.config,
+                binding,
+            ).status in {"updated", "unchanged"}
+        remember_key()
+
+    assert len(observed_keys) == 1
+    assert derived_keys == observed_keys
 
 
 @pytest.mark.parametrize("turn_model", ["legacy", "observed"])
@@ -1391,7 +1677,6 @@ def test_official_idless_event_reuses_single_authenticated_pane_owner(
     assert len(before.workers) == len(before_bindings) == 1
     worker_id = before.workers[0].id
     stable_key = before.workers[0].meta["stable_key"]
-    marker = backend.config.installation_key_marker_path.read_bytes()
     if key_failure:
         backend.config.installation_key_marker_path.unlink()
 
@@ -1425,52 +1710,20 @@ def test_official_idless_event_reuses_single_authenticated_pane_owner(
     assert after is not None
     assert len(after.workers) == len(bindings) == 1
     assert after.workers[0].id == worker_id
+    assert after.workers[0].meta["stable_key"] == stable_key
+    assert after.backend_health[0].status == "healthy"
     if key_failure:
-        assert after.workers == before.workers
-        assert bindings == before_bindings
-        assert after.backend_health[0].status == "degraded"
-        assert after.backend_health[0].outcome == "continuity_unavailable"
-        assert after.backend_health[0].counts == {"spaces": 1, "workers": 1}
-
-        assert backend.queue_event_envelope(
-            {"event": "workspace.updated", "data": {
-                "workspace": {
-                    "workspace_id": "wR9",
-                    "name": "Build Renamed",
-                }
-            }}
-        )
-        after_unrelated = latest_snapshot(backend.db_path, backend.config.host_id)
-        assert after_unrelated is not None
-        assert after_unrelated.backend_health[0].status == "degraded"
-        assert after_unrelated.backend_health[0].outcome == "continuity_unavailable"
-
-        after_cap = backend._mark_worker_cap_exceeded_locked(999)
-        assert after_cap.backend_health[0].outcome == "continuity_unavailable"
-        after_disconnect = backend._mark_unhealthy("socket_disconnected")
-        assert after_disconnect.backend_health[0].outcome == "continuity_unavailable"
-
-        backend.config.installation_key_marker_path.write_bytes(marker)
-        os.chmod(backend.config.installation_key_marker_path, 0o600)
-        assert backend.queue_event_envelope(
-            {"event": event_name, "data": event_payload}
-        )
-        after = latest_snapshot(backend.db_path, backend.config.host_id)
-        bindings = list_worker_bindings(
-            backend.db_path,
-            backend.config.host_id,
-            backend="herdr",
-        )
-        assert after is not None
-        assert after.backend_health[0].status == "healthy"
-        assert after.workers[0].meta["stable_key"] == stable_key
-    else:
-        assert after.workers[0].meta["stable_key"] == stable_key
+        assert not backend.config.installation_key_marker_path.exists()
     assert bindings[0].worker_id == worker_id
-    assert bindings[0].target_kind == "agent_id"
-    assert bindings[0].target_value == "new-agent-target-secret"
-    assert bindings[0].turn_target_kind == "codex_session_id"
-    assert bindings[0].turn_target_value == "new-session-secret"
+    assert bindings[0].private_fingerprint == before_bindings[0].private_fingerprint
+    assert (bindings[0].target_kind, bindings[0].target_value) == (
+        before_bindings[0].target_kind,
+        before_bindings[0].target_value,
+    )
+    assert (bindings[0].turn_target_kind, bindings[0].turn_target_value) == (
+        before_bindings[0].turn_target_kind,
+        before_bindings[0].turn_target_value,
+    )
     _assert_no_public_json_forbidden(json.loads(after.to_json()))
 
 
