@@ -224,17 +224,32 @@ def test_validate_server_envelope_rejects_missing_id() -> None:
         validate_server_envelope({"result": {"ok": True}})
 
 
-def test_validate_server_envelope_rejects_herdr_075_uncorrelated_error() -> None:
+def test_validate_server_envelope_scopes_herdr_075_uncorrelated_error() -> None:
+    envelope = {
+        "id": "",
+        "error": {
+            "code": "invalid_request",
+            "message": "invalid request: missing field pane_id",
+        },
+    }
+
     with pytest.raises(HerdrEnvelopeError):
-        validate_server_envelope(
-            {
-                "id": "",
-                "error": {
-                    "code": "invalid_request",
-                    "message": "invalid request: missing field pane_id",
-                },
-            }
-        )
+        validate_server_envelope(envelope)
+
+    assert validate_server_envelope(
+        envelope,
+        allow_uncorrelated_error=True,
+    ) == envelope
+
+    for error in (
+        {"code": "permission_denied", "message": "invalid request: denied"},
+        {"code": "invalid_request", "message": "subscription unavailable"},
+    ):
+        with pytest.raises(HerdrEnvelopeError):
+            validate_server_envelope(
+                {"id": "", "error": error},
+                allow_uncorrelated_error=True,
+            )
 
 
 def test_validate_server_envelope_rejects_missing_id_error() -> None:

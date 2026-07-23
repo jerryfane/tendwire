@@ -1079,7 +1079,9 @@ class HerdrEventBackend:
                 )
             except TypeError:
                 return client.subscribe(self.subscribe_method, params)
-            except (HerdrEnvelopeError, HerdrErrorResponse):
+            except HerdrErrorResponse as exc:
+                if not exc.uncorrelated:
+                    raise
                 if hasattr(client, "close"):
                     client.close()
                 if hasattr(client, "connect"):
