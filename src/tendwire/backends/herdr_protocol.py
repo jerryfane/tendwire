@@ -270,15 +270,24 @@ def is_event(envelope: Mapping[str, Any]) -> bool:
     return "event" in envelope and "result" not in envelope and "error" not in envelope
 
 
-def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
+def validate_response(
+    envelope: Mapping[str, Any],
+    *,
+    allow_uncorrelated_error: bool = False,
+) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
     if not is_response(envelope):
         raise HerdrEnvelopeError("Herdr response must contain exactly one of result or error")
     # Herdr 0.7.5 emits ``{"id":"", "error":...}`` when subscription
-    # parameters fail schema validation.  Preserve that error response so the
-    # caller can take its compatibility fallback; successful responses remain
+    # parameters fail schema validation. Only the subscription negotiation
+    # path may opt into that compatibility exception; ordinary requests remain
     # strictly correlated.
-    if not is_error_response(envelope) or envelope.get("id") != "":
+    uncorrelated_subscription_error = (
+        allow_uncorrelated_error
+        and is_error_response(envelope)
+        and envelope.get("id") == ""
+    )
+    if not uncorrelated_subscription_error:
         _validated_id(envelope)
     return dict(envelope)
 
@@ -302,10 +311,17 @@ def validate_event(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return dict(envelope)
 
 
-def validate_server_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
+def validate_server_envelope(
+    envelope: Mapping[str, Any],
+    *,
+    allow_uncorrelated_error: bool = False,
+) -> dict[str, Any]:
     """Validate a decoded server response or event envelope."""
     if is_response(envelope):
-        return validate_response(envelope)
+        return validate_response(
+            envelope,
+            allow_uncorrelated_error=allow_uncorrelated_error,
+        )
     if is_event(envelope):
         return validate_event(envelope)
     _validated_id(envelope)

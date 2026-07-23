@@ -106,6 +106,11 @@ _GLOBAL_EVENT_NAMES = tuple(
     for event_name in _SUPPORTED_EVENT_NAMES
     if event_name not in _PARAMETERIZED_EVENT_NAMES
 )
+_HERDR_074_GLOBAL_EVENT_NAMES = tuple(
+    event_name
+    for event_name in _HERDR_074_EVENT_NAMES
+    if event_name not in _PARAMETERIZED_EVENT_NAMES
+)
 _CLOSED_EVENT_NAMES = frozenset({"pane.closed", "pane.exited"})
 _SPACE_EVENT_NAMES = frozenset(
     {
@@ -1081,8 +1086,6 @@ class HerdrEventBackend:
             except TypeError:
                 return client.subscribe(self.subscribe_method, params)
             except (HerdrEnvelopeError, HerdrErrorResponse):
-                if not self._subscription_pane_ids:
-                    raise
                 if hasattr(client, "close"):
                     client.close()
                 if hasattr(client, "connect"):
@@ -1112,11 +1115,21 @@ class HerdrEventBackend:
         # parameterized by pane, while unrelated global event variants tolerate
         # the same pane_id field. Replay-only events remain excluded exactly as
         # before so reconnecting does not synthesize focus/detection activity.
-        subscriptions = [
-            {"pane_id": pane_id, "type": event_name}
-            for pane_id in self._subscription_pane_ids
-            for event_name in _HERDR_074_PANE_SCOPED_FALLBACK_EVENT_NAMES
-        ]
+        if self._subscription_pane_ids:
+            subscriptions = [
+                {"pane_id": pane_id, "type": event_name}
+                for pane_id in self._subscription_pane_ids
+                for event_name in _HERDR_074_PANE_SCOPED_FALLBACK_EVENT_NAMES
+            ]
+        else:
+            # An empty installation still needs a live stream for future
+            # workspace/pane creation.  A zero-entry legacy fallback merely
+            # repeats the negotiation failure/reconnect loop, so retain every
+            # 0.7.4 event that is valid without a pane parameter.
+            subscriptions = [
+                {"type": event_name}
+                for event_name in _HERDR_074_GLOBAL_EVENT_NAMES
+            ]
         params = {"subscriptions": subscriptions}
         try:
             return client.subscribe(

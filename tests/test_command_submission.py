@@ -4076,3 +4076,32 @@ def test_terminal_id_binding_falls_back_to_agent_list_when_agent_get_refuses(mon
     except HerdrErrorResponse:
         pass
     assert calls == ["agent.get"]
+
+
+def test_terminal_id_agent_list_fallback_rejects_ambiguous_matches(monkeypatch) -> None:
+    from tendwire import command_submission as cs
+    from tendwire.backends.herdr_protocol import HerdrErrorResponse
+
+    def fake_socket_request(client, method, params, *, timeout):
+        if method == "agent.get":
+            raise HerdrErrorResponse(
+                {"code": "agent_not_found", "message": "target not found"},
+                "req-1",
+            )
+        if method == "agent.list":
+            return {
+                "agents": [
+                    {"terminal_id": "term-shared", "pane_id": "w1:p1"},
+                    {"terminal_id": "term-shared", "pane_id": "w1:p2"},
+                ]
+            }
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(cs, "_socket_request", fake_socket_request)
+
+    class _Binding:
+        target_kind = "terminal_id"
+        target_value = "term-shared"
+
+    with pytest.raises(ValueError, match="ambiguous agent.list terminal_id match"):
+        cs._private_pane_id_for_binding(object(), _Binding(), timeout=5.0)

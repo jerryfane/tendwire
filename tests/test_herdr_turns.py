@@ -222,6 +222,127 @@ def test_refresh_structured_turn_content_uses_private_binding_without_public_lea
     assert turn["has_open_turn"] is False
 
 
+def test_missing_pane_turn_cli_falls_back_to_socket_scrollback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = Config(
+        host_id="turn-host",
+        db_path=tmp_path / "turns.db",
+        herdr_bin="herdr",
+        herdr_timeout_seconds=2,
+    )
+    monkeypatch.setattr(
+        herdr_turns.subprocess,
+        "run",
+        lambda args, **kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=2,
+            stdout="",
+            stderr="error: unrecognized subcommand 'turn'",
+        ),
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeSocketClient:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def pane_list(self, params, *, timeout):
+            calls.append(("pane.list", dict(params)))
+            return {
+                "type": "pane_list",
+                "panes": [
+                    {
+                        "pane_id": "pane-private",
+                        "terminal_id": "terminal-private",
+                        "agent": "codex",
+                        "agent_status": "done",
+                    }
+                ],
+            }
+
+        def agent_list(self, params, *, timeout):
+            calls.append(("agent.list", dict(params)))
+            return {
+                "type": "agent_list",
+                "agents": [
+                    {
+                        "pane_id": "pane-private",
+                        "terminal_id": "terminal-private",
+                        "agent": "codex",
+                        "agent_status": "done",
+                    }
+                ],
+            }
+
+        def agent_get(self, params, *, timeout):
+            calls.append(("agent.get", dict(params)))
+            return {
+                "type": "agent_info",
+                "agent": {
+                    "pane_id": "pane-private",
+                    "agent": "codex",
+                    "agent_status": "done",
+                },
+            }
+
+        def pane_read(self, params, *, timeout):
+            calls.append(("pane.read", dict(params)))
+            return {
+                "type": "pane_read",
+                "read": {
+                    "pane_id": "pane-private",
+                    "source": "recent_unwrapped",
+                    "format": "text",
+                    "text": "standalone socket fallback answer",
+                    "revision": 42,
+                    "truncated": False,
+                },
+            }
+
+    monkeypatch.setattr(
+        herdr_turns,
+        "_new_herdr_socket_client",
+        lambda *, timeout: FakeSocketClient(timeout=timeout),
+    )
+
+    turn = herdr_turns._read_private_turn(
+        config,
+        "pane-private",
+        raise_timeout=True,
+    )
+
+    assert turn is not None
+    assert turn["assistant_final_text"] == "standalone socket fallback answer"
+    assert turn["complete"] is True
+    assert turn["has_open_turn"] is False
+    assert turn["source_turn_id"].startswith("socket-turn-")
+    public_turn = {key: value for key, value in turn.items() if not key.startswith("_")}
+    assert "pane-private" not in json.dumps(public_turn)
+    assert "terminal-private" not in json.dumps(public_turn)
+    assert calls == [
+        ("pane.list", {}),
+        ("agent.list", {}),
+        ("agent.get", {"target": "pane-private"}),
+        (
+            "pane.read",
+            {
+                "pane_id": "pane-private",
+                "source": "recent_unwrapped",
+                "format": "text",
+                "strip_ansi": True,
+            },
+        ),
+    ]
+
+
 def test_refresh_structured_turn_content_reads_codex_session_jsonl(
     tmp_path: Path,
     monkeypatch,

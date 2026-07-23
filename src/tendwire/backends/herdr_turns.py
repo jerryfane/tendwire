@@ -616,6 +616,171 @@ class _TurnReadFailed(Exception):
     """Fixed internal adapter failure signal; never serialized with raw errors."""
 
 
+def _pane_turn_subcommand_missing(completed: subprocess.CompletedProcess[str]) -> bool:
+    if completed.returncode == 0:
+        return False
+    error_text = str(completed.stderr or "").lower()
+    missing_markers = (
+        "unrecognized subcommand",
+        "unknown subcommand",
+        "invalid subcommand",
+        "no such subcommand",
+    )
+    return "turn" in error_text and any(
+        marker in error_text for marker in missing_markers
+    )
+
+
+def _socket_result_mapping(value: Any, key: str) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result = value.get("result")
+    if isinstance(result, Mapping):
+        value = result
+    nested = value.get(key)
+    if isinstance(nested, Mapping):
+        return nested
+    return value
+
+
+def _socket_result_items(value: Any, key: str) -> list[Mapping[str, Any]]:
+    if not isinstance(value, Mapping):
+        return []
+    result = value.get("result")
+    if isinstance(result, Mapping):
+        value = result
+    items = value.get(key)
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, Mapping)]
+
+
+def _new_herdr_socket_client(*, timeout: float) -> Any:
+    # Preserve the CLI backend's lazy boundary: importing normal Tendwire CLI
+    # modules must not load the opt-in socket transport unless this exact
+    # compatibility fallback is needed.
+    from .herdr_socket import HerdrSocketClient
+
+    return HerdrSocketClient(timeout=timeout)
+
+
+def _read_private_turn_via_socket(
+    pane_id: str,
+    *,
+    timeout_seconds: float,
+) -> Mapping[str, Any]:
+    """Reconstruct a bounded standalone turn after ``pane turn`` removal."""
+    from .herdr_protocol import (
+        HerdrEnvelopeError,
+        HerdrErrorResponse,
+        HerdrProtocolError,
+    )
+
+    try:
+        with _new_herdr_socket_client(timeout=timeout_seconds) as client:
+            pane_matches = [
+                pane
+                for pane in _socket_result_items(
+                    client.pane_list({}, timeout=timeout_seconds),
+                    "panes",
+                )
+                if str(
+                    pane.get("pane_id") or pane.get("paneId") or ""
+                ).strip()
+                == pane_id
+            ]
+            if len(pane_matches) != 1:
+                raise _TurnReadFailed
+            pane = pane_matches[0]
+
+            agent_matches = [
+                agent
+                for agent in _socket_result_items(
+                    client.agent_list({}, timeout=timeout_seconds),
+                    "agents",
+                )
+                if str(
+                    agent.get("pane_id") or agent.get("paneId") or ""
+                ).strip()
+                == pane_id
+            ]
+            if len(agent_matches) > 1:
+                raise _TurnReadFailed
+            listed_agent = agent_matches[0] if agent_matches else None
+            try:
+                agent = _socket_result_mapping(
+                    client.agent_get(
+                        {"target": pane_id},
+                        timeout=timeout_seconds,
+                    ),
+                    "agent",
+                )
+            except (HerdrEnvelopeError, HerdrErrorResponse):
+                agent = listed_agent
+            if agent is None:
+                agent = pane
+            agent_pane_id = str(
+                agent.get("pane_id") or agent.get("paneId") or pane_id
+            ).strip()
+            if agent_pane_id != pane_id:
+                raise _TurnReadFailed
+
+            read = _socket_result_mapping(
+                client.pane_read(
+                    {
+                        "pane_id": pane_id,
+                        "source": "recent_unwrapped",
+                        "format": "text",
+                        "strip_ansi": True,
+                    },
+                    timeout=timeout_seconds,
+                ),
+                "read",
+            )
+            if read is None:
+                raise _TurnReadFailed
+            read_pane_id = str(
+                read.get("pane_id") or read.get("paneId") or pane_id
+            ).strip()
+            text = read.get("text")
+            if (
+                read_pane_id != pane_id
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                raise _TurnReadFailed
+
+            status = str(
+                agent.get("agent_status")
+                or agent.get("status")
+                or pane.get("agent_status")
+                or pane.get("status")
+                or "unknown"
+            ).strip().lower()
+            settled = status in {"idle", "done", "blocked"} and not bool(
+                read.get("truncated")
+            )
+            revision = str(read.get("revision") or pane.get("revision") or "")
+            source_digest = hashlib.sha256(
+                (pane_id + "\x00" + revision + "\x00" + text).encode("utf-8")
+            ).hexdigest()[:32]
+            turn: dict[str, Any] = {
+                "available": True,
+                "complete": settled,
+                "has_open_turn": not settled,
+                "source_turn_id": f"socket-turn-{source_digest}",
+            }
+            if settled:
+                turn["assistant_final_text"] = text
+            else:
+                turn["assistant_stream_text"] = text
+            return turn
+    except _TurnReadFailed:
+        raise
+    except (OSError, ValueError, HerdrProtocolError):
+        raise _TurnReadFailed from None
+
+
 def _read_private_turn(
     config: Config,
     pane_id: str,
@@ -686,15 +851,30 @@ def _read_private_turn(
             raise _TurnReadFailed from None
         return None
     if completed.returncode != 0:
-        if raise_timeout:
-            raise _TurnReadFailed
-        return None
-    try:
-        payload = json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        if raise_timeout:
-            raise _TurnReadFailed from None
-        return None
+        if not _pane_turn_subcommand_missing(completed):
+            if raise_timeout:
+                raise _TurnReadFailed
+            return None
+        try:
+            payload = _read_private_turn_via_socket(
+                pane_id,
+                timeout_seconds=float(timeout),
+            )
+        except _TurnReadFailed:
+            if raise_timeout:
+                raise
+            return None
+        except (OSError, ValueError):
+            if raise_timeout:
+                raise _TurnReadFailed from None
+            return None
+    else:
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            if raise_timeout:
+                raise _TurnReadFailed from None
+            return None
     turn = _extract_turn_payload(payload)
     if not isinstance(turn, Mapping):
         if raise_timeout:

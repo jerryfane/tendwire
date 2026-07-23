@@ -224,7 +224,7 @@ def test_validate_server_envelope_rejects_missing_id() -> None:
         validate_server_envelope({"result": {"ok": True}})
 
 
-def test_validate_server_envelope_accepts_herdr_075_uncorrelated_error() -> None:
+def test_validate_server_envelope_scopes_herdr_075_uncorrelated_error() -> None:
     envelope = {
         "id": "",
         "error": {
@@ -233,7 +233,13 @@ def test_validate_server_envelope_accepts_herdr_075_uncorrelated_error() -> None
         },
     }
 
-    assert validate_server_envelope(envelope) == envelope
+    with pytest.raises(HerdrEnvelopeError):
+        validate_server_envelope(envelope)
+
+    assert validate_server_envelope(
+        envelope,
+        allow_uncorrelated_error=True,
+    ) == envelope
 
 
 def test_validate_server_envelope_rejects_missing_id_error() -> None:

@@ -356,13 +356,18 @@ def _private_pane_id_for_binding(client: Any, binding: WorkerBinding, *, timeout
             raise
         listing = _socket_request(client, "agent.list", {}, timeout=timeout)
         agents = listing.get("agents") if isinstance(listing, Mapping) else None
+        matches: list[str] = []
         for agent in agents or []:
             if not isinstance(agent, Mapping):
                 continue
             if str(agent.get("terminal_id") or "") == str(binding.target_value or ""):
                 pane_id = str(agent.get("pane_id") or "").strip()
                 if pane_id:
-                    return pane_id
+                    matches.append(pane_id)
+        if len(matches) > 1:
+            raise ValueError("ambiguous agent.list terminal_id match")
+        if matches:
+            return matches[0]
         raise
     return _pane_id_from_agent_info(response)
 
