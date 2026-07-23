@@ -132,7 +132,7 @@ from ..core.turns import (
 
 
 FINGERPRINT_HEX_LENGTH = FINGERPRINT_HEX_CHARS
-STORE_SCHEMA_VERSION = 20
+STORE_SCHEMA_VERSION = 21
 CONNECTOR_ACK_TTL_SECONDS = DEFAULT_CONNECTOR_ACK_TTL_SECONDS
 _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
@@ -481,6 +481,20 @@ class TurnRefreshApplyResult:
     pending_changed: bool
     stale_binding: bool = False
     cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class HerdrTurnWatermark:
+    """Durable replay position and retained completeness-break evidence."""
+
+    host_id: str
+    pane_id: str
+    turn_epoch: int
+    last_turn: int
+    completeness_break_count: int
+    last_completeness_break_reason: str | None
+    last_completeness_break_at: str | None
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -1458,6 +1472,48 @@ CREATE TABLE IF NOT EXISTS backend_pending_claims (
     PRIMARY KEY (host_id, worker_id)
 );
 """
+
+CREATE_HERDR_TURN_WATERMARKS_TABLE = """
+CREATE TABLE IF NOT EXISTS herdr_turn_watermarks (
+    host_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
+    last_turn INTEGER NOT NULL CHECK (last_turn >= 0),
+    completeness_break_count INTEGER NOT NULL DEFAULT 0
+        CHECK (completeness_break_count >= 0),
+    last_completeness_break_reason TEXT,
+    last_completeness_break_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, pane_id)
+);
+"""
+
+CREATE_HERDR_TURN_COMPLETIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS herdr_turn_completions (
+    host_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    turn_epoch INTEGER NOT NULL CHECK (turn_epoch >= 0),
+    turn INTEGER NOT NULL CHECK (turn >= 0),
+    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'aborted')),
+    completed_unix_ms INTEGER NOT NULL CHECK (completed_unix_ms >= 0),
+    message TEXT,
+    message_truncated INTEGER NOT NULL DEFAULT 0
+        CHECK (message_truncated IN (0, 1)),
+    agent_session_path TEXT,
+    worker_id TEXT,
+    refreshed_turn_id TEXT,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (host_id, pane_id, turn_epoch, turn)
+);
+"""
+
+CREATE_HERDR_TURN_INDEXES = (
+    (
+        "CREATE INDEX IF NOT EXISTS idx_herdr_turn_completions_worker "
+        "ON herdr_turn_completions(host_id, worker_id, turn_epoch, turn)"
+    ),
+)
+
 CREATE_PR6_TABLES = (
     CREATE_EVENTS_TABLE,
     CREATE_SPACES_TABLE,
@@ -12645,6 +12701,14 @@ def _migrate_v19_to_v20_conn(conn: sqlite3.Connection) -> None:
     _backfill_turn_supersessions_conn(conn)
 
 
+def _migrate_v20_to_v21_conn(conn: sqlite3.Connection) -> None:
+    """Add durable Herdr turn replay watermarks and completion provenance."""
+    conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
+    conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
+    for statement in CREATE_HERDR_TURN_INDEXES:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(0, 1, _migrate_v0_to_v1_conn),
     Migration(1, 2, _migrate_v1_to_v2_conn),
@@ -12666,6 +12730,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(17, 18, _migrate_v17_to_v18_conn),
     Migration(18, 19, _migrate_v18_to_v19_conn),
     Migration(19, 20, _migrate_v19_to_v20_conn),
+    Migration(20, 21, _migrate_v20_to_v21_conn),
 )
 
 
@@ -12717,6 +12782,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         conn.execute(CREATE_TURN_CHANGE_STATE_TABLE)
         conn.execute(CREATE_TURN_SUBMISSIONS_TABLE)
         conn.execute(CREATE_TURN_SUPERSESSIONS_TABLE)
+        conn.execute(CREATE_HERDR_TURN_WATERMARKS_TABLE)
+        conn.execute(CREATE_HERDR_TURN_COMPLETIONS_TABLE)
         for statement in CREATE_COMMAND_RECEIPT_INDEXES:
             conn.execute(statement)
         for statement in CREATE_WORKER_BINDING_INDEXES:
@@ -12735,6 +12802,8 @@ def _create_current_schema_conn(conn: sqlite3.Connection) -> None:
         for statement in CREATE_TURN_SUBMISSION_INDEXES:
             conn.execute(statement)
         for statement in CREATE_TURN_SUPERSESSION_INDEXES:
+            conn.execute(statement)
+        for statement in CREATE_HERDR_TURN_INDEXES:
             conn.execute(statement)
         for statement in CREATE_ATTENTION_LIFECYCLE_INDEXES:
             conn.execute(statement)
@@ -12862,6 +12931,277 @@ def init_store(
                 1, int(connector_ack_ttl_seconds)
             ),
         )
+
+
+def _herdr_turn_counter(value: Any, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= _SQLITE_MAX_INTEGER
+    ):
+        raise ValueError(f"{field} must be a nonnegative SQLite integer")
+    return int(value)
+
+
+def _herdr_turn_watermark_from_row(row: tuple[Any, ...]) -> HerdrTurnWatermark:
+    return HerdrTurnWatermark(
+        host_id=str(row[0]),
+        pane_id=str(row[1]),
+        turn_epoch=int(row[2]),
+        last_turn=int(row[3]),
+        completeness_break_count=int(row[4]),
+        last_completeness_break_reason=(
+            str(row[5]) if row[5] is not None else None
+        ),
+        last_completeness_break_at=(
+            str(row[6]) if row[6] is not None else None
+        ),
+        updated_at=str(row[7]),
+    )
+
+
+def get_herdr_turn_watermark(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+) -> HerdrTurnWatermark | None:
+    """Return one pane's durable Herdr replay watermark."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT
+                host_id, pane_id, turn_epoch, last_turn,
+                completeness_break_count, last_completeness_break_reason,
+                last_completeness_break_at, updated_at
+            FROM herdr_turn_watermarks
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (str(host_id), str(pane_id)),
+        ).fetchone()
+    return _herdr_turn_watermark_from_row(row) if row is not None else None
+
+
+def set_herdr_turn_watermark(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    last_turn: int,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Create or re-baseline a watermark while retaining prior break evidence."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn = _herdr_turn_counter(last_turn, "last_turn")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO herdr_turn_watermarks (
+                host_id, pane_id, turn_epoch, last_turn, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                turn_epoch = excluded.turn_epoch,
+                last_turn = excluded.last_turn,
+                updated_at = excluded.updated_at
+            """,
+            (str(host_id), str(pane_id), epoch, turn, current),
+        )
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
+
+
+def record_herdr_turn_completeness_break(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    newest_turn: int,
+    reason: str,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Persist an explicit replay gap and atomically re-baseline the pane."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    newest = _herdr_turn_counter(newest_turn, "newest_turn")
+    break_reason = str(reason).strip()
+    if not break_reason:
+        raise ValueError("reason must not be empty")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO herdr_turn_watermarks (
+                host_id, pane_id, turn_epoch, last_turn,
+                completeness_break_count, last_completeness_break_reason,
+                last_completeness_break_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                turn_epoch = excluded.turn_epoch,
+                last_turn = excluded.last_turn,
+                completeness_break_count =
+                    herdr_turn_watermarks.completeness_break_count + 1,
+                last_completeness_break_reason =
+                    excluded.last_completeness_break_reason,
+                last_completeness_break_at =
+                    excluded.last_completeness_break_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(host_id),
+                str(pane_id),
+                epoch,
+                newest,
+                break_reason,
+                current,
+                current,
+            ),
+        )
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
+
+
+def latest_turn_id_for_worker(
+    db_path: Path | str,
+    host_id: str,
+    worker_id: str,
+) -> str | None:
+    """Return the newest live semantic turn row for provenance linking."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT turn_id
+            FROM turns
+            WHERE host_id = ?
+              AND worker_id = ?
+              AND COALESCE(json_extract(payload_json, '$.superseded_at'), '') = ''
+            ORDER BY observed_at DESC, list_sequence DESC
+            LIMIT 1
+            """,
+            (str(host_id), str(worker_id)),
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def record_herdr_turn_completion(
+    db_path: Path | str,
+    host_id: str,
+    pane_id: str,
+    *,
+    turn_epoch: int,
+    turn: int,
+    outcome: str,
+    completed_unix_ms: int,
+    message: str | None,
+    message_truncated: bool,
+    agent_session_path: str | None,
+    worker_id: str | None,
+    refreshed_turn_id: str | None,
+    observed_at: str | None = None,
+) -> HerdrTurnWatermark:
+    """Store completion provenance and advance its replay watermark atomically."""
+    epoch = _herdr_turn_counter(turn_epoch, "turn_epoch")
+    turn_number = _herdr_turn_counter(turn, "turn")
+    completed_ms = _herdr_turn_counter(completed_unix_ms, "completed_unix_ms")
+    normalized_outcome = str(outcome)
+    if normalized_outcome not in {"completed", "aborted"}:
+        raise ValueError("outcome must be completed or aborted")
+    if message is not None and not isinstance(message, str):
+        raise ValueError("message must be text or None")
+    if isinstance(message, str) and len(message.encode("utf-8")) > 8 * 1024:
+        raise ValueError("message must not exceed 8 KiB")
+    if not isinstance(message_truncated, bool):
+        raise ValueError("message_truncated must be a boolean")
+    if agent_session_path is not None and not isinstance(
+        agent_session_path,
+        str,
+    ):
+        raise ValueError("agent_session_path must be text or None")
+    current = observed_at or utc_timestamp()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                """
+                SELECT turn_epoch, last_turn
+                FROM herdr_turn_watermarks
+                WHERE host_id = ? AND pane_id = ?
+                """,
+                (str(host_id), str(pane_id)),
+            ).fetchone()
+            if existing is not None and int(existing[0]) != epoch:
+                raise StoreSchemaError("herdr_turn_epoch_changed")
+            conn.execute(
+                """
+                INSERT INTO herdr_turn_completions (
+                    host_id, pane_id, turn_epoch, turn, outcome,
+                    completed_unix_ms, message, message_truncated,
+                    agent_session_path, worker_id, refreshed_turn_id, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(host_id, pane_id, turn_epoch, turn) DO UPDATE SET
+                    outcome = excluded.outcome,
+                    completed_unix_ms = excluded.completed_unix_ms,
+                    message = excluded.message,
+                    message_truncated = excluded.message_truncated,
+                    agent_session_path = excluded.agent_session_path,
+                    worker_id = COALESCE(
+                        excluded.worker_id, herdr_turn_completions.worker_id
+                    ),
+                    refreshed_turn_id = COALESCE(
+                        excluded.refreshed_turn_id,
+                        herdr_turn_completions.refreshed_turn_id
+                    ),
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    str(host_id),
+                    str(pane_id),
+                    epoch,
+                    turn_number,
+                    normalized_outcome,
+                    completed_ms,
+                    message,
+                    int(message_truncated),
+                    agent_session_path,
+                    str(worker_id) if worker_id else None,
+                    str(refreshed_turn_id) if refreshed_turn_id else None,
+                    current,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO herdr_turn_watermarks (
+                    host_id, pane_id, turn_epoch, last_turn, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(host_id, pane_id) DO UPDATE SET
+                    last_turn = MAX(
+                        herdr_turn_watermarks.last_turn, excluded.last_turn
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (str(host_id), str(pane_id), epoch, turn_number, current),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    watermark = get_herdr_turn_watermark(db_path, host_id, pane_id)
+    if watermark is None:
+        raise StoreSchemaError("herdr_turn_watermark_unavailable")
+    return watermark
 
 
 def _normalized_command_request_policy(

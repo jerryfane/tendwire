@@ -50,6 +50,7 @@ from tendwire.store.sqlite import (
     SnapshotObservationContext,
     SnapshotRetentionPolicy,
     apply_backend_pending_observation,
+    get_herdr_turn_watermark,
     init_store,
     latest_snapshot,
     list_attention_items,
@@ -59,6 +60,7 @@ from tendwire.store.sqlite import (
     merge_turn_content,
     pending_payload_from_store,
     save_snapshot,
+    set_herdr_turn_watermark,
     turns_payload_from_store,
 )
 
@@ -5388,3 +5390,486 @@ def test_authoritative_recovery_payload_promotes_herdres_working_once(
     assert "last_stream_message_id" not in worker_entry
     assert "last_stream_bot_kind" not in worker_entry
     assert direct_boundary_attempts == []
+
+
+def _turn_api_pane() -> dict[str, Any]:
+    return {
+        "pane_id": "w123456789abcde:pA",
+        "terminal_id": "terminal-turn-api",
+        "agent": "claude",
+        "workspace_id": "w123456789abcde",
+        "agent_status": "idle",
+        "last_completed_turn": {
+            "turn": 0,
+            "turn_epoch": 7,
+            "completed_unix_ms": 0,
+        },
+        "turn": 0,
+        "turn_epoch": 7,
+        "outcome": "completed",
+    }
+
+
+def _turn_record(
+    turn: int,
+    *,
+    epoch: int = 7,
+    outcome: str = "completed",
+) -> dict[str, Any]:
+    return {
+        "turn": turn,
+        "turn_epoch": epoch,
+        "outcome": outcome,
+        "completed_unix_ms": 1_700_000_000_000 + turn,
+        "message": f"turn {turn}",
+        "message_truncated": False,
+        "agent_session_path": None,
+    }
+
+
+def _turn_api_backend(
+    tmp_path: Path,
+    host_id: str,
+    processor: Callable[..., Any],
+) -> HerdrEventBackend:
+    backend = _backend(tmp_path, host_id)
+    backend.turn_completion_processor = processor
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[_turn_api_pane()],
+        )
+    )
+    return backend
+
+
+def test_turn_api_absent_preserves_old_subscription_negotiation(tmp_path: Path) -> None:
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-absent",
+        lambda *_args, **_kwargs: SimpleNamespace(status="updated"),
+    )
+
+    class OldClient:
+        subscriptions: list[dict[str, Any]] = []
+
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            raise HerdrErrorResponse(
+                {"code": "invalid_params", "message": "unknown method"},
+                "probe",
+            )
+
+        def subscribe(
+            self,
+            _method: str,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            self.subscriptions.append(dict(params))
+            return SimpleNamespace(subscription_id="old")
+
+    client = OldClient()
+    backend._replay_turns_after_reconcile(client)
+    backend._subscribe_event_stream(client)
+
+    assert backend._turn_api_supported is False
+    assert all(
+        item["type"] != "pane.turn_completed"
+        for item in client.subscriptions[0]["subscriptions"]
+    )
+    assert get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        _turn_api_pane()["pane_id"],
+    ) is None
+
+
+def test_turn_api_replay_subscribes_and_persists_ordered_completions(
+    tmp_path: Path,
+) -> None:
+    processed: list[str] = []
+    binding_hints: list[str | None] = []
+
+    def process(_config: Config, pane_id: str, **kwargs: Any) -> Any:
+        processed.append(pane_id)
+        binding_hints.append(kwargs.get("binding_private_fingerprint"))
+        return SimpleNamespace(
+            status="updated",
+            worker_id="claude",
+            refreshed_turn_id=f"public-turn-{len(processed)}",
+        )
+
+    backend = _turn_api_backend(tmp_path, "turn-api-happy", process)
+
+    class NewClient:
+        subscriptions: list[dict[str, Any]] = []
+
+        def pane_turns(self, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            assert params == {
+                "pane_id": _turn_api_pane()["pane_id"],
+                "since": 0,
+            }
+            return {
+                "type": "pane_turns",
+                "turns": {
+                    "pane_id": _turn_api_pane()["pane_id"],
+                    "turn_epoch": 7,
+                    "records": [_turn_record(1), _turn_record(2)],
+                    "truncated": False,
+                    "oldest_available": 1,
+                },
+            }
+
+        def subscribe(
+            self,
+            _method: str,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            self.subscriptions.append(dict(params))
+            return SimpleNamespace(subscription_id="new")
+
+    client = NewClient()
+    backend._replay_turns_after_reconcile(client)
+    backend._subscribe_event_stream(client)
+
+    assert processed == [_turn_api_pane()["pane_id"]] * 2
+    assert len(binding_hints) == 2
+    assert all(binding_hints)
+    assert len(set(binding_hints)) == 1
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        _turn_api_pane()["pane_id"],
+    )
+    assert watermark is not None
+    assert (watermark.turn_epoch, watermark.last_turn) == (7, 2)
+    assert watermark.completeness_break_count == 0
+    assert {
+        "type": "pane.turn_completed",
+        "pane_id": _turn_api_pane()["pane_id"],
+    } in client.subscriptions[0]["subscriptions"]
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT turn, outcome, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ?
+            ORDER BY turn
+            """,
+            (backend.config.host_id,),
+        ).fetchall() == [
+            (1, "completed", "public-turn-1"),
+            (2, "completed", "public-turn-2"),
+        ]
+
+
+def test_turn_api_run_loop_closes_probe_to_subscribe_completion_race(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "turn-api-subscribe-race")
+    init_store(Path(config.db_path))
+    pane_id = _turn_api_pane()["pane_id"]
+    processed: list[str] = []
+    operations: list[str] = []
+
+    class RaceClient(_StaticClient):
+        def __init__(self) -> None:
+            super().__init__(
+                workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+                panes=[_turn_api_pane()],
+            )
+            self.subscribed = False
+
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def pane_turns(
+            self,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            operations.append("replay" if self.subscribed else "probe")
+            records = [_turn_record(1)] if self.subscribed else []
+            if self.subscribed:
+                backend.stop_event.set()
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": records,
+                    "truncated": False,
+                    "oldest_available": 1 if records else None,
+                }
+            }
+
+        def subscribe(
+            self,
+            _method: str,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            operations.append("subscribe")
+            assert {
+                "type": "pane.turn_completed",
+                "pane_id": pane_id,
+            } in params["subscriptions"]
+            self.subscribed = True
+            return SimpleNamespace(subscription_id="race")
+
+    client = RaceClient()
+    backend = HerdrEventBackend(
+        config,
+        client_factory=lambda _config: client,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        turn_completion_processor=lambda _config, current_pane, **_kwargs: (
+            processed.append(current_pane)
+            or SimpleNamespace(status="unchanged")
+        ),
+    )
+
+    backend.run_forever()
+
+    assert operations == ["probe", "subscribe", "replay"]
+    assert processed == [pane_id]
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None
+    assert (watermark.turn_epoch, watermark.last_turn) == (7, 1)
+
+
+def test_turn_api_restart_replays_exactly_the_missed_turn(tmp_path: Path) -> None:
+    pane_id = _turn_api_pane()["pane_id"]
+    first = _turn_api_backend(
+        tmp_path,
+        "turn-api-restart",
+        lambda *_args, **_kwargs: SimpleNamespace(status="unchanged"),
+    )
+    set_herdr_turn_watermark(
+        first.db_path,
+        first.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=2,
+    )
+    processed: list[str] = []
+    restarted = HerdrEventBackend(
+        first.config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+        turn_completion_processor=lambda _config, current_pane, **_kwargs: (
+            processed.append(current_pane)
+            or SimpleNamespace(status="unchanged")
+        ),
+    )
+    restarted.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[_turn_api_pane()],
+        )
+    )
+
+    class ReplayClient:
+        params: dict[str, Any] | None = None
+
+        def pane_turns(self, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            self.params = dict(params)
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": [_turn_record(3)],
+                    "truncated": False,
+                    "oldest_available": 1,
+                }
+            }
+
+    client = ReplayClient()
+    restarted._replay_turns_after_reconcile(client)
+
+    assert client.params == {
+        "pane_id": pane_id,
+        "since": 2,
+        "expected_epoch": 7,
+    }
+    assert processed == [pane_id]
+    watermark = get_herdr_turn_watermark(
+        restarted.db_path,
+        restarted.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_epoch", "expected_turn", "expected_reason"),
+    [
+        ("truncated", 7, 12, "replay_truncated"),
+        ("epoch", 8, 1, "turn_epoch_mismatch"),
+    ],
+)
+def test_turn_api_breaks_rebaseline_without_inferring_completion(
+    tmp_path: Path,
+    mode: str,
+    expected_epoch: int,
+    expected_turn: int,
+    expected_reason: str,
+) -> None:
+    processed: list[str] = []
+    backend = _turn_api_backend(
+        tmp_path,
+        f"turn-api-break-{mode}",
+        lambda _config, pane_id, **_kwargs: (
+            processed.append(pane_id)
+            or SimpleNamespace(status="updated")
+        ),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=2,
+    )
+
+    class BreakClient:
+        calls = 0
+
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            self.calls += 1
+            if mode == "epoch" and self.calls == 1:
+                raise HerdrErrorResponse(
+                    {
+                        "code": "turn_epoch_mismatch",
+                        "message": "epoch changed",
+                    },
+                    "epoch",
+                )
+            records = (
+                [_turn_record(1, epoch=8)]
+                if mode == "epoch"
+                else [_turn_record(11), _turn_record(12)]
+            )
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": expected_epoch,
+                    "records": records,
+                    "truncated": mode == "truncated",
+                    "oldest_available": records[0]["turn"],
+                }
+            }
+
+    backend._replay_turns_after_reconcile(BreakClient())
+
+    assert processed == []
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None
+    assert (watermark.turn_epoch, watermark.last_turn) == (
+        expected_epoch,
+        expected_turn,
+    )
+    assert watermark.completeness_break_count == 1
+    assert watermark.last_completeness_break_reason == expected_reason
+
+
+def test_live_aborted_completion_refreshes_then_advances_with_provenance(
+    tmp_path: Path,
+) -> None:
+    processed: list[str] = []
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-live-abort",
+        lambda _config, pane_id, **_kwargs: (
+            processed.append(pane_id)
+            or SimpleNamespace(
+                status="updated",
+                worker_id="claude",
+                refreshed_turn_id="public-aborted-turn",
+            )
+        ),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=1,
+    )
+    backend._turn_api_supported = True
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {
+                "pane": _turn_api_pane(),
+                **_turn_record(2, outcome="aborted"),
+            },
+        }
+    )
+
+    assert processed == [pane_id]
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 2
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT outcome, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ? AND turn = 2
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchone() == ("aborted", "public-aborted-turn")
+
+
+def test_status_turn_hints_never_advance_completion_watermarks(
+    tmp_path: Path,
+) -> None:
+    processed: list[str] = []
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-hints-only",
+        lambda _config, pane_id, **_kwargs: (
+            processed.append(pane_id)
+            or SimpleNamespace(status="updated")
+        ),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {
+                "pane_id": pane_id,
+                "workspace_id": "w123456789abcde",
+                "agent": "claude",
+                "agent_status": "idle",
+                "turn": 19,
+                "turn_epoch": 7,
+            },
+        }
+    )
+
+    assert processed == []
+    assert get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    ) is None

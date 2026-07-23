@@ -23,6 +23,7 @@ _SESSION_ENV_ORDER = (
 )
 
 HERDR_EVENTS_SUBSCRIBE_METHOD = "events.subscribe"
+HERDR_TURN_COMPLETED_EVENT_NAME = "pane.turn_completed"
 HERDR_OFFICIAL_EVENT_NAMES = (
     "workspace.created",
     "workspace.updated",
