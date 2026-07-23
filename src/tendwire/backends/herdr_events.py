@@ -49,6 +49,7 @@ from .herdr_cli import (
     _payload_items,
     _spaces_from_payload,
     _records_from_agent_and_pane_payloads,
+    _strip_turn_api_fields,
     _worker_record_from_item,
     _workers_and_bindings_from_records,
     _strip_stable_key_fields,
@@ -423,7 +424,7 @@ def _merge_worker_update(
         if status is not None:
             return _worker_copy(observed, status=status)
         return observed
-    merged_meta = _strip_stable_key_fields(existing.meta)
+    merged_meta = _strip_turn_api_fields(_strip_stable_key_fields(existing.meta))
     if (
         preserve_existing_continuity
         and is_stable_worker_key(existing.meta.get("stable_key"))
@@ -1656,7 +1657,7 @@ class HerdrEventBackend:
                     }
             ambiguous_worker = _worker_copy(
                 worker,
-                meta=_strip_stable_key_fields(worker.meta),
+                meta=_strip_turn_api_fields(_strip_stable_key_fields(worker.meta)),
                 backend_target=ambiguous_target,
             )
             if _worker_state_equal(worker, ambiguous_worker):

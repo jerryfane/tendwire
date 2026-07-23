@@ -1029,6 +1029,32 @@ def _strip_status_fields(value: Any) -> Any:
     return value
 
 
+def _is_turn_api_metadata_field(key: object) -> bool:
+    """Return whether a Herdr turn-API field is volatile worker metadata."""
+    normalized = str(key).strip().lower().replace("-", "_").replace(".", "_")
+    return (
+        _field_matches(key, "last_completed_turn")
+        or _field_matches(key, "turn")
+        or _field_matches(key, "turn_epoch")
+        or normalized.startswith("turn_")
+    )
+
+
+def _strip_turn_api_fields(value: Any) -> Any:
+    """Recursively drop volatile Herdr turn-API fields from worker metadata."""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_turn_api_fields(child)
+            for key, child in value.items()
+            if not _is_turn_api_metadata_field(key)
+        }
+    if isinstance(value, list):
+        return [_strip_turn_api_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_turn_api_fields(item) for item in value]
+    return value
+
+
 def _payload_items(payload: Any, keys: Sequence[str]) -> list[dict[str, Any]]:
     """Extract object records from conservative herdr list payload shapes."""
     if isinstance(payload, list):
@@ -1130,11 +1156,12 @@ def _meta_from_item(item: Mapping[str, Any], excluded_keys: set[str], raw_status
     item = _strip_stable_key_fields(item)
     explicit_meta = _value_for_key(item, "meta")
     meta = {
-        str(key): _strip_status_fields(value)
+        str(key): _strip_turn_api_fields(_strip_status_fields(value))
         for key, value in item.items()
         if not _field_matches(key, "meta")
         and not any(_field_matches(key, excluded_key) for excluded_key in excluded_keys)
         and not any(_field_matches(key, status_key) for status_key in _STATUS_KEYS)
+        and not _is_turn_api_metadata_field(key)
     }
     if isinstance(explicit_meta, Mapping):
         for key, value in explicit_meta.items():
@@ -1142,7 +1169,9 @@ def _meta_from_item(item: Mapping[str, Any], excluded_keys: set[str], raw_status
                 continue
             if any(_field_matches(key, status_key) for status_key in _STATUS_KEYS):
                 continue
-            meta[str(key)] = _strip_status_fields(value)
+            if _is_turn_api_metadata_field(key):
+                continue
+            meta[str(key)] = _strip_turn_api_fields(_strip_status_fields(value))
     if raw_status is not None:
         meta["raw_status"] = raw_status
     return meta

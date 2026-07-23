@@ -149,6 +149,53 @@ def test_restore_fixture_matches_verified_herdr_contract() -> None:
         assert "pane" in move["data"]
 
 
+def test_turn_api_fields_do_not_change_worker_fingerprint_or_identity(
+    tmp_path: Path,
+) -> None:
+    pane = deepcopy(_fixture()["pre_restore"]["pane_info"])
+    stable_meta = {"safe_observation": "kept", "nested": {}}
+    observations = [
+        {**pane, "meta": stable_meta},
+        {
+            **pane,
+            "meta": stable_meta,
+            "last_completed_turn": {
+                "number": 41,
+                "epoch": 7,
+                "timestamp": "2026-07-23T10:00:00Z",
+            },
+        },
+        {
+            **pane,
+            "last_completed_turn": {
+                "number": 42,
+                "epoch": 8,
+                "timestamp": "2026-07-23T10:01:00Z",
+            },
+            "meta": {
+                "safe_observation": "kept",
+                "turn_epoch": 8,
+                "nested": {"turn_completed_at": "2026-07-23T10:01:00Z"},
+            },
+        },
+    ]
+
+    config = _config(tmp_path / "state")
+    workers = [
+        _single_worker(config, observation)
+        for observation in observations
+    ]
+    fingerprints = {worker.fingerprint for worker in workers}
+    identities = {(worker.id, _stable(worker)) for worker in workers}
+
+    assert len(fingerprints) == 1
+    assert len(identities) == 1
+    assert workers[2].meta["safe_observation"] == "kept"
+    assert "last_completed_turn" not in workers[1].meta
+    assert "turn_epoch" not in workers[2].meta
+    assert workers[2].meta["nested"] == {}
+
+
 def test_exact_format_version_and_domain_separated_hmac(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

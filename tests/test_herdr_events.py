@@ -359,6 +359,64 @@ def _status_event(status: str) -> dict[str, Any]:
     }
 
 
+def test_status_event_turn_fields_do_not_perturb_worker_fingerprint(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "turn-status-fingerprint")
+    backend.reconcile_once(client=_initial_pane_client())
+    before = backend._workers["Agent One"]
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {
+                "pane_id": "pane-1",
+                "agent": "Agent One",
+                "status": "running",
+                "turn": 12,
+                "turn_epoch": 4,
+            },
+        }
+    )
+
+    after = backend._workers["Agent One"]
+    assert after.fingerprint == before.fingerprint
+    assert after.id == before.id
+    assert after.meta == before.meta
+
+
+def test_worker_fingerprint_stays_stable_across_three_turn_completions(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "consecutive-turn-fingerprint")
+    backend.reconcile_once(client=_initial_pane_client())
+    fingerprints = [backend._workers["Agent One"].fingerprint]
+
+    for number in range(1, 4):
+        assert backend.queue_event_envelope(
+            {
+                "event": "pane.agent_status_changed",
+                "data": {
+                    "pane_id": "pane-1",
+                    "agent": "Agent One",
+                    "status": "running",
+                    "turn": number,
+                    "turn_epoch": number,
+                    "turn_completed_at": f"2026-07-23T10:0{number}:00Z",
+                    "last_completed_turn": {
+                        "number": number,
+                        "epoch": number,
+                        "timestamp": f"2026-07-23T10:0{number}:00Z",
+                    },
+                },
+            }
+        )
+        worker = backend._workers["Agent One"]
+        fingerprints.append(worker.fingerprint)
+
+    assert len(set(fingerprints)) == 1
+
+
 def _write_decision_adapter(tmp_path: Path) -> Path:
     adapter = tmp_path / "fake-herdr-turn-adapter"
     adapter.write_text(
