@@ -850,8 +850,8 @@ def test_submission_first_keeps_observation_authoritative_during_send(
     )
 
     assert accepted.status == STATUS_ACCEPTED
-    assert accepted.result["observed_turn_state"] == "pending_observation"
-    assert accepted.result["turn_id"] is None
+    assert accepted.result["observed_turn_state"] == "complete"
+    assert isinstance(accepted.result["turn_id"], str)
     turns = turns_payload_from_store(
         config.db_path,
         config.host_id,
@@ -859,6 +859,7 @@ def test_submission_first_keeps_observation_authoritative_during_send(
     )["turns"]
     matching = [turn for turn in turns if turn.get("user_text") == "hello"]
     assert len(matching) == 1
+    assert accepted.result["turn_id"] == matching[0]["id"]
     assert matching[0]["assistant_final_text"] == "observed during send"
 
 
