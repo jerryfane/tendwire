@@ -274,12 +274,7 @@ def validate_response(envelope: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a response envelope while tolerating unknown fields."""
     if not is_response(envelope):
         raise HerdrEnvelopeError("Herdr response must contain exactly one of result or error")
-    # Herdr 0.7.5 emits ``{"id":"", "error":...}`` when subscription
-    # parameters fail schema validation.  Preserve that error response so the
-    # caller can take its compatibility fallback; successful responses remain
-    # strictly correlated.
-    if not is_error_response(envelope) or envelope.get("id") != "":
-        _validated_id(envelope)
+    _validated_id(envelope)
     return dict(envelope)
 
 

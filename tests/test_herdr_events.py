@@ -807,6 +807,59 @@ def test_backend_falls_back_to_herdr_074_pane_scoped_event_subscriptions(tmp_pat
     assert {item["pane_id"] for item in subscriptions} == {"pane-private"}
 
 
+def test_backend_empty_installation_falls_back_to_herdr_074_global_subscription(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, "empty-global-fallback")
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(config, debounce_seconds=0, reconnect_delay_seconds=0)
+
+    class EmptyInstallationClient(_StaticClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscriptions: list[tuple[str, dict[str, Any]]] = []
+            self.closed = 0
+            self.connected = 0
+
+        def connect(self) -> None:
+            self.connected += 1
+
+        def close(self) -> None:
+            self.closed += 1
+
+        def subscribe(
+            self,
+            method: str,
+            params: Mapping[str, Any],
+            *,
+            timeout: float | None = None,
+            event_timeout: float | None = None,
+        ) -> Any:
+            copied = (method, {"subscriptions": [dict(item) for item in params["subscriptions"]]})
+            self.subscriptions.append(copied)
+            if any(item.get("type") == "pane.updated" for item in params["subscriptions"]):
+                raise HerdrEnvelopeError("0.7.4 does not know pane.updated")
+            backend.stop_event.set()
+            return SimpleNamespace(subscription_id="empty-global-sub")
+
+    client = EmptyInstallationClient()
+    backend.client_factory = lambda _config: client
+
+    backend.run_forever()
+
+    assert client.closed >= 1
+    assert client.connected >= 1
+    assert len(client.subscriptions) == 2
+    method, params = client.subscriptions[1]
+    assert method == HERDR_EVENTS_SUBSCRIBE_METHOD
+    subscriptions = params["subscriptions"]
+    assert subscriptions
+    assert all(set(item) == {"type"} for item in subscriptions)
+    assert {item["type"] for item in subscriptions} == set(HERDR_OFFICIAL_EVENT_NAMES) - {
+        "pane.updated"
+    }
+
+
 def test_herdr_075_observation_paths_preserve_474_identity_inputs_byte_for_byte(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
