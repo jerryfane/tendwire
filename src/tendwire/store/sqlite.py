@@ -2202,6 +2202,42 @@ _CONNECTOR_POLLABLE_STATUSES = frozenset({"queued", "deferred", "retry"})
 _CONNECTOR_TERMINAL_OUTBOX_STATUS = "delivered"
 _CONNECTOR_EXHAUSTED_OUTBOX_STATUS = "dead_letter"
 _CONNECTOR_SUPERSEDED_OUTBOX_STATUS = "superseded"
+_CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS = 30
+_CONNECTOR_DRAIN_TARGET_SECONDS = 30
+_TURN_FINAL_PUBLIC_REASONS = frozenset(
+    {
+        "backpressure",
+        "content_fetch_failed",
+        "content_known_incomplete",
+        "content_revision_not_found",
+        "delivery_rejected",
+        "delivery_uncertain",
+        "invalid_content_page",
+        "invalid_content_schema",
+        "invalid_pending_plan",
+        "invalid_prepare_response",
+        "invalid_presentation_plan",
+        "invalid_recovery_predecessor_receipt",
+        "invalid_turn_final_job",
+        "missing_message_owner_token",
+        "operation_budget_exhausted",
+        "predecessor_pending",
+        "prepare_failed",
+        "rate_limited",
+        "rejected",
+        "revision_conflict",
+        "stale_or_unavailable_content_revision",
+        "stale_or_unroutable_turn_plan",
+        "stale_ref",
+        "stale_revision",
+        "temporary",
+        "timeout",
+        "transient_delivery",
+        "unavailable",
+        "unroutable_final_ready",
+        "upgrade_required",
+    }
+)
 _CONNECTOR_PUBLIC_OUTBOX_STATUSES = frozenset(
     {
         _CONNECTOR_LEASE_STATUS,
@@ -2238,6 +2274,30 @@ def _connector_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _connector_strict_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _connector_deadline_due(*values: Any, now_dt: datetime) -> bool:
+    """Use the first valid deadline; malformed-only state is already overdue."""
+    for value in values:
+        parsed = _connector_strict_datetime(value)
+        if parsed is not None:
+            return parsed <= now_dt
+    return True
 
 
 def _connector_iso(value: str | datetime) -> str:
@@ -2335,6 +2395,32 @@ def _connector_private_clear_current(raw: Any) -> str:
     return _canonical_json(state)
 
 
+def _connector_ack_retry_state(
+    raw: Any,
+    *,
+    now: str,
+) -> tuple[dict[str, Any], str]:
+    """Record one ACK timeout and return its bounded exponential retry time."""
+    state = _json_object(_connector_private_clear_current(raw))
+    previous = state.get("ack_timeout_count")
+    timeout_count = (
+        int(previous) + 1
+        if (
+            isinstance(previous, int)
+            and not isinstance(previous, bool)
+            and previous >= 0
+        )
+        else 1
+    )
+    state["ack_timeout_count"] = timeout_count
+    state.pop("ack_deadline_at", None)
+    delay_seconds = min(
+        1 << min(timeout_count - 1, 30),
+        _CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS,
+    )
+    return state, _connector_add_seconds(str(now), delay_seconds)
+
+
 def _connector_response(
     *,
     ok: bool,
@@ -2413,7 +2499,7 @@ def _connector_reclaim_expired_leases_conn(
     for delivery_id, outbox_id, delivery_private, outbox_status, outbox_private in rows:
         state = _json_object(delivery_private)
         lease_expires_at = state.get("lease_expires_at")
-        if not lease_expires_at or _connector_datetime(str(lease_expires_at)) > now_dt:
+        if not _connector_deadline_due(lease_expires_at, now_dt=now_dt):
             continue
         conn.execute(
             """
@@ -2491,7 +2577,11 @@ def _connector_reclaim_expired_awaiting_ack_conn(
         params.append(str(name))
     rows = conn.execute(
         f"""
-        SELECT outbox.id, outbox.connector, outbox.private_state_json
+        SELECT
+            outbox.id,
+            outbox.connector,
+            outbox.private_state_json,
+            outbox.next_attempt_at
         FROM connector_outbox AS outbox
         WHERE {" AND ".join(clauses)}
         ORDER BY outbox.id
@@ -2500,9 +2590,9 @@ def _connector_reclaim_expired_awaiting_ack_conn(
     ).fetchall()
     reclaimed = 0
     now_dt = _connector_datetime(now)
-    for outbox_id, connector, private_state_json in rows:
+    for outbox_id, connector, private_state_json, next_attempt_at in rows:
         outbox_state = _json_object(private_state_json)
-        deadline = str(outbox_state.get("ack_deadline_at") or "")
+        deadline = outbox_state.get("ack_deadline_at")
         delivery = conn.execute(
             """
             SELECT id, private_state_json
@@ -2513,11 +2603,19 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             """,
             (int(outbox_id),),
         ).fetchone()
-        if not deadline and delivery is not None:
-            deadline = str(
-                _json_object(delivery[1]).get("ack_deadline_at") or ""
-            )
-        if not deadline or _connector_datetime(deadline) > now_dt:
+        delivery_deadline = (
+            _json_object(delivery[1]).get("ack_deadline_at")
+            if delivery is not None
+            else None
+        )
+        # A legacy/noncanonical awaiting_ack row without a deadline is already
+        # overdue. Every non-terminal state must be swept rather than wedged.
+        if not _connector_deadline_due(
+            deadline,
+            next_attempt_at,
+            delivery_deadline,
+            now_dt=now_dt,
+        ):
             continue
 
         plan = conn.execute(
@@ -2611,19 +2709,21 @@ def _connector_reclaim_expired_awaiting_ack_conn(
                         int(job_outbox_id),
                     ),
                 )
-            source_state = _json_object(
-                _connector_private_clear_current(private_state_json)
+            source_state, retry_at = _connector_ack_retry_state(
+                private_state_json,
+                now=str(now),
             )
             source_state["presentation_generation"] = max(
                 int(source_state.get("presentation_generation") or 1),
                 int(plan[2] or 1) + 1,
             )
-            source_status = "queued"
+            source_status = "retry"
         else:
             source_state = _json_object(
                 _connector_private_clear_current(private_state_json)
             )
             source_status = _CONNECTOR_EXHAUSTED_OUTBOX_STATUS
+            retry_at = None
 
         if delivery is not None:
             conn.execute(
@@ -2656,7 +2756,7 @@ def _connector_reclaim_expired_awaiting_ack_conn(
             """,
             (
                 source_status,
-                str(now) if source_status == "queued" else None,
+                retry_at,
                 str(now),
                 _canonical_json(source_state),
                 int(outbox_id),
@@ -2693,12 +2793,10 @@ def _connector_plan_has_live_job_lease_conn(
         (int(plan_id),),
     ).fetchall()
     return any(
-        (
-            lease_expires_at := str(
-                _json_object(row[0]).get("lease_expires_at") or ""
-            )
+        not _connector_deadline_due(
+            _json_object(row[0]).get("lease_expires_at"),
+            now_dt=now_dt,
         )
-        and _connector_datetime(lease_expires_at) > now_dt
         for row in live_job_leases
     )
 
@@ -2805,16 +2903,15 @@ def connector_reclaim_due(
             params,
         ).fetchall()
         for (private_state_json,) in lease_rows:
-            expires_at = str(
-                _json_object(private_state_json).get("lease_expires_at") or ""
-            )
-            if expires_at and _connector_datetime(expires_at) <= now_dt:
+            expires_at = _json_object(private_state_json).get("lease_expires_at")
+            if _connector_deadline_due(expires_at, now_dt=now_dt):
                 return True
         awaiting_rows = conn.execute(
             f"""
             SELECT
                 outbox.id,
                 outbox.private_state_json,
+                outbox.next_attempt_at,
                 (
                     SELECT deliveries.private_state_json
                     FROM connector_deliveries AS deliveries
@@ -2828,15 +2925,18 @@ def connector_reclaim_due(
             """,
             params,
         ).fetchall()
-        for outbox_id, outbox_private, delivery_private in awaiting_rows:
-            deadline = str(
-                _json_object(outbox_private).get("ack_deadline_at") or ""
-            )
-            if not deadline:
-                deadline = str(
-                    _json_object(delivery_private).get("ack_deadline_at") or ""
-                )
-            if not deadline or _connector_datetime(deadline) > now_dt:
+        for (
+            outbox_id,
+            outbox_private,
+            next_attempt_at,
+            delivery_private,
+        ) in awaiting_rows:
+            if not _connector_deadline_due(
+                _json_object(outbox_private).get("ack_deadline_at"),
+                next_attempt_at,
+                _json_object(delivery_private).get("ack_deadline_at"),
+                now_dt=now_dt,
+            ):
                 continue
             plan = conn.execute(
                 """
@@ -4938,11 +5038,13 @@ def _update_presentation_plan_after_outbox_conn(
                     conn.execute(
                         """
                         UPDATE connector_outbox
-                        SET private_state_json = ?, updated_at = ?
+                        SET private_state_json = ?, next_attempt_at = ?,
+                            updated_at = ?
                         WHERE id = ? AND status = 'awaiting_ack'
                         """,
                         (
                             _canonical_json(source_state),
+                            deadline,
                             str(now),
                             source_outbox_id,
                         ),
@@ -5590,12 +5692,13 @@ def prepare_connector_plan_commit(
                     """
                     UPDATE connector_outbox
                     SET status = 'awaiting_ack',
-                        next_attempt_at = NULL,
+                        next_attempt_at = ?,
                         updated_at = ?,
                         private_state_json = ?
                     WHERE id = ? AND status = 'leased'
                     """,
                     (
+                        ack_deadline_at,
                         current_time,
                         _canonical_json(next_source_state),
                         source_outbox_id,
@@ -6210,7 +6313,8 @@ def poll_connector_outbox(
                   AND (
                       outbox.next_attempt_at IS NULL
                       OR outbox.next_attempt_at = ''
-                      OR outbox.next_attempt_at <= ?
+                      OR julianday(outbox.next_attempt_at) IS NULL
+                      OR julianday(outbox.next_attempt_at) <= julianday(?)
                   )
                   AND (
                       outbox.delivery_kind != 'final_ready'
@@ -6536,8 +6640,11 @@ def _connector_validate_live_ref_conn(
             return row, "stale_ref"
         if str(row[8] or "") != _CONNECTOR_LEASE_STATUS:
             return row, "stale_ref"
-        lease_expires_at = str(delivery_state.get("lease_expires_at") or "")
-        if not lease_expires_at or _connector_datetime(lease_expires_at) <= _connector_datetime(now):
+        lease_expires_at = delivery_state.get("lease_expires_at")
+        if _connector_deadline_due(
+            lease_expires_at,
+            now_dt=_connector_datetime(now),
+        ):
             return row, "expired_ref"
         return row, None
     return None, "invalid_ref"
@@ -6747,14 +6854,7 @@ def _connector_update_ref(
     sanitized_reason = (
         _store_public_label(
             reason,
-            allowed={
-                "backpressure",
-                "rate_limited",
-                "rejected",
-                "temporary",
-                "timeout",
-                "unavailable",
-            },
+            allowed=_TURN_FINAL_PUBLIC_REASONS,
         )
         if str(name) == _TURN_FINAL_NAME
         else _connector_public_reason(reason)
@@ -7633,6 +7733,51 @@ def inspect_connector_outbox(
                 max(0, bounded_limit - len(rows)),
             ),
         ).fetchall()
+        classification_rows = conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN jobs.id IS NOT NULL THEN 'failed_plan_job'
+                    WHEN outbox.delivery_kind = 'final_ready'
+                        THEN 'final_anchor'
+                    WHEN outbox.delivery_kind = 'final_migration_hold'
+                        THEN 'migration_hold'
+                    ELSE 'other'
+                END,
+                COALESCE(
+                    CASE
+                        WHEN json_valid(deliveries.response_json)
+                        THEN json_extract(deliveries.response_json, '$.status')
+                    END,
+                    'missing'
+                ),
+                COALESCE(
+                    CASE
+                        WHEN json_valid(deliveries.response_json)
+                        THEN json_extract(deliveries.response_json, '$.reason')
+                    END,
+                    'missing'
+                ),
+                COUNT(*)
+            FROM connector_outbox AS outbox
+            LEFT JOIN turn_presentation_jobs AS jobs
+              ON jobs.outbox_id = outbox.id
+            LEFT JOIN connector_deliveries AS deliveries
+              ON deliveries.id = (
+                  SELECT latest.id
+                  FROM connector_deliveries AS latest
+                  WHERE latest.outbox_id = outbox.id
+                  ORDER BY latest.id DESC
+                  LIMIT 1
+              )
+            WHERE outbox.host_id = ?
+              AND outbox.connector = ?
+              AND outbox.status = 'dead_letter'
+            GROUP BY 1, 2, 3
+            ORDER BY COUNT(*) DESC, 1, 2, 3
+            """,
+            (str(host_id), str(name)),
+        ).fetchall()
         total = anchor_total + failed_total
     items: list[dict[str, Any]] = []
     for (
@@ -7710,6 +7855,50 @@ def inspect_connector_outbox(
                 "attempt_count": _bounded_connector_attempt_count(attempt_count),
             }
         )
+    classifications: list[dict[str, Any]] = []
+    classification_statuses = {
+        "ack_deadline_expired",
+        "attempts_exhausted",
+        "deferred",
+        "expired",
+        "missing",
+        "plan_unrecoverable",
+        "retry_scheduled",
+    }
+    classification_reasons = {*_TURN_FINAL_PUBLIC_REASONS, "missing", "unknown"}
+    for kind_value, status_value, reason_value, count_value in classification_rows:
+        kind = _store_public_label(
+            kind_value,
+            allowed={
+                "failed_plan_job",
+                "final_anchor",
+                "migration_hold",
+                "other",
+            },
+        )
+        recovery = (
+            "source_retry"
+            if kind == "failed_plan_job"
+            else "exact_key"
+            if kind in {"final_anchor", "migration_hold"}
+            else "none"
+        )
+        classifications.append(
+            {
+                "kind": kind,
+                "last_status": _store_public_label(
+                    status_value,
+                    allowed=classification_statuses,
+                ),
+                "last_reason": _store_public_label(
+                    reason_value,
+                    allowed=classification_reasons,
+                ),
+                "count": max(0, int(count_value or 0)),
+                "recovery": recovery,
+            }
+        )
+    dead_letter_rows = sum(item["count"] for item in classifications)
     result = dict(
         sanitize_public_value(
             {
@@ -7720,6 +7909,8 @@ def inspect_connector_outbox(
                 "name": str(name),
                 "filter_status": str(status),
                 "total": total,
+                "dead_letter_rows": dead_letter_rows,
+                "classifications": classifications,
                 "items": items,
             }
         )
@@ -12294,8 +12485,12 @@ def _migrate_v15_to_v16_conn(
         state = _json_object(private_state_json)
         state["ack_deadline_at"] = deadline
         conn.execute(
-            "UPDATE connector_outbox SET private_state_json = ? WHERE id = ?",
-            (_canonical_json(state), int(outbox_id)),
+            """
+            UPDATE connector_outbox
+            SET private_state_json = ?, next_attempt_at = ?
+            WHERE id = ?
+            """,
+            (_canonical_json(state), deadline, int(outbox_id)),
         )
         delivery_rows = (
             conn.execute(
@@ -13438,6 +13633,11 @@ def store_status(
                 "leased": 0,
                 "completed": 0,
                 "by_status": {},
+                "due": 0,
+                "oldest_due_at": None,
+                "overdue_awaiting_ack": 0,
+                "drain_target_seconds": _CONNECTOR_DRAIN_TARGET_SECONDS,
+                "starved": False,
             },
             "final_retention": final_retention_empty,
             "command_requests": command_requests_empty,
@@ -13505,6 +13705,75 @@ def store_status(
                 """,
                 (str(host_id),),
             ).fetchall()
+            drain_now = utc_timestamp()
+            due_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    MIN(
+                        CASE
+                            WHEN next_attempt_at IS NOT NULL
+                             AND next_attempt_at != ''
+                             AND julianday(next_attempt_at) IS NOT NULL
+                             AND julianday(next_attempt_at) > julianday(created_at)
+                            THEN next_attempt_at
+                            ELSE created_at
+                        END
+                    )
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND status IN ('queued', 'deferred', 'retry')
+                  AND (
+                      next_attempt_at IS NULL
+                      OR next_attempt_at = ''
+                      OR julianday(next_attempt_at) IS NULL
+                      OR julianday(next_attempt_at) <= julianday(?)
+                  )
+                """,
+                (str(host_id), drain_now),
+            ).fetchone()
+            overdue_ack_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM connector_outbox
+                WHERE host_id = ?
+                  AND status = 'awaiting_ack'
+                  AND COALESCE(
+                      CASE
+                          WHEN json_valid(
+                              connector_outbox.private_state_json
+                          )
+                          THEN julianday(
+                              json_extract(
+                                  connector_outbox.private_state_json,
+                                  '$.ack_deadline_at'
+                              )
+                          )
+                      END,
+                      julianday(connector_outbox.next_attempt_at),
+                      (
+                          SELECT CASE
+                              WHEN json_valid(
+                                  deliveries.private_state_json
+                              )
+                              THEN julianday(
+                                  json_extract(
+                                      deliveries.private_state_json,
+                                      '$.ack_deadline_at'
+                                  )
+                              )
+                          END
+                          FROM connector_deliveries AS deliveries
+                          WHERE deliveries.outbox_id = connector_outbox.id
+                            AND deliveries.status = 'awaiting_ack'
+                          ORDER BY deliveries.id DESC
+                          LIMIT 1
+                      ),
+                      -1
+                  ) <= julianday(?)
+                """,
+                (str(host_id), drain_now),
+            ).fetchone()
             maintenance_row = conn.execute(
                 """
                 SELECT last_completed_at, last_status
@@ -13570,6 +13839,16 @@ def store_status(
             count for status, count in by_status.items() if status in terminal_statuses
         ),
         "by_status": by_status,
+        "due": int(due_row[0] or 0),
+        "oldest_due_at": _strict_utc_timestamp(due_row[1]),
+        "overdue_awaiting_ack": int(overdue_ack_row[0] or 0),
+        "drain_target_seconds": _CONNECTOR_DRAIN_TARGET_SECONDS,
+        "starved": bool(
+            due_row[1] is not None
+            and _connector_datetime(str(due_row[1]))
+            <= _connector_datetime(drain_now)
+            - timedelta(seconds=_CONNECTOR_DRAIN_TARGET_SECONDS)
+        ),
     }
     maintenance = {
         **maintenance_empty,

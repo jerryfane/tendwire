@@ -8294,7 +8294,12 @@ def test_turn_content_maintenance_preserves_live_and_young_final_sources(
 
     assert result["turn_content"]["examined"] == 0
     assert result["turn_content"]["deleted"] == 0
-    assert preserved == (source_status,)
+    expected_status = (
+        "dead_letter"
+        if source_status == "awaiting_ack" and attempt_status is None
+        else source_status
+    )
+    assert preserved == (expected_status,)
     assert attempt_count == int(attempt_status is not None)
     assert integrity == "ok"
 
