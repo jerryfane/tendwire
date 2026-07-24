@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2240,7 +2241,7 @@ def test_store_maintenance_bounds_herdr_completions_and_drops_dead_watermarks(
     assert result["ok"] is True
     assert result["herdr_turns"]["deleted_completions"] == 3
     assert result["herdr_turns"]["deleted_watermarks"] == 1
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         assert conn.execute(
             """
             SELECT turn
@@ -2355,7 +2356,7 @@ def test_herdr_turn_maintenance_reports_watermark_deferred_by_full_batch(
     assert second["deleted_completions"] == 0
     assert second["deleted_watermarks"] == 1
     assert second["remaining_candidates"] is False
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         assert conn.execute(
             """
             SELECT turn
@@ -2374,6 +2375,62 @@ def test_herdr_turn_maintenance_reports_watermark_deferred_by_full_batch(
             """,
             (host_id,),
         ).fetchall() == [(active_pane,)]
+
+
+def test_herdr_turn_maintenance_low_count_preserves_fresh_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "herdr-turn-fresh-count-floor.db"
+    init_store(db_path)
+    host_id = "herdr-fresh-retention-host"
+    pane_id = "workspace:pFresh"
+    store_sqlite.set_herdr_turn_watermark(
+        db_path,
+        host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+        observed_at="2026-03-14T00:00:00+00:00",
+    )
+    for turn in range(1, 4):
+        store_sqlite.record_herdr_turn_completion(
+            db_path,
+            host_id,
+            pane_id,
+            turn_epoch=7,
+            turn=turn,
+            outcome="completed",
+            completed_unix_ms=turn,
+            message=None,
+            message_truncated=False,
+            agent_session_path=None,
+            worker_id="fresh-worker",
+            refreshed_turn_id=None,
+            observed_at=f"2026-03-14T00:00:0{turn}+00:00",
+        )
+
+    result = store_sqlite.cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=30,
+        retention_count=1,
+        batch_size=100,
+        now="2026-03-15T00:00:00+00:00",
+    )
+
+    assert result["deleted_completions"] == 0
+    assert result["deleted_watermarks"] == 0
+    assert result["remaining_candidates"] is False
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        assert conn.execute(
+            """
+            SELECT turn
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            ORDER BY turn
+            """,
+            (host_id, pane_id),
+        ).fetchall() == [(1,), (2,), (3,)]
 
 
 def test_exhaust_connector_retries_reclaims_expired_leases_before_dead_letter(tmp_path: Path) -> None:

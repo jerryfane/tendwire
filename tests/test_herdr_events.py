@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -5685,7 +5686,7 @@ def test_turn_completion_late_attaches_final_after_idle_event_wins_race(
             "json",
         ]
     ]
-    with sqlite3.connect(str(backend.db_path)) as conn:
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
         completion = conn.execute(
             """
             SELECT turn, refreshed_turn_id
@@ -5778,7 +5779,7 @@ def test_default_completion_processor_nonterminal_status_advances_with_diagnosti
     assert backend.operational_status["turn_completion_diagnostics"] == {
         f"herdr_turn_completion_refresh_skipped:{refresh_status}": 1
     }
-    with sqlite3.connect(str(backend.db_path)) as conn:
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
         assert conn.execute(
             """
             SELECT turn, refreshed_turn_id

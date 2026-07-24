@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
@@ -368,7 +369,7 @@ def test_outbox_health_ages_retry_from_due_time_and_respects_private_ack_deadlin
         lambda: current[0].isoformat(),
     )
     _enqueue(db_path, key="retry-due-now", status="retry")
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute(
             """
             UPDATE connector_outbox
@@ -438,7 +439,7 @@ def test_retry_with_malformed_availability_is_due_and_pollable(
     current = datetime(2026, 1, 2, tzinfo=timezone.utc)
     monkeypatch.setattr(store_sqlite, "utc_timestamp", lambda: current.isoformat())
     _enqueue(db_path, key="retry-malformed-availability", status="retry")
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute(
             """
             UPDATE connector_outbox
@@ -493,7 +494,7 @@ def test_noncanonical_lease_deadline_is_reclaimed_instead_of_wedging(
     _enqueue(db_path)
     api = ConnectorOutboxAPI(db_path, "host-a")
     first = api.poll({"name": "attention", "lease_seconds": 60})["items"][0]
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         if lease_expiry is None:
             conn.execute(
                 """
@@ -2977,7 +2978,7 @@ def test_restart_orphaned_awaiting_ack_retries_same_dedup_key_and_preserves_fifo
             "source_ref": source["ref"],
         }
     )
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         ordering_key = conn.execute(
             "SELECT ordering_key FROM connector_outbox WHERE id = ?",
             (source_id,),
