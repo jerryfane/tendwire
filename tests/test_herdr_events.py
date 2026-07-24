@@ -140,7 +140,7 @@ def _persisted_event_effect_counts(backend: HerdrEventBackend) -> dict[str, int]
 
 
 def _attention_lifecycle_rows(backend: HerdrEventBackend) -> tuple[tuple[Any, ...], ...]:
-    with sqlite3.connect(str(backend.db_path)) as conn:
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
         return tuple(
             conn.execute(
                 """
@@ -165,7 +165,7 @@ def _attention_lifecycle_rows(backend: HerdrEventBackend) -> tuple[tuple[Any, ..
 
 
 def _attention_event_types(backend: HerdrEventBackend) -> list[str]:
-    with sqlite3.connect(str(backend.db_path)) as conn:
+    with closing(sqlite3.connect(str(backend.db_path))) as conn, conn:
         rows = conn.execute(
             """
             SELECT payload_json

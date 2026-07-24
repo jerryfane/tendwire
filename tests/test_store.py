@@ -348,7 +348,7 @@ def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
     state_dir.mkdir()
     os.chmod(state_dir, 0o755)
     db_path = state_dir / "tendwire.db"
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute("CREATE TABLE preserved (value TEXT NOT NULL)")
         conn.execute("INSERT INTO preserved (value) VALUES ('kept')")
     conn.close()
@@ -357,7 +357,7 @@ def test_store_startup_repairs_broad_modes_idempotently_and_preserves_data(
 
     init_store(db_path)
     first_modes = (_mode(state_dir), _mode(db_path))
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         first_value = conn.execute("SELECT value FROM preserved").fetchone()[0]
         first_version = _user_version(conn)
     conn.close()
