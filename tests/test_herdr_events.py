@@ -5484,7 +5484,7 @@ def test_turn_api_absent_preserves_old_subscription_negotiation(tmp_path: Path) 
     ) is None
 
 
-def test_turn_api_replay_subscribes_and_persists_ordered_completions(
+def test_turn_api_first_connect_baselines_full_ring_without_processing(
     tmp_path: Path,
 ) -> None:
     processed: list[str] = []
@@ -5514,7 +5514,7 @@ def test_turn_api_replay_subscribes_and_persists_ordered_completions(
                 "turns": {
                     "pane_id": _turn_api_pane()["pane_id"],
                     "turn_epoch": 7,
-                    "records": [_turn_record(1), _turn_record(2)],
+                    "records": [_turn_record(turn) for turn in range(1, 65)],
                     "truncated": False,
                     "oldest_available": 1,
                 },
@@ -5533,17 +5533,15 @@ def test_turn_api_replay_subscribes_and_persists_ordered_completions(
     backend._replay_turns_after_reconcile(client)
     backend._subscribe_event_stream(client)
 
-    assert processed == [_turn_api_pane()["pane_id"]] * 2
-    assert len(binding_hints) == 2
-    assert all(binding_hints)
-    assert len(set(binding_hints)) == 1
+    assert processed == []
+    assert binding_hints == []
     watermark = get_herdr_turn_watermark(
         backend.db_path,
         backend.config.host_id,
         _turn_api_pane()["pane_id"],
     )
     assert watermark is not None
-    assert (watermark.turn_epoch, watermark.last_turn) == (7, 2)
+    assert (watermark.turn_epoch, watermark.last_turn) == (7, 64)
     assert watermark.completeness_break_count == 0
     assert {
         "type": "pane.turn_completed",
@@ -5558,10 +5556,502 @@ def test_turn_api_replay_subscribes_and_persists_ordered_completions(
             ORDER BY turn
             """,
             (backend.config.host_id,),
-        ).fetchall() == [
-            (1, "completed", "public-turn-1"),
-            (2, "completed", "public-turn-2"),
+        ).fetchall() == []
+
+
+def test_turn_completion_late_attaches_final_after_idle_event_wins_race(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(
+        host_id="turn-api-content-race",
+        data_dir=tmp_path,
+        db_path=tmp_path / "turn-api-content-race.db",
+        herdr_backend="socket",
+        herdr_bin="turn-adapter",
+        herdr_timeout_seconds=0.5,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    working_pane = {
+        **_turn_api_pane(),
+        "agent_status": "working",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[working_pane],
+        )
+    )
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+
+    # Reproduce the production ordering: the status stream closes the public
+    # projection first, before any semantic adapter read has run.
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {
+                **working_pane,
+                "agent_status": "idle",
+            },
+        }
+    )
+    idle_snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert idle_snapshot is not None
+    idle_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=idle_snapshot,
+    )
+    assert idle_snapshot.workers[0].status == "idle"
+    assert not any(
+        turn.get("assistant_final_text") for turn in idle_payload["turns"]
+    )
+
+    adapter_calls: list[list[str]] = []
+    final_payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": "reply with purple elephant 42",
+                "assistant_final_text": "purple elephant 42",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "event-close-race-turn",
+            }
+        }
+    }
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        adapter_calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(final_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
+    backend._turn_api_supported = True
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {
+                "pane": {
+                    **working_pane,
+                    "agent_status": "idle",
+                },
+                **_turn_record(1),
+            },
+        }
+    )
+
+    completed_snapshot = latest_snapshot(
+        backend.db_path,
+        backend.config.host_id,
+    )
+    assert completed_snapshot is not None
+    captured_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=completed_snapshot,
+    )
+    captured = next(
+        turn
+        for turn in captured_payload["turns"]
+        if turn.get("assistant_final_text") == "purple elephant 42"
+    )
+    assert captured["status"] == "idle"
+    assert captured["complete"] is True
+    assert adapter_calls == [
+        [
+            "turn-adapter",
+            "pane",
+            "turn",
+            pane_id,
+            "--last",
+            "--format",
+            "json",
         ]
+    ]
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        completion = conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchone()
+    assert completion == (1, captured["id"])
+
+
+@pytest.mark.parametrize(
+    "refresh_status",
+    [
+        "timeout",
+        "failed",
+        "stale_binding",
+        "binding_missing",
+        "binding_ambiguous",
+        "store_unavailable",
+    ],
+)
+def test_default_completion_processor_nonterminal_status_advances_with_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refresh_status: str,
+) -> None:
+    backend = _backend(tmp_path, f"default-composition-{refresh_status}")
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[_turn_api_pane()],
+        )
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    bindings = list_worker_bindings(
+        backend.db_path,
+        backend.config.host_id,
+        backend="herdr",
+    )
+    assert len(bindings) == 1
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+
+    if refresh_status in {"timeout", "failed", "stale_binding"}:
+        monkeypatch.setattr(
+            herdr_turns,
+            "_refresh_turn_binding",
+            lambda *_args, **_kwargs: herdr_turns.TurnRefreshResult(
+                refresh_status,
+                0,
+            ),
+        )
+    elif refresh_status == "binding_missing":
+        monkeypatch.setattr(
+            herdr_turns,
+            "list_worker_bindings",
+            lambda *_args, **_kwargs: [],
+        )
+    elif refresh_status == "binding_ambiguous":
+        monkeypatch.setattr(
+            herdr_turns,
+            "list_worker_bindings",
+            lambda *_args, **_kwargs: [bindings[0], bindings[0]],
+        )
+    else:
+        def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(herdr_turns, "list_worker_bindings", unavailable)
+
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {"pane": _turn_api_pane(), **_turn_record(1)},
+        }
+    )
+
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None and watermark.last_turn == 1
+    assert backend.operational_status["turn_completion_diagnostics"] == {
+        f"herdr_turn_completion_refresh_skipped:{refresh_status}": 1
+    }
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchall() == [(1, None)]
+
+
+def test_replay_timeout_on_one_pane_does_not_block_other_panes_or_subscribe(
+    tmp_path: Path,
+) -> None:
+    pane_a = _turn_api_pane()
+    pane_b = {
+        **_turn_api_pane(),
+        "pane_id": "w123456789abcde:pB",
+        "terminal_id": "terminal-turn-api-b",
+        "agent": "codex",
+    }
+    processed: list[str] = []
+
+    def process(_config: Config, pane_id: str, **_kwargs: Any) -> Any:
+        processed.append(pane_id)
+        return SimpleNamespace(
+            status="timeout" if pane_id == pane_a["pane_id"] else "updated",
+            worker_id=pane_id,
+            refreshed_turn_id=f"public-{pane_id}",
+        )
+
+    backend = _backend(tmp_path, "turn-api-pane-timeout")
+    backend.turn_completion_processor = process
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[pane_a, pane_b],
+        )
+    )
+    for pane in (pane_a, pane_b):
+        set_herdr_turn_watermark(
+            backend.db_path,
+            backend.config.host_id,
+            pane["pane_id"],
+            turn_epoch=7,
+            last_turn=0,
+        )
+
+    class Client:
+        subscriptions: list[dict[str, Any]] = []
+
+        def pane_turns(self, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            pane_id = str(params["pane_id"])
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": [{**_turn_record(1), "pane_id": pane_id}],
+                    "truncated": False,
+                    "oldest_available": 1,
+                }
+            }
+
+        def subscribe(
+            self,
+            _method: str,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            self.subscriptions.append(dict(params))
+            return SimpleNamespace(subscription_id="healthy")
+
+    client = Client()
+    backend._replay_turns_after_reconcile(client)
+    backend._subscribe_event_stream(client)
+
+    assert set(processed) == {pane_a["pane_id"], pane_b["pane_id"]}
+    assert len(client.subscriptions) == 1
+    for pane in (pane_a, pane_b):
+        watermark = get_herdr_turn_watermark(
+            backend.db_path,
+            backend.config.host_id,
+            pane["pane_id"],
+        )
+        assert watermark is not None and watermark.last_turn == 1
+
+
+def test_first_probe_pane_not_found_skips_only_that_pane(tmp_path: Path) -> None:
+    pane_a = _turn_api_pane()
+    pane_b = {
+        **_turn_api_pane(),
+        "pane_id": "w123456789abcde:pB",
+        "terminal_id": "terminal-turn-api-b",
+        "agent": "codex",
+    }
+    processed: list[str] = []
+    backend = _backend(tmp_path, "turn-api-probe-pane-missing")
+    backend.turn_completion_processor = (
+        lambda _config, pane_id, **_kwargs: (
+            processed.append(pane_id) or SimpleNamespace(status="unchanged")
+        )
+    )
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[pane_a, pane_b],
+        )
+    )
+    for pane in (pane_a, pane_b):
+        set_herdr_turn_watermark(
+            backend.db_path,
+            backend.config.host_id,
+            pane["pane_id"],
+            turn_epoch=7,
+            last_turn=0,
+        )
+
+    class Client:
+        subscriptions: list[dict[str, Any]] = []
+
+        def pane_turns(self, params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            pane_id = str(params["pane_id"])
+            if pane_id == pane_a["pane_id"]:
+                raise HerdrErrorResponse(
+                    {"code": "pane_not_found", "message": "pane disappeared"},
+                    "probe",
+                )
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": [{**_turn_record(1), "pane_id": pane_id}],
+                    "truncated": False,
+                    "oldest_available": 1,
+                }
+            }
+
+        def subscribe(
+            self,
+            _method: str,
+            params: Mapping[str, Any],
+            **_kwargs: Any,
+        ) -> Any:
+            self.subscriptions.append(dict(params))
+            return SimpleNamespace(subscription_id="new")
+
+    client = Client()
+    backend._replay_turns_after_reconcile(client)
+    backend._subscribe_event_stream(client)
+
+    assert backend._turn_api_supported is True
+    assert processed == [pane_b["pane_id"]]
+    assert len(client.subscriptions) == 1
+    assert {
+        "type": "pane.turn_completed",
+        "pane_id": pane_b["pane_id"],
+    } in client.subscriptions[0]["subscriptions"]
+
+
+def test_malformed_completion_is_quarantined_without_poisoning_batch(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path, "turn-api-malformed-batch", debounce_seconds=1)
+    backend.reconcile_once(client=_initial_pane_client())
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {
+                "pane_id": "pane-1",
+                "turn": "not-an-integer",
+                "turn_epoch": 7,
+                "outcome": "completed",
+                "completed_unix_ms": 1,
+            },
+        },
+        flush=False,
+    )
+    assert backend.queue_event_envelope(_status_event("idle"), flush=False)
+
+    backend.flush()
+
+    snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert snapshot is not None
+    assert snapshot.workers[0].status == "idle"
+    assert backend.health.outcome != "protocol_error"
+    assert backend.operational_status["turn_completion_diagnostics"] == {
+        "herdr_turn_completion_record_quarantined": 1
+    }
+
+
+def test_replay_gap_inside_records_records_break_without_processing(
+    tmp_path: Path,
+) -> None:
+    processed: list[str] = []
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-interior-gap",
+        lambda _config, pane_id, **_kwargs: (
+            processed.append(pane_id) or SimpleNamespace(status="updated")
+        ),
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=2,
+    )
+
+    class GapClient:
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            return {
+                "turns": {
+                    "pane_id": pane_id,
+                    "turn_epoch": 7,
+                    "records": [_turn_record(3), _turn_record(5)],
+                    "truncated": False,
+                    "oldest_available": 3,
+                }
+            }
+
+    backend._replay_turns_after_reconcile(GapClient())
+
+    assert processed == []
+    watermark = get_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+    )
+    assert watermark is not None
+    assert watermark.last_turn == 5
+    assert watermark.last_completeness_break_reason == "replay_gap"
+
+
+def test_optional_signature_fallback_never_double_invokes_typeerror(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def broken_processor(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise TypeError("processor body failed")
+
+    backend = _turn_api_backend(
+        tmp_path,
+        "turn-api-no-double-invoke",
+        broken_processor,
+    )
+    with pytest.raises(TypeError, match="processor body failed"):
+        backend._completion_processor_result(
+            herdr_events._turn_completion_record(
+                {"pane_id": _turn_api_pane()["pane_id"], **_turn_record(1)}
+            )
+        )
+    assert calls == 1
+
+    pane_calls = 0
+
+    class BrokenClient:
+        def pane_turns(self, _params: Mapping[str, Any], **_kwargs: Any) -> Any:
+            nonlocal pane_calls
+            pane_calls += 1
+            raise TypeError("pane.turns body failed")
+
+    with pytest.raises(TypeError, match="pane.turns body failed"):
+        backend._call_pane_turns(
+            BrokenClient(),
+            _turn_api_pane()["pane_id"],
+            since=0,
+            expected_epoch=None,
+        )
+    assert pane_calls == 1
 
 
 def test_turn_api_run_loop_closes_probe_to_subscribe_completion_race(

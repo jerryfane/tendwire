@@ -138,6 +138,9 @@ _LEGACY_TURN_CLAIM_HARD_TTL_SECONDS = 86_400
 TURN_CHANGE_RETENTION_DAYS = 7
 TURN_CHANGE_RETENTION_COUNT = 100_000
 TURN_CHANGE_COMPACTION_BATCH_SIZE = 1_000
+HERDR_TURN_RETENTION_DAYS = 30
+HERDR_TURN_RETENTION_COUNT = 4096
+HERDR_TURN_RETENTION_BATCH_SIZE = 100
 TURN_SUBMISSION_OBSERVATION_ADOPTION_WINDOW_SECONDS = 60.0
 SUBMISSION_LINK_WINDOW_SECONDS = DEFAULT_SUBMISSION_LINK_WINDOW_SECONDS
 SUBMISSION_HARD_TTL_SECONDS = DEFAULT_SUBMISSION_HARD_TTL_SECONDS
@@ -15804,6 +15807,16 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
+    empty_herdr_turns = {
+        "examined": 0,
+        "deleted": 0,
+        "deleted_completions": 0,
+        "deleted_watermarks": 0,
+        "remaining_candidates": False,
+        "retention_days": policy.retention_days,
+        "retention_count": policy.retention_count,
+        "batch_size": policy.batch_size,
+    }
     if not _sqlite_store_exists(db_path):
         return dict(sanitize_public_value({
             "schema_version": 1,
@@ -15829,6 +15842,7 @@ def maybe_run_automatic_store_maintenance(
                 ),
             },
             "command_requests": empty_command_requests,
+            "herdr_turns": empty_herdr_turns,
             "batch_size": policy.batch_size,
         }))
     cutoff_at = _utc_cutoff(retention_days=policy.retention_days, now=current_at)
@@ -15885,6 +15899,7 @@ def maybe_run_automatic_store_maintenance(
                         ),
                     },
                     "command_requests": empty_command_requests,
+                    "herdr_turns": empty_herdr_turns,
                     "batch_size": policy.batch_size,
                 }))
             if _submission_linking_enabled(turn_model):
@@ -16018,10 +16033,25 @@ def maybe_run_automatic_store_maintenance(
         retention_count=command_receipt_retention_count,
         batch_size=policy.batch_size,
     )
+    herdr_turns = cleanup_herdr_turn_retention(
+        db_path,
+        retention_days=policy.retention_days,
+        retention_count=policy.retention_count,
+        batch_size=policy.batch_size,
+        now=current_at,
+    )
     return dict(sanitize_public_value({
         "schema_version": 1,
-        "ok": bool(command_requests["ok"]),
-        "status": "ok" if command_requests["ok"] else command_requests["status"],
+        "ok": bool(command_requests["ok"]) and bool(herdr_turns["ok"]),
+        "status": (
+            "ok"
+            if command_requests["ok"] and herdr_turns["ok"]
+            else (
+                command_requests["status"]
+                if not command_requests["ok"]
+                else herdr_turns["status"]
+            )
+        ),
         "due": True,
         "last_completed_at": current_at,
         "next_due_at": _connector_add_seconds(current_at, cadence_seconds),
@@ -16042,6 +16072,7 @@ def maybe_run_automatic_store_maintenance(
             ),
         },
         "command_requests": command_requests,
+        "herdr_turns": herdr_turns,
         "batch_size": policy.batch_size,
     }))
 
@@ -17451,6 +17482,165 @@ def compact_turn_change_journal(
     }
 
 
+def cleanup_herdr_turn_retention(
+    db_path: Path | str,
+    *,
+    host_id: str | None = None,
+    retention_days: int = HERDR_TURN_RETENTION_DAYS,
+    retention_count: int = HERDR_TURN_RETENTION_COUNT,
+    batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
+    now: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Bound completion provenance and remove old watermarks for dead panes."""
+    days = max(1, min(int(retention_days), _MAX_RETENTION_DAYS))
+    count = max(1, min(int(retention_count), _SQLITE_MAX_INTEGER))
+    bounded_batch = max(1, min(int(batch_size), 1_000))
+    current_at = _connector_now(now)
+    cutoff_at = _utc_cutoff(retention_days=days, now=current_at)
+    base = {
+        "schema_version": 1,
+        "ok": False,
+        "status": "store_unavailable",
+        "scope": "host" if host_id is not None else "database",
+        "host_id": str(host_id) if host_id is not None else None,
+        "dry_run": bool(dry_run),
+        "retention_days": days,
+        "retention_count": count,
+        "cutoff_at": cutoff_at,
+        "batch_size": bounded_batch,
+    }
+    if not _sqlite_store_exists(db_path):
+        return dict(sanitize_public_value({
+            **base,
+            "examined": 0,
+            "deleted": 0,
+            "deleted_completions": 0,
+            "deleted_watermarks": 0,
+            "remaining_candidates": False,
+        }))
+    host_clause = "AND host_id = :host_id" if host_id is not None else ""
+    watermark_host_clause = (
+        "AND watermarks.host_id = :host_id" if host_id is not None else ""
+    )
+    params: dict[str, Any] = {
+        "host_id": str(host_id) if host_id is not None else "",
+        "cutoff_at": cutoff_at,
+        "current_at": current_at,
+        "retention_count": count,
+        "limit": bounded_batch + 1,
+    }
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            completion_pool = [
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    WITH ranked AS (
+                        SELECT
+                            rowid AS completion_rowid,
+                            observed_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY host_id
+                                ORDER BY observed_at DESC, rowid DESC
+                            ) AS retention_rank
+                        FROM herdr_turn_completions
+                        WHERE 1 = 1 {host_clause}
+                    )
+                    SELECT completion_rowid
+                    FROM ranked
+                    WHERE observed_at < :cutoff_at
+                      AND retention_rank > :retention_count
+                    ORDER BY observed_at, completion_rowid
+                    LIMIT :limit
+                    """,
+                    params,
+                ).fetchall()
+            ]
+            completion_ids = completion_pool[:bounded_batch]
+            remaining_budget = bounded_batch - len(completion_ids)
+            watermark_params = {
+                **params,
+                # Query one extra row even when completions consume the whole
+                # batch so remaining_candidates still advertises dead panes.
+                "limit": remaining_budget + 1,
+            }
+            watermark_pool = [
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    f"""
+                    SELECT watermarks.host_id, watermarks.pane_id
+                    FROM herdr_turn_watermarks AS watermarks
+                    WHERE watermarks.updated_at < :cutoff_at
+                      {watermark_host_clause}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM worker_bindings AS bindings
+                          WHERE bindings.host_id = watermarks.host_id
+                            AND bindings.backend = 'herdr'
+                            AND bindings.expires_at > :current_at
+                            AND (
+                                (
+                                    bindings.target_kind = 'pane_id'
+                                    AND bindings.target_value = watermarks.pane_id
+                                )
+                                OR (
+                                    bindings.turn_target_kind = 'pane_id'
+                                    AND bindings.turn_target_value = watermarks.pane_id
+                                )
+                            )
+                      )
+                    ORDER BY watermarks.updated_at, watermarks.host_id,
+                             watermarks.pane_id
+                    LIMIT :limit
+                    """,
+                    watermark_params,
+                ).fetchall()
+            ]
+            watermark_keys = watermark_pool[:remaining_budget]
+            if not dry_run:
+                if completion_ids:
+                    placeholders = ",".join("?" for _ in completion_ids)
+                    conn.execute(
+                        f"""
+                        DELETE FROM herdr_turn_completions
+                        WHERE rowid IN ({placeholders})
+                        """,
+                        completion_ids,
+                    )
+                if watermark_keys:
+                    conn.executemany(
+                        """
+                        DELETE FROM herdr_turn_watermarks
+                        WHERE host_id = ? AND pane_id = ?
+                        """,
+                        watermark_keys,
+                    )
+                conn.commit()
+            else:
+                conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+    examined = len(completion_ids) + len(watermark_keys)
+    remaining = (
+        len(completion_pool) > len(completion_ids)
+        or len(watermark_pool) > len(watermark_keys)
+    )
+    return dict(sanitize_public_value({
+        **base,
+        "ok": True,
+        "status": "ok",
+        "examined": examined,
+        "deleted": examined,
+        "deleted_completions": len(completion_ids),
+        "deleted_watermarks": len(watermark_keys),
+        "remaining_candidates": remaining,
+    }))
+
+
 def run_store_maintenance(
     db_path: Path,
     host_id: str,
@@ -17472,6 +17662,9 @@ def run_store_maintenance(
     turn_change_retention_days: int = TURN_CHANGE_RETENTION_DAYS,
     turn_change_retention_count: int = TURN_CHANGE_RETENTION_COUNT,
     turn_change_batch_size: int = TURN_CHANGE_COMPACTION_BATCH_SIZE,
+    herdr_turn_retention_days: int = HERDR_TURN_RETENTION_DAYS,
+    herdr_turn_retention_count: int = HERDR_TURN_RETENTION_COUNT,
+    herdr_turn_batch_size: int = HERDR_TURN_RETENTION_BATCH_SIZE,
 ) -> dict[str, Any]:
     """Run one bounded batch for every online store-maintenance class."""
     retention = cleanup_event_retention(
@@ -17541,6 +17734,15 @@ def run_store_maintenance(
         now=now,
         dry_run=dry_run,
     )
+    herdr_turns = cleanup_herdr_turn_retention(
+        db_path,
+        host_id=host_id,
+        retention_days=herdr_turn_retention_days,
+        retention_count=herdr_turn_retention_count,
+        batch_size=herdr_turn_batch_size,
+        now=now,
+        dry_run=dry_run,
+    )
     ok = (
         bool(retention.get("ok"))
         and bool(snapshots.get("ok"))
@@ -17549,6 +17751,7 @@ def run_store_maintenance(
         and bool(turn_content.get("ok"))
         and bool(command_requests.get("ok"))
         and bool(turn_changes.get("ok"))
+        and bool(herdr_turns.get("ok"))
     )
     return sanitize_public_value({
         "schema_version": 1,
@@ -17633,6 +17836,30 @@ def run_store_maintenance(
             "examined": int(turn_changes.get("examined") or 0),
             "deleted": int(turn_changes.get("deleted") or 0),
             "remaining_candidates": bool(turn_changes.get("remaining_candidates")),
+        },
+        "herdr_turns": {
+            "dry_run": bool(herdr_turns.get("dry_run")),
+            "retention_days": int(
+                herdr_turns.get("retention_days") or herdr_turn_retention_days
+            ),
+            "retention_count": int(
+                herdr_turns.get("retention_count") or herdr_turn_retention_count
+            ),
+            "cutoff_at": herdr_turns.get("cutoff_at"),
+            "batch_size": int(
+                herdr_turns.get("batch_size") or herdr_turn_batch_size
+            ),
+            "examined": int(herdr_turns.get("examined") or 0),
+            "deleted": int(herdr_turns.get("deleted") or 0),
+            "deleted_completions": int(
+                herdr_turns.get("deleted_completions") or 0
+            ),
+            "deleted_watermarks": int(
+                herdr_turns.get("deleted_watermarks") or 0
+            ),
+            "remaining_candidates": bool(
+                herdr_turns.get("remaining_candidates")
+            ),
         },
         "turn_content": {
             "dry_run": bool(turn_content.get("dry_run")),

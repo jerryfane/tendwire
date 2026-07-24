@@ -7,6 +7,7 @@ projection helpers for Tendwire model normalization.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -151,6 +152,7 @@ _TURN_REFRESH_EVENT_NAMES = frozenset(
         "pane.output_matched",
     }
 )
+_COMPLETED_TURN_REFRESH_STATUSES = frozenset({"updated", "unchanged", "missing"})
 
 
 class HerdrEventBackendError(Exception):
@@ -266,6 +268,23 @@ def _first_text(item: Mapping[str, Any], keys: Iterable[str]) -> str | None:
 
 def _safe_mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _call_with_optional_keywords(
+    callback: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> Any:
+    """Invoke once, omitting optional keywords only when the signature requires it."""
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return callback(*args, **dict(kwargs))
+    try:
+        signature.bind(*args, **dict(kwargs))
+    except TypeError:
+        return callback(*args)
+    return callback(*args, **dict(kwargs))
 
 
 def _nonnegative_protocol_integer(value: Any, field: str) -> int:
@@ -788,7 +807,9 @@ class HerdrEventBackend:
         self._automatic_maintenance_status: dict[str, Any] | None = None
         self._next_reconcile_monotonic: float | None = None
         self._subscription_pane_ids: list[str] = []
+        self._turn_api_probed = False
         self._turn_api_supported = False
+        self._turn_completion_diagnostic_counts: dict[str, int] = {}
         self._load_existing_state()
 
     @staticmethod
@@ -841,6 +862,9 @@ class HerdrEventBackend:
                     dict(self._automatic_maintenance_status)
                     if self._automatic_maintenance_status is not None
                     else None
+                ),
+                "turn_completion_diagnostics": dict(
+                    self._turn_completion_diagnostic_counts
                 ),
             }
 
@@ -1000,6 +1024,8 @@ class HerdrEventBackend:
             try:
                 client = self.client_factory(self.config)
                 try:
+                    self._turn_api_probed = False
+                    self._turn_api_supported = False
                     self.reconcile_once(client=client)
                     reconciled = True
                     self._replay_turns_after_reconcile(client)
@@ -1265,26 +1291,45 @@ class HerdrEventBackend:
             params["expected_epoch"] = int(expected_epoch)
         method = getattr(client, "pane_turns", None)
         if callable(method):
-            try:
-                value = method(
-                    params,
-                    timeout=self.config.herdr_timeout_seconds,
-                )
-            except TypeError:
-                value = method(params)
+            value = _call_with_optional_keywords(
+                method,
+                (params,),
+                {"timeout": self.config.herdr_timeout_seconds},
+            )
         else:
             request = getattr(client, "request", None)
             if not callable(request):
                 raise AttributeError("client does not expose pane.turns")
-            try:
-                value = request(
-                    "pane.turns",
-                    params,
-                    timeout=self.config.herdr_timeout_seconds,
-                )
-            except TypeError:
-                value = request("pane.turns", params)
+            value = _call_with_optional_keywords(
+                request,
+                ("pane.turns", params),
+                {"timeout": self.config.herdr_timeout_seconds},
+            )
         return _pane_turns_replay(value, pane_id)
+
+    def _record_turn_diagnostic(
+        self,
+        code: str,
+        pane_id: str,
+        *,
+        status: str | None = None,
+    ) -> None:
+        count_key = f"{code}:{status}" if status else code
+        with self._lock:
+            self._turn_completion_diagnostic_counts[count_key] = (
+                self._turn_completion_diagnostic_counts.get(count_key, 0) + 1
+            )
+        diagnostic = {
+            "code": code,
+            "host_id": self.config.host_id,
+            "pane_id": pane_id,
+        }
+        if status:
+            diagnostic["status"] = status
+        _LOGGER.warning(
+            code,
+            extra={"tendwire_diagnostic": diagnostic},
+        )
 
     def _record_completeness_break(
         self,
@@ -1327,15 +1372,14 @@ class HerdrEventBackend:
             if len(owner_bindings) == 1
             else None
         )
-        try:
-            result = self.turn_completion_processor(
-                self.config,
-                record.pane_id,
-                terminal_id=terminal_id,
-                binding_private_fingerprint=binding_private_fingerprint,
-            )
-        except TypeError:
-            result = self.turn_completion_processor(self.config, record.pane_id)
+        result = _call_with_optional_keywords(
+            self.turn_completion_processor,
+            (self.config, record.pane_id),
+            {
+                "terminal_id": terminal_id,
+                "binding_private_fingerprint": binding_private_fingerprint,
+            },
+        )
         if isinstance(result, Mapping):
             status = str(result.get("status") or "")
             worker_id = result.get("worker_id")
@@ -1360,22 +1404,53 @@ class HerdrEventBackend:
             record.pane_id,
         )
         if watermark is None:
-            raise HerdrEventBackendError(
-                "turn completion arrived before replay baseline"
+            self._record_completeness_break(
+                HerdrPaneTurnsReplay(
+                    pane_id=record.pane_id,
+                    turn_epoch=record.turn_epoch,
+                    records=(record,),
+                    truncated=False,
+                    oldest_available=record.turn,
+                ),
+                "live_without_baseline",
             )
+            return
         if watermark.turn_epoch != record.turn_epoch:
-            raise HerdrEventBackendError("turn completion epoch changed")
+            self._record_completeness_break(
+                HerdrPaneTurnsReplay(
+                    pane_id=record.pane_id,
+                    turn_epoch=record.turn_epoch,
+                    records=(record,),
+                    truncated=False,
+                    oldest_available=record.turn,
+                ),
+                "turn_epoch_mismatch",
+            )
+            return
         if record.turn <= watermark.last_turn:
             return
         if record.turn != watermark.last_turn + 1:
-            raise HerdrEventBackendError("turn completion replay gap")
+            self._record_completeness_break(
+                HerdrPaneTurnsReplay(
+                    pane_id=record.pane_id,
+                    turn_epoch=record.turn_epoch,
+                    records=(record,),
+                    truncated=False,
+                    oldest_available=record.turn,
+                ),
+                "live_gap",
+            )
+            return
         status, worker_id, refreshed_turn_id = self._completion_processor_result(
             record
         )
-        if status not in {"updated", "unchanged", "missing"}:
-            raise HerdrEventBackendError(
-                "turn completion semantic refresh did not finish"
+        if status not in _COMPLETED_TURN_REFRESH_STATUSES:
+            self._record_turn_diagnostic(
+                "herdr_turn_completion_refresh_skipped",
+                record.pane_id,
+                status=status or "unknown",
             )
+            refreshed_turn_id = None
         record_herdr_turn_completion(
             self.db_path,
             self.config.host_id,
@@ -1397,13 +1472,14 @@ class HerdrEventBackend:
         watermark: HerdrTurnWatermark | None,
     ) -> None:
         if watermark is None:
-            watermark = set_herdr_turn_watermark(
+            set_herdr_turn_watermark(
                 self.db_path,
                 self.config.host_id,
                 replay.pane_id,
                 turn_epoch=replay.turn_epoch,
-                last_turn=0,
+                last_turn=replay.newest_turn,
             )
+            return
         if replay.turn_epoch != watermark.turn_epoch:
             self._record_completeness_break(replay, "turn_epoch_mismatch")
             return
@@ -1411,80 +1487,183 @@ class HerdrEventBackend:
             self._record_completeness_break(replay, "replay_truncated")
             return
         expected = watermark.last_turn + 1
-        if replay.records and replay.records[0].turn != expected:
+        actual_turns = tuple(record.turn for record in replay.records)
+        expected_turns = tuple(range(expected, expected + len(replay.records)))
+        if actual_turns != expected_turns:
             self._record_completeness_break(replay, "replay_gap")
             return
         for record in replay.records:
             self._process_turn_record(record)
 
-    def _replay_turns_after_reconcile(self, client: Any) -> None:
-        """Capability-probe and replay every known pane from durable watermarks."""
-        pane_ids = tuple(self._subscription_pane_ids)
-        self._turn_api_supported = False
-        if not pane_ids:
+    @classmethod
+    def _turn_api_method_unsupported(cls, exc: HerdrErrorResponse) -> bool:
+        code = cls._herdr_error_code(exc).strip().lower().replace("-", "_")
+        message = cls._herdr_error_message(exc).strip().lower()
+        if code in {
+            "method_not_found",
+            "unknown_method",
+            "unsupported_method",
+            "not_implemented",
+        }:
+            return True
+        return code == "invalid_params" and any(
+            marker in message
+            for marker in (
+                "unknown method",
+                "method not found",
+                "unsupported method",
+                "pane.turns is not supported",
+            )
+        )
+
+    def _probe_turn_api(
+        self,
+        client: Any,
+        pane_id: str,
+        watermark: HerdrTurnWatermark | None,
+    ) -> tuple[
+        bool,
+        HerdrPaneTurnsReplay | None,
+        HerdrErrorResponse | AttributeError | None,
+    ]:
+        """Probe pane.turns once without treating pane-scoped errors as absence."""
+        if not callable(getattr(client, "pane_turns", None)) and not callable(
+            getattr(client, "request", None)
+        ):
+            return False, None, None
+        try:
+            replay = self._call_pane_turns(
+                client,
+                pane_id,
+                since=watermark.last_turn if watermark is not None else 0,
+                expected_epoch=watermark.turn_epoch if watermark is not None else None,
+            )
+        except HerdrErrorResponse as exc:
+            if self._turn_api_method_unsupported(exc):
+                return False, None, None
+            return True, None, exc
+        except AttributeError as exc:
+            return True, None, exc
+        return True, replay, None
+
+    def _consume_pane_replay(
+        self,
+        client: Any,
+        pane_id: str,
+        watermark: HerdrTurnWatermark | None,
+        *,
+        replay: HerdrPaneTurnsReplay | None = None,
+        error: HerdrErrorResponse | AttributeError | None = None,
+    ) -> None:
+        try:
+            if error is not None:
+                raise error
+            current_replay = replay or self._call_pane_turns(
+                client,
+                pane_id,
+                since=watermark.last_turn if watermark is not None else 0,
+                expected_epoch=watermark.turn_epoch if watermark is not None else None,
+            )
+        except HerdrErrorResponse as exc:
+            code = self._herdr_error_code(exc)
+            message = self._herdr_error_message(exc)
+            if code == "turn_epoch_mismatch":
+                try:
+                    current_replay = self._call_pane_turns(
+                        client,
+                        pane_id,
+                        since=0,
+                        expected_epoch=None,
+                    )
+                except (HerdrErrorResponse, AttributeError) as retry_exc:
+                    self._record_turn_diagnostic(
+                        "herdr_turn_replay_pane_skipped",
+                        pane_id,
+                        status=(
+                            self._herdr_error_code(retry_exc)
+                            if isinstance(retry_exc, HerdrErrorResponse)
+                            else "method_unavailable"
+                        ),
+                    )
+                    return
+                self._record_completeness_break(
+                    current_replay,
+                    "turn_epoch_mismatch",
+                )
+                return
+            if code == "invalid_params" and "newer than current turn" in message:
+                try:
+                    current_replay = self._call_pane_turns(
+                        client,
+                        pane_id,
+                        since=0,
+                        expected_epoch=None,
+                    )
+                except (HerdrErrorResponse, AttributeError) as retry_exc:
+                    self._record_turn_diagnostic(
+                        "herdr_turn_replay_pane_skipped",
+                        pane_id,
+                        status=(
+                            self._herdr_error_code(retry_exc)
+                            if isinstance(retry_exc, HerdrErrorResponse)
+                            else "method_unavailable"
+                        ),
+                    )
+                    return
+                self._record_completeness_break(current_replay, "watermark_ahead")
+                return
+            self._record_turn_diagnostic(
+                "herdr_turn_replay_pane_skipped",
+                pane_id,
+                status=code or "pane_error",
+            )
             return
-        capability_confirmed = False
-        for pane_id in pane_ids:
-            watermark = get_herdr_turn_watermark(
+        except AttributeError:
+            self._record_turn_diagnostic(
+                "herdr_turn_replay_pane_skipped",
+                pane_id,
+                status="method_unavailable",
+            )
+            return
+        self._consume_replay(current_replay, watermark)
+
+    def _replay_turns_after_reconcile(self, client: Any) -> None:
+        """Probe pane.turns once, then replay each pane independently."""
+        pane_ids = tuple(self._subscription_pane_ids)
+        if not pane_ids:
+            self._turn_api_probed = True
+            self._turn_api_supported = False
+            return
+        watermarks = {
+            pane_id: get_herdr_turn_watermark(
                 self.db_path,
                 self.config.host_id,
                 pane_id,
             )
-            try:
-                replay = self._call_pane_turns(
-                    client,
-                    pane_id,
-                    since=watermark.last_turn if watermark is not None else 0,
-                    expected_epoch=(
-                        watermark.turn_epoch if watermark is not None else None
-                    ),
-                )
-            except HerdrErrorResponse as exc:
-                code = self._herdr_error_code(exc)
-                if code == "turn_epoch_mismatch":
-                    capability_confirmed = True
-                    replay = self._call_pane_turns(
-                        client,
-                        pane_id,
-                        since=0,
-                        expected_epoch=None,
-                    )
-                    self._record_completeness_break(
-                        replay,
-                        "turn_epoch_mismatch",
-                    )
-                    continue
-                if (
-                    code == "invalid_params"
-                    and "newer than current turn"
-                    in self._herdr_error_message(exc)
-                ):
-                    capability_confirmed = True
-                    replay = self._call_pane_turns(
-                        client,
-                        pane_id,
-                        since=0,
-                        expected_epoch=None,
-                    )
-                    self._record_completeness_break(
-                        replay,
-                        "watermark_ahead",
-                    )
-                    continue
-                if not capability_confirmed:
-                    # Old Herdr rejects the unknown method. Keep its established
-                    # subscription shape and all projections unchanged.
-                    self._turn_api_supported = False
-                    return
-                raise
-            except AttributeError:
-                if not capability_confirmed:
-                    self._turn_api_supported = False
-                    return
-                raise
-            capability_confirmed = True
-            self._consume_replay(replay, watermark)
-        self._turn_api_supported = capability_confirmed
+            for pane_id in pane_ids
+        }
+        probe_pane_id: str | None = None
+        probe_replay: HerdrPaneTurnsReplay | None = None
+        probe_error: HerdrErrorResponse | AttributeError | None = None
+        if not self._turn_api_probed:
+            probe_pane_id = pane_ids[0]
+            supported, probe_replay, probe_error = self._probe_turn_api(
+                client,
+                probe_pane_id,
+                watermarks[probe_pane_id],
+            )
+            self._turn_api_probed = True
+            self._turn_api_supported = supported
+        if not self._turn_api_supported:
+            return
+        for pane_id in pane_ids:
+            self._consume_pane_replay(
+                client,
+                pane_id,
+                watermarks[pane_id],
+                replay=probe_replay if pane_id == probe_pane_id else None,
+                error=probe_error if pane_id == probe_pane_id else None,
+            )
 
     def _subscribe_event_stream(self, client: Any) -> Any:
         # Herdr 0.7.5 strictly validates pane-scoped status subscriptions and
@@ -1643,11 +1822,17 @@ class HerdrEventBackend:
                 event.name in _TURN_REFRESH_EVENT_NAMES for event in events
             )
             notify_turn_refresh = has_turn_refresh_event
-            completed_turns = [
-                _turn_completion_record(event.payload)
-                for event in events
-                if event.name == "pane.turn_completed"
-            ]
+            for event in events:
+                if event.name != "pane.turn_completed":
+                    continue
+                try:
+                    completed_turns.append(_turn_completion_record(event.payload))
+                except HerdrEnvelopeError:
+                    self._record_turn_diagnostic(
+                        "herdr_turn_completion_record_quarantined",
+                        _first_text(event.payload, ("pane_id", "paneId"))
+                        or "unknown",
+                    )
             try:
                 self._event_continuity_revalidated = False
                 changed = False

@@ -171,6 +171,7 @@ def test_turn_observation_fields_are_byte_identical_identity_exclusions(
                 "completed_unix_ms": 1_700_000_000_000,
             },
             "outcome": "aborted",
+            "state_change_seq": 100,
         }
     )
     observed["meta"]["provider"].update(
@@ -179,6 +180,7 @@ def test_turn_observation_fields_are_byte_identical_identity_exclusions(
             "turn_epoch": 99,
             "last_completed_turn": {"turn": 41},
             "outcome": "aborted",
+            "state_change_seq": 100,
         }
     )
     _backend, turn_workers, turn_bindings, _records = _project(
