@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -3972,12 +3972,19 @@ def _refresh_turn_binding(
     config: Config,
     binding: WorkerBinding,
     *,
+    pane_target_override: str | None = None,
     adapter_timeout_seconds: float | None = None,
     cancel_event: threading.Event | None = None,
     apply_deadline_monotonic: float | None = None,
     observed_at: str | None = None,
 ) -> TurnRefreshResult:
-    """Read and atomically apply exactly one immutable private binding."""
+    """Read and atomically apply exactly one immutable private binding.
+
+    Completion-authoritative callers may read through the live pane while the
+    immutable stored binding remains the ownership and transaction guard. This
+    prevents a prior agent-session generation from choosing the content source
+    after Herdr has reported completion for the current pane.
+    """
     if config.db_path is None or not _eligible_turn_binding(binding):
         return TurnRefreshResult("missing", 0)
     timeout_seconds = (
@@ -3988,10 +3995,21 @@ def _refresh_turn_binding(
     if timeout_seconds <= 0:
         return TurnRefreshResult("failed", 0)
     item = _TurnRefreshItem.from_binding(binding)
+    read_binding = binding
+    if pane_target_override is not None:
+        live_pane_id = str(pane_target_override).strip()
+        if not live_pane_id:
+            return TurnRefreshResult("missing", 0)
+        read_binding = replace(
+            binding,
+            turn_target_kind=_PANE_TURN_KIND,
+            turn_target_value=live_pane_id,
+        )
+    read_target_kind = str(read_binding.turn_target_kind or "")
     current_time = observed_at or utc_timestamp()
     grace_seconds = float(config.pending_stale_grace_seconds)
     def failed_pending_result(status: Literal["failed", "timeout"]) -> TurnRefreshResult:
-        if item.turn_target_kind != _PANE_TURN_KIND:
+        if read_target_kind != _PANE_TURN_KIND:
             return TurnRefreshResult(status, 0)
         if not _binding_still_matches(config, item):
             return TurnRefreshResult("stale_binding", 0)
@@ -4021,7 +4039,7 @@ def _refresh_turn_binding(
     try:
         observed = _read_turn_for_binding(
             config,
-            binding,
+            read_binding,
             timeout_seconds=timeout_seconds,
             cancel_event=cancel_event,
         )
@@ -4042,14 +4060,14 @@ def _refresh_turn_binding(
             return TurnRefreshResult("unchanged", 0)
     if observed is None:
         return TurnRefreshResult("missing", 0)
-    if item.turn_target_kind == _PANE_TURN_KIND:
+    if read_target_kind == _PANE_TURN_KIND:
         content, pending_observation = _pop_backend_pending_observation(observed)
     else:
         content, pending_observation = dict(observed), None
     if not _binding_still_matches(config, item):
         return TurnRefreshResult("stale_binding", 0)
     try:
-        if item.turn_target_kind == _PANE_TURN_KIND:
+        if read_target_kind == _PANE_TURN_KIND:
             applied = apply_turn_refresh(
                 config.db_path,
                 config.host_id,
@@ -4126,7 +4144,7 @@ def refresh_completed_pane_turn(
     binding_private_fingerprint: str | None = None,
     adapter_timeout_seconds: float | None = None,
 ) -> CompletedPaneTurnRefreshResult:
-    """Run the existing session-log adapter for exactly one completed pane."""
+    """Capture one completed turn through its current pane adapter target."""
     if config.db_path is None:
         return CompletedPaneTurnRefreshResult("store_unavailable")
     try:
@@ -4137,36 +4155,46 @@ def refresh_completed_pane_turn(
         )
     except Exception:
         return CompletedPaneTurnRefreshResult("store_unavailable")
-    candidates = [
-        binding
-        for binding in bindings
-        if _eligible_turn_binding(binding)
-        and (
-            (
-                binding_private_fingerprint is not None
-                and binding.private_fingerprint
-                == binding_private_fingerprint
-            )
-            or
-            (
-                binding.turn_target_kind == _PANE_TURN_KIND
-                and str(binding.turn_target_value or "") == str(pane_id)
-            )
-            or (
-                terminal_id is not None
-                and str(binding.target_kind or "") == "terminal_id"
+    eligible = [binding for binding in bindings if _eligible_turn_binding(binding)]
+    candidate_tiers: list[list[WorkerBinding]] = []
+    if binding_private_fingerprint is not None:
+        candidate_tiers.append(
+            [
+                binding
+                for binding in eligible
+                if binding.private_fingerprint == binding_private_fingerprint
+            ]
+        )
+    candidate_tiers.append(
+        [
+            binding
+            for binding in eligible
+            if binding.turn_target_kind == _PANE_TURN_KIND
+            and str(binding.turn_target_value or "") == str(pane_id)
+        ]
+    )
+    if terminal_id is not None:
+        candidate_tiers.append(
+            [
+                binding
+                for binding in eligible
+                if str(binding.target_kind or "") == "terminal_id"
                 and str(binding.target_value or "") == str(terminal_id)
-            )
+            ]
         )
-    ]
-    if len(candidates) != 1:
-        return CompletedPaneTurnRefreshResult(
-            "binding_missing" if not candidates else "binding_ambiguous"
-        )
-    binding = candidates[0]
+    binding = None
+    for candidates in candidate_tiers:
+        if len(candidates) > 1:
+            return CompletedPaneTurnRefreshResult("binding_ambiguous")
+        if candidates:
+            binding = candidates[0]
+            break
+    if binding is None:
+        return CompletedPaneTurnRefreshResult("binding_missing")
     refreshed = _refresh_turn_binding(
         config,
         binding,
+        pane_target_override=pane_id,
         adapter_timeout_seconds=adapter_timeout_seconds,
     )
     if refreshed.status not in {"updated", "unchanged", "missing"}:
