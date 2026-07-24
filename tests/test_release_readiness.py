@@ -332,6 +332,11 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
         "leased": 0,
         "completed": 0,
         "by_status": {"queued": 1},
+        "due": 1,
+        "oldest_due_at": "2026-01-10T00:00:00+00:00",
+        "overdue_awaiting_ack": 0,
+        "drain_target_seconds": 30,
+        "starved": True,
     }
     assert status["final_retention"] == {
         "acknowledged": 0,
@@ -427,7 +432,8 @@ def test_maintenance_release_surfaces_are_fixed_aggregate_and_private_clean(
             "turns": 0,
         },
     }
-    assert health["status"] == "ok"
+    assert health["status"] == "degraded"
+    assert health["store"]["outbox"]["starved"] is True
     assert health["store"]["counts"]["snapshots"] == 1
     assert health["limits"]["acknowledged_final_retention_days"] == 36500
     assert health["limits"]["acknowledged_final_retention_count"] == 100
