@@ -5564,6 +5564,144 @@ def test_turn_api_replay_subscribes_and_persists_ordered_completions(
         ]
 
 
+def test_turn_completion_late_attaches_final_after_idle_event_wins_race(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    config = Config(
+        host_id="turn-api-content-race",
+        data_dir=tmp_path,
+        db_path=tmp_path / "turn-api-content-race.db",
+        herdr_backend="socket",
+        herdr_bin="turn-adapter",
+        herdr_timeout_seconds=0.5,
+    )
+    init_store(Path(config.db_path))
+    backend = HerdrEventBackend(
+        config,
+        debounce_seconds=0,
+        reconnect_delay_seconds=0,
+    )
+    pane_id = _turn_api_pane()["pane_id"]
+    working_pane = {
+        **_turn_api_pane(),
+        "agent_status": "working",
+    }
+    backend.reconcile_once(
+        client=_StaticClient(
+            workspaces=[{"id": "w123456789abcde", "name": "Build"}],
+            panes=[working_pane],
+        )
+    )
+    set_herdr_turn_watermark(
+        backend.db_path,
+        backend.config.host_id,
+        pane_id,
+        turn_epoch=7,
+        last_turn=0,
+    )
+
+    # Reproduce the production ordering: the status stream closes the public
+    # projection first, before any semantic adapter read has run.
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.agent_status_changed",
+            "data": {
+                **working_pane,
+                "agent_status": "idle",
+            },
+        }
+    )
+    idle_snapshot = latest_snapshot(backend.db_path, backend.config.host_id)
+    assert idle_snapshot is not None
+    idle_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=idle_snapshot,
+    )
+    assert idle_snapshot.workers[0].status == "idle"
+    assert not any(
+        turn.get("assistant_final_text") for turn in idle_payload["turns"]
+    )
+
+    adapter_calls: list[list[str]] = []
+    final_payload = {
+        "result": {
+            "turn": {
+                "available": True,
+                "user_text": "reply with purple elephant 42",
+                "assistant_final_text": "purple elephant 42",
+                "complete": True,
+                "has_open_turn": False,
+                "source_turn_id": "event-close-race-turn",
+            }
+        }
+    }
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        adapter_calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(final_payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(herdr_turns.subprocess, "run", fake_run)
+    backend._turn_api_supported = True
+    assert backend.queue_event_envelope(
+        {
+            "event": "pane.turn_completed",
+            "data": {
+                "pane": {
+                    **working_pane,
+                    "agent_status": "idle",
+                },
+                **_turn_record(1),
+            },
+        }
+    )
+
+    completed_snapshot = latest_snapshot(
+        backend.db_path,
+        backend.config.host_id,
+    )
+    assert completed_snapshot is not None
+    captured_payload = turns_payload_from_store(
+        backend.db_path,
+        backend.config.host_id,
+        snapshot=completed_snapshot,
+    )
+    captured = next(
+        turn
+        for turn in captured_payload["turns"]
+        if turn.get("assistant_final_text") == "purple elephant 42"
+    )
+    assert captured["status"] == "idle"
+    assert captured["complete"] is True
+    assert adapter_calls == [
+        [
+            "turn-adapter",
+            "pane",
+            "turn",
+            pane_id,
+            "--last",
+            "--format",
+            "json",
+        ]
+    ]
+    with sqlite3.connect(str(backend.db_path)) as conn:
+        completion = conn.execute(
+            """
+            SELECT turn, refreshed_turn_id
+            FROM herdr_turn_completions
+            WHERE host_id = ? AND pane_id = ?
+            """,
+            (backend.config.host_id, pane_id),
+        ).fetchone()
+    assert completion == (1, captured["id"])
+
+
 def test_turn_api_run_loop_closes_probe_to_subscribe_completion_race(
     tmp_path: Path,
 ) -> None:
