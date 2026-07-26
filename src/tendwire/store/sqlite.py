@@ -80,6 +80,7 @@ from ..core.models import (
     separate_duplicate_worker_bindings,
     sanitize_canonical_turn_text,
     sanitize_public_mapping,
+    sanitize_public_text,
     sanitize_public_value,
     stable_fingerprint,
     utc_timestamp,
@@ -2371,6 +2372,13 @@ def _store_public_text(
     return clean if isinstance(clean, str) and clean else default
 
 
+def _store_private_diagnostic_text(value: Any) -> str:
+    return sanitize_public_text(
+        str(value or ""),
+        max_chars=_TURN_FINAL_REASON_DETAIL_MAX_CHARS,
+    )
+
+
 def _turn_final_reason_diagnostics(value: Any) -> tuple[str, str]:
     public_reason = _store_public_label(
         value,
@@ -2378,11 +2386,7 @@ def _turn_final_reason_diagnostics(value: Any) -> tuple[str, str]:
     )
     if public_reason != "unknown":
         return public_reason, ""
-    detail = _store_public_text(
-        str(value or "").strip()[:_TURN_FINAL_REASON_DETAIL_MAX_CHARS],
-        free_text=True,
-    )
-    return public_reason, detail[:_TURN_FINAL_REASON_DETAIL_MAX_CHARS]
+    return public_reason, _store_private_diagnostic_text(value)
 
 
 def _connector_private_with_terminal_diagnostic(
@@ -2405,10 +2409,7 @@ def _connector_private_with_terminal_diagnostic(
         "terminalized_at": str(terminalized_at),
     }
     if reason_detail:
-        terminal["reason_detail"] = _store_public_text(
-            reason_detail[:_TURN_FINAL_REASON_DETAIL_MAX_CHARS],
-            free_text=True,
-        )[:_TURN_FINAL_REASON_DETAIL_MAX_CHARS]
+        terminal["reason_detail"] = _store_private_diagnostic_text(reason_detail)
     state[_CONNECTOR_TERMINAL_DIAGNOSTIC_KEY] = terminal
     return _canonical_json(state)
 
@@ -2467,16 +2468,11 @@ def _turn_final_latest_reason_conn(
         allowed={*_TURN_FINAL_PUBLIC_REASONS, "missing", "unknown"},
     )
     detail = (
-        _store_public_text(
-            str(response.get("reason_detail") or "")[
-                :_TURN_FINAL_REASON_DETAIL_MAX_CHARS
-            ],
-            free_text=True,
-        )
+        _store_private_diagnostic_text(response.get("reason_detail"))
         if public_reason == "unknown"
         else ""
     )
-    return public_reason, detail[:_TURN_FINAL_REASON_DETAIL_MAX_CHARS]
+    return public_reason, detail
 
 
 def _connector_private_with_lease(
@@ -7228,18 +7224,22 @@ def _connector_update_ref(
             if terminal_after_lease:
                 result_status = "superseded"
                 outbox_status = _CONNECTOR_SUPERSEDED_OUTBOX_STATUS
-            response_payload = {
-                "schema_version": 1,
-                "status": result_status,
-                "reason": sanitized_reason,
-                "available_at": None if terminal_after_lease else available_at,
-                "response": dict(sanitized_response),
-            }
+            response_payload = dict(
+                sanitize_public_value(
+                    {
+                        "schema_version": 1,
+                        "status": result_status,
+                        "reason": sanitized_reason,
+                        "available_at": (
+                            None if terminal_after_lease else available_at
+                        ),
+                        "response": dict(sanitized_response),
+                    }
+                )
+            )
             if reason_detail:
                 response_payload["reason_detail"] = reason_detail
-            response_json = _canonical_json(
-                sanitize_public_value(response_payload)
-            )
+            response_json = _canonical_json(response_payload)
             conn.execute(
                 """
                 UPDATE connector_deliveries

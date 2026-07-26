@@ -680,7 +680,10 @@ def test_turn_final_unknown_reason_survives_terminalization_privately(
         ordering_key="worker-a",
     )
     reason = "presentation_plan_mismatch:" + ("x" * 300)
-    expected_detail = reason[:240]
+    truncation_marker = "\n[truncated]"
+    expected_detail = (
+        reason[: 240 - len(truncation_marker)].rstrip() + truncation_marker
+    )
     leased = poll_connector_outbox(
         db_path,
         "host-a",
@@ -752,6 +755,182 @@ def test_turn_final_unknown_reason_survives_terminalization_privately(
         "terminalized_at": "2026-01-01T00:00:01+00:00",
     }
     assert expected_detail not in json.dumps(inspected, sort_keys=True)
+
+
+def test_turn_final_backend_reason_survives_privately_and_clears_lease(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-final-backend-diagnostic.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="backend-diagnostic",
+        ordering_key="worker-a",
+    )
+    reason = "Telegram API error: chat not found"
+    leased = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="turn-final",
+        ref=leased["ref"],
+        reason=reason,
+        delay_seconds=0,
+        max_attempts=1,
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_json, response_json = conn.execute(
+            """
+            SELECT outbox.private_state_json, deliveries.response_json
+            FROM connector_outbox AS outbox
+            JOIN connector_deliveries AS deliveries
+              ON deliveries.outbox_id = outbox.id
+            WHERE outbox.delivery_key = ?
+            ORDER BY deliveries.id DESC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+
+    private_state = json.loads(private_json)
+    response = json.loads(response_json)
+    inspected = ConnectorOutboxAPI(db_path, "host-a").inspect(
+        {
+            "schema_version": 1,
+            "name": "turn-final",
+            "status": "dead_letter",
+            "limit": 10,
+        }
+    )
+    polled = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:02+00:00",
+    )
+
+    assert private_state["terminal_diagnostic"]["reason_detail"] == reason
+    assert response["reason"] == "unknown"
+    assert response["reason_detail"] == reason
+    for live_field in (
+        "current_delivery_id",
+        "current_attempt",
+        "lease_token",
+        "lease_expires_at",
+        "public_ref",
+    ):
+        assert live_field not in private_state
+    for public_result in (failed, polled, inspected):
+        encoded = json.dumps(public_result, sort_keys=True)
+        assert reason not in encoded
+        assert "reason_detail" not in encoded
+    _assert_no_forbidden(failed)
+    _assert_no_forbidden(polled)
+    _assert_no_forbidden(inspected)
+
+
+def test_turn_final_private_reason_redacts_before_truncation(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-final-boundary-secret.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="boundary-secret",
+        ordering_key="worker-a",
+    )
+    reason = ("x" * 231) + "ghp_" + ("A" * 30)
+    leased = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="turn-final",
+        ref=leased["ref"],
+        reason=reason,
+        delay_seconds=0,
+        max_attempts=1,
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_json, response_json = conn.execute(
+            """
+            SELECT outbox.private_state_json, deliveries.response_json
+            FROM connector_outbox AS outbox
+            JOIN connector_deliveries AS deliveries
+              ON deliveries.outbox_id = outbox.id
+            WHERE outbox.delivery_key = ?
+            ORDER BY deliveries.id DESC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+
+    private_detail = json.loads(private_json)["terminal_diagnostic"]["reason_detail"]
+    response_detail = json.loads(response_json)["reason_detail"]
+    persisted = f"{private_json}\n{response_json}"
+    assert private_detail
+    assert private_detail == response_detail
+    assert len(private_detail) <= 240
+    assert private_detail.endswith("\n[truncated]")
+    assert "ghp_" not in persisted
+    assert "reason_detail" not in failed
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {
+            "schema_version": 1,
+            "name": "turn-final",
+            "status": "dead_letter",
+            "limit": 10,
+            "extra": True,
+        },
+        {
+            "schema_version": 1,
+            "name": "turn-final",
+            "status": "dead_letter",
+        },
+        {
+            "schema_version": 1,
+            "name": "attention",
+            "status": "dead_letter",
+            "limit": 10,
+        },
+        {
+            "schema_version": 1,
+            "name": "turn-final",
+            "status": "dead_letter",
+            "limit": True,
+        },
+    ],
+    ids=["extra-key", "missing-key", "wrong-name", "boolean-limit"],
+)
+def test_turn_final_inspect_rejects_non_exact_parameter_shapes(
+    tmp_path: Path,
+    params: dict[str, Any],
+) -> None:
+    db_path = tmp_path / "turn-final-inspect-strict.db"
+    init_store(db_path)
+
+    result = ConnectorOutboxAPI(db_path, "host-a").inspect(params)
+
+    assert result["ok"] is False
+    assert result["status"] == "invalid_params"
 
 
 def test_existing_dead_letter_private_state_is_not_rewritten(tmp_path: Path) -> None:
