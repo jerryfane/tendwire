@@ -670,6 +670,113 @@ def test_max_outbox_attempts_dead_letters_exhausted_failures(tmp_path: Path) -> 
     _assert_no_forbidden(exhausted)
 
 
+def test_turn_final_unknown_reason_survives_terminalization_privately(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "turn-final-terminal-diagnostic.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="terminal-diagnostic",
+        ordering_key="worker-a",
+    )
+    reason = "presentation_plan_mismatch:" + ("x" * 300)
+    expected_detail = reason[:240]
+    leased = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="turn-final",
+        ref=leased["ref"],
+        reason=reason,
+        delay_seconds=0,
+        max_attempts=1,
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    copied_db_path = tmp_path / "turn-final-terminal-diagnostic-copy.db"
+    with (
+        sqlite3.connect(str(db_path)) as source,
+        sqlite3.connect(str(copied_db_path)) as target,
+    ):
+        source.backup(target)
+    copied_db_path.chmod(0o600)
+
+    with sqlite3.connect(str(copied_db_path)) as conn:
+        outbox_status, private_json = conn.execute(
+            """
+            SELECT status, private_state_json
+            FROM connector_outbox
+            WHERE delivery_key = ?
+            """,
+            (key,),
+        ).fetchone()
+        response_json = conn.execute(
+            """
+            SELECT response_json
+            FROM connector_deliveries
+            WHERE delivery_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()[0]
+
+    response = json.loads(response_json)
+    terminal = json.loads(private_json)["terminal_diagnostic"]
+    inspected = ConnectorOutboxAPI(copied_db_path, "host-a").inspect(
+        {
+            "schema_version": 1,
+            "name": "turn-final",
+            "status": "dead_letter",
+            "limit": 10,
+        }
+    )
+
+    assert failed["status"] == "attempts_exhausted"
+    assert "reason" not in failed
+    assert "reason_detail" not in failed
+    assert outbox_status == "dead_letter"
+    assert response["reason"] == "unknown"
+    assert response["reason_detail"] == expected_detail
+    assert terminal == {
+        "reason": "unknown",
+        "reason_detail": expected_detail,
+        "attempt_count": 1,
+        "classification": "attempts_exhausted",
+        "terminalized_at": "2026-01-01T00:00:01+00:00",
+    }
+    assert expected_detail not in json.dumps(inspected, sort_keys=True)
+
+
+def test_existing_dead_letter_private_state_is_not_rewritten(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-dead-letter-diagnostic.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix="legacy-terminal-diagnostic",
+        ordering_key="worker-a",
+        status="dead_letter",
+    )
+
+    init_store(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_json = conn.execute(
+            """
+            SELECT private_state_json
+            FROM connector_outbox
+            WHERE delivery_key = ?
+            """,
+            (key,),
+        ).fetchone()[0]
+    assert json.loads(private_json) == {}
+
+
 def test_poll_dead_letters_expired_lease_at_max_attempts_before_repoll(tmp_path: Path) -> None:
     db_path = tmp_path / "expired-max-attempt.db"
     _enqueue(db_path, key="expired-max")
@@ -3069,7 +3176,7 @@ def test_restart_orphaned_awaiting_ack_retries_same_dedup_key_and_preserves_fifo
         ).fetchone()[0]
         job_statuses = conn.execute(
             """
-            SELECT outbox.status
+            SELECT outbox.status, outbox.private_state_json
             FROM turn_presentation_jobs AS jobs
             JOIN connector_outbox AS outbox ON outbox.id = jobs.outbox_id
             JOIN turn_presentation_plans AS plans ON plans.id = jobs.plan_id
@@ -3078,11 +3185,32 @@ def test_restart_orphaned_awaiting_ack_retries_same_dedup_key_and_preserves_fifo
             """,
             (committed["plan_token"],),
         ).fetchall()
+    job_terminal_diagnostics = [
+        json.loads(private_json)["terminal_diagnostic"]
+        for _status, private_json in job_statuses
+    ]
     assert reclaimed["reclaimed"] == 1
     assert during_backoff == []
     assert plan_state == "failed"
     assert source_status == "leased"
-    assert job_statuses == [("dead_letter",), ("dead_letter",)]
+    assert [status for status, _private_json in job_statuses] == [
+        "dead_letter",
+        "dead_letter",
+    ]
+    assert job_terminal_diagnostics == [
+        {
+            "reason": "missing",
+            "attempt_count": 0,
+            "classification": "ack_deadline_expired",
+            "terminalized_at": "9999-01-01T00:00:00+00:00",
+        },
+        {
+            "reason": "missing",
+            "attempt_count": 0,
+            "classification": "ack_deadline_expired",
+            "terminalized_at": "9999-01-01T00:00:00+00:00",
+        },
+    ]
     assert retry["key"] == source["key"]
     assert retry["key"] != tail_key
     assert retry["attempt"] == 2
@@ -3186,9 +3314,17 @@ def test_awaiting_ack_without_plan_becomes_terminal_failed(tmp_path: Path) -> No
         now="2026-01-01T00:00:01+00:00",
     )
     with sqlite3.connect(str(db_path)) as conn:
-        status = conn.execute("SELECT status FROM connector_outbox").fetchone()[0]
+        status, private_json = conn.execute(
+            "SELECT status, private_state_json FROM connector_outbox"
+        ).fetchone()
     assert reclaimed["reclaimed"] == 1
     assert status == "dead_letter"
+    assert json.loads(private_json)["terminal_diagnostic"] == {
+        "reason": "missing",
+        "attempt_count": 0,
+        "classification": "plan_unrecoverable",
+        "terminalized_at": "2026-01-01T00:00:01+00:00",
+    }
 
 
 def test_v16_migration_backfills_ordering_and_awaiting_ack_deadlines(
