@@ -974,6 +974,82 @@ def test_turn_final_private_reason_redacts_shared_credential_prefix_matrix(
         assert "reason_detail" not in failed
 
 
+def _provider_body_at_source_minimum(prefix: str) -> str:
+    # Prefer lowercase to exercise the boundary rule; AKIA's source class
+    # permits only uppercase letters and digits.
+    for body_char in ("a", "A"):
+        for body_length in range(1, 65):
+            candidate = prefix + (body_char * body_length)
+            if any(
+                pattern.fullmatch(candidate)
+                for pattern in (
+                    store_sqlite._TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS
+                )
+            ):
+                return body_char * body_length
+    raise AssertionError(f"no provider body available for {prefix}")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    store_sqlite._TURN_FINAL_PRIVATE_CREDENTIAL_PREFIXES,
+)
+def test_turn_final_private_reason_redacts_boundary_credential_before_underscore(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    db_path = tmp_path / "turn-final-boundary-credential-before-underscore.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix=f"boundary-credential-{prefix}",
+        ordering_key="worker-a",
+    )
+    body = _provider_body_at_source_minimum(prefix)
+    credential = prefix + body
+    reason = f"error: {credential}_expired"
+    leased = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="turn-final",
+        ref=leased["ref"],
+        reason=reason,
+        delay_seconds=0,
+        max_attempts=1,
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_json, response_json = conn.execute(
+            """
+            SELECT outbox.private_state_json, deliveries.response_json
+            FROM connector_outbox AS outbox
+            JOIN connector_deliveries AS deliveries
+              ON deliveries.outbox_id = outbox.id
+            WHERE outbox.delivery_key = ?
+            ORDER BY deliveries.id DESC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+
+    private_detail = json.loads(private_json)["terminal_diagnostic"]["reason_detail"]
+    response_detail = json.loads(response_json)["reason_detail"]
+    persisted = f"{private_json}\n{response_json}"
+    assert private_detail == response_detail
+    assert "[redacted]" in private_detail
+    assert credential not in persisted
+    assert prefix not in persisted
+    assert body not in persisted
+    assert "reason_detail" not in failed
+
+
 @pytest.mark.parametrize(
     "reason",
     [
@@ -985,12 +1061,19 @@ def test_turn_final_private_reason_redacts_shared_credential_prefix_matrix(
         "npm_install failed",
     ],
 )
+@pytest.mark.parametrize(
+    "word_prefix",
+    ["", "x"],
+    ids=["as-reported", "word-char-prefixed"],
+)
 def test_turn_final_private_reason_preserves_ordinary_diagnostic_text(
     reason: str,
+    word_prefix: str,
 ) -> None:
-    assert store_sqlite._turn_final_reason_diagnostics(reason) == (
+    diagnostic = word_prefix + reason
+    assert store_sqlite._turn_final_reason_diagnostics(diagnostic) == (
         "unknown",
-        reason,
+        diagnostic,
     )
 
 

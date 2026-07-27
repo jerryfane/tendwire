@@ -2441,12 +2441,25 @@ def _redact_turn_final_provider_credentials(value: str) -> str:
         redacted = pattern.sub(
             lambda match: (
                 "[redacted]"
-                if _turn_final_provider_body_is_token_shaped(match.group("body"))
+                if _turn_final_provider_match_is_sensitive(redacted, match)
                 else match.group(0)
             ),
             redacted,
         )
     return redacted
+
+
+def _turn_final_provider_match_is_sensitive(
+    value: str,
+    match: re.Match[str],
+) -> bool:
+    leading_boundary = match.start() == 0 or not (
+        value[match.start() - 1].isalnum()
+        or value[match.start() - 1] == "_"
+    )
+    return leading_boundary or _turn_final_provider_body_is_token_shaped(
+        match.group("body")
+    )
 
 
 def _turn_final_provider_body_is_token_shaped(body: str) -> bool:
@@ -2477,7 +2490,7 @@ def _repair_turn_final_provider_credential_tail(
     best_prefix_length = 0
     for pattern in _TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS:
         for match in pattern.finditer(original):
-            if not _turn_final_provider_body_is_token_shaped(match.group("body")):
+            if not _turn_final_provider_match_is_sensitive(original, match):
                 continue
             token = match.group(0)
             prefix = next(
