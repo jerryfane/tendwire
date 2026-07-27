@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import sqlite3
 import stat
@@ -76,6 +77,7 @@ from ..core.models import (
     SCHEMA_VERSION,
     Snapshot,
     WorkerBinding,
+    _PUBLIC_PROVIDER_CREDENTIAL_RE,
     normalize_severity,
     separate_duplicate_worker_bindings,
     sanitize_canonical_turn_text,
@@ -2210,6 +2212,18 @@ _CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS = 30
 _CONNECTOR_DRAIN_TARGET_SECONDS = 30
 _TURN_FINAL_REASON_DETAIL_MAX_CHARS = 240
 _CONNECTOR_TERMINAL_DIAGNOSTIC_KEY = "terminal_diagnostic"
+_TURN_FINAL_PRIVATE_CREDENTIAL_FRAGMENT_RE = re.compile(
+    re.sub(
+        r"\{\d+,\}",
+        "*",
+        "|".join(
+            alternative
+            for alternative in _PUBLIC_PROVIDER_CREDENTIAL_RE.pattern.split("|")
+            if not alternative.lstrip().startswith(r"\b\d")
+        ).replace(r"\b", ""),
+    ),
+    _PUBLIC_PROVIDER_CREDENTIAL_RE.flags,
+)
 _TURN_FINAL_PUBLIC_REASONS = frozenset(
     {
         "backpressure",
@@ -2373,9 +2387,21 @@ def _store_public_text(
 
 
 def _store_private_diagnostic_text(value: Any) -> str:
-    return sanitize_public_text(
+    retained = sanitize_public_text(
         str(value or ""),
         max_chars=_TURN_FINAL_REASON_DETAIL_MAX_CHARS,
+    )
+    redacted = _TURN_FINAL_PRIVATE_CREDENTIAL_FRAGMENT_RE.sub(
+        "[redacted]",
+        retained,
+    )
+    if len(redacted) <= _TURN_FINAL_REASON_DETAIL_MAX_CHARS:
+        return redacted
+    marker = "\n[truncated]"
+    visible = redacted.removesuffix(marker)
+    return (
+        visible[: _TURN_FINAL_REASON_DETAIL_MAX_CHARS - len(marker)].rstrip()
+        + marker
     )
 
 
