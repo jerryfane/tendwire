@@ -2212,18 +2212,67 @@ _CONNECTOR_ACK_RETRY_BACKOFF_MAX_SECONDS = 30
 _CONNECTOR_DRAIN_TARGET_SECONDS = 30
 _TURN_FINAL_REASON_DETAIL_MAX_CHARS = 240
 _CONNECTOR_TERMINAL_DIAGNOSTIC_KEY = "terminal_diagnostic"
-_TURN_FINAL_PRIVATE_CREDENTIAL_FRAGMENT_RE = re.compile(
-    re.sub(
-        r"\{\d+,\}",
-        "*",
-        "|".join(
-            alternative
-            for alternative in _PUBLIC_PROVIDER_CREDENTIAL_RE.pattern.split("|")
-            if not alternative.lstrip().startswith(r"\b\d")
-        ).replace(r"\b", ""),
-    ),
-    _PUBLIC_PROVIDER_CREDENTIAL_RE.flags,
+_TURN_FINAL_PROVIDER_BODY_SUFFIX_RE = re.compile(
+    r"(?P<body_class>\[[^\]]+\])(?P<minimum>\{\d+,\})\\b$"
 )
+
+
+def _expand_turn_final_provider_prefix(pattern: str) -> tuple[str, ...]:
+    expanded = [""]
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "[":
+            end = pattern.find("]", index + 1)
+            if end < 0:
+                raise RuntimeError("invalid provider credential prefix pattern")
+            choices = pattern[index + 1 : end]
+            if not choices or "\\" in choices or "-" in choices:
+                raise RuntimeError("unsupported provider credential prefix pattern")
+            expanded = [head + choice for head in expanded for choice in choices]
+            index = end + 1
+            continue
+        if char == "\\":
+            index += 1
+            if index >= len(pattern):
+                raise RuntimeError("invalid provider credential prefix escape")
+            char = pattern[index]
+        expanded = [head + char for head in expanded]
+        index += 1
+    return tuple(expanded)
+
+
+def _turn_final_provider_credential_patterns(
+    source: re.Pattern[str],
+) -> tuple[tuple[re.Pattern[str], ...], tuple[str, ...]]:
+    patterns: list[re.Pattern[str]] = []
+    prefixes: list[str] = []
+    for raw_alternative in source.pattern.split("|"):
+        alternative = raw_alternative.strip()
+        if alternative.startswith(r"\b\d"):
+            continue
+        without_boundary = alternative.removeprefix(r"\b")
+        suffix = _TURN_FINAL_PROVIDER_BODY_SUFFIX_RE.search(without_boundary)
+        if suffix is None:
+            raise RuntimeError("unsupported provider credential pattern")
+        prefix_pattern = without_boundary[: suffix.start()]
+        body_pattern = suffix.group("body_class") + suffix.group("minimum")
+        patterns.append(
+            re.compile(
+                rf"(?:{prefix_pattern})(?P<body>{body_pattern})",
+                source.flags,
+            )
+        )
+        prefixes.extend(_expand_turn_final_provider_prefix(prefix_pattern))
+    if not patterns or not prefixes:
+        raise RuntimeError("provider credential patterns unavailable")
+    return tuple(patterns), tuple(dict.fromkeys(prefixes))
+
+
+(
+    _TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS,
+    _TURN_FINAL_PRIVATE_CREDENTIAL_PREFIXES,
+) = _turn_final_provider_credential_patterns(_PUBLIC_PROVIDER_CREDENTIAL_RE)
 _TURN_FINAL_PUBLIC_REASONS = frozenset(
     {
         "backpressure",
@@ -2386,23 +2435,96 @@ def _store_public_text(
     return clean if isinstance(clean, str) and clean else default
 
 
-def _store_private_diagnostic_text(value: Any) -> str:
-    retained = sanitize_public_text(
-        str(value or ""),
-        max_chars=_TURN_FINAL_REASON_DETAIL_MAX_CHARS,
-    )
-    redacted = _TURN_FINAL_PRIVATE_CREDENTIAL_FRAGMENT_RE.sub(
-        "[redacted]",
-        retained,
-    )
-    if len(redacted) <= _TURN_FINAL_REASON_DETAIL_MAX_CHARS:
-        return redacted
+def _redact_turn_final_provider_credentials(value: str) -> str:
+    redacted = value
+    for pattern in _TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS:
+        redacted = pattern.sub(
+            lambda match: (
+                "[redacted]"
+                if _turn_final_provider_body_is_token_shaped(match.group("body"))
+                else match.group(0)
+            ),
+            redacted,
+        )
+    return redacted
+
+
+def _turn_final_provider_body_is_token_shaped(body: str) -> bool:
+    return any(char.isdigit() or char.isupper() for char in body)
+
+
+def _cap_turn_final_private_diagnostic(value: str) -> str:
+    if len(value) <= _TURN_FINAL_REASON_DETAIL_MAX_CHARS:
+        return value
     marker = "\n[truncated]"
-    visible = redacted.removesuffix(marker)
+    visible = value.removesuffix(marker)
     return (
         visible[: _TURN_FINAL_REASON_DETAIL_MAX_CHARS - len(marker)].rstrip()
         + marker
     )
+
+
+def _repair_turn_final_provider_credential_tail(
+    retained: str,
+    *,
+    original: str,
+) -> str:
+    marker = "\n[truncated]"
+    if not retained.endswith(marker):
+        return retained
+    visible = retained[: -len(marker)]
+    best_overlap = 0
+    best_prefix_length = 0
+    for pattern in _TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS:
+        for match in pattern.finditer(original):
+            if not _turn_final_provider_body_is_token_shaped(match.group("body")):
+                continue
+            token = match.group(0)
+            prefix = next(
+                (
+                    candidate
+                    for candidate in _TURN_FINAL_PRIVATE_CREDENTIAL_PREFIXES
+                    if token.startswith(candidate)
+                ),
+                "",
+            )
+            if not prefix:
+                continue
+            overlap = min(len(token), len(visible))
+            while overlap > 0 and not visible.endswith(token[:overlap]):
+                overlap -= 1
+            if (
+                overlap > best_overlap
+                and match.start() == len(visible) - overlap
+            ):
+                best_overlap = overlap
+                best_prefix_length = len(prefix)
+    if not best_overlap:
+        return retained
+    replacement = "[redacted]" if best_overlap > best_prefix_length else ""
+    head = visible[:-best_overlap].rstrip()
+    if replacement:
+        head = head[
+            : _TURN_FINAL_REASON_DETAIL_MAX_CHARS
+            - len(marker)
+            - len(replacement)
+        ].rstrip()
+    return head + replacement + marker
+
+
+def _store_private_diagnostic_text(value: Any) -> str:
+    original = str(value or "")
+    retained = sanitize_public_text(
+        original,
+        max_chars=_TURN_FINAL_REASON_DETAIL_MAX_CHARS,
+    )
+    redacted = _redact_turn_final_provider_credentials(retained)
+    capped = _cap_turn_final_private_diagnostic(redacted)
+    repaired = _repair_turn_final_provider_credential_tail(
+        capped,
+        original=original,
+    )
+    return _cap_turn_final_private_diagnostic(repaired)
 
 
 def _turn_final_reason_diagnostics(value: Any) -> tuple[str, str]:
