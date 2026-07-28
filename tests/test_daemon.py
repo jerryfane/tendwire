@@ -4737,7 +4737,10 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             if method == "agent.get":
                 return {"result": {"agent": {"pane_id": "pane-private"}}}
             if method == "pane.read":
-                return {"type": "pane_read", "read": {"text": ""}}
+                return {
+                    "type": "pane_read",
+                    "read": {"text": "Completed previous turn.\n── status: idle ──"},
+                }
             if method == "agent.prompt":
                 return {
                     "type": "agent_prompted",
@@ -4832,15 +4835,6 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
-            {
-                "method": "pane.read",
-                "params": {
-                    "pane_id": "pane-private",
-                    "source": "visible",
-                    "format": "text",
-                    "strip_ansi": True,
-                },
-            },
             {
                 "method": "agent.prompt",
                 "params": {

@@ -368,6 +368,14 @@ def test_public_structural_key_allowlist_rejects_dynamic_id_and_fingerprint_shap
     assert sanitize_public_value({"host_id": "session_PUBLICSAFETY123456"}) == {}
 
 
+def test_public_submission_verdict_is_closed_vocabulary() -> None:
+    assert sanitize_public_value({"submission_verdict": "submitted"}) == {
+        "submission_verdict": "submitted"
+    }
+    assert sanitize_public_value({"submission_verdict": "invented"}) == {}
+    assert sanitize_public_value({"submission_verdict": 1}) == {}
+
+
 @pytest.mark.parametrize("host_id", ("output-excerpt", "pane-id-private"))
 def test_public_host_id_provenance_preserves_opaque_field_name_words(host_id: str) -> None:
     snapshot = Snapshot(

@@ -487,7 +487,6 @@ _PUBLIC_SUBMISSION_VERDICTS = frozenset(
         "agent_input_pending",
         "agent_prompt_stalled",
         "unknown",
-        "composer_clear_unverified",
     }
 )
 _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
@@ -975,6 +974,17 @@ def sanitize_public_value(
     private. Ordinary numeric topic/message IDs are ambiguous and require key
     provenance at the adapter boundary.
     """
+    normalized_field = str(_field).strip().lower().replace("-", "_")
+    if normalized_field == "submission_verdict":
+        if not isinstance(value, str):
+            return _PUBLIC_DROP if _nested else None
+        verdict = sanitize_public_text(
+            value,
+            max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS,
+        )
+        if verdict not in _PUBLIC_SUBMISSION_VERDICTS:
+            return _PUBLIC_DROP if _nested else None
+        return verdict
     if isinstance(value, datetime):
         return utc_timestamp(value)
     if isinstance(value, Mapping):
@@ -1031,11 +1041,6 @@ def sanitize_public_value(
         text = sanitize_public_text(value, max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS)
         field_text = str(_field)
         normalized_field = field_text.strip().lower().replace("-", "_")
-        if (
-            normalized_field == "submission_verdict"
-            and text in _PUBLIC_SUBMISSION_VERDICTS
-        ):
-            return text
         if backend_neutral and (
             "[redacted]" in text
             or _contains_connector_private_text(value)

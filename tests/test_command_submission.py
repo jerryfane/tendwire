@@ -211,6 +211,15 @@ def _binding(
     )
 
 
+_REALISTIC_VISIBLE_PANE = """\
+╭─ Claude Code ─────────────────────────────────────────────────────────────╮
+│ Completed the previous task.                                             │
+╰───────────────────────────────────────────────────────────────────────────╯
+─────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ accept edits on · esc to interrupt
+"""
+
+
 class _FakeSocketClient:
     def __init__(
         self,
@@ -234,7 +243,10 @@ class _FakeSocketClient:
         if method == "agent.get":
             return {"result": {"agent": {"pane_id": self.pane_id}}}
         if method == "pane.read":
-            return {"type": "pane_read", "read": {"text": ""}}
+            return {
+                "type": "pane_read",
+                "read": {"text": _REALISTIC_VISIBLE_PANE},
+            }
         if method == "agent.prompt":
             return {
                 "type": "agent_prompted",
@@ -259,7 +271,7 @@ class _PromptVerdictClient(_FakeSocketClient):
         super().__init__(calls)
         self.delivery = delivery
         self.error_code = error_code
-        self.pane_reads = list(pane_reads or [""])
+        self.pane_reads = list(pane_reads or [_REALISTIC_VISIBLE_PANE])
 
     def request(
         self,
@@ -307,15 +319,6 @@ def _expected_submit_calls(
     return [
         {"method": "agent.get", "params": {"target": target}},
         *_expected_private_clear_calls(pane_id),
-        {
-            "method": "pane.read",
-            "params": {
-                "pane_id": pane_id,
-                "source": "visible",
-                "format": "text",
-                "strip_ansi": True,
-            },
-        },
         {
             "method": "agent.prompt",
             "params": {
@@ -533,15 +536,6 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {
-            "method": "pane.read",
-            "params": {
-                "pane_id": "pane-secret",
-                "source": "visible",
-                "format": "text",
-                "strip_ansi": True,
-            },
-        },
         {
             "method": "agent.prompt",
             "params": {
@@ -1195,6 +1189,8 @@ def test_submit_command_uses_verified_agent_prompt(tmp_path: Path) -> None:
 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == _expected_submit_calls()
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+    assert not any(call["method"] == "pane.read" for call in calls)
     assert not any(call["method"] == "pane.send_text" for call in calls)
     assert not any(
         call["method"] == "pane.send_keys" and call["params"].get("keys") == ["Enter"]
@@ -1360,7 +1356,7 @@ def test_agent_prompt_stalled_reads_composer_and_never_resends(
         socket_client_factory=lambda _config: _PromptVerdictClient(
             calls,
             error_code="agent_prompt_stalled",
-            pane_reads=["", composer_after_stall],
+            pane_reads=[composer_after_stall],
         ),
     )
     second = submit_command(
@@ -1376,30 +1372,41 @@ def test_agent_prompt_stalled_reads_composer_and_never_resends(
     assert first.disposition == expected_disposition
     assert first.result["submission_verdict"] == "agent_prompt_stalled"
     assert first.result["composer_state"] == composer_state
-    assert sum(call["method"] == "pane.read" for call in calls) == 2
+    assert sum(call["method"] == "pane.read" for call in calls) == 1
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
 
-def test_composer_clear_requires_empty_readback_before_prompt(tmp_path: Path) -> None:
+def test_composer_clear_failures_do_not_gate_verified_prompt(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
 
+    class ClearFailsClient(_FakeSocketClient):
+        def request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            *,
+            timeout: float | None = None,
+        ) -> dict[str, Any]:
+            if method == "pane.send_keys":
+                self.calls.append({"method": method, "params": dict(params)})
+                raise HerdrProtocolError("clear key rejected")
+            return super().request(method, params, timeout=timeout)
+
     envelope = submit_command(
         config,
-        _request(request_id="composer-not-empty"),
-        socket_client_factory=lambda _config: _PromptVerdictClient(
-            calls,
-            pane_reads=["draft remains"],
-        ),
+        _request(request_id="composer-clear-failed"),
+        socket_client_factory=lambda _config: ClearFailsClient(calls),
     )
 
-    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
-    assert envelope.disposition == DISPOSITION_TERMINAL_UNCERTAIN
-    assert envelope.result["submission_verdict"] == "composer_clear_unverified"
-    assert sum(call["method"] == "pane.read" for call in calls) == 1
-    assert sum(call["method"] == "agent.prompt" for call in calls) == 0
+    assert envelope.status == STATUS_ACCEPTED
+    assert envelope.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert envelope.result["submission_verdict"] == "submitted"
+    assert sum(call["method"] == "pane.send_keys" for call in calls) == 3
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+    assert not any(call["method"] == "pane.read" for call in calls)
 
 
 def test_crash_after_prompt_write_recovers_unknown_without_resend(
@@ -1530,15 +1537,6 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
         *_expected_private_clear_calls("pane-private"),
-        {
-            "method": "pane.read",
-            "params": {
-                "pane_id": "pane-private",
-                "source": "visible",
-                "format": "text",
-                "strip_ansi": True,
-            },
-        },
         {
             "method": "agent.prompt",
             "params": {
@@ -3953,7 +3951,7 @@ def test_observed_turn_identity_and_link_are_order_independent(
         config = _config(
             case_path,
             turn_model="observed",
-            submission_link_window_seconds=2,
+            submission_link_window_seconds=30,
         )
         assert config.db_path is not None
         worker = Worker(
@@ -4299,7 +4297,10 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
                     ]
                 }
             if method == "pane.read":
-                return {"type": "pane_read", "read": {"text": ""}}
+                return {
+                    "type": "pane_read",
+                    "read": {"text": _REALISTIC_VISIBLE_PANE},
+                }
             if method == "agent.prompt":
                 return {
                     "type": "agent_prompted",
@@ -4319,15 +4320,6 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
         {"method": "agent.get", "params": {"target": "term-dup"}},
         {"method": "agent.list", "params": {}},
         *_expected_private_clear_calls("w1:p1"),
-        {
-            "method": "pane.read",
-            "params": {
-                "pane_id": "w1:p1",
-                "source": "visible",
-                "format": "text",
-                "strip_ansi": True,
-            },
-        },
         {
             "method": "agent.prompt",
             "params": {

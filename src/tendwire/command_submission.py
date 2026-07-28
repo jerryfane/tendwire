@@ -421,10 +421,6 @@ class _PaneInputNotStartedError(RuntimeError):
     """The instruction input operation was never attempted."""
 
 
-class _ComposerClearUnverifiedError(RuntimeError):
-    """The private pane composer could not be proven empty."""
-
-
 def _pane_read_text(value: Any) -> str:
     if not isinstance(value, Mapping):
         raise ValueError("invalid pane.read response")
@@ -459,19 +455,19 @@ def _clear_private_pane_composer(
     *,
     timeout: float,
 ) -> None:
-    try:
-        for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
+    # pane.read exposes rendered terminal output, not the composer, so it
+    # cannot verify that these key sequences cleared the input. Treat clearing
+    # as best-effort and let agent.prompt provide the authoritative verdict.
+    for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
+        try:
             _socket_request(
                 client,
                 "pane.send_keys",
                 {"pane_id": pane_id, "keys": list(keys)},
                 timeout=timeout,
             )
-        visible = _read_private_pane_text(client, pane_id, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
-        raise _ComposerClearUnverifiedError from exc
-    if visible.strip():
-        raise _ComposerClearUnverifiedError
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _agent_prompt_delivery(value: Any) -> str:
@@ -1700,23 +1696,11 @@ def _submit_instruction(
 ) -> CommandEnvelope:
     assert config.db_path is not None
     try:
-        try:
-            _clear_private_pane_composer(
-                prepared.client,
-                prepared.pane_id,
-                timeout=config.herdr_timeout_seconds,
-            )
-        except _ComposerClearUnverifiedError:
-            return _finish_before_send(
-                config,
-                request,
-                reservation,
-                _instruction_uncertain_envelope(
-                    request,
-                    worker,
-                    verdict="composer_clear_unverified",
-                ),
-            )
+        _clear_private_pane_composer(
+            prepared.client,
+            prepared.pane_id,
+            timeout=config.herdr_timeout_seconds,
+        )
 
         send_started = _mark_request_send_started(
             config,

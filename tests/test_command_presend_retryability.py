@@ -169,7 +169,10 @@ class _FakeSocketClient:
                 return self.agent_get_response
             return {"result": {"agent": {"pane_id": "pane-w-1"}}}
         if method == "pane.read":
-            return {"type": "pane_read", "read": {"text": ""}}
+            return {
+                "type": "pane_read",
+                "read": {"text": "Completed previous turn.\n── status: idle ──"},
+            }
         if method == "agent.prompt":
             return {
                 "type": "agent_prompted",
