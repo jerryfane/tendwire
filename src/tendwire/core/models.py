@@ -464,6 +464,7 @@ _PUBLIC_ALLOWED_MAPPING_KEYS = frozenset(
         "segment_id",
         "source_turn_id",
         "space_id",
+        "submission_verdict",
         "submission_id",
         "transport_state",
         "turn_id",
@@ -478,6 +479,17 @@ _PUBLIC_STRUCTURAL_MAPPING_KEY_SUFFIXES = (
     "_fingerprints",
 )
 _PUBLIC_VALUE_TEXT_MAX_CHARS = 12000
+_PUBLIC_SUBMISSION_VERDICTS = frozenset(
+    {
+        "submitted",
+        "written_to_pty",
+        "agent_prompt_unsubmitted",
+        "agent_input_pending",
+        "agent_prompt_stalled",
+        "unknown",
+        "composer_clear_unverified",
+    }
+)
 _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
 _PUBLIC_SANITIZER_CONFIG_VERSION = 1
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
@@ -1019,6 +1031,11 @@ def sanitize_public_value(
         text = sanitize_public_text(value, max_chars=_PUBLIC_VALUE_TEXT_MAX_CHARS)
         field_text = str(_field)
         normalized_field = field_text.strip().lower().replace("-", "_")
+        if (
+            normalized_field == "submission_verdict"
+            and text in _PUBLIC_SUBMISSION_VERDICTS
+        ):
+            return text
         if backend_neutral and (
             "[redacted]" in text
             or _contains_connector_private_text(value)

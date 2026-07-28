@@ -4736,6 +4736,14 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             calls.append({"method": method, "params": dict(params)})
             if method == "agent.get":
                 return {"result": {"agent": {"pane_id": "pane-private"}}}
+            if method == "pane.read":
+                return {"type": "pane_read", "read": {"text": ""}}
+            if method == "agent.prompt":
+                return {
+                    "type": "agent_prompted",
+                    "agent": {"pane_id": "pane-private"},
+                    "delivery": "submitted",
+                }
             return {"accepted": True}
 
         def close(self) -> None:
@@ -4824,7 +4832,23 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
             {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
-            {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello", "keys": ["Enter"]}},
+            {
+                "method": "pane.read",
+                "params": {
+                    "pane_id": "pane-private",
+                    "source": "visible",
+                    "format": "text",
+                    "strip_ansi": True,
+                },
+            },
+            {
+                "method": "agent.prompt",
+                "params": {
+                    "target": "agent-private",
+                    "text": "hello",
+                    "wait": {"until": ["working"], "timeout_ms": 5000},
+                },
+            },
         ]
         receipt = get_command_request(db_path, "cmd-host", "req-1")
         assert receipt is not None
@@ -4862,7 +4886,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert cli_result == replay["result"]
         assert cli_result["disposition"] == DISPOSITION_TERMINAL_ACCEPTED
         _assert_no_public_json_forbidden(cli_result)
-        assert len([call for call in calls if call["method"] == "pane.send_input"]) == 1
+        assert len([call for call in calls if call["method"] == "agent.prompt"]) == 1
         for response in [*responses, replay]:
             encoded = json.dumps(response)
             assert "agent-private" not in encoded

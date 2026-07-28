@@ -18571,6 +18571,7 @@ def _terminalize_turn_submission_conn(
     """Advance an existing shadow row with its command receipt transaction."""
     next_state = {
         "accepted": "submitted",
+        "rejected": "cancelled",
         "uncertain": "uncertain",
     }.get(str(terminal_state))
     if next_state is None:
@@ -25593,6 +25594,292 @@ def mark_command_send_started(
         conn.close()
 
 
+def record_command_send_queued(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    owner_token: str,
+    result_json: str,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Persist a verified queued send without permitting another mutation."""
+    current = _command_request_now(now)
+    owner_hash = _owner_token_hash(owner_token)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if str(row[8]) != "send_started":
+            conn.commit()
+            return _command_request_response("invalid_state", row)
+        if not owner_hash or not secrets.compare_digest(str(row[11]), owner_hash):
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET status = 'pending',
+                result_json = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = 'send_started'
+              AND canonical_fingerprint = ?
+              AND owner_token_hash = ?
+            """,
+            (
+                str(result_json),
+                current,
+                int(row[0]),
+                str(canonical_fingerprint),
+                owner_hash,
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("not_owner", row)
+        submission_updated = conn.execute(
+            """
+            UPDATE turn_submissions
+            SET state = 'submitted',
+                submitted_at = ?,
+                link_expires_at = hard_expires_at,
+                updated_at = ?
+            WHERE host_id = ? AND request_id = ?
+              AND state = 'send_started'
+              AND linked_turn_id IS NULL
+            """,
+            (current, current, str(host_id), str(request_id)),
+        )
+        if int(submission_updated.rowcount or 0) != 1:
+            raise StoreSchemaError("queued turn submission transition failed")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("queued command request disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response("queued", row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finish_queued_command_request(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    queued_result_json: str,
+    accepted_result_json: str,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Accept a queued request only after its exact observed turn is linked."""
+    current = _command_request_now(now)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if (
+            str(row[8]) != "send_started"
+            or str(row[9]) != "pending"
+            or str(row[10]) != str(queued_result_json)
+        ):
+            conn.commit()
+            return _command_request_response("invalid_state", row)
+        linked = conn.execute(
+            """
+            SELECT 1
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+              AND state = 'linked' AND linked_turn_id IS NOT NULL
+            LIMIT 1
+            """,
+            (str(host_id), str(request_id)),
+        ).fetchone()
+        if linked is None:
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET state = 'accepted',
+                status = 'accepted',
+                result_json = ?,
+                owner_token_hash = '',
+                owner_expires_at = NULL,
+                terminal_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = 'send_started'
+              AND canonical_fingerprint = ?
+              AND status = 'pending'
+              AND result_json = ?
+            """,
+            (
+                str(accepted_result_json),
+                current,
+                current,
+                int(row[0]),
+                str(canonical_fingerprint),
+                str(queued_result_json),
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("accepted queued command request disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response("accepted", row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def recover_unresolved_command_send(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    unresolved_result_json: str,
+    uncertain_result_json: str,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Resolve an abandoned, verdict-less send-start as terminal uncertainty."""
+    current = _command_request_now(now)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if (
+            str(row[8]) != "send_started"
+            or str(row[9]) != "pending"
+            or str(row[10]) != str(unresolved_result_json)
+        ):
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        expires_at = str(row[12] or "")
+        if (
+            not expires_at
+            or datetime.fromisoformat(expires_at)
+            > datetime.fromisoformat(current)
+        ):
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET state = 'uncertain',
+                status = 'request_state_uncertain',
+                result_json = ?,
+                owner_token_hash = '',
+                owner_expires_at = NULL,
+                terminal_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = 'send_started'
+              AND canonical_fingerprint = ?
+              AND status = 'pending'
+              AND result_json = ?
+            """,
+            (
+                str(uncertain_result_json),
+                current,
+                current,
+                int(row[0]),
+                str(canonical_fingerprint),
+                str(unresolved_result_json),
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        _terminalize_turn_submission_conn(
+            conn,
+            host_id=str(host_id),
+            request_id=str(request_id),
+            terminal_state="uncertain",
+            current=current,
+        )
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("uncertain recovered command request disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response("uncertain", row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def finish_command_request(
     db_path: Path,
     *,
@@ -25613,7 +25900,7 @@ def finish_command_request(
     terminal = str(terminal_state)
     allowed = {
         "reserved": {"rejected", "uncertain"},
-        "send_started": {"accepted", "uncertain"},
+        "send_started": {"accepted", "rejected", "uncertain"},
     }
     if expected not in allowed or terminal not in allowed[expected]:
         raise ValueError("illegal command request transition")

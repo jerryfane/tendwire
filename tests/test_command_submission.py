@@ -15,7 +15,7 @@ import pytest
 import tendwire.command_submission as command_submission
 import tendwire.store.sqlite as store_sqlite
 
-from tendwire.backends.herdr_protocol import HerdrProtocolError
+from tendwire.backends.herdr_protocol import HerdrErrorResponse, HerdrProtocolError
 from tendwire.backends.herdr_socket import (
     HerdrSocketDisconnectedError,
     HerdrSocketTimeoutError,
@@ -229,14 +229,65 @@ class _FakeSocketClient:
 
     def request(self, method: str, params: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
         self.calls.append({"method": method, "params": dict(params)})
-        if self.raises is not None and method == "pane.send_input":
+        if self.raises is not None and method in {"pane.send_input", "agent.prompt"}:
             raise self.raises
         if method == "agent.get":
             return {"result": {"agent": {"pane_id": self.pane_id}}}
+        if method == "pane.read":
+            return {"type": "pane_read", "read": {"text": ""}}
+        if method == "agent.prompt":
+            return {
+                "type": "agent_prompted",
+                "agent": {"pane_id": self.pane_id},
+                "delivery": "submitted",
+            }
         return {"accepted": True}
 
     def close(self) -> None:
         self.close_count += 1
+
+
+class _PromptVerdictClient(_FakeSocketClient):
+    def __init__(
+        self,
+        calls: list[dict[str, Any]],
+        *,
+        delivery: str = "submitted",
+        error_code: str | None = None,
+        pane_reads: list[str] | None = None,
+    ) -> None:
+        super().__init__(calls)
+        self.delivery = delivery
+        self.error_code = error_code
+        self.pane_reads = list(pane_reads or [""])
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if method == "pane.read":
+            self.calls.append({"method": method, "params": dict(params)})
+            text = self.pane_reads.pop(0) if self.pane_reads else ""
+            return {"type": "pane_read", "read": {"text": text}}
+        if method == "agent.prompt":
+            self.calls.append({"method": method, "params": dict(params)})
+            if self.error_code is not None:
+                raise HerdrErrorResponse(
+                    {
+                        "code": self.error_code,
+                        "message": self.error_code,
+                    },
+                    "test-request",
+                )
+            return {
+                "type": "agent_prompted",
+                "agent": {"pane_id": self.pane_id},
+                "delivery": self.delivery,
+            }
+        return super().request(method, params, timeout=timeout)
 
 
 def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None, pane_id: str = "pane-secret"):
@@ -246,13 +297,32 @@ def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None
     return make_client
 
 
-def _expected_submit_calls(target: str = "agent-secret", *, pane_id: str = "pane-secret") -> list[dict[str, Any]]:
+def _expected_submit_calls(
+    target: str = "agent-secret",
+    *,
+    pane_id: str = "pane-secret",
+    text: str = "hello",
+    timeout_ms: int = 5000,
+) -> list[dict[str, Any]]:
     return [
         {"method": "agent.get", "params": {"target": target}},
         *_expected_private_clear_calls(pane_id),
         {
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": "hello", "keys": ["Enter"]},
+            "method": "pane.read",
+            "params": {
+                "pane_id": pane_id,
+                "source": "visible",
+                "format": "text",
+                "strip_ansi": True,
+            },
+        },
+        {
+            "method": "agent.prompt",
+            "params": {
+                "target": target,
+                "text": text,
+                "wait": {"until": ["working"], "timeout_ms": timeout_ms},
+            },
         },
     ]
 
@@ -428,7 +498,7 @@ def test_submit_command_socket_setup_failures_are_backend_unavailable(
     )
     assert recovered.status == STATUS_ACCEPTED
     assert recovered.disposition == DISPOSITION_TERMINAL_ACCEPTED
-    assert [call["method"] for call in recovery_calls].count("pane.send_input") == 1
+    assert [call["method"] for call in recovery_calls].count("agent.prompt") == 1
     receipt = get_command_request(config.db_path, "cmd-host", f"setup-{label}")
     assert receipt is not None
     assert receipt["state"] == "accepted"
@@ -463,7 +533,23 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert calls == [
         {"method": "agent.get", "params": {"target": "agent-secret"}},
         *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
+        {
+            "method": "pane.read",
+            "params": {
+                "pane_id": "pane-secret",
+                "source": "visible",
+                "format": "text",
+                "strip_ansi": True,
+            },
+        },
+        {
+            "method": "agent.prompt",
+            "params": {
+                "target": "agent-secret",
+                "text": "hello",
+                "wait": {"until": ["working"], "timeout_ms": 5000},
+            },
+        },
     ]
     assert config.db_path is not None
     receipt = _receipt_for_action(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
@@ -517,6 +603,7 @@ def test_submit_command_uses_socket_pane_input_once_and_caches_result(tmp_path: 
         "target_state_at_send": "active",
         "observed_turn_state": "pending_observation",
         "turn_id": first.result["turn_id"],
+        "submission_verdict": "submitted",
     }
     assert second.to_dict() == first.to_dict()
     assert duplicate.status == STATUS_DUPLICATE_REQUEST
@@ -686,7 +773,7 @@ def test_request_id_can_be_resubmitted_after_receipt_retention_purge(
 
     assert resubmitted.status == STATUS_ACCEPTED
     assert resubmitted.disposition == DISPOSITION_TERMINAL_ACCEPTED
-    assert [call["method"] for call in calls].count("pane.send_input") == 3
+    assert [call["method"] for call in calls].count("agent.prompt") == 3
     with sqlite3.connect(str(config.db_path)) as conn:
         assert conn.execute(
             """
@@ -732,7 +819,7 @@ def test_submission_envelope_v3_requires_explicit_negotiation(tmp_path: Path) ->
     )
     assert opted_in.result["turn_id"] is None
     assert replayed.to_dict() == opted_in.to_dict()
-    assert [call["method"] for call in calls].count("pane.send_input") == 2
+    assert [call["method"] for call in calls].count("agent.prompt") == 2
 
     assert config.db_path is not None
     receipt = get_command_request(config.db_path, config.host_id, "opted-v3")
@@ -827,7 +914,7 @@ def test_submission_first_keeps_observation_authoritative_during_send(
     class ObservingClient(_FakeSocketClient):
         def request(self, method, params, *, timeout=None):
             result = super().request(method, params, timeout=timeout)
-            if method == "pane.send_input":
+            if method == "agent.prompt":
                 assert merge_turn_content(
                     config.db_path,
                     config.host_id,
@@ -896,11 +983,7 @@ def test_submit_command_sends_identical_100_character_instructions_without_turn_
     assert second.status == STATUS_ACCEPTED
     assert first.result["turn_id"] is None
     assert second.result["turn_id"] is None
-    expected_send = [
-        {"method": "agent.get", "params": {"target": "agent-secret"}},
-        *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
-    ]
+    expected_send = _expected_submit_calls(text=text)
     assert calls == [*expected_send, *expected_send]
 
     assert config.db_path is not None
@@ -1017,12 +1100,8 @@ def test_submit_command_allows_same_instruction_after_worker_fingerprint_changes
 
     assert second.status == STATUS_ACCEPTED
     assert calls == [
-        {"method": "agent.get", "params": {"target": "old-agent-secret"}},
-        *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
-        {"method": "agent.get", "params": {"target": "new-agent-secret"}},
-        *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": text, "keys": ["Enter"]}},
+        *_expected_submit_calls("old-agent-secret", text=text),
+        *_expected_submit_calls("new-agent-secret", text=text),
     ]
 
 
@@ -1106,7 +1185,7 @@ def test_submit_command_terminal_worker_id_and_fingerprint_replays_after_healthy
     assert calls == _expected_submit_calls()
 
 
-def test_submit_command_sends_text_and_enter_atomically(tmp_path: Path) -> None:
+def test_submit_command_uses_verified_agent_prompt(tmp_path: Path) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
@@ -1115,16 +1194,271 @@ def test_submit_command_sends_text_and_enter_atomically(tmp_path: Path) -> None:
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls))
 
     assert envelope.status == STATUS_ACCEPTED
-    assert calls == [
-        {"method": "agent.get", "params": {"target": "agent-secret"}},
-        *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
-    ]
+    assert calls == _expected_submit_calls()
     assert not any(call["method"] == "pane.send_text" for call in calls)
     assert not any(
         call["method"] == "pane.send_keys" and call["params"].get("keys") == ["Enter"]
         for call in calls
     )
+
+
+def test_written_to_pty_is_queued_without_retry_and_accepts_after_observed_turn(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(
+        id="w-1",
+        name="Alpha",
+        status="working",
+        meta={
+            "stable_key": "wsk1_" + ("7" * 64),
+            "stable_key_version": 1,
+        },
+    )
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = "queued-written-to-pty"
+
+    queued = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            delivery="written_to_pty",
+        ),
+    )
+    replay = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "queued replay must not issue a second prompt"
+        ),
+    )
+
+    assert queued.status == replay.status == STATUS_PENDING
+    assert queued.disposition == replay.disposition == DISPOSITION_IN_PROGRESS
+    assert queued.result["submission_verdict"] == "written_to_pty"
+    assert queued.result["delivery_state"] == "queued"
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE turn_submissions
+            SET submitted_at = ?, link_not_before = ?
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                config.host_id,
+                request_id,
+            ),
+        )
+    assert merge_turn_content(
+        config.db_path,
+        config.host_id,
+        worker.id,
+        {
+            "source_turn_id": "queued-observed-source",
+            "user_text": "hello",
+            "assistant_final_text": None,
+            "complete": False,
+            "has_open_turn": True,
+        },
+        observed_at="2026-01-01T00:00:01+00:00",
+    ) == 1
+
+    accepted = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "observed queued replay must not issue a second prompt"
+        ),
+    )
+
+    assert accepted.status == STATUS_ACCEPTED
+    assert accepted.disposition == DISPOSITION_TERMINAL_ACCEPTED
+    assert accepted.result["submission_verdict"] == "written_to_pty"
+    assert accepted.result["transport_state"] == "queued"
+    assert isinstance(accepted.result["turn_id"], str)
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    ["agent_prompt_unsubmitted", "agent_input_pending"],
+)
+def test_positive_non_delivery_verdict_is_terminal_rejected_without_retry(
+    tmp_path: Path,
+    verdict: str,
+) -> None:
+    config = _config(tmp_path / verdict)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = f"not-delivered-{verdict}"
+
+    first = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            error_code=verdict,
+        ),
+    )
+    second = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "terminal non-delivery replay must not issue another prompt"
+        ),
+    )
+
+    assert first.to_dict() == second.to_dict()
+    assert first.status == STATUS_REJECTED
+    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert first.result["submission_verdict"] == verdict
+    assert first.result["delivery_state"] == "not_delivered"
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("composer_after_stall", "expected_status", "expected_disposition", "composer_state"),
+    [
+        (
+            "hello",
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            DISPOSITION_TERMINAL_UNCERTAIN,
+            "instruction_visible",
+        ),
+        (
+            "",
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            DISPOSITION_TERMINAL_UNCERTAIN,
+            "instruction_absent",
+        ),
+    ],
+)
+def test_agent_prompt_stalled_reads_composer_and_never_resends(
+    tmp_path: Path,
+    composer_after_stall: str,
+    expected_status: str,
+    expected_disposition: str,
+    composer_state: str,
+) -> None:
+    config = _config(tmp_path / composer_state)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = f"stalled-{composer_state}"
+
+    first = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            error_code="agent_prompt_stalled",
+            pane_reads=["", composer_after_stall],
+        ),
+    )
+    second = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "stalled replay must not issue another prompt"
+        ),
+    )
+
+    assert first.to_dict() == second.to_dict()
+    assert first.status == expected_status
+    assert first.disposition == expected_disposition
+    assert first.result["submission_verdict"] == "agent_prompt_stalled"
+    assert first.result["composer_state"] == composer_state
+    assert sum(call["method"] == "pane.read" for call in calls) == 2
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+
+def test_composer_clear_requires_empty_readback_before_prompt(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+
+    envelope = submit_command(
+        config,
+        _request(request_id="composer-not-empty"),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            pane_reads=["draft remains"],
+        ),
+    )
+
+    assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert envelope.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert envelope.result["submission_verdict"] == "composer_clear_unverified"
+    assert sum(call["method"] == "pane.read" for call in calls) == 1
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 0
+
+
+def test_crash_after_prompt_write_recovers_unknown_without_resend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = "write-before-verdict-record"
+    real_finish = command_submission.finish_command_request
+
+    def crash_before_record(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("simulated process loss after prompt write")
+
+    monkeypatch.setattr(
+        command_submission,
+        "finish_command_request",
+        crash_before_record,
+    )
+    first = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(calls),
+    )
+    assert first.status == STATUS_PENDING
+    assert first.disposition == DISPOSITION_IN_PROGRESS
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+    monkeypatch.setattr(
+        command_submission,
+        "finish_command_request",
+        real_finish,
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE command_receipts
+            SET owner_expires_at = ?
+            WHERE host_id = ? AND request_id = ?
+            """,
+            ("2000-01-01T00:00:00+00:00", config.host_id, request_id),
+        )
+
+    recovered = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "unknown recovery must never resend"
+        ),
+    )
+
+    assert recovered.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert recovered.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert recovered.result["submission_verdict"] == "unknown"
+    assert recovered.result["delivery_state"] == "unknown"
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
 
 def test_submit_command_reports_submitted_transport_and_worker_state(tmp_path: Path) -> None:
@@ -1144,6 +1478,7 @@ def test_submit_command_reports_submitted_transport_and_worker_state(tmp_path: P
         "target_state_at_send": "active",
         "observed_turn_state": "pending_observation",
         "turn_id": envelope.result["turn_id"],
+        "submission_verdict": "submitted",
     }
 
 
@@ -1164,6 +1499,7 @@ def test_submit_command_marks_idle_worker_delivery_as_submitted(tmp_path: Path) 
         "target_state_at_send": "idle",
         "observed_turn_state": "pending_observation",
         "turn_id": envelope.result["turn_id"],
+        "submission_verdict": "submitted",
     }
 
 
@@ -1194,7 +1530,23 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
         *_expected_private_clear_calls("pane-private"),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-private", "text": "hello", "keys": ["Enter"]}},
+        {
+            "method": "pane.read",
+            "params": {
+                "pane_id": "pane-private",
+                "source": "visible",
+                "format": "text",
+                "strip_ansi": True,
+            },
+        },
+        {
+            "method": "agent.prompt",
+            "params": {
+                "target": "pane-private",
+                "text": "hello",
+                "wait": {"until": ["working"], "timeout_ms": 5000},
+            },
+        },
     ]
     public_json = json.dumps(envelope.to_dict())
     assert "pane-private" not in public_json
@@ -1458,9 +1810,7 @@ def test_submit_command_timeout_after_send_start_is_uncertain_and_not_retried(tm
     assert second.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert second.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert calls == [
-        {"method": "agent.get", "params": {"target": "agent-secret"}},
-        *_expected_private_clear_calls(),
-        {"method": "pane.send_input", "params": {"pane_id": "pane-secret", "text": "hello", "keys": ["Enter"]}},
+        *_expected_submit_calls(),
     ]
 
     assert config.db_path is not None
@@ -1952,7 +2302,7 @@ def test_submit_command_private_preparation_over_30_second_budget_precedes_reser
     assert first.status == STATUS_ACCEPTED
     assert second.status == STATUS_ACCEPTED
     assert first_calls == [{"method": "agent.get", "params": {"target": "agent-secret"}}]
-    assert second_calls == _expected_submit_calls()
+    assert second_calls == _expected_submit_calls(timeout_ms=31_000)
     assert [client.close_count for client in clients] == [1, 1]
     receipt = get_command_request(config.db_path, config.host_id, "concurrent-1")
     assert receipt is not None
@@ -1963,7 +2313,7 @@ def test_submit_command_private_preparation_over_30_second_budget_precedes_reser
             "WHERE host_id = ? AND request_id = ? AND state = 'accepted'",
             (config.host_id, "concurrent-1"),
         ).fetchone()[0] == 1
-    assert sum(call["method"] == "pane.send_input" for call in first_calls + second_calls) == 1
+    assert sum(call["method"] == "agent.prompt" for call in first_calls + second_calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -2011,7 +2361,7 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
 
     assert first.status == expected_status
     assert first.disposition == DISPOSITION_IN_PROGRESS
-    assert calls == [{"method": "agent.get", "params": {"target": "agent-secret"}}]
+    assert calls == _expected_submit_calls()[:-1]
     assert clients[0].close_count == 1
     assert config.db_path is not None
     receipt = get_command_request(config.db_path, config.host_id, "send-start-loss")
@@ -2046,9 +2396,7 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
         )
         assert conflict.status == STATUS_DUPLICATE_REQUEST
         assert [client.close_count for client in clients] == [1]
-        assert calls == [
-            {"method": "agent.get", "params": {"target": "agent-secret"}},
-        ]
+        assert calls == _expected_submit_calls()[:-1]
     assert not any(call["method"] == "pane.send_input" for call in calls)
 
 
@@ -2166,7 +2514,7 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
     assert receipt is not None
     assert receipt["state"] == expected_state
     assert receipt["state"] != "reserved"
-    assert sum(call["method"] == "pane.send_input" for call in initial_calls) == (
+    assert sum(call["method"] == "agent.prompt" for call in initial_calls) == (
         1 if initial_kind == "accepted" else 0
     )
 
@@ -2216,7 +2564,7 @@ def test_submit_command_timeout_before_send_start_stays_retryable(
         socket_client_factory=_factory(recovery_calls),
     )
     assert recovered.status == STATUS_ACCEPTED
-    assert [call["method"] for call in recovery_calls].count("pane.send_input") == 1
+    assert [call["method"] for call in recovery_calls].count("agent.prompt") == 1
     receipt = get_command_request(config.db_path, config.host_id, "before-timeout")
     assert receipt is not None
     assert receipt["state"] == "accepted"
@@ -3950,6 +4298,14 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
                         {"terminal_id": "term-dup", "pane_id": "w1:p1"},
                     ]
                 }
+            if method == "pane.read":
+                return {"type": "pane_read", "read": {"text": ""}}
+            if method == "agent.prompt":
+                return {
+                    "type": "agent_prompted",
+                    "agent": {"pane_id": "w1:p1"},
+                    "delivery": "submitted",
+                }
             return {"accepted": True}
 
     result = submit_command(
@@ -3964,8 +4320,21 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
         {"method": "agent.list", "params": {}},
         *_expected_private_clear_calls("w1:p1"),
         {
-            "method": "pane.send_input",
-            "params": {"pane_id": "w1:p1", "text": "hello", "keys": ["Enter"]},
+            "method": "pane.read",
+            "params": {
+                "pane_id": "w1:p1",
+                "source": "visible",
+                "format": "text",
+                "strip_ansi": True,
+            },
+        },
+        {
+            "method": "agent.prompt",
+            "params": {
+                "target": "term-dup",
+                "text": "hello",
+                "wait": {"until": ["working"], "timeout_ms": 5000},
+            },
         },
     ]
 
