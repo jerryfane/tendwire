@@ -1740,6 +1740,7 @@ def _submit_instruction(
         except Exception as exc:  # noqa: BLE001
             verdict = _herdr_error_code(exc)
             if verdict in {
+                "agent_prompt_not_received",
                 "agent_prompt_unsubmitted",
                 "agent_input_pending",
             }:
@@ -1775,9 +1776,9 @@ def _submit_instruction(
                             isinstance(composer, str)
                             and _instruction_text(request) in composer
                         )
-                        else "instruction_absent"
-                        if isinstance(composer, str)
                         else "unreadable"
+                        if composer is None
+                        else None
                     ),
                 )
             else:

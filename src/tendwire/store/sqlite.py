@@ -18860,12 +18860,20 @@ def settle_submission_links_conn(
     for (
         submission_id,
         owner_version,
-        _state,
+        state,
         lower,
         upper,
-        _submitted_at,
+        submitted_at,
         _send_started_at,
     ) in submissions:
+        # Turn ingestion records when an observation first reached Tendwire,
+        # not when the underlying agent turn started. record_command_send_queued
+        # stamps submitted_at while retaining send_started, which marks a
+        # written_to_pty prompt that cannot safely use observations as evidence.
+        # A pre-verdict send_started row has submitted_at NULL and may still be
+        # linked provisionally; the authoritative queued verdict clears it.
+        if state == "send_started" and submitted_at is not None:
+            continue
         for turn_id, turn_owner_version, observed_at in turns:
             if owner_version == turn_owner_version and lower <= observed_at <= upper:
                 submission_edges[submission_id].add(turn_id)
@@ -25654,13 +25662,14 @@ def record_command_send_queued(
         submission_updated = conn.execute(
             """
             UPDATE turn_submissions
-            SET state = 'submitted',
+            SET state = 'send_started',
+                linked_turn_id = NULL,
+                linked_at = NULL,
                 submitted_at = ?,
                 link_expires_at = hard_expires_at,
                 updated_at = ?
             WHERE host_id = ? AND request_id = ?
-              AND state = 'send_started'
-              AND linked_turn_id IS NULL
+              AND state IN ('send_started', 'linked')
             """,
             (current, current, str(host_id), str(request_id)),
         )

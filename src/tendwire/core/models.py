@@ -483,6 +483,7 @@ _PUBLIC_SUBMISSION_VERDICTS = frozenset(
     {
         "submitted",
         "written_to_pty",
+        "agent_prompt_not_received",
         "agent_prompt_unsubmitted",
         "agent_input_pending",
         "agent_prompt_stalled",

@@ -1198,7 +1198,7 @@ def test_submit_command_uses_verified_agent_prompt(tmp_path: Path) -> None:
     )
 
 
-def test_written_to_pty_is_queued_without_retry_and_accepts_after_observed_turn(
+def test_written_to_pty_prior_running_turn_observed_later_stays_queued(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -1242,10 +1242,11 @@ def test_written_to_pty_is_queued_without_retry_and_accepts_after_observed_turn(
         conn.execute(
             """
             UPDATE turn_submissions
-            SET submitted_at = ?, link_not_before = ?
+            SET submitted_at = ?, send_started_at = ?, link_not_before = ?
             WHERE host_id = ? AND request_id = ?
             """,
             (
+                "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
                 "2026-01-01T00:00:00+00:00",
                 config.host_id,
@@ -1266,25 +1267,37 @@ def test_written_to_pty_is_queued_without_retry_and_accepts_after_observed_turn(
         observed_at="2026-01-01T00:00:01+00:00",
     ) == 1
 
-    accepted = submit_command(
+    still_queued = submit_command(
         config,
         _request(request_id=request_id),
         socket_client_factory=lambda _config: pytest.fail(
-            "observed queued replay must not issue a second prompt"
+            "queued replay with an observed prior turn must not issue a second prompt"
         ),
     )
 
-    assert accepted.status == STATUS_ACCEPTED
-    assert accepted.disposition == DISPOSITION_TERMINAL_ACCEPTED
-    assert accepted.result["submission_verdict"] == "written_to_pty"
-    assert accepted.result["transport_state"] == "queued"
-    assert isinstance(accepted.result["turn_id"], str)
+    assert still_queued.status == STATUS_PENDING
+    assert still_queued.disposition == DISPOSITION_IN_PROGRESS
+    assert still_queued.result["submission_verdict"] == "written_to_pty"
+    assert still_queued.result["transport_state"] == "queued"
+    assert still_queued.result["turn_id"] is None
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT linked_turn_id FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchone() == (None,)
 
 
 @pytest.mark.parametrize(
     "verdict",
-    ["agent_prompt_unsubmitted", "agent_input_pending"],
+    [
+        "agent_prompt_not_received",
+        "agent_prompt_unsubmitted",
+        "agent_input_pending",
+    ],
 )
 def test_positive_non_delivery_verdict_is_terminal_rejected_without_retry(
     tmp_path: Path,
@@ -1321,34 +1334,29 @@ def test_positive_non_delivery_verdict_is_terminal_rejected_without_retry(
 
 
 @pytest.mark.parametrize(
-    ("composer_after_stall", "expected_status", "expected_disposition", "composer_state"),
+    ("composer_after_stall", "expected_composer_state"),
     [
         (
-            "hello",
-            STATUS_REQUEST_STATE_UNCERTAIN,
-            DISPOSITION_TERMINAL_UNCERTAIN,
+            f"{_REALISTIC_VISIBLE_PANE}\nhello",
             "instruction_visible",
         ),
         (
-            "",
-            STATUS_REQUEST_STATE_UNCERTAIN,
-            DISPOSITION_TERMINAL_UNCERTAIN,
-            "instruction_absent",
+            _REALISTIC_VISIBLE_PANE,
+            None,
         ),
     ],
 )
 def test_agent_prompt_stalled_reads_composer_and_never_resends(
     tmp_path: Path,
     composer_after_stall: str,
-    expected_status: str,
-    expected_disposition: str,
-    composer_state: str,
+    expected_composer_state: str | None,
 ) -> None:
-    config = _config(tmp_path / composer_state)
+    case_name = expected_composer_state or "no_composer_claim"
+    config = _config(tmp_path / case_name)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-    request_id = f"stalled-{composer_state}"
+    request_id = f"stalled-{case_name}"
 
     first = submit_command(
         config,
@@ -1368,10 +1376,13 @@ def test_agent_prompt_stalled_reads_composer_and_never_resends(
     )
 
     assert first.to_dict() == second.to_dict()
-    assert first.status == expected_status
-    assert first.disposition == expected_disposition
+    assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert first.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert first.result["submission_verdict"] == "agent_prompt_stalled"
-    assert first.result["composer_state"] == composer_state
+    if expected_composer_state is None:
+        assert "composer_state" not in first.result
+    else:
+        assert first.result["composer_state"] == expected_composer_state
     assert sum(call["method"] == "pane.read" for call in calls) == 1
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
