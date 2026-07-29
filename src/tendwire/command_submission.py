@@ -421,34 +421,6 @@ class _PaneInputNotStartedError(RuntimeError):
     """The instruction input operation was never attempted."""
 
 
-def _pane_read_text(value: Any) -> str:
-    if not isinstance(value, Mapping):
-        raise ValueError("invalid pane.read response")
-    read = value.get("read")
-    if isinstance(read, Mapping):
-        text = read.get("text")
-    else:
-        text = value.get("text")
-    if not isinstance(text, str):
-        raise ValueError("invalid pane.read text")
-    return text
-
-
-def _read_private_pane_text(client: Any, pane_id: str, *, timeout: float) -> str:
-    response = _socket_request(
-        client,
-        "pane.read",
-        {
-            "pane_id": pane_id,
-            "source": "visible",
-            "format": "text",
-            "strip_ansi": True,
-        },
-        timeout=timeout,
-    )
-    return _pane_read_text(response)
-
-
 def _clear_private_pane_composer(
     client: Any,
     pane_id: str,
@@ -1549,23 +1521,19 @@ def _instruction_rejected_envelope(
     worker: Worker,
     *,
     verdict: str,
-    composer_state: str | None = None,
 ) -> CommandEnvelope:
-    result: dict[str, Any] = {
-        "target": {"worker_id": worker.id},
-        "delivery_state": "not_delivered",
-        "transport_state": "not_submitted",
-        "target_state_at_send": _target_state_at_send(worker),
-        "submission_verdict": verdict,
-    }
-    if composer_state:
-        result["composer_state"] = composer_state
     return CommandEnvelope.from_result(
         request,
         ok=False,
         status=STATUS_REJECTED,
         disposition=DISPOSITION_TERMINAL_REJECTED,
-        result=result,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "not_delivered",
+            "transport_state": "not_submitted",
+            "target_state_at_send": _target_state_at_send(worker),
+            "submission_verdict": verdict,
+        },
         error=error_value(STATUS_REJECTED, "instruction was not delivered"),
     )
 
@@ -1575,23 +1543,19 @@ def _instruction_uncertain_envelope(
     worker: Worker,
     *,
     verdict: str,
-    composer_state: str | None = None,
 ) -> CommandEnvelope:
-    result: dict[str, Any] = {
-        "target": {"worker_id": worker.id},
-        "delivery_state": "unknown",
-        "transport_state": "unknown",
-        "target_state_at_send": _target_state_at_send(worker),
-        "submission_verdict": verdict,
-    }
-    if composer_state:
-        result["composer_state"] = composer_state
     return CommandEnvelope.from_result(
         request,
         ok=False,
         status=STATUS_REQUEST_STATE_UNCERTAIN,
         disposition=DISPOSITION_TERMINAL_UNCERTAIN,
-        result=result,
+        result={
+            "target": {"worker_id": worker.id},
+            "delivery_state": "unknown",
+            "transport_state": "unknown",
+            "target_state_at_send": _target_state_at_send(worker),
+            "submission_verdict": verdict,
+        },
         error=error_value(
             STATUS_REQUEST_STATE_UNCERTAIN,
             "instruction delivery is unknown; not retrying mutation",
@@ -1740,6 +1704,8 @@ def _submit_instruction(
         except Exception as exc:  # noqa: BLE001
             verdict = _herdr_error_code(exc)
             if verdict in {
+                "agent_not_ready",
+                "agent_target_ambiguous",
                 "agent_prompt_not_received",
                 "agent_prompt_unsubmitted",
                 "agent_input_pending",
@@ -1758,28 +1724,10 @@ def _submit_instruction(
                     terminal_state="rejected",
                 )
             if verdict == "agent_prompt_stalled":
-                try:
-                    composer = _read_private_pane_text(
-                        prepared.client,
-                        prepared.pane_id,
-                        timeout=config.herdr_timeout_seconds,
-                    )
-                except Exception:  # noqa: BLE001
-                    composer = None
                 envelope = _instruction_uncertain_envelope(
                     request,
                     worker,
                     verdict=verdict,
-                    composer_state=(
-                        "instruction_visible"
-                        if (
-                            isinstance(composer, str)
-                            and _instruction_text(request) in composer
-                        )
-                        else "unreadable"
-                        if composer is None
-                        else None
-                    ),
                 )
             else:
                 envelope = _instruction_uncertain_envelope(

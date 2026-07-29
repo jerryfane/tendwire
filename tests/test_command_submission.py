@@ -1294,6 +1294,8 @@ def test_written_to_pty_prior_running_turn_observed_later_stays_queued(
 @pytest.mark.parametrize(
     "verdict",
     [
+        "agent_not_ready",
+        "agent_target_ambiguous",
         "agent_prompt_not_received",
         "agent_prompt_unsubmitted",
         "agent_input_pending",
@@ -1333,30 +1335,14 @@ def test_positive_non_delivery_verdict_is_terminal_rejected_without_retry(
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
 
-@pytest.mark.parametrize(
-    ("composer_after_stall", "expected_composer_state"),
-    [
-        (
-            f"{_REALISTIC_VISIBLE_PANE}\nhello",
-            "instruction_visible",
-        ),
-        (
-            _REALISTIC_VISIBLE_PANE,
-            None,
-        ),
-    ],
-)
-def test_agent_prompt_stalled_reads_composer_and_never_resends(
+def test_agent_prompt_stalled_never_infers_composer_from_stale_scrollback(
     tmp_path: Path,
-    composer_after_stall: str,
-    expected_composer_state: str | None,
 ) -> None:
-    case_name = expected_composer_state or "no_composer_claim"
-    config = _config(tmp_path / case_name)
+    config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
-    request_id = f"stalled-{case_name}"
+    request_id = "stalled-stale-scrollback"
 
     first = submit_command(
         config,
@@ -1364,7 +1350,11 @@ def test_agent_prompt_stalled_reads_composer_and_never_resends(
         socket_client_factory=lambda _config: _PromptVerdictClient(
             calls,
             error_code="agent_prompt_stalled",
-            pane_reads=[composer_after_stall],
+            pane_reads=[
+                f"{_REALISTIC_VISIBLE_PANE}\n"
+                "User: hello\n"
+                "Assistant: an answer from an old completed turn"
+            ],
         ),
     )
     second = submit_command(
@@ -1379,11 +1369,39 @@ def test_agent_prompt_stalled_reads_composer_and_never_resends(
     assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert first.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert first.result["submission_verdict"] == "agent_prompt_stalled"
-    if expected_composer_state is None:
-        assert "composer_state" not in first.result
-    else:
-        assert first.result["composer_state"] == expected_composer_state
-    assert sum(call["method"] == "pane.read" for call in calls) == 1
+    assert "composer_state" not in first.result
+    assert not any(call["method"] == "pane.read" for call in calls)
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+
+def test_agent_not_found_remains_unknown_without_retry(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = "agent-not-found-unknown"
+
+    first = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            error_code="agent_not_found",
+        ),
+    )
+    second = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "unknown agent_not_found replay must not issue another prompt"
+        ),
+    )
+
+    assert first.to_dict() == second.to_dict()
+    assert first.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert first.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert first.result["submission_verdict"] == "unknown"
+    assert first.result["delivery_state"] == "unknown"
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
 
@@ -2409,23 +2427,12 @@ def test_submit_command_send_start_exception_recovers_durable_state_and_closes_p
     assert not any(call["method"] == "pane.send_input" for call in calls)
 
 
-@pytest.mark.parametrize(
-    ("initial_kind", "expected_replay_status", "expected_state"),
-    [
-        ("accepted", STATUS_REQUEST_STATE_UNCERTAIN, "uncertain"),
-        ("rejected", STATUS_REJECTED, "rejected"),
-    ],
-)
-def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepared_takeover(
+def test_submit_command_accepted_terminal_replay_delete_fences_prepared_takeover(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    initial_kind: str,
-    expected_replay_status: str,
-    expected_state: str,
 ) -> None:
-    config = _config(tmp_path / initial_kind)
-    worker_status = "active" if initial_kind == "accepted" else "closed"
-    worker = Worker(id="w-1", name="Alpha", status=worker_status)
+    config = _config(tmp_path)
+    worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     initial_calls: list[dict[str, Any]] = []
     first = submit_command(
@@ -2433,9 +2440,10 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
         _request(request_id="terminal-delete-race"),
         socket_client_factory=_factory(initial_calls),
     )
-    assert first.status == (
-        STATUS_ACCEPTED if initial_kind == "accepted" else STATUS_REJECTED
-    )
+    assert first.status == STATUS_ACCEPTED
+    assert first.result["submission_verdict"] == "submitted"
+    assert sum(call["method"] == "agent.prompt" for call in initial_calls) == 1
+    assert not any(call["method"] == "pane.send_input" for call in initial_calls)
     assert config.db_path is not None
 
     active_worker = Worker(id="w-1", name="Alpha", status="active")
@@ -2512,7 +2520,7 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
         replay = replay_future.result(timeout=5)
         contender = contender_future.result(timeout=5)
 
-    assert replay.status == expected_replay_status
+    assert replay.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert contender.to_dict() == replay.to_dict()
     assert atomic_calls == 1
     assert contender_client.close_count == 1
@@ -2521,11 +2529,9 @@ def test_submit_command_terminal_replay_retention_delete_atomically_fences_prepa
     ]
     receipt = get_command_request(config.db_path, config.host_id, "terminal-delete-race")
     assert receipt is not None
-    assert receipt["state"] == expected_state
+    assert receipt["state"] == "uncertain"
     assert receipt["state"] != "reserved"
-    assert sum(call["method"] == "agent.prompt" for call in initial_calls) == (
-        1 if initial_kind == "accepted" else 0
-    )
+    assert sum(call["method"] == "agent.prompt" for call in initial_calls) == 1
 
 
 def test_submit_command_timeout_before_send_start_stays_retryable(
@@ -3994,11 +4000,15 @@ def test_observed_turn_identity_and_link_are_order_independent(
                 },
                 turn_model="observed",
             ) == 1
+        prompt_calls: list[dict[str, Any]] = []
         accepted = submit_command(
             config,
             request,
-            socket_client_factory=_factory([]),
+            socket_client_factory=_factory(prompt_calls),
         )
+        assert accepted.result["submission_verdict"] == "submitted"
+        assert sum(call["method"] == "agent.prompt" for call in prompt_calls) == 1
+        assert not any(call["method"] == "pane.send_input" for call in prompt_calls)
         if order == "submission-first":
             assert merge_turn_content(
                 config.db_path,

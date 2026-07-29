@@ -372,8 +372,23 @@ def test_public_submission_verdict_is_closed_vocabulary() -> None:
     assert sanitize_public_value({"submission_verdict": "submitted"}) == {
         "submission_verdict": "submitted"
     }
+    assert sanitize_public_value({"submission_verdict": "agent_not_ready"}) == {
+        "submission_verdict": "agent_not_ready"
+    }
+    assert sanitize_public_value(
+        {"submission_verdict": "agent_target_ambiguous"}
+    ) == {"submission_verdict": "agent_target_ambiguous"}
     assert sanitize_public_value({"submission_verdict": "invented"}) == {}
     assert sanitize_public_value({"submission_verdict": 1}) == {}
+
+
+def test_public_submission_diagnostics_drop_composer_state() -> None:
+    assert sanitize_public_value(
+        {
+            "submission_verdict": "agent_prompt_stalled",
+            "composer_state": "instruction_visible",
+        }
+    ) == {"submission_verdict": "agent_prompt_stalled"}
 
 
 @pytest.mark.parametrize("host_id", ("output-excerpt", "pane-id-private"))

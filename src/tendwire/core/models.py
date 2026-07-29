@@ -483,6 +483,8 @@ _PUBLIC_SUBMISSION_VERDICTS = frozenset(
     {
         "submitted",
         "written_to_pty",
+        "agent_not_ready",
+        "agent_target_ambiguous",
         "agent_prompt_not_received",
         "agent_prompt_unsubmitted",
         "agent_input_pending",
@@ -976,6 +978,8 @@ def sanitize_public_value(
     provenance at the adapter boundary.
     """
     normalized_field = str(_field).strip().lower().replace("-", "_")
+    if normalized_field == "composer_state":
+        return _PUBLIC_DROP if _nested else None
     if normalized_field == "submission_verdict":
         if not isinstance(value, str):
             return _PUBLIC_DROP if _nested else None
