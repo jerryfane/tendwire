@@ -312,13 +312,11 @@ def _factory(calls: list[dict[str, Any]], *, raises: BaseException | None = None
 def _expected_submit_calls(
     target: str = "agent-secret",
     *,
-    pane_id: str = "pane-secret",
     text: str = "hello",
     timeout_ms: int = 5000,
 ) -> list[dict[str, Any]]:
     return [
         {"method": "agent.get", "params": {"target": target}},
-        *_expected_private_clear_calls(pane_id),
         {
             "method": "agent.prompt",
             "params": {
@@ -533,18 +531,7 @@ def test_submit_command_post_send_transport_failures_are_uncertain(
     assert envelope.status == STATUS_REQUEST_STATE_UNCERTAIN
     assert envelope.disposition == DISPOSITION_TERMINAL_UNCERTAIN
     assert envelope.status != STATUS_BACKEND_UNAVAILABLE
-    assert calls == [
-        {"method": "agent.get", "params": {"target": "agent-secret"}},
-        *_expected_private_clear_calls(),
-        {
-            "method": "agent.prompt",
-            "params": {
-                "target": "agent-secret",
-                "text": "hello",
-                "wait": {"until": ["working"], "timeout_ms": 5000},
-            },
-        },
-    ]
+    assert calls == _expected_submit_calls()
     assert config.db_path is not None
     receipt = _receipt_for_action(config.db_path, "cmd-host", f"uncertain-{type(exc).__name__}", "send_instruction")
     assert receipt is not None
@@ -1192,10 +1179,7 @@ def test_submit_command_uses_verified_agent_prompt(tmp_path: Path) -> None:
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
     assert not any(call["method"] == "pane.read" for call in calls)
     assert not any(call["method"] == "pane.send_text" for call in calls)
-    assert not any(
-        call["method"] == "pane.send_keys" and call["params"].get("keys") == ["Enter"]
-        for call in calls
-    )
+    assert not any(call["method"] == "pane.send_keys" for call in calls)
 
 
 def test_written_to_pty_prior_running_turn_observed_later_stays_queued(
@@ -1405,37 +1389,39 @@ def test_agent_not_found_remains_unknown_without_retry(tmp_path: Path) -> None:
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
 
 
-def test_composer_clear_failures_do_not_gate_verified_prompt(tmp_path: Path) -> None:
+def test_dirty_composer_non_delivery_is_surfaced_without_clear_or_resend(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path)
     worker = Worker(id="w-1", name="Alpha", status="active")
     _seed(config, [worker], [_binding(worker)])
     calls: list[dict[str, Any]] = []
+    request_id = "dirty-composer"
 
-    class ClearFailsClient(_FakeSocketClient):
-        def request(
-            self,
-            method: str,
-            params: dict[str, Any],
-            *,
-            timeout: float | None = None,
-        ) -> dict[str, Any]:
-            if method == "pane.send_keys":
-                self.calls.append({"method": method, "params": dict(params)})
-                raise HerdrProtocolError("clear key rejected")
-            return super().request(method, params, timeout=timeout)
-
-    envelope = submit_command(
+    first = submit_command(
         config,
-        _request(request_id="composer-clear-failed"),
-        socket_client_factory=lambda _config: ClearFailsClient(calls),
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            error_code="agent_prompt_unsubmitted",
+        ),
+    )
+    second = submit_command(
+        config,
+        _request(request_id=request_id),
+        socket_client_factory=lambda _config: pytest.fail(
+            "dirty-composer non-delivery replay must not resend"
+        ),
     )
 
-    assert envelope.status == STATUS_ACCEPTED
-    assert envelope.disposition == DISPOSITION_TERMINAL_ACCEPTED
-    assert envelope.result["submission_verdict"] == "submitted"
-    assert sum(call["method"] == "pane.send_keys" for call in calls) == 3
+    assert first.to_dict() == second.to_dict()
+    assert first.status == STATUS_REJECTED
+    assert first.disposition == DISPOSITION_TERMINAL_REJECTED
+    assert first.result["submission_verdict"] == "agent_prompt_unsubmitted"
+    assert first.result["delivery_state"] == "not_delivered"
+    assert calls == _expected_submit_calls()
+    assert not any(call["method"] == "pane.send_keys" for call in calls)
     assert sum(call["method"] == "agent.prompt" for call in calls) == 1
-    assert not any(call["method"] == "pane.read" for call in calls)
 
 
 def test_crash_after_prompt_write_recovers_unknown_without_resend(
@@ -1548,7 +1534,7 @@ def test_submit_command_terminal_binding_resolves_pane_and_submits_input(tmp_pat
     envelope = submit_command(config, _request(), socket_client_factory=_factory(calls, pane_id="pane-private"))
 
     assert envelope.status == STATUS_ACCEPTED
-    assert calls == _expected_submit_calls("term-secret", pane_id="pane-private")
+    assert calls == _expected_submit_calls("term-secret")
     public_json = json.dumps(envelope.to_dict())
     assert "term-secret" not in public_json
     assert "pane-private" not in public_json
@@ -1565,7 +1551,6 @@ def test_submit_command_pane_binding_submits_without_public_pane_leak(tmp_path: 
 
     assert envelope.status == STATUS_ACCEPTED
     assert calls == [
-        *_expected_private_clear_calls("pane-private"),
         {
             "method": "agent.prompt",
             "params": {
@@ -4000,15 +3985,11 @@ def test_observed_turn_identity_and_link_are_order_independent(
                 },
                 turn_model="observed",
             ) == 1
-        prompt_calls: list[dict[str, Any]] = []
         accepted = submit_command(
             config,
             request,
-            socket_client_factory=_factory(prompt_calls),
+            socket_client_factory=_factory([]),
         )
-        assert accepted.result["submission_verdict"] == "submitted"
-        assert sum(call["method"] == "agent.prompt" for call in prompt_calls) == 1
-        assert not any(call["method"] == "pane.send_input" for call in prompt_calls)
         if order == "submission-first":
             assert merge_turn_content(
                 config.db_path,
@@ -4340,7 +4321,6 @@ def test_terminal_id_agent_list_identical_duplicates_converge_and_send_succeeds(
     assert calls == [
         {"method": "agent.get", "params": {"target": "term-dup"}},
         {"method": "agent.list", "params": {}},
-        *_expected_private_clear_calls("w1:p1"),
         {
             "method": "agent.prompt",
             "params": {

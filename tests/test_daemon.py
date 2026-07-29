@@ -4832,9 +4832,6 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
         assert calls == [
             {"method": "agent.get", "params": {"target": "agent-private"}},
             {"method": "agent.get", "params": {"target": "agent-private"}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+u"]}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "ctrl+k"]}},
-            {"method": "pane.send_keys", "params": {"pane_id": "pane-private", "keys": ["ctrl+a", "backspace"]}},
             {
                 "method": "agent.prompt",
                 "params": {
@@ -4844,6 +4841,7 @@ def test_daemon_concurrent_same_request_id_sends_once_and_replays_accepted(
                 },
             },
         ]
+        assert not any(call["method"] == "pane.send_keys" for call in calls)
         receipt = get_command_request(db_path, "cmd-host", "req-1")
         assert receipt is not None
         assert receipt["state"] == "accepted"

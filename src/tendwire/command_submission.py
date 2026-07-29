@@ -421,27 +421,6 @@ class _PaneInputNotStartedError(RuntimeError):
     """The instruction input operation was never attempted."""
 
 
-def _clear_private_pane_composer(
-    client: Any,
-    pane_id: str,
-    *,
-    timeout: float,
-) -> None:
-    # pane.read exposes rendered terminal output, not the composer, so it
-    # cannot verify that these key sequences cleared the input. Treat clearing
-    # as best-effort and let agent.prompt provide the authoritative verdict.
-    for keys in _PRIVATE_PANE_CLEAR_KEY_SEQUENCES:
-        try:
-            _socket_request(
-                client,
-                "pane.send_keys",
-                {"pane_id": pane_id, "keys": list(keys)},
-                timeout=timeout,
-            )
-        except Exception:  # noqa: BLE001
-            continue
-
-
 def _agent_prompt_delivery(value: Any) -> str:
     if not isinstance(value, Mapping):
         return ""
@@ -1660,12 +1639,6 @@ def _submit_instruction(
 ) -> CommandEnvelope:
     assert config.db_path is not None
     try:
-        _clear_private_pane_composer(
-            prepared.client,
-            prepared.pane_id,
-            timeout=config.herdr_timeout_seconds,
-        )
-
         send_started = _mark_request_send_started(
             config,
             request,
