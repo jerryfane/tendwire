@@ -60,7 +60,6 @@ FORBIDDEN = {
     "bot token",
 }
 
-
 def _assert_no_forbidden(value: Any) -> None:
     encoded = json.dumps(value, sort_keys=True).lower()
     for forbidden in FORBIDDEN:
@@ -835,6 +834,9 @@ def test_turn_final_backend_reason_survives_privately_and_clears_lease(
     _assert_no_forbidden(failed)
     _assert_no_forbidden(polled)
     _assert_no_forbidden(inspected)
+    assert store_sqlite._turn_final_reason_diagnostics(
+        "/root/herdres/foo.py failed"
+    ) == ("unknown", "[redacted] failed")
 
 
 def test_turn_final_private_reason_redacts_before_truncation(
@@ -846,7 +848,7 @@ def test_turn_final_private_reason_redacts_before_truncation(
         key_suffix="boundary-secret",
         ordering_key="worker-a",
     )
-    reason = ("x" * 231) + "ghp_" + ("A" * 30)
+    reason = ("x" * 220) + "ghp_" + ("A" * 30)
     leased = poll_connector_outbox(
         db_path,
         "host-a",
@@ -885,9 +887,200 @@ def test_turn_final_private_reason_redacts_before_truncation(
     assert private_detail
     assert private_detail == response_detail
     assert len(private_detail) <= 240
-    assert private_detail.endswith("\n[truncated]")
     assert "ghp_" not in persisted
     assert "reason_detail" not in failed
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    store_sqlite._TURN_FINAL_PRIVATE_CREDENTIAL_PREFIXES,
+)
+@pytest.mark.parametrize(
+    "word_char_preceded",
+    [False, True],
+    ids=["boundary-preceded", "word-char-preceded"],
+)
+def test_turn_final_private_reason_redacts_shared_credential_prefix_matrix(
+    tmp_path: Path,
+    prefix: str,
+    word_char_preceded: bool,
+) -> None:
+    db_path = tmp_path / "turn-final-credential-prefix-matrix.db"
+    for prefix_offset in range(200, 246):
+        key = _enqueue_final_root(
+            db_path,
+            key_suffix=f"credential-prefix-{prefix_offset}",
+            ordering_key="worker-a",
+        )
+        if word_char_preceded:
+            head = "errorz"
+            reason = head + ("z" * (prefix_offset - len(head))) + prefix
+        else:
+            head = "error: "
+            reason = (
+                head
+                + ("z" * (prefix_offset - len(head) - 1))
+                + " "
+                + prefix
+            )
+        reason += "A" * 40
+        assert reason.index(prefix) == prefix_offset
+
+        leased = poll_connector_outbox(
+            db_path,
+            "host-a",
+            "turn-final",
+            max_attempts=1,
+            now="2026-01-01T00:00:00+00:00",
+        )["items"][0]
+        failed = fail_connector_delivery(
+            db_path,
+            host_id="host-a",
+            name="turn-final",
+            ref=leased["ref"],
+            reason=reason,
+            delay_seconds=0,
+            max_attempts=1,
+            now="2026-01-01T00:00:01+00:00",
+        )
+
+        with sqlite3.connect(str(db_path)) as conn:
+            private_json, response_json = conn.execute(
+                """
+                SELECT outbox.private_state_json, deliveries.response_json
+                FROM connector_outbox AS outbox
+                JOIN connector_deliveries AS deliveries
+                  ON deliveries.outbox_id = outbox.id
+                WHERE outbox.delivery_key = ?
+                ORDER BY deliveries.id DESC
+                LIMIT 1
+                """,
+                (key,),
+            ).fetchone()
+
+        private_detail = json.loads(private_json)["terminal_diagnostic"][
+            "reason_detail"
+        ]
+        response_detail = json.loads(response_json)["reason_detail"]
+        persisted = f"{private_json}\n{response_json}"
+        visible_tail = private_detail.removesuffix("\n[truncated]")
+        visible_limit = 240 - len("\n[truncated]")
+        partial_prefix_length = visible_limit - prefix_offset
+        assert private_detail == response_detail
+        assert len(private_detail) <= 240
+        assert prefix not in persisted
+        if 0 < partial_prefix_length < len(prefix):
+            assert not visible_tail.endswith(prefix[:partial_prefix_length])
+        assert "reason_detail" not in failed
+
+
+def _provider_body_at_source_minimum(prefix: str) -> str:
+    # Prefer lowercase to exercise the boundary rule; AKIA's source class
+    # permits only uppercase letters and digits.
+    for body_char in ("a", "A"):
+        for body_length in range(1, 65):
+            candidate = prefix + (body_char * body_length)
+            if any(
+                pattern.fullmatch(candidate)
+                for pattern in (
+                    store_sqlite._TURN_FINAL_PRIVATE_CREDENTIAL_PATTERNS
+                )
+            ):
+                return body_char * body_length
+    raise AssertionError(f"no provider body available for {prefix}")
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    store_sqlite._TURN_FINAL_PRIVATE_CREDENTIAL_PREFIXES,
+)
+def test_turn_final_private_reason_redacts_boundary_credential_before_underscore(
+    tmp_path: Path,
+    prefix: str,
+) -> None:
+    db_path = tmp_path / "turn-final-boundary-credential-before-underscore.db"
+    key = _enqueue_final_root(
+        db_path,
+        key_suffix=f"boundary-credential-{prefix}",
+        ordering_key="worker-a",
+    )
+    body = _provider_body_at_source_minimum(prefix)
+    credential = prefix + body
+    reason = f"error: {credential}_expired"
+    leased = poll_connector_outbox(
+        db_path,
+        "host-a",
+        "turn-final",
+        max_attempts=1,
+        now="2026-01-01T00:00:00+00:00",
+    )["items"][0]
+    failed = fail_connector_delivery(
+        db_path,
+        host_id="host-a",
+        name="turn-final",
+        ref=leased["ref"],
+        reason=reason,
+        delay_seconds=0,
+        max_attempts=1,
+        now="2026-01-01T00:00:01+00:00",
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        private_json, response_json = conn.execute(
+            """
+            SELECT outbox.private_state_json, deliveries.response_json
+            FROM connector_outbox AS outbox
+            JOIN connector_deliveries AS deliveries
+              ON deliveries.outbox_id = outbox.id
+            WHERE outbox.delivery_key = ?
+            ORDER BY deliveries.id DESC
+            LIMIT 1
+            """,
+            (key,),
+        ).fetchone()
+
+    private_detail = json.loads(private_json)["terminal_diagnostic"]["reason_detail"]
+    response_detail = json.loads(response_json)["reason_detail"]
+    persisted = f"{private_json}\n{response_json}"
+    assert private_detail == response_detail
+    assert "[redacted]" in private_detail
+    assert credential not in persisted
+    assert prefix not in persisted
+    assert body not in persisted
+    assert "reason_detail" not in failed
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "flask-app failed to import",
+        "task-skipped after validation",
+        "mask-sensitive output",
+        "disk-space low",
+        "risk-threshold exceeded",
+        "npm_install failed",
+    ],
+)
+@pytest.mark.parametrize(
+    "word_prefix",
+    ["", "x"],
+    ids=["as-reported", "word-char-prefixed"],
+)
+def test_turn_final_private_reason_preserves_ordinary_diagnostic_text(
+    reason: str,
+    word_prefix: str,
+) -> None:
+    diagnostic = word_prefix + reason
+    assert store_sqlite._turn_final_reason_diagnostics(diagnostic) == (
+        "unknown",
+        diagnostic,
+    )
+
+
+def test_turn_final_private_reason_redacts_token_shaped_provider_body() -> None:
+    assert store_sqlite._turn_final_reason_diagnostics(
+        "glpat-" + ("A" * 40)
+    ) == ("unknown", "[redacted]")
 
 
 @pytest.mark.parametrize(
