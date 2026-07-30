@@ -1275,6 +1275,187 @@ def test_written_to_pty_prior_running_turn_observed_later_stays_queued(
         ).fetchone() == (None,)
 
 
+def test_written_to_pty_expired_verification_becomes_terminal_uncertain(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(id="w-1", name="Alpha", status="working")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = "queued-verification-expired"
+    request = _request(request_id=request_id)
+
+    queued = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            delivery="written_to_pty",
+        ),
+    )
+    with sqlite3.connect(str(config.db_path)) as conn:
+        conn.execute(
+            """
+            UPDATE turn_submissions
+            SET link_expires_at = ?, hard_expires_at = ?
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (
+                "2000-01-01T00:00:00+00:00",
+                "2000-01-01T00:00:00+00:00",
+                config.host_id,
+                request_id,
+            ),
+        )
+
+    uncertain = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: pytest.fail(
+            "expired queued replay must not issue another prompt"
+        ),
+    )
+    replay = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: pytest.fail(
+            "terminal-uncertain replay must not issue another prompt"
+        ),
+    )
+
+    assert queued.status == STATUS_PENDING
+    assert uncertain.to_dict() == replay.to_dict()
+    assert uncertain.status == STATUS_REQUEST_STATE_UNCERTAIN
+    assert uncertain.disposition == DISPOSITION_TERMINAL_UNCERTAIN
+    assert uncertain.result["submission_verdict"] == "written_to_pty"
+    assert uncertain.result["delivery_state"] == "unknown"
+    assert uncertain.error is not None
+    assert "verification expired" in uncertain.error["message"]
+    assert "queued" not in uncertain.error["message"].lower()
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+    with sqlite3.connect(str(config.db_path)) as conn:
+        assert conn.execute(
+            """
+            SELECT state, status
+            FROM command_receipts
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchone() == ("uncertain", STATUS_REQUEST_STATE_UNCERTAIN)
+        assert conn.execute(
+            """
+            SELECT state
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchone() == ("expired",)
+
+
+def test_written_to_pty_replay_settles_only_its_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.db_path is not None
+    worker = Worker(id="w-1", name="Alpha", status="working")
+    _seed(config, [worker], [_binding(worker)])
+    calls: list[dict[str, Any]] = []
+    request_id = "queued-one-of-forty"
+    request = _request(request_id=request_id)
+
+    queued = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: _PromptVerdictClient(
+            calls,
+            delivery="written_to_pty",
+        ),
+    )
+    assert queued.status == STATUS_PENDING
+    with sqlite3.connect(str(config.db_path)) as conn:
+        for index in range(1, 40):
+            conn.execute(
+                """
+                INSERT INTO turn_submissions (
+                    host_id, submission_id, request_id, owner_key,
+                    owner_key_version, instruction_fingerprint, state,
+                    linked_turn_id, link_not_before, link_expires_at,
+                    hard_expires_at, linked_at, terminal_at, submitted_at,
+                    send_started_at, updated_at
+                )
+                SELECT host_id, ?, ?, ?, owner_key_version, ?, state,
+                       linked_turn_id, link_not_before, link_expires_at,
+                       hard_expires_at, linked_at, terminal_at, submitted_at,
+                       send_started_at, updated_at
+                FROM turn_submissions
+                WHERE host_id = ? AND request_id = ?
+                """,
+                (
+                    f"submission-extra-{index}",
+                    f"request-extra-{index}",
+                    f"owner-extra-{index}",
+                    f"fingerprint-extra-{index}",
+                    config.host_id,
+                    request_id,
+                ),
+            )
+        assert conn.execute(
+            """
+            SELECT COUNT(DISTINCT owner_key || ':' || instruction_fingerprint)
+            FROM turn_submissions
+            WHERE host_id = ?
+            """,
+            (config.host_id,),
+        ).fetchone() == (40,)
+        own_component = conn.execute(
+            """
+            SELECT owner_key, instruction_fingerprint
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (config.host_id, request_id),
+        ).fetchone()
+        assert own_component is not None
+
+    original_settle = store_sqlite.settle_submission_links_conn
+    settled_components: list[tuple[str, str]] = []
+
+    def counted_settle(
+        conn: sqlite3.Connection,
+        host_id: str,
+        owner_key: str,
+        instruction_fingerprint_value: str,
+        **kwargs: Any,
+    ) -> int:
+        settled_components.append((owner_key, instruction_fingerprint_value))
+        return original_settle(
+            conn,
+            host_id,
+            owner_key,
+            instruction_fingerprint_value,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        store_sqlite,
+        "settle_submission_links_conn",
+        counted_settle,
+    )
+    replay = submit_command(
+        config,
+        request,
+        socket_client_factory=lambda _config: pytest.fail(
+            "queued replay must not issue another prompt"
+        ),
+    )
+
+    assert replay.status == STATUS_PENDING
+    assert settled_components == [own_component]
+    assert sum(call["method"] == "agent.prompt" for call in calls) == 1
+
+
 @pytest.mark.parametrize(
     "verdict",
     [

@@ -25390,6 +25390,63 @@ def sweep_submission_links(
             raise
 
 
+def settle_submission_link_for_request(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    now: str | None = None,
+) -> dict[str, Any] | None:
+    """Settle only the owner/fingerprint component containing one request."""
+    if not _sqlite_store_exists(db_path):
+        return None
+    current = _command_request_now(now)
+    with _connect(db_path, isolation_level=None) as conn:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            component = conn.execute(
+                """
+                SELECT owner_key, instruction_fingerprint
+                FROM turn_submissions
+                WHERE host_id = ? AND request_id = ?
+                """,
+                (str(host_id), str(request_id)),
+            ).fetchone()
+            if component is None:
+                conn.commit()
+                return None
+            owner_key, fingerprint = map(str, component)
+            changed = settle_submission_links_conn(
+                conn,
+                str(host_id),
+                owner_key,
+                fingerprint,
+                now=current,
+            )
+            row = conn.execute(
+                """
+                SELECT state, linked_turn_id
+                FROM turn_submissions
+                WHERE host_id = ? AND request_id = ?
+                """,
+                (str(host_id), str(request_id)),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                return None
+            return {
+                "state": str(row[0]),
+                "linked_turn_id": (
+                    None if row[1] is None else str(row[1])
+                ),
+                "changed": changed,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def linked_turn_for_submission(
     db_path: Path,
     *,
@@ -25783,6 +25840,104 @@ def finish_queued_command_request(
         )
         conn.commit()
         return _command_request_response("accepted", row)
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def finish_unverified_queued_command_request(
+    db_path: Path,
+    *,
+    host_id: str,
+    request_id: str,
+    canonical_fingerprint: str,
+    queued_result_json: str,
+    uncertain_result_json: str,
+    event_payload: Mapping[str, Any] | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Terminalize a queued receipt after its ledger can no longer verify it."""
+    current = _command_request_now(now)
+    conn = _connect(db_path, isolation_level=None, prepare=True)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            conn.commit()
+            return _command_request_response("not_found", None)
+        if str(row[5]) != str(canonical_fingerprint):
+            conn.commit()
+            return _command_request_response("request_id_conflict", row)
+        if str(row[8]) in _COMMAND_REQUEST_TERMINAL_STATES:
+            conn.commit()
+            return _command_request_response("terminal", row)
+        if (
+            str(row[8]) != "send_started"
+            or str(row[9]) != "pending"
+            or str(row[10]) != str(queued_result_json)
+        ):
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        ledger = conn.execute(
+            """
+            SELECT state, linked_turn_id
+            FROM turn_submissions
+            WHERE host_id = ? AND request_id = ?
+            """,
+            (str(host_id), str(request_id)),
+        ).fetchone()
+        if (
+            ledger is None
+            or str(ledger[0]) not in {"ambiguous", "expired"}
+            or ledger[1] is not None
+        ):
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        updated = conn.execute(
+            """
+            UPDATE command_receipts
+            SET state = 'uncertain',
+                status = 'request_state_uncertain',
+                result_json = ?,
+                owner_token_hash = '',
+                owner_expires_at = NULL,
+                terminal_at = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND state = 'send_started'
+              AND canonical_fingerprint = ?
+              AND status = 'pending'
+              AND result_json = ?
+            """,
+            (
+                str(uncertain_result_json),
+                current,
+                current,
+                int(row[0]),
+                str(canonical_fingerprint),
+                str(queued_result_json),
+            ),
+        )
+        if int(updated.rowcount or 0) != 1:
+            row = _command_request_row(conn, host_id, request_id)
+            conn.commit()
+            return _command_request_response("in_progress", row)
+        row = _command_request_row(conn, host_id, request_id)
+        if row is None:
+            raise RuntimeError("uncertain queued command request disappeared")
+        _project_command_request_conn(conn, row)
+        _command_transition_event_conn(
+            conn,
+            row,
+            observed_at=current,
+            event_payload=event_payload,
+        )
+        conn.commit()
+        return _command_request_response("uncertain", row)
     except Exception:
         if conn.in_transaction:
             conn.rollback()

@@ -63,6 +63,7 @@ from .store.sqlite import (
     envelope_to_receipt_json,
     finish_command_request,
     finish_queued_command_request,
+    finish_unverified_queued_command_request,
     get_command_request,
     linked_turn_for_submission,
     latest_snapshot,
@@ -72,7 +73,7 @@ from .store.sqlite import (
     recover_unresolved_command_send,
     reserve_command_request,
     reserve_terminal_command_replay,
-    sweep_submission_links,
+    settle_submission_link_for_request,
     start_backend_pending_choice_send,
     start_backend_pending_decision_send,
 )
@@ -1597,6 +1598,34 @@ def _accepted_queued_send_envelope(
     )
 
 
+def _unverified_queued_send_envelope(
+    request: CommandRequest,
+    queued: CommandEnvelope,
+) -> CommandEnvelope:
+    queued_result = queued.result if isinstance(queued.result, Mapping) else {}
+    return CommandEnvelope.from_result(
+        request,
+        ok=False,
+        status=STATUS_REQUEST_STATE_UNCERTAIN,
+        disposition=DISPOSITION_TERMINAL_UNCERTAIN,
+        result={
+            "target": queued_result.get("target"),
+            "delivery_state": "unknown",
+            "transport_state": "unknown",
+            "target_state_at_send": queued_result.get("target_state_at_send"),
+            "turn_id": None,
+            "submission_verdict": "written_to_pty",
+        },
+        error=error_value(
+            STATUS_REQUEST_STATE_UNCERTAIN,
+            (
+                "instruction verification expired; delivery is unknown "
+                "and will not be retried"
+            ),
+        ),
+    )
+
+
 def _record_queued_send(
     config: Config,
     request: CommandRequest,
@@ -2428,9 +2457,10 @@ def _receipt_authority(
             if config.db_path is None:
                 return replay
             try:
-                sweep_submission_links(
+                settlement = settle_submission_link_for_request(
                     config.db_path,
                     host_id=config.host_id,
+                    request_id=request.request_id or "",
                 )
                 linked = linked_turn_for_submission(
                     config.db_path,
@@ -2439,21 +2469,49 @@ def _receipt_authority(
                 )
             except Exception:  # noqa: BLE001
                 return replay
-            if not isinstance(linked, Mapping):
+            if isinstance(linked, Mapping):
+                accepted = _accepted_queued_send_envelope(request, replay, linked)
+                try:
+                    finished = finish_queued_command_request(
+                        config.db_path,
+                        host_id=config.host_id,
+                        request_id=request.request_id or "",
+                        canonical_fingerprint=canonical.fingerprint,
+                        queued_result_json=str(receipt.get("result_json") or ""),
+                        accepted_result_json=envelope_to_receipt_json(accepted),
+                        event_payload=_transition_payload(
+                            request,
+                            worker_id=proven,
+                            envelope=accepted,
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    return replay
+                if not isinstance(finished, Mapping):
+                    return replay
+                return _envelope_from_receipt(
+                    request,
+                    canonical,
+                    finished.get("receipt"),
+                )
+            if (
+                not isinstance(settlement, Mapping)
+                or settlement.get("state") not in {"ambiguous", "expired"}
+            ):
                 return replay
-            accepted = _accepted_queued_send_envelope(request, replay, linked)
+            uncertain = _unverified_queued_send_envelope(request, replay)
             try:
-                finished = finish_queued_command_request(
+                finished = finish_unverified_queued_command_request(
                     config.db_path,
                     host_id=config.host_id,
                     request_id=request.request_id or "",
                     canonical_fingerprint=canonical.fingerprint,
                     queued_result_json=str(receipt.get("result_json") or ""),
-                    accepted_result_json=envelope_to_receipt_json(accepted),
+                    uncertain_result_json=envelope_to_receipt_json(uncertain),
                     event_payload=_transition_payload(
                         request,
                         worker_id=proven,
-                        envelope=accepted,
+                        envelope=uncertain,
                     ),
                 )
             except Exception:  # noqa: BLE001
@@ -2789,9 +2847,10 @@ def _negotiated_submission_envelope(
     )
     if config.db_path is not None:
         try:
-            sweep_submission_links(
+            settle_submission_link_for_request(
                 config.db_path,
                 host_id=config.host_id,
+                request_id=request.request_id or "",
             )
             linked_turn = linked_turn_for_submission(
                 config.db_path,
