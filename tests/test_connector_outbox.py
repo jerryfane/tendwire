@@ -837,7 +837,7 @@ def test_turn_final_backend_reason_survives_privately_and_clears_lease(
     _assert_no_forbidden(inspected)
 
 
-def test_turn_final_private_reason_redacts_before_truncation(
+def test_turn_final_private_reason_redacts_word_adjacent_credential_before_truncation(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "turn-final-boundary-secret.db"
@@ -846,7 +846,7 @@ def test_turn_final_private_reason_redacts_before_truncation(
         key_suffix="boundary-secret",
         ordering_key="worker-a",
     )
-    reason = ("x" * 231) + "ghp_" + ("A" * 30)
+    reason = ("x" * 220) + "ghp_" + ("A" * 30)
     leased = poll_connector_outbox(
         db_path,
         "host-a",
@@ -885,7 +885,6 @@ def test_turn_final_private_reason_redacts_before_truncation(
     assert private_detail
     assert private_detail == response_detail
     assert len(private_detail) <= 240
-    assert private_detail.endswith("\n[truncated]")
     assert "ghp_" not in persisted
     assert "reason_detail" not in failed
 

@@ -369,16 +369,58 @@ _PUBLIC_PRIVATE_ENDPOINT_RE = re.compile(
     r"(?::\d{1,5})?\b"
     r"|(?i:\b(?:fc|fd)[0-9a-f:]*:[0-9a-f:]+\b|\bfe80:[0-9a-f:]+\b|(?<!:)::1\b)"
 )
-_PUBLIC_PROVIDER_CREDENTIAL_RE = re.compile(
-    r"\bsk-[A-Za-z0-9_-]{6,}\b"
-    r"|\bgh[oprsu]_[A-Za-z0-9]{6,}\b"
-    r"|\bxox[baprs]-[A-Za-z0-9-]{6,}\b"
-    r"|\bAKIA[0-9A-Z]{12,}\b"
-    r"|\bAIza[0-9A-Za-z_-]{10,}\b"
-    r"|\bglpat-[A-Za-z0-9_-]{8,}\b"
-    r"|\bnpm_[A-Za-z0-9]{20,}\b"
-    r"|\bpypi-[A-Za-z0-9_-]{20,}\b"
-    r"|\b\d{6,}:[A-Za-z0-9_-]{20,}\b"
+
+
+@dataclass(frozen=True)
+class _ProviderCredentialSpec:
+    prefixes: tuple[str, ...]
+    body_class: str
+    minimum: int
+
+
+_PUBLIC_PROVIDER_CREDENTIAL_SPECS = (
+    _ProviderCredentialSpec(("sk-",), r"A-Za-z0-9_-", 6),
+    _ProviderCredentialSpec(
+        ("gho_", "ghp_", "ghr_", "ghs_", "ghu_"),
+        r"A-Za-z0-9",
+        6,
+    ),
+    _ProviderCredentialSpec(
+        ("xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"),
+        r"A-Za-z0-9-",
+        6,
+    ),
+    _ProviderCredentialSpec(("AKIA",), r"0-9A-Z", 12),
+    _ProviderCredentialSpec(("AIza",), r"0-9A-Za-z_-", 10),
+    _ProviderCredentialSpec(("glpat-",), r"A-Za-z0-9_-", 8),
+    _ProviderCredentialSpec(("npm_",), r"A-Za-z0-9", 20),
+    _ProviderCredentialSpec(("pypi-",), r"A-Za-z0-9_-", 20),
+)
+_PUBLIC_PROVIDER_CREDENTIAL_PREFIXES = tuple(
+    prefix
+    for spec in _PUBLIC_PROVIDER_CREDENTIAL_SPECS
+    for prefix in spec.prefixes
+)
+
+
+def _provider_credential_pattern() -> re.Pattern[str]:
+    alternatives: list[str] = []
+    for index, spec in enumerate(_PUBLIC_PROVIDER_CREDENTIAL_SPECS):
+        prefixes = "|".join(re.escape(prefix) for prefix in spec.prefixes)
+        alternatives.append(
+            rf"(?P<provider_{index}>(?:{prefixes})"
+            rf"(?P<provider_body_{index}>[{spec.body_class}]{{{spec.minimum},}}))"
+        )
+    return re.compile("|".join(alternatives))
+
+
+_PUBLIC_PROVIDER_CREDENTIAL_RE = _provider_credential_pattern()
+_PUBLIC_PROVIDER_TOKEN_SHAPE_RE = re.compile(r"[A-Z0-9]")
+_PUBLIC_TELEGRAM_BOT_URL_CREDENTIAL_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])bot\d{6,}:[A-Za-z0-9_-]{20,}"
+)
+_PUBLIC_GENERIC_BOT_CREDENTIAL_RE = re.compile(
+    r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"
 )
 _PUBLIC_JWT_RE = re.compile(
     r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\b"
@@ -404,7 +446,7 @@ _PUBLIC_SENSITIVE_TEXT_RES = (
     _PUBLIC_SOCKET_URI_RE,
     _PUBLIC_PATH_RE,
     _PUBLIC_PRIVATE_ENDPOINT_RE,
-    _PUBLIC_PROVIDER_CREDENTIAL_RE,
+    _PUBLIC_GENERIC_BOT_CREDENTIAL_RE,
     _PUBLIC_JWT_RE,
     _PUBLIC_BEARER_RE,
     _PUBLIC_ENV_ASSIGNMENT_RE,
@@ -432,8 +474,6 @@ _PUBLIC_SENSITIVE_CROSSING_RE = re.compile(
     r"secret|password|api[_ -]?key|authorization|credential)\s*[:=]\s*"
     r"(?:\"[^\"\n]*|'[^'\n]*'|[^\s,;]*)"
     r"|\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s<>()]*"
-    r"|\b(?:sk-|gh[oprsu]_|xox[baprs]-|AKIA|AIza|glpat-|npm_|pypi-)"
-    r"[A-Za-z0-9_-]*"
     r"|(?<!\d)\d{6,}:[A-Za-z0-9_-]*"
     r"|\beyJ[A-Za-z0-9_.-]*"
     r"|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*"
@@ -493,7 +533,7 @@ _PUBLIC_SUBMISSION_VERDICTS = frozenset(
     }
 )
 _PUBLIC_SANITIZE_CACHE_DEFAULT_SIZE = 2048
-_PUBLIC_SANITIZER_CONFIG_VERSION = 1
+_PUBLIC_SANITIZER_CONFIG_VERSION = 2
 _PUBLIC_FREE_TEXT_KEYS = frozenset(
     {
         "assistant_final_text",
@@ -830,8 +870,55 @@ def _contains_connector_private_text(value: str) -> bool:
     )
 
 
+def _redact_provider_credentials(text: str) -> str:
+    """Redact provider-shaped secrets without treating lowercase prose as a token.
+
+    Provider bodies containing an uppercase letter or digit are token-shaped and
+    redact regardless of the character before the prefix.  A lowercase body at a
+    clean boundary is retained as ordinary prose, except when an underscore after
+    the provider minimum supplies the credential/suffix boundary.  This also
+    closes the strict matcher's trailing-boundary hole for body classes that do
+    not admit underscores.  Word-internal lowercase forms remain prose (for
+    example, ``task-skipped``).
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        for index, spec in enumerate(_PUBLIC_PROVIDER_CREDENTIAL_SPECS):
+            body = match.group(f"provider_body_{index}")
+            if body is None:
+                continue
+            preceded_by_word = bool(
+                match.start() > 0
+                and re.match(r"[A-Za-z0-9_]", text[match.start() - 1])
+            )
+            if _PUBLIC_PROVIDER_TOKEN_SHAPE_RE.search(body):
+                return "[redacted]"
+            if preceded_by_word:
+                return match.group(0)
+            next_character = text[match.end() : match.end() + 1]
+            underscore_after_minimum = (
+                next_character == "_"
+                or body.find("_", spec.minimum) >= spec.minimum
+            )
+            if underscore_after_minimum:
+                return "[redacted]"
+            return match.group(0)
+        return match.group(0)
+
+    if "bot" in text.lower():
+        text = _PUBLIC_TELEGRAM_BOT_URL_CREDENTIAL_RE.sub("[redacted]", text)
+    if any(prefix in text for prefix in _PUBLIC_PROVIDER_CREDENTIAL_PREFIXES):
+        text = _PUBLIC_PROVIDER_CREDENTIAL_RE.sub(_replace, text)
+    return text
+
+
 def _redact_and_truncate_public_text(text: str, max_chars: int | None) -> str:
-    """Redact a bounded prefix plus any sensitive value crossing its boundary."""
+    """Redact providers in full, then other values in the bounded prefix."""
+    # Provider credentials are scanned in the complete normalized input.  Besides
+    # preserving redact-before-truncate semantics, this prevents a truncation cut
+    # from hiding the prefix, minimum body length, or trailing delimiter from the
+    # matcher.  The remaining public patterns keep the bounded-prefix fast path.
+    text = _redact_provider_credentials(text)
     if max_chars is None:
         return _PUBLIC_SENSITIVE_TEXT_RE.sub("[redacted]", text)
 

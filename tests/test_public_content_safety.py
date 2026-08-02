@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from types import SimpleNamespace
 from typing import Any
@@ -11,8 +12,8 @@ import pytest
 from tendwire.cli import cmd_snapshot
 from tendwire.config import Config
 from tendwire.connectors import ConnectorOutboxAPI
+from tendwire.core import models as core_models
 from tendwire.core.attention import attention_payload_from_snapshot
-
 from tendwire.core.models import (
     AttentionSignal,
     Snapshot,
@@ -111,6 +112,81 @@ def _sentinel_corpus() -> dict[str, str]:
         "telegram_topic_id": "topic id: 731245",
         "telegram_message_id": "message id: 918273",
     }
+
+
+_PROVIDER_PREFIX_FALSE_POSITIVE_CORPUS = (
+    "desk-rendering queue delayed",
+    "rougho_optimizer returned empty output",
+    "roughp_parser missed a field",
+    "roughr_router chose fallback",
+    "roughs_scheduler delayed retry",
+    "roughu_uploader closed early",
+    "boxoxb-backfill worker paused",
+    "boxoxa-analysis worker paused",
+    "boxoxp-parser worker paused",
+    "boxoxr-recovery worker paused",
+    "boxoxs-scheduler worker paused",
+    "makia-development pipeline paused",
+    "plAIza-renderer timed out",
+    "glpat-renderer cache miss",
+    "npm_install failed",
+    "mypypi-mirror returned 503",
+    "risk-threshold exceeded",
+    "task-skipped after validation",
+    "mask-sensitive output",
+    "ask-handler returned no answer",
+    "flask-app failed to import",
+    "disk-space low",
+    "brisk-response from backend",
+    "work_skipped_by_policy",
+    "desk-check pending",
+    "brisk-retry backoff",
+    "asyncio-timeout waiting for ack",
+    "worker-pool exhausted",
+    "http-503 from upstream",
+    "AKIAlike-normal-word here",
+    "pypi-mirror unreachable",
+    "glpat-like text follows",
+    "subprocess exited 1",
+    "boxoxs-scheduling state",
+    "makia-development-service unavailable",
+    "plAIza-rendering-service unavailable",
+    "glpat-rendering-service unavailable",
+    "cnpm_installation_service unavailable",
+    "mypypi-mirroring-service unavailable",
+    "desk-reconciliation worker failed",
+    "sk-lower diagnostic",
+    "sk-lowercase diagnostic",
+    "sk-lowercaseword diagnostic",
+    "gho_lower diagnostic",
+    "gho_lowercase diagnostic",
+    "ghp_lowercaseword diagnostic",
+    "xoxb-lowercase diagnostic",
+    "xoxp-lowercasename diagnostic",
+    "AIza_lowercaseword diagnostic",
+    "glpat-lowercaseword diagnostic",
+    "npm_installationpendingnow diagnostic",
+    "pypi-lowercaseworddiagnostic diagnostic",
+)
+
+
+def _provider_prefix_specs() -> list[tuple[str, str, int]]:
+    return [
+        (prefix, spec.body_class, spec.minimum)
+        for spec in core_models._PUBLIC_PROVIDER_CREDENTIAL_SPECS
+        for prefix in spec.prefixes
+    ]
+
+
+def _provider_token_body(body_class: str, minimum: int) -> str:
+    # Every provider body class admits uppercase ASCII and digits.  Keeping both
+    # makes the generated value token-shaped instead of an English word.
+    assert "A-Z" in body_class and "0-9" in body_class
+    return ("A0" + ("B" * minimum))[:minimum]
+
+
+def _provider_lowercase_body(body_class: str, minimum: int) -> str:
+    return ("a" if "a-z" in body_class else "A") * minimum
 
 
 def _sentinels_as_dynamic_keys(corpus: dict[str, str]) -> dict[str, str]:
@@ -596,6 +672,110 @@ def test_credentials_are_redacted_before_a_straddling_truncation_boundary(
     assert len(sanitized) <= max_chars, name
     assert marker in sanitized, name
     assert visible_prefix not in sanitized, name
+
+
+def test_provider_credentials_redact_at_every_prefix_placement_and_delimiter() -> None:
+    delimiters = tuple(
+        chr(codepoint)
+        for codepoint in range(128)
+        if re.fullmatch(r"\W", chr(codepoint))
+    ) + ("🙂",)
+
+    for prefix, body_class, minimum in _provider_prefix_specs():
+        body = _provider_token_body(body_class, minimum)
+        credential = prefix + body
+        for preceding in (" ", "x"):
+            for delimiter in delimiters:
+                raw = f"diagnostic{preceding}{credential}{delimiter}tail"
+                sanitized = sanitize_public_text(raw)
+
+                assert credential not in sanitized, (prefix, preceding, delimiter)
+                assert "[redacted]" in sanitized, (prefix, preceding, delimiter)
+
+
+def test_provider_truncation_sweep_redacts_tokens_without_destroying_prose() -> None:
+    marker = "\n[truncated]"
+    max_chars = 240
+
+    for prefix, body_class, minimum in _provider_prefix_specs():
+        body = _provider_token_body(body_class, minimum)
+        credential = prefix + body
+        ordinary_body = "lowercaseworddiagnostic"[: max(minimum, 8)]
+        ordinary = prefix + ordinary_body
+        for offset in range(195, 251):
+            for preceding in (".", "w"):
+                for redactable_head in ("", "/root/herdres/foo.py failed: "):
+                    padding = "q" * (offset - len(redactable_head) - 1)
+                    head = redactable_head + padding + preceding
+                    raw = head + credential + "/tail"
+                    assert raw.index(prefix) == offset
+                    sanitized = sanitize_public_text(raw, max_chars=max_chars)
+                    visible = sanitized.removesuffix(marker)
+                    unbounded = sanitize_public_text(raw)
+
+                    assert len(sanitized) <= max_chars, (prefix, offset, preceding)
+                    assert credential not in sanitized, (prefix, offset, preceding)
+                    assert credential not in unbounded, (prefix, offset, preceding)
+                    assert "[redacted]" in unbounded, (prefix, offset, preceding)
+                    assert not any(
+                        visible.endswith(prefix[:partial])
+                        for partial in range(1, len(prefix) + 1)
+                    ), (prefix, offset, preceding, visible[-len(prefix) :])
+
+                    # Use the same absolute raw placement without truncation so
+                    # the over-redaction half is tested even when the bounded
+                    # value is removed by position rather than by redaction.
+                    ordinary_raw = head + ordinary + " diagnostic"
+                    ordinary_sanitized = sanitize_public_text(ordinary_raw)
+                    assert ordinary in ordinary_sanitized, (
+                        prefix,
+                        offset,
+                        preceding,
+                    )
+                    if not redactable_head:
+                        assert ordinary_sanitized == ordinary_raw
+
+
+def test_provider_prefix_like_ordinary_diagnostics_remain_legible() -> None:
+    assert len(_PROVIDER_PREFIX_FALSE_POSITIVE_CORPUS) == 52
+
+    for diagnostic in _PROVIDER_PREFIX_FALSE_POSITIVE_CORPUS:
+        assert sanitize_public_text(diagnostic) == diagnostic
+
+
+def test_backend_neutral_value_redacts_token_but_retains_prefix_like_prose() -> None:
+    credential = "errorxsk-" + ("B" * 36)
+
+    assert sanitize_public_value(credential, backend_neutral=True) is None
+    ordinary = "glpat-renderer cache miss"
+    assert sanitize_public_value(ordinary, backend_neutral=True) == ordinary
+
+
+def test_provider_body_before_underscore_is_redacted_for_every_prefix() -> None:
+    for prefix, body_class, minimum in _provider_prefix_specs():
+        credential = prefix + _provider_lowercase_body(body_class, minimum)
+        raw = f"error: {credential}_expired"
+        sanitized = sanitize_public_text(raw)
+
+        assert credential not in sanitized, prefix
+        assert prefix not in sanitized, prefix
+        assert "[redacted]" in sanitized, prefix
+
+        ordinary_body = "lowercaseworddiagnostic"[: max(minimum, 8)]
+        ordinary = f"errorx{prefix}{ordinary_body}_expired"
+        assert sanitize_public_text(ordinary) == ordinary, prefix
+
+
+def test_telegram_bot_token_in_api_url_is_redacted_without_matching_long_numbers() -> None:
+    token = "123456:" + "AbCdEf0123456789AbCdEf012345"
+    raw = f"POST https://api.telegram.org/bot{token}/sendMessage failed"
+
+    sanitized = sanitize_public_text(raw)
+
+    assert token not in sanitized
+    assert sanitized == "POST https://api.telegram.org/[redacted]/sendMessage failed"
+    ordinary = "event id 123456789012345678901234567890 remains public"
+    assert sanitize_public_text(ordinary) == ordinary
 
 
 def test_numeric_telegram_chat_ids_are_private_but_ordinary_integers_are_not() -> None:
